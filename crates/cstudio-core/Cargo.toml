@@ -1,0 +1,13 @@
+[package]
+name = "cstudio-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core assembly model and editing engine for C-Studio"
+license = "MIT"
+
+[lib]
+name = "cstudio_core"
+path = "src/lib.rs"
+
+[dependencies]
+hdf5 = "0.8"

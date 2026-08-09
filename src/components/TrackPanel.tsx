@@ -1,0 +1,709 @@
+import {
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
+import { Eye, EyeOff, SlidersHorizontal } from "lucide-react";
+import { buildAssemblyEditModel, selectedBlockIds } from "../state/assemblyEditing";
+import type { ContactViewport } from "../state/contactViewport";
+import type { CoverageView } from "../state/coverageView";
+import type { ContactMapLayoutBlock } from "../state/importers";
+import type { UiAction, UiState } from "../state/uiState";
+
+interface TrackPanelProps {
+  coverageView: CoverageView | null;
+  uiState: UiState;
+  onUiAction: (action: UiAction) => void;
+  onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
+}
+
+export interface CoverageTrackBar {
+  xBin: number;
+  value: number;
+  blockId: string | null;
+  leftRatio: number;
+  widthRatio: number;
+}
+
+export interface CoverageScaleDomain {
+  min: number;
+  max: number;
+}
+
+export interface CoverageSelectionRange {
+  id: string;
+  leftRatio: number;
+  widthRatio: number;
+}
+
+export interface CoverageChromosomeBoundary {
+  positionBp: number;
+  leftRatio: number;
+}
+
+interface CoverageSelectionModifiers {
+  shiftKey: boolean;
+  metaKey: boolean;
+  ctrlKey: boolean;
+}
+
+interface CoverageSelectionDrag {
+  pointerId: number;
+  startClientX: number;
+  startRatio: number;
+  currentRatio: number;
+  moved: boolean;
+}
+
+const defaultCoverageMultiplier = 2;
+const minimumCoverageMultiplier = 1;
+const maximumCoverageMultiplier = 100;
+const coverageDragThresholdPx = 4;
+
+export function TrackPanel({ coverageView, onContextMenu, onUiAction, uiState }: TrackPanelProps) {
+  const [scaleOverride, setScaleOverride] = useState<CoverageScaleDomain | null>(null);
+  const [automaticMultiplier, setAutomaticMultiplier] = useState(defaultCoverageMultiplier);
+  const [automaticMultiplierInput, setAutomaticMultiplierInput] = useState(
+    formatCoverageMultiplier(defaultCoverageMultiplier),
+  );
+  const [coverageSelectionAnchorId, setCoverageSelectionAnchorId] = useState<string | null>(null);
+  const [coverageSelectionDrag, setCoverageSelectionDrag] = useState<CoverageSelectionDrag | null>(null);
+  const coverageSelectionDragRef = useRef<CoverageSelectionDrag | null>(null);
+  const lastDragSelectionSignatureRef = useRef("");
+  const suppressCoverageClickRef = useRef(false);
+  const bars = useMemo(
+    () => buildCoverageTrackBars(coverageView, uiState.assembly.blocks),
+    [coverageView, uiState.assembly.blocks],
+  );
+  const selectedIds = new Set(selectedBlockIds(
+    uiState.assembly.blocks,
+    uiState.assembly.selection,
+  ));
+  const selectionRanges = buildCoverageSelectionRanges(
+    coverageView?.viewport ?? null,
+    uiState.assembly.blocks,
+    selectedIds,
+  );
+  const interactiveRanges = buildCoverageSelectionRanges(
+    coverageView?.viewport ?? null,
+    uiState.assembly.blocks,
+    new Set(uiState.assembly.blocks.map((block) => block.id)),
+  );
+  const blocksById = new Map(uiState.assembly.blocks.map((block) => [block.id, block]));
+  const chromosomeBoundaries = buildCoverageChromosomeBoundaries(
+    coverageView?.viewport ?? null,
+    uiState.assembly.blocks,
+  );
+  const automaticScale = coverageAutoScaleDomain(
+    bars.map((bar) => bar.value),
+    automaticMultiplier,
+  );
+  const scale = scaleOverride ?? automaticScale;
+
+  function setScaleBoundary(field: keyof CoverageScaleDomain, value: number) {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+
+    setScaleOverride((current) => {
+      const next = { ...(current ?? automaticScale), [field]: value };
+      if (next.max <= next.min) {
+        return field === "min"
+          ? { min: value, max: value + 1 }
+          : { min: value - 1, max: value };
+      }
+      return next;
+    });
+  }
+
+  function updateAutomaticMultiplier(value: string) {
+    setAutomaticMultiplierInput(value);
+    const parsed = Number(value);
+    if (value.trim() && Number.isFinite(parsed)
+      && parsed >= minimumCoverageMultiplier && parsed <= maximumCoverageMultiplier) {
+      setAutomaticMultiplier(parsed);
+      setScaleOverride(null);
+    }
+  }
+
+  function commitAutomaticMultiplier() {
+    const parsed = automaticMultiplierInput.trim()
+      ? Number(automaticMultiplierInput)
+      : Number.NaN;
+    const multiplier = normalizeCoverageMultiplier(
+      parsed,
+      automaticMultiplier,
+    );
+    setAutomaticMultiplier(multiplier);
+    setAutomaticMultiplierInput(formatCoverageMultiplier(multiplier));
+    setScaleOverride(null);
+  }
+
+  function storeCoverageSelectionDrag(drag: CoverageSelectionDrag | null) {
+    coverageSelectionDragRef.current = drag;
+    setCoverageSelectionDrag(drag);
+  }
+
+  function suppressNextCoverageClick() {
+    suppressCoverageClickRef.current = true;
+    setTimeout(() => {
+      suppressCoverageClickRef.current = false;
+    }, 0);
+  }
+
+  function selectCoverageContig(
+    id: string,
+    modifiers: CoverageSelectionModifiers,
+  ) {
+    if (suppressCoverageClickRef.current) {
+      return;
+    }
+
+    if (coverageSelectionIsAdditive(modifiers)) {
+      setCoverageSelectionAnchorId(id);
+      onUiAction({ type: "selectAssemblyContig", id, additive: true });
+      return;
+    }
+
+    if (coverageShiftClickClearsSelection(selectedIds, id, modifiers)) {
+      setCoverageSelectionAnchorId(null);
+      onUiAction({ type: "clearAssemblySelection" });
+      return;
+    }
+
+    if (modifiers.shiftKey) {
+      const anchorId = coverageSelectionAnchorId;
+      if (anchorId && blocksById.has(anchorId)) {
+        onUiAction({
+          type: "selectAssemblyContigs",
+          ids: coverageContigIdsBetween(uiState.assembly.blocks, anchorId, id),
+        });
+        return;
+      }
+
+      setCoverageSelectionAnchorId(id);
+      onUiAction({ type: "selectAssemblyContig", id, additive: false });
+      return;
+    }
+
+    setCoverageSelectionAnchorId(id);
+    onUiAction({
+      type: "selectAssemblyContig",
+      id,
+      additive: false,
+    });
+  }
+
+  function startCoverageSelectionDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!event.shiftKey || event.metaKey || event.ctrlKey || event.button !== 0) {
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    if (bounds.width <= 0) {
+      return;
+    }
+    const ratio = clamp01((event.clientX - bounds.left) / bounds.width);
+    event.preventDefault();
+    if (!event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    lastDragSelectionSignatureRef.current = "";
+    storeCoverageSelectionDrag({
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startRatio: ratio,
+      currentRatio: ratio,
+      moved: false,
+    });
+  }
+
+  function moveCoverageSelectionDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = coverageSelectionDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    if (bounds.width <= 0) {
+      return;
+    }
+    const currentRatio = clamp01((event.clientX - bounds.left) / bounds.width);
+    const moved = drag.moved
+      || Math.abs(event.clientX - drag.startClientX) >= coverageDragThresholdPx;
+    const nextDrag = { ...drag, currentRatio, moved };
+    storeCoverageSelectionDrag(nextDrag);
+    if (!moved) {
+      return;
+    }
+
+    event.preventDefault();
+    const ids = coverageContigIdsInRatioRange(
+      coverageView?.viewport ?? null,
+      uiState.assembly.blocks,
+      nextDrag.startRatio,
+      nextDrag.currentRatio,
+    );
+    const signature = ids.join("\u0000");
+    if (signature !== lastDragSelectionSignatureRef.current) {
+      lastDragSelectionSignatureRef.current = signature;
+      onUiAction({ type: "selectAssemblyContigs", ids });
+    }
+  }
+
+  function stopCoverageSelectionDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = coverageSelectionDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (drag.moved) {
+      event.preventDefault();
+      const bounds = event.currentTarget.getBoundingClientRect();
+      const currentRatio = bounds.width > 0
+        ? clamp01((event.clientX - bounds.left) / bounds.width)
+        : drag.currentRatio;
+      const ids = coverageContigIdsInRatioRange(
+        coverageView?.viewport ?? null,
+        uiState.assembly.blocks,
+        drag.startRatio,
+        currentRatio,
+      );
+      onUiAction({ type: "selectAssemblyContigs", ids });
+      setCoverageSelectionAnchorId(
+        coverageBlockIdAtRatio(
+          coverageView?.viewport ?? null,
+          uiState.assembly.blocks,
+          drag.startRatio,
+        ) ?? ids[0] ?? null,
+      );
+    } else {
+      const id = coverageBlockIdAtRatio(
+        coverageView?.viewport ?? null,
+        uiState.assembly.blocks,
+        drag.startRatio,
+      );
+      if (id) {
+        selectCoverageContig(id, { shiftKey: true, metaKey: false, ctrlKey: false });
+      }
+    }
+    suppressNextCoverageClick();
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    storeCoverageSelectionDrag(null);
+  }
+
+  function cancelCoverageSelectionDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = coverageSelectionDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    storeCoverageSelectionDrag(null);
+  }
+
+  return (
+    <section
+      className={`track-panel coverage-track ${uiState.tracks.coverageVisible ? "" : "track-hidden"}`}
+      aria-label="Coverage track"
+    >
+      <div className="coverage-controls">
+        <button
+          className="coverage-control-button"
+          type="button"
+          aria-label={uiState.tracks.coverageVisible ? "Hide coverage track" : "Show coverage track"}
+          title={uiState.tracks.coverageVisible ? "Hide coverage track" : "Show coverage track"}
+          onClick={() => onUiAction({ type: "toggleTrackVisibility", track: "coverage" })}
+        >
+          {uiState.tracks.coverageVisible ? <Eye size={13} aria-hidden="true" /> : <EyeOff size={13} aria-hidden="true" />}
+        </button>
+        <details className="coverage-scale-control">
+          <summary
+            className="coverage-control-button"
+            aria-label="Set coverage range"
+            title={`Coverage range ${formatCoverageScale(scale.min)}–${formatCoverageScale(scale.max)}`}
+          >
+            <SlidersHorizontal size={13} aria-hidden="true" />
+          </summary>
+          <div className="coverage-scale-popover" aria-label="Coverage range settings">
+            <label>
+              <span>Min</span>
+              <input
+                type="number"
+                step="any"
+                value={formatCoverageScale(scale.min)}
+                aria-label="Coverage minimum"
+                onChange={(event) => setScaleBoundary("min", Number(event.currentTarget.value))}
+              />
+            </label>
+            <label>
+              <span>Max</span>
+              <input
+                type="number"
+                step="any"
+                value={formatCoverageScale(scale.max)}
+                aria-label="Coverage maximum"
+                onChange={(event) => setScaleBoundary("max", Number(event.currentTarget.value))}
+              />
+            </label>
+            <label className="coverage-multiplier-field">
+              <span>Auto max</span>
+              <span className="coverage-multiplier-input">
+                <input
+                  type="number"
+                  min={minimumCoverageMultiplier}
+                  max={maximumCoverageMultiplier}
+                  step="0.1"
+                  inputMode="decimal"
+                  value={automaticMultiplierInput}
+                  aria-label="Coverage automatic multiplier"
+                  onChange={(event) => updateAutomaticMultiplier(event.currentTarget.value)}
+                  onBlur={commitAutomaticMultiplier}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+                <span aria-hidden="true">×</span>
+              </span>
+            </label>
+            <button
+              type="button"
+              className={scaleOverride === null ? "active" : ""}
+              aria-pressed={scaleOverride === null}
+              onClick={commitAutomaticMultiplier}
+            >
+              Auto {formatCoverageMultiplier(automaticMultiplier)}×
+            </button>
+          </div>
+        </details>
+      </div>
+      {uiState.tracks.coverageVisible ? (
+        <div
+          className={`coverage-bars ${coverageSelectionDrag ? "coverage-range-dragging" : ""}`}
+          aria-label="Coverage distribution; click selects one contig, Shift-click selects a continuous range, Shift-drag selects a window, and Command or Control-click toggles individual contigs"
+          data-resolution={coverageView?.resolution ?? undefined}
+          data-viewport-x-start={coverageView?.viewport.xStart ?? undefined}
+          data-viewport-x-end={coverageView?.viewport.xEnd ?? undefined}
+          data-scale-min={scale.min}
+          data-scale-max={scale.max}
+          data-auto-multiplier={automaticMultiplier}
+          onPointerDown={startCoverageSelectionDrag}
+          onPointerMove={moveCoverageSelectionDrag}
+          onPointerUp={stopCoverageSelectionDrag}
+          onPointerCancel={cancelCoverageSelectionDrag}
+          onContextMenu={onContextMenu}
+        >
+          {bars.map((bar) => (
+            <span
+              key={bar.xBin}
+              className={`coverage-bin ${bar.value > scale.max ? "coverage-bin-clipped" : ""}`}
+              aria-hidden="true"
+              style={{
+                left: `${bar.leftRatio * 100}%`,
+                width: `${bar.widthRatio * 100}%`,
+                height: `${coverageValueHeightRatio(bar.value, scale) * 100}%`,
+              }}
+            />
+          ))}
+          <div className="coverage-chromosome-grid" aria-hidden="true">
+            {chromosomeBoundaries.map((boundary) => (
+              <span
+                key={boundary.positionBp}
+                data-boundary-bp={boundary.positionBp}
+                style={{ left: `${boundary.leftRatio * 100}%` }}
+              />
+            ))}
+          </div>
+          <div className="coverage-contig-hit-layer">
+            {interactiveRanges.map((range) => {
+              const block = blocksById.get(range.id);
+              return (
+                <button
+                  key={range.id}
+                  type="button"
+                  data-block-id={range.id}
+                  aria-pressed={selectedIds.has(range.id)}
+                  aria-label={`Select ${block?.sourceId ?? range.id} in coverage`}
+                  title={`${block?.sourceId ?? range.id} · Shift-click range · Shift-drag window · Cmd/Ctrl-click toggle`}
+                  style={{
+                    left: `${range.leftRatio * 100}%`,
+                    width: `${range.widthRatio * 100}%`,
+                  }}
+                  onClick={(event) => selectCoverageContig(range.id, event)}
+                />
+              );
+            })}
+          </div>
+          <div className="coverage-selection-layer" aria-hidden="true">
+            {selectionRanges.map((range) => (
+              <span
+                key={range.id}
+                data-block-id={range.id}
+                style={{
+                  left: `${range.leftRatio * 100}%`,
+                  width: `${range.widthRatio * 100}%`,
+                }}
+              />
+            ))}
+          </div>
+          {coverageSelectionDrag?.moved ? (
+            <div
+              className="coverage-range-selection-preview"
+              aria-hidden="true"
+              style={coverageRatioWindowStyle(
+                coverageSelectionDrag.startRatio,
+                coverageSelectionDrag.currentRatio,
+              )}
+            />
+          ) : null}
+        </div>
+      ) : (
+        <div className="coverage-bars coverage-bars-hidden" aria-hidden="true" />
+      )}
+      <div className="coverage-track-end" aria-hidden="true" />
+    </section>
+  );
+}
+
+export function coverageAutoScaleDomain(
+  values: number[],
+  multiplier = defaultCoverageMultiplier,
+): CoverageScaleDomain {
+  const finiteValues = values.filter(Number.isFinite);
+  const minimum = Math.min(0, ...finiteValues);
+  const observedMaximum = Math.max(minimum, ...finiteValues);
+  const observedRange = Math.max(1, observedMaximum - minimum);
+  const safeMultiplier = normalizeCoverageMultiplier(multiplier);
+
+  return {
+    min: minimum,
+    max: minimum + observedRange * safeMultiplier,
+  };
+}
+
+export function normalizeCoverageMultiplier(
+  value: number,
+  fallback = defaultCoverageMultiplier,
+) {
+  const safeFallback = Number.isFinite(fallback)
+    ? Math.min(maximumCoverageMultiplier, Math.max(minimumCoverageMultiplier, fallback))
+    : defaultCoverageMultiplier;
+  if (!Number.isFinite(value)) {
+    return safeFallback;
+  }
+  return Math.min(maximumCoverageMultiplier, Math.max(minimumCoverageMultiplier, value));
+}
+
+export function coverageValueHeightRatio(value: number, scale: CoverageScaleDomain) {
+  if (!Number.isFinite(value) || !Number.isFinite(scale.min) || !Number.isFinite(scale.max)) {
+    return 0;
+  }
+
+  return clamp01((value - scale.min) / Math.max(Number.EPSILON, scale.max - scale.min));
+}
+
+export function coverageSelectionIsAdditive({
+  metaKey,
+  ctrlKey,
+}: CoverageSelectionModifiers) {
+  return metaKey || ctrlKey;
+}
+
+export function coverageShiftClickClearsSelection(
+  selectedIds: ReadonlySet<string>,
+  id: string,
+  { shiftKey, metaKey, ctrlKey }: CoverageSelectionModifiers,
+) {
+  return shiftKey && !metaKey && !ctrlKey && selectedIds.has(id);
+}
+
+export function coverageContigIdsBetween(
+  blocks: ContactMapLayoutBlock[],
+  anchorId: string,
+  targetId: string,
+) {
+  const orderedBlocks = [...blocks].sort((left, right) => (
+    left.visualStart - right.visualStart || left.visualEnd - right.visualEnd
+  ));
+  const anchorIndex = orderedBlocks.findIndex((block) => block.id === anchorId);
+  const targetIndex = orderedBlocks.findIndex((block) => block.id === targetId);
+  if (targetIndex < 0) {
+    return [];
+  }
+  if (anchorIndex < 0) {
+    return [targetId];
+  }
+
+  const startIndex = Math.min(anchorIndex, targetIndex);
+  const endIndex = Math.max(anchorIndex, targetIndex);
+  return orderedBlocks.slice(startIndex, endIndex + 1).map((block) => block.id);
+}
+
+export function coverageContigIdsInRatioRange(
+  viewport: ContactViewport | null,
+  blocks: ContactMapLayoutBlock[],
+  startRatio: number,
+  endRatio: number,
+) {
+  if (!viewport || viewport.xEnd <= viewport.xStart
+    || !Number.isFinite(startRatio) || !Number.isFinite(endRatio)) {
+    return [];
+  }
+
+  const lowerRatio = Math.min(clamp01(startRatio), clamp01(endRatio));
+  const upperRatio = Math.max(clamp01(startRatio), clamp01(endRatio));
+  if (upperRatio === lowerRatio) {
+    const id = coverageBlockIdAtRatio(viewport, blocks, lowerRatio);
+    return id ? [id] : [];
+  }
+
+  const span = viewport.xEnd - viewport.xStart;
+  const visualStart = viewport.xStart + lowerRatio * span;
+  const visualEnd = viewport.xStart + upperRatio * span;
+  return [...blocks]
+    .sort((left, right) => left.visualStart - right.visualStart || left.visualEnd - right.visualEnd)
+    .filter((block) => block.visualEnd > visualStart && block.visualStart < visualEnd)
+    .map((block) => block.id);
+}
+
+export function coverageRatioWindowStyle(startRatio: number, endRatio: number) {
+  const leftRatio = Math.min(clamp01(startRatio), clamp01(endRatio));
+  const rightRatio = Math.max(clamp01(startRatio), clamp01(endRatio));
+  return {
+    left: `${Number((leftRatio * 100).toFixed(6))}%`,
+    width: `${Number(((rightRatio - leftRatio) * 100).toFixed(6))}%`,
+  };
+}
+
+export function buildCoverageSelectionRanges(
+  viewport: ContactViewport | null,
+  blocks: ContactMapLayoutBlock[],
+  selectedIds: ReadonlySet<string>,
+): CoverageSelectionRange[] {
+  if (!viewport || viewport.xEnd <= viewport.xStart || selectedIds.size === 0) {
+    return [];
+  }
+
+  const span = viewport.xEnd - viewport.xStart;
+  return blocks.flatMap((block) => {
+    if (!selectedIds.has(block.id)) {
+      return [];
+    }
+    const visibleStart = Math.max(viewport.xStart, block.visualStart);
+    const visibleEnd = Math.min(viewport.xEnd, block.visualEnd);
+    if (visibleEnd <= visibleStart) {
+      return [];
+    }
+
+    return [{
+      id: block.id,
+      leftRatio: (visibleStart - viewport.xStart) / span,
+      widthRatio: (visibleEnd - visibleStart) / span,
+    }];
+  });
+}
+
+export function buildCoverageChromosomeBoundaries(
+  viewport: ContactViewport | null,
+  blocks: ContactMapLayoutBlock[],
+): CoverageChromosomeBoundary[] {
+  if (!viewport || viewport.xEnd <= viewport.xStart || blocks.length === 0) {
+    return [];
+  }
+
+  const span = viewport.xEnd - viewport.xStart;
+  const positions = new Set<number>();
+  for (const chromosome of buildAssemblyEditModel(blocks).chromosomes) {
+    if (chromosome.visualStart > viewport.xStart && chromosome.visualStart < viewport.xEnd) {
+      positions.add(chromosome.visualStart);
+    }
+    if (chromosome.visualEnd > viewport.xStart && chromosome.visualEnd < viewport.xEnd) {
+      positions.add(chromosome.visualEnd);
+    }
+  }
+
+  return [...positions]
+    .sort((left, right) => left - right)
+    .map((positionBp) => ({
+      positionBp,
+      leftRatio: (positionBp - viewport.xStart) / span,
+    }));
+}
+
+export function coverageBlockIdAtRatio(
+  viewport: ContactViewport | null,
+  blocks: ContactMapLayoutBlock[],
+  ratio: number,
+) {
+  if (!viewport || viewport.xEnd <= viewport.xStart || !Number.isFinite(ratio)) {
+    return null;
+  }
+
+  const clampedRatio = clamp01(ratio);
+  const visualPosition = Math.min(
+    viewport.xEnd - 0.000001,
+    viewport.xStart + clampedRatio * (viewport.xEnd - viewport.xStart),
+  );
+  return blocks.find((block) => (
+    visualPosition >= block.visualStart && visualPosition < block.visualEnd
+  ))?.id ?? null;
+}
+
+export function buildCoverageTrackBars(
+  coverageView: CoverageView | null,
+  blocks: ContactMapLayoutBlock[],
+): CoverageTrackBar[] {
+  if (!coverageView || coverageView.resolution <= 0) {
+    return [];
+  }
+
+  const values = new Map(coverageView.bins.map((bin) => [bin.xBin, bin.value]));
+  const startBin = Math.floor(coverageView.viewport.xStart / coverageView.resolution);
+  const endBin = Math.ceil(coverageView.viewport.xEnd / coverageView.resolution) - 1;
+  const viewportSpan = Math.max(1, coverageView.viewport.xEnd - coverageView.viewport.xStart);
+  const orderedBlocks = [...blocks].sort((left, right) => left.visualStart - right.visualStart);
+  let blockIndex = 0;
+
+  return Array.from({ length: Math.max(0, endBin - startBin + 1) }, (_, index) => {
+    const xBin = startBin + index;
+    const binStart = xBin * coverageView.resolution;
+    const binEnd = binStart + coverageView.resolution;
+    const visibleStart = Math.max(binStart, coverageView.viewport.xStart);
+    const visibleEnd = Math.min(binEnd, coverageView.viewport.xEnd);
+    const visualPosition = (visibleStart + visibleEnd) / 2;
+    while (orderedBlocks[blockIndex] && visualPosition >= orderedBlocks[blockIndex].visualEnd) {
+      blockIndex += 1;
+    }
+    const candidate = orderedBlocks[blockIndex];
+    const block = candidate
+      && visualPosition >= candidate.visualStart
+      && visualPosition < candidate.visualEnd
+      ? candidate
+      : null;
+    return {
+      xBin,
+      value: values.get(xBin) ?? 0,
+      blockId: block?.id ?? null,
+      leftRatio: (visibleStart - coverageView.viewport.xStart) / viewportSpan,
+      widthRatio: Math.max(0, visibleEnd - visibleStart) / viewportSpan,
+    };
+  });
+}
+
+function formatCoverageScale(value: number) {
+  return Number(value.toFixed(2));
+}
+
+function formatCoverageMultiplier(value: number) {
+  return String(Number(value.toFixed(2)));
+}
+
+function clamp01(value: number) {
+  return Math.min(1, Math.max(0, value));
+}
