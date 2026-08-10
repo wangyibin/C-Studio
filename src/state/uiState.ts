@@ -231,6 +231,23 @@ export function contactNormalizationForBackend(
   return contactNormalizationByLabel[normalization];
 }
 
+export function contactNormalizationLabel(
+  normalization: ContactNormalization,
+): Normalization {
+  switch (normalization) {
+    case "raw":
+      return "None (Raw)";
+    case "ice":
+      return "ICE (Balanced)";
+    case "kr":
+      return "KR (Balanced)";
+    case "vc":
+      return "VC (Coverage)";
+    case "vc_sqrt":
+      return "VC_SQRT";
+  }
+}
+
 export function availableContactResolutions(
   contact: UiState["contact"],
   totalSpanMb = contact.totalSpanMb,
@@ -241,10 +258,20 @@ export function availableContactResolutions(
     contact.viewportHeightPx,
   );
 
-  return [...contactResolutionLevelsForViewport(
+  const fittedLevels = contactResolutionLevelsForViewport(
     wholeGenomeViewportSpanMb,
     contact.viewportSizePx,
-  )];
+  );
+  const fittedIndex = contactResolutionLevels.indexOf(fittedLevels[0] ?? contact.resolution);
+  const currentIndex = contactResolutionLevels.indexOf(contact.resolution);
+
+  // A resize preserves the current pixels-per-bin even when a larger window
+  // could fit the whole genome at a finer level. Keep that transient coarser
+  // level represented by the slider until the user explicitly changes it.
+  const firstIndex = currentIndex >= 0 && currentIndex < fittedIndex
+    ? currentIndex
+    : fittedIndex;
+  return [...contactResolutionLevels.slice(Math.max(0, firstIndex))];
 }
 
 export function createInitialUiState(initialMessage: string): UiState {
@@ -500,14 +527,21 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         state.contact.viewportWidthPx,
         state.contact.viewportHeightPx,
       );
+      const totalSpanChanged = totalSpanMb !== state.contact.totalSpanMb;
       const wasFittedToWholeGenome = sameContactViewportSpan(
         state.contact.viewportSpanMb,
         previousMaximumViewportSpanMb,
       );
+      const previousViewportSizePx = sanitizeContactViewportSizePx(
+        state.contact.viewportSizePx,
+      );
+      const resizedViewportSpanMb = state.contact.viewportSpanMb
+        * viewportSizePx
+        / previousViewportSizePx;
       const viewportSpanMb = roundContactViewportMb(
-        wasFittedToWholeGenome
+        totalSpanChanged && wasFittedToWholeGenome
           ? maximumViewportSpanMb
-          : Math.min(state.contact.viewportSpanMb, maximumViewportSpanMb),
+          : resizedViewportSpanMb,
       );
       const { xSpanMb, ySpanMb } = contactViewportAxisSpansMb(
         viewportSpanMb,
@@ -529,13 +563,9 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         maximumViewportSpanMb,
         viewportSizePx,
       );
-      const resolution = sameContactViewportSpan(viewportSpanMb, maximumViewportSpanMb)
+      const resolution = totalSpanChanged && wasFittedToWholeGenome
         ? wholeGenomeResolution
-        : state.contact.resolutionLocked
-          ? state.contact.resolution
-          : chooseContactResolutionForBpPerPixel(
-              (viewportSpanMb * 1_000_000) / viewportSizePx,
-            );
+        : state.contact.resolution;
       const colorScale = resolution === state.contact.resolution
         ? state.contact.colorScale
         : state.contact.colorScaleByResolution[resolution] ?? {
@@ -636,13 +666,22 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         state.contact.viewportWidthPx,
         state.contact.viewportHeightPx,
       );
-      const zoomMaximumViewportSpanMb = state.contact.resolutionLocked
+      const fittedZoomMaximumViewportSpanMb = state.contact.resolutionLocked
         ? contactViewportSpanForResolution(
             state.contact.resolution,
             viewportSizePx,
             maximumViewportSpanMb,
           )
         : maximumViewportSpanMb;
+      const currentViewportSpanMb = Number.isFinite(state.contact.viewportSpanMb)
+        ? Math.max(0.000001, state.contact.viewportSpanMb)
+        : fittedZoomMaximumViewportSpanMb;
+      // A window resize can expose empty field beyond the genome. Zooming in
+      // must start from that real scale instead of first snapping back to Fit.
+      const zoomMaximumViewportSpanMb = Math.max(
+        fittedZoomMaximumViewportSpanMb,
+        currentViewportSpanMb,
+      );
       const finestResolution = contactResolutionLevels[contactResolutionLevels.length - 1] ?? "5 kb";
       const floorResolution = state.contact.resolutionLocked
         ? state.contact.resolution
@@ -667,16 +706,8 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
       let snappedResolution: ContactResolution | null = null;
 
       if (action.snapToResolution && !state.contact.resolutionLocked) {
-        const levels = contactResolutionLevelsForViewport(
-          maximumViewportSpanMb,
-          viewportSizePx,
-        );
-        const currentResolution = clampContactResolutionToViewport(
-          state.contact.resolution,
-          maximumViewportSpanMb,
-          viewportSizePx,
-        );
-        const currentIndex = Math.max(0, levels.indexOf(currentResolution));
+        const levels = availableContactResolutions(state.contact, totalSpanMb);
+        const currentIndex = Math.max(0, levels.indexOf(state.contact.resolution));
         const step = action.direction === "in" ? 1 : -1;
 
         for (
@@ -705,7 +736,11 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           }
         }
 
-        if (action.direction === "out" && snappedResolution === null) {
+        if (
+          action.direction === "out"
+          && snappedResolution === null
+          && currentSpanMb < maximumViewportSpanMb - 0.000001
+        ) {
           viewportSpanMb = roundContactViewportMb(maximumViewportSpanMb);
           snappedResolution = levels[0] ?? null;
         }
@@ -776,6 +811,8 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         ? state.contact.resolution
         : snappedResolution
           ? snappedResolution
+          : sameContactViewportSpan(viewportSpanMb, currentSpanMb)
+            ? state.contact.resolution
           : sameContactViewportSpan(viewportSpanMb, maximumViewportSpanMb)
             ? wholeGenomeResolution
             : chooseContactResolutionForBpPerPixel(

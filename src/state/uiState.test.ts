@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   availableContactResolutions,
   contactNormalizationForBackend,
+  contactNormalizationLabel,
   contactResolutions,
   createInitialUiState,
   normalizations,
@@ -60,6 +61,9 @@ describe("reduceUiState", () => {
       ["VC (Coverage)", "vc"],
       ["VC_SQRT", "vc_sqrt"],
     ]);
+    expect(normalizations.map((normalization) =>
+      contactNormalizationLabel(contactNormalizationForBackend(normalization))
+    )).toEqual(normalizations);
   });
 
   it("selects toolbar controls and records readable log entries", () => {
@@ -189,8 +193,8 @@ describe("reduceUiState", () => {
 
     expect(state.contact.resolution).toBe("50 kb");
     expect(state.contact.viewportSpanMb).toBe(26.8);
-    expect(state.contact.viewportCenterXMb).toBe(100);
-    expect(state.contact.viewportCenterYMb).toBe(100);
+    expect(state.contact.viewportCenterXMb).toBe(98.42);
+    expect(state.contact.viewportCenterYMb).toBe(98.42);
   });
 
   it("clamps resolutions coarser than the fitted whole-map level", () => {
@@ -265,7 +269,128 @@ describe("reduceUiState", () => {
     expect(state.contact.resolution).toBe("250 kb");
   });
 
-  it("fits and immediately zooms a wide viewport without stretching chromosome blocks", () => {
+  it("preserves pixels per bin when a zoomed square viewport grows", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 640,
+      viewportWidthPx: 640,
+      viewportHeightPx: 640,
+      totalSpanMb: 500,
+    });
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "250 kb" });
+
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 960,
+      viewportWidthPx: 960,
+      viewportHeightPx: 960,
+      totalSpanMb: 500,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(240);
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSizePx * 0.25 / state.contact.viewportSpanMb).toBe(1);
+  });
+
+  it("keeps a whole-genome view at the same physical scale when the window grows", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 640,
+      viewportWidthPx: 640,
+      viewportHeightPx: 640,
+      totalSpanMb: 500,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(500);
+    expect(state.contact.resolution).toBe("1 Mb");
+
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 960,
+      viewportWidthPx: 960,
+      viewportHeightPx: 960,
+      totalSpanMb: 500,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(750);
+    expect(state.contact.resolution).toBe("1 Mb");
+    expect(state.contact.viewportSizePx / state.contact.viewportSpanMb).toBe(1.28);
+    expect(availableContactResolutions(state.contact)[0]).toBe("1 Mb");
+
+    const zoomedOut = reduceUiState(state, {
+      type: "zoomContactViewport",
+      direction: "out",
+      scaleFactor: 0.5,
+      totalSpanMb: 500,
+    });
+    expect(zoomedOut.contact.viewportSpanMb).toBe(750);
+    expect(zoomedOut.contact.resolution).toBe("1 Mb");
+
+    const zoomedIn = reduceUiState(state, {
+      type: "zoomContactViewport",
+      direction: "in",
+      focusRatioX: 0.5,
+      focusRatioY: 0.5,
+      snapToResolution: true,
+      totalSpanMb: 500,
+    });
+    expect(zoomedIn.contact.viewportSpanMb).toBe(480);
+    expect(zoomedIn.contact.resolution).toBe("500 kb");
+  });
+
+  it("reveals more sequence without deforming bins when the viewport aspect changes", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 640,
+      viewportWidthPx: 640,
+      viewportHeightPx: 640,
+      totalSpanMb: 500,
+    });
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "250 kb" });
+
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 800,
+      viewportWidthPx: 1200,
+      viewportHeightPx: 800,
+      totalSpanMb: 500,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(200);
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportWidthPx * 0.25 / 300).toBe(1);
+    expect(state.contact.viewportHeightPx * 0.25 / state.contact.viewportSpanMb).toBe(1);
+  });
+
+  it("keeps the same scale and resolution while resizing a locked viewport", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 640,
+      viewportWidthPx: 640,
+      viewportHeightPx: 640,
+      totalSpanMb: 500,
+    });
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "250 kb" });
+    state = reduceUiState(state, { type: "toggleContactResolutionLock" });
+
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 960,
+      viewportWidthPx: 960,
+      viewportHeightPx: 960,
+      totalSpanMb: 500,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(240);
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.resolutionLocked).toBe(true);
+  });
+
+  it("preserves scale on a wide resize and only refits after an explicit fit action", () => {
     const initialState = createInitialUiState("Browser preview mode");
     let state = {
       ...initialState,
@@ -287,12 +412,12 @@ describe("reduceUiState", () => {
       totalSpanMb: 300,
     });
 
-    expect(state.contact.viewportSpanMb).toBe(200);
+    expect(state.contact.viewportSpanMb).toBe(375);
     expect(state.contact.viewportWidthPx).toBe(1200);
     expect(state.contact.viewportHeightPx).toBe(800);
 
     state = reduceUiState(state, { type: "fitContactViewport", totalSpanMb: 300 });
-    expect(state.contact.viewportSpanMb).toBe(200);
+    expect(state.contact.viewportSpanMb).toBe(300);
     expect(state.contact.viewportCenterXMb).toBe(150);
     expect(state.contact.viewportCenterYMb).toBe(150);
 
@@ -304,7 +429,7 @@ describe("reduceUiState", () => {
       scaleFactor: 1.008,
       totalSpanMb: 300,
     });
-    expect(state.contact.viewportSpanMb).toBeLessThan(200);
+    expect(state.contact.viewportSpanMb).toBeLessThan(300);
   });
 
   it("chooses a dynamic whole-map level for a rectangular viewport", () => {
@@ -317,9 +442,10 @@ describe("reduceUiState", () => {
       totalSpanMb: 300,
     });
 
-    expect(state.contact.viewportSpanMb).toBe(200);
-    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSpanMb).toBe(300);
+    expect(state.contact.resolution).toBe("500 kb");
     expect(availableContactResolutions(state.contact)).toEqual([
+      "500 kb",
       "250 kb",
       "100 kb",
       "50 kb",
@@ -329,8 +455,8 @@ describe("reduceUiState", () => {
     ]);
 
     state = reduceUiState(state, { type: "setContactResolution", resolution: "2 Mb" });
-    expect(state.contact.resolution).toBe("250 kb");
-    expect(state.contact.viewportSpanMb).toBe(200);
+    expect(state.contact.resolution).toBe("500 kb");
+    expect(state.contact.viewportSpanMb).toBe(300);
 
     state = reduceUiState(state, { type: "setContactResolution", resolution: "100 kb" });
     expect(state.contact.viewportSpanMb).toBe(80);

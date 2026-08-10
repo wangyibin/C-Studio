@@ -16,6 +16,25 @@ const defaultColorScale = {
   auto: true,
 };
 
+/**
+ * Keep one visual threshold while comparing normalization modes. Data/tile
+ * caches remain mode-specific, but independently auto-fitting every mode can
+ * make genuinely different matrices look nearly identical.
+ */
+export function contactAutoColorScaleKey(
+  coolPath: string,
+  targetResolution: number,
+  tileSizeBins: number,
+  log: boolean,
+): string {
+  return [
+    coolPath,
+    targetResolution,
+    tileSizeBins,
+    log ? "log" : "linear",
+  ].join("|");
+}
+
 export function contactCountSampleForColorScale(contactMap: ContactMapView): number[] {
   if (contactMap.tiles && contactMap.tiles.length > 0) {
     const counts: number[] = [];

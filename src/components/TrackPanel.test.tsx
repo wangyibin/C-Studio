@@ -205,6 +205,49 @@ describe("TrackPanel", () => {
     expect(markup).toContain('left:60%');
   });
 
+  it("projects coverage against the live heatmap viewport when resize exposes empty field", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.assembly.blocks = [
+      {
+        id: "A",
+        objectId: "Chr01",
+        sourceId: "ctgA",
+        sourceStart: 0,
+        sourceEnd: 100,
+        visualStart: 0,
+        visualEnd: 100,
+        orientation: "+",
+      },
+      {
+        id: "B",
+        objectId: "Chr02",
+        sourceId: "ctgB",
+        sourceStart: 0,
+        sourceEnd: 200,
+        visualStart: 100,
+        visualEnd: 300,
+        orientation: "+",
+      },
+    ];
+
+    const markup = renderToStaticMarkup(
+      <TrackPanel
+        coverageView={{
+          resolution: 50,
+          viewport: { xStart: 0, xEnd: 300, yStart: 0, yEnd: 1 },
+          bins: [],
+        }}
+        viewport={{ xStart: 0, xEnd: 450, yStart: 0, yEnd: 300 }}
+        uiState={uiState}
+        onUiAction={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('data-viewport-x-end="450"');
+    expect(markup).toContain('data-boundary-bp="100"');
+    expect(markup).toContain('left:22.22222222222222%');
+  });
+
   it("projects every selected contig onto the exact coverage viewport", () => {
     const selectionBlocks = [
       {

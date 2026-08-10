@@ -17,7 +17,12 @@ import {
 } from "../state/assemblyEditing";
 import type { CoverageView } from "../state/coverageView";
 import type { SyntenyView } from "../state/syntenyView";
-import type { UiAction, UiState } from "../state/uiState";
+import {
+  contactNormalizationForBackend,
+  contactNormalizationLabel,
+  type UiAction,
+  type UiState,
+} from "../state/uiState";
 import {
   isEditableShortcutTarget,
   juiceboxShortcutIntent,
@@ -118,6 +123,13 @@ export function AppShell({
     activeAssemblyBlocks,
     uiState.assembly.selection,
   );
+  const selectedContactNormalization = contactNormalizationForBackend(uiState.normalization);
+  const displayedContactNormalization = contactMap?.normalization;
+  const displayedNormalizationLabel =
+    displayedContactNormalization !== undefined
+    && displayedContactNormalization !== selectedContactNormalization
+      ? ` (showing ${contactNormalizationLabel(displayedContactNormalization)})`
+      : "";
 
   function selectSyntenyBlock(id: string, modifiers: SyntenySelectionModifiers) {
     const intent = assemblyContigSelectionIntent(
@@ -423,7 +435,9 @@ export function AppShell({
 
       <footer className="status-bar" role="status" aria-live="polite">
         <span>Resolution: {uiState.contact.resolution}</span>
-        <span>Normalization: {uiState.normalization}</span>
+        <span>
+          Normalization: {uiState.normalization}{displayedNormalizationLabel}
+        </span>
         <span>Matrix: {fileName(dataset?.mcool_path ?? dataset?.cool_path, "None")}</span>
         <span>Assembly: {fileName(dataset?.agp_path, "None")}</span>
         <span>Tool: {uiState.selectedTool}</span>

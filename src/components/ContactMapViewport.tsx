@@ -240,9 +240,9 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   const contactTileLayerRef = useRef<HTMLDivElement>(null);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const latestContactMapRef = useRef(contactMap);
+  const latestContactMapRef = useRef<ContactMapView | null>(null);
+  const latestDisplayContactMapRef = useRef<ContactMapView | null>(null);
   const latestUiStateRef = useRef(uiState);
-  latestContactMapRef.current = contactMap;
   latestUiStateRef.current = uiState;
   const [contextMenu, setContextMenu] = useState<AssemblyContextMenuPosition | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -262,16 +262,50 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   );
   const contactSize = dataset?.mcool_size_bytes ? formatBytes(dataset.mcool_size_bytes) : null;
   const hasCoverageTrack = Boolean(dataset?.coverage_path);
-  const liveViewport = buildCenteredContactViewport({
+  const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
+    ? uiState.assembly.blocks
+    : dataset?.agp_layout.blocks ?? [];
+  const activeAssemblyTotalBp = useMemo(
+    () => activeAssemblyBlocks.reduce(
+      (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
+      0,
+    ),
+    [activeAssemblyBlocks],
+  );
+  const liveTotalSpanBp = Math.max(
+    1,
+    activeAssemblyTotalBp
+      || dataset?.agp_layout.totalSpan
+      || uiState.contact.totalSpanMb * 1_000_000,
+  );
+  const liveViewport = useMemo(() => buildCenteredContactViewport({
     centerMb: uiState.contact.viewportCenterMb,
     centerXMb: uiState.contact.viewportCenterXMb,
     centerYMb: uiState.contact.viewportCenterYMb,
-    totalSpanBp: Math.max(1, dataset?.agp_layout.totalSpan ?? contactMap?.viewport.xEnd ?? 200_000_000),
+    totalSpanBp: liveTotalSpanBp,
     windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
     viewportWidthPx: uiState.contact.viewportWidthPx,
     viewportHeightPx: uiState.contact.viewportHeightPx,
-  });
-  const displayViewport = dragState?.previewViewport ?? contactMap?.viewport ?? liveViewport;
+  }), [
+    liveTotalSpanBp,
+    uiState.contact.viewportCenterMb,
+    uiState.contact.viewportCenterXMb,
+    uiState.contact.viewportCenterYMb,
+    uiState.contact.viewportHeightPx,
+    uiState.contact.viewportSpanMb,
+    uiState.contact.viewportWidthPx,
+  ]);
+  const displayViewport = dragState?.previewViewport ?? liveViewport;
+  const liveContactMap = useMemo(
+    () => contactMap ? { ...contactMap, viewport: liveViewport } : null,
+    [contactMap, liveViewport],
+  );
+  const displayContactMap = useMemo(
+    () => contactMap ? { ...contactMap, viewport: displayViewport } : null,
+    [contactMap, displayViewport],
+  );
+  latestContactMapRef.current = liveContactMap;
+  latestDisplayContactMapRef.current = displayContactMap;
   const viewportXStartMb = displayViewport.xStart / 1_000_000;
   const viewportXEndMb = displayViewport.xEnd / 1_000_000;
   const viewportXCenterMb = (viewportXStartMb + viewportXEndMb) / 2 || uiState.contact.viewportCenterXMb;
@@ -280,9 +314,6 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   const viewportYCenterMb = (viewportYStartMb + viewportYEndMb) / 2 || uiState.contact.viewportCenterYMb;
   const viewportXSpanMb = Math.max(0.000001, viewportXEndMb - viewportXStartMb);
   const viewportYSpanMb = Math.max(0.000001, viewportYEndMb - viewportYStartMb);
-  const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
-    ? uiState.assembly.blocks
-    : dataset?.agp_layout.blocks ?? [];
   const layoutRasterPlan = useMemo(
     () => contactMap?.layoutBlocks
       ? buildContactLayoutRasterPlan(contactMap.layoutBlocks, activeAssemblyBlocks)
@@ -295,13 +326,13 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     && layoutRasterPlan?.changesPixels
     && contactLayoutRasterPlanCoversViewport(
       layoutRasterPlan,
-      contactMap.viewport.xStart,
-      contactMap.viewport.xEnd,
+      displayViewport.xStart,
+      displayViewport.xEnd,
     )
     && contactLayoutRasterPlanCoversViewport(
       layoutRasterPlan,
-      contactMap.viewport.yStart,
-      contactMap.viewport.yEnd,
+      displayViewport.yStart,
+      displayViewport.yEnd,
     ),
   );
   // During a pure move/reverse, pixels and annotations switch to the edited
@@ -331,13 +362,6 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
         (chromosome) => chromosome.visualEnd > displayViewport.xStart && chromosome.visualStart < displayViewport.xEnd,
       ),
     [assemblyModel, displayViewport.xStart, displayViewport.xEnd],
-  );
-  const activeAssemblyTotalBp = useMemo(
-    () => uiState.assembly.blocks.reduce(
-      (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
-      0,
-    ),
-    [uiState.assembly.blocks],
   );
   const totalSpanMb = Math.max(
     0.000001,
@@ -442,8 +466,9 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
 
       event.preventDefault();
       event.stopPropagation();
+      const currentContactMap = { ...sourceContactMap, viewport: currentViewport };
       const previewContactMap = contactMapWithPannedViewport(
-        { ...sourceContactMap, viewport: currentViewport },
+        currentContactMap,
         -intent.deltaXPx,
         -intent.deltaYPx,
         bounds.width,
@@ -457,7 +482,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
       }
 
       schedulePanTransform(
-        sourceContactMap,
+        currentContactMap,
         previewContactMap,
         bounds.width,
         bounds.height,
@@ -492,7 +517,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
       if (canvas && resizeContactMapCanvas(canvas, frame)) {
         drawContactMapBuffer(
           canvas,
-          latestContactMapRef.current,
+          latestDisplayContactMapRef.current,
           latestUiStateRef.current,
         );
       }
@@ -512,7 +537,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     }
     redrawAnimationFrameRef.current = window.requestAnimationFrame(() => {
       redrawAnimationFrameRef.current = null;
-      drawContactMapBuffer(canvasRef.current, contactMap, uiState);
+      drawContactMapBuffer(canvasRef.current, displayContactMap, uiState);
       resetPanTransform();
     });
     return () => {
@@ -521,7 +546,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
         redrawAnimationFrameRef.current = null;
       }
     };
-  }, [contactMap, uiState.contact.colormap, uiState.contact.colorScale]);
+  }, [displayContactMap, uiState.contact.colormap, uiState.contact.colorScale]);
 
   function openContextMenu(event: React.MouseEvent<HTMLDivElement>) {
     event.preventDefault();
@@ -537,7 +562,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   }
 
   function startPan(event: React.PointerEvent<HTMLElement>) {
-    if (!contactMap || event.button !== 0) {
+    if (!liveContactMap || event.button !== 0) {
       return;
     }
 
@@ -562,7 +587,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
 
   function movePan(event: React.PointerEvent<HTMLElement>) {
     const currentDragState = dragStateRef.current;
-    if (!currentDragState || !contactMap || currentDragState.pointerId !== event.pointerId) {
+    if (!currentDragState || !liveContactMap || currentDragState.pointerId !== event.pointerId) {
       return;
     }
 
@@ -574,7 +599,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     }
 
     const previewContactMap = contactMapWithPannedViewport(
-      contactMap,
+      liveContactMap,
       deltaX,
       deltaY,
       currentDragState.width,
@@ -588,7 +613,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
       previewViewport: previewContactMap.viewport,
     };
     schedulePanTransform(
-      contactMap,
+      liveContactMap,
       previewContactMap,
       currentDragState.width,
       currentDragState.height,
@@ -597,14 +622,14 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
 
   function stopPan(event: React.PointerEvent<HTMLElement>) {
     const currentDragState = dragStateRef.current;
-    if (currentDragState?.pointerId !== event.pointerId || !contactMap) {
+    if (currentDragState?.pointerId !== event.pointerId || !liveContactMap) {
       return;
     }
 
     const deltaX = event.clientX - currentDragState.startX;
     const deltaY = event.clientY - currentDragState.startY;
     const finalContactMap = contactMapWithPannedViewport(
-      contactMap,
+      liveContactMap,
       deltaX,
       deltaY,
       currentDragState.width,
@@ -615,7 +640,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     const deltaYMb = ((finalContactMap.viewport.yStart - liveViewport.yStart) / 1_000_000);
     cancelScheduledPanFrame();
     applyPanTransform(
-      contactMap,
+      liveContactMap,
       finalContactMap,
       currentDragState.width,
       currentDragState.height,
@@ -626,7 +651,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
       onUiAction({ type: "panContactViewport", deltaXMb, deltaYMb });
     } else {
       resetPanTransform();
-      drawContactMapBuffer(canvasRef.current, contactMap, uiState);
+      drawContactMapBuffer(canvasRef.current, liveContactMap, uiState);
     }
   }
 
@@ -702,7 +727,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   }
 
   function previewAxisNavigator(axis: "x" | "y", centerRatio: number) {
-    if (!contactMap) {
+    if (!liveContactMap) {
       return;
     }
 
@@ -722,8 +747,8 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
       centerYMb: uiState.contact.viewportCenterYMb,
     });
     schedulePanTransform(
-      contactMap,
-      { ...contactMap, viewport: previewViewport },
+      liveContactMap,
+      { ...liveContactMap, viewport: previewViewport },
       bounds.width,
       bounds.height,
     );
@@ -1044,6 +1069,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
         {hasCoverageTrack ? (
           <TrackPanel
             coverageView={coverageView}
+            viewport={displayViewport}
             uiState={uiState}
             onUiAction={onUiAction}
             onContextMenu={openContextMenu}
@@ -1074,6 +1100,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
                 onPointerUp={stopPan}
                 onPointerCancel={stopPan}
                 uiState={uiState}
+                viewport={displayViewport}
               />
             ) : (
               <canvas
@@ -1088,7 +1115,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
               <ContactLayoutRasterPreview
                 sourceLayerRef={contactTileLayerRef}
                 segments={layoutRasterPlan.segments}
-                viewport={contactMap.viewport}
+                viewport={displayViewport}
                 sourceRevision={[
                   contactMap.layoutScope,
                   contactMap.resolution,

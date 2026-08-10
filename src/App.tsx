@@ -3,6 +3,7 @@ import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { AppShell } from "./components/AppShell";
 import { exportAgpText } from "./state/agpExport";
 import {
+  contactAutoColorScaleKey,
   contactCountSampleForColorScale,
   estimateContactColorScale,
   type ContactColorScale,
@@ -22,7 +23,6 @@ import {
   type CoverageView,
 } from "./state/coverageView";
 import {
-  contactTileDataScope,
   createContactTileCacheKeyResolver,
   contactTileScope,
   contactTileSizeBins,
@@ -51,6 +51,7 @@ import {
   contactNormalizationForBackend,
   createInitialUiState,
   reduceUiState,
+  type ContactNormalization,
   type ContactResolution,
 } from "./state/uiState";
 
@@ -83,6 +84,8 @@ export interface ContactMapCell {
 
 export interface ContactMapView {
   resolution: number;
+  /** Normalization of the pixels currently displayed, not merely selected. */
+  normalization?: ContactNormalization;
   viewport: {
     xStart: number;
     xEnd: number;
@@ -237,12 +240,6 @@ export function App() {
     });
     const tileSizeBins = contactTileSizeBins;
     const normalization = contactNormalizationForBackend(uiState.normalization);
-    const tileDataScope = contactTileDataScope(
-      dataset.cool_path,
-      targetResolution,
-      tileSizeBins,
-      normalization,
-    );
     const tileScope = contactTileScope(
       dataset.cool_path,
       targetResolution,
@@ -261,11 +258,18 @@ export function App() {
       viewport,
       resolution: targetResolution,
       tileSizeBins,
+      totalSpanBp,
       scope: tileScope,
       cache: contactTileCacheRef.current,
       cacheKeyForTile,
     });
     const previousCompleteMap = lastCompleteContactMapRef.current;
+    if (
+      previousCompleteMap?.normalization !== undefined
+      && previousCompleteMap.normalization !== normalization
+    ) {
+      setStatusMessage(`Applying ${uiState.normalization} normalization…`);
+    }
     const holdsPreviousCompleteFrame = shouldHoldPreviousContactMapFrame(
       previousCompleteMap,
       targetResolution,
@@ -283,6 +287,7 @@ export function App() {
     );
     const contactMapForWorld = (world: typeof tileWorld): ContactMapView => ({
       ...projectContactTileWorldView(world),
+      normalization,
       layoutBlocks: assemblyLayout.blocks,
       layoutScope: tileScope,
       visibleLayerComplete: world.missingVisibleTiles.length === 0,
@@ -304,6 +309,8 @@ export function App() {
       ...loadPlan.prefetchBatches.map((tiles) => ({ kind: "prefetch" as const, tiles })),
     ];
     const plannedTiles = tileBatches.flatMap((batch) => batch.tiles);
+    const renderedStatusMessage =
+      `Contact map rendered with ${uiState.normalization} at ${uiState.contact.resolution}, ${formatViewportLabel(viewport)}`;
     const retainedRequestIds = contactTileFlightsRef.current.requestIdsFor(
       tileScope,
       plannedTiles,
@@ -326,10 +333,12 @@ export function App() {
       if (cancelled || generation !== contactTileGenerationRef.current) {
         return;
       }
-      const autoColorScaleKey = [
-        tileDataScope,
-        uiState.contact.colorScale.log ? "log" : "linear",
-      ].join("|");
+      const autoColorScaleKey = contactAutoColorScaleKey(
+        dataset.cool_path,
+        targetResolution,
+        tileSizeBins,
+        uiState.contact.colorScale.log,
+      );
       const applyAutoColorScale = (map: ContactMapView) => {
         if (!uiState.contact.colorScale.auto || !hasContactMapData(map)) {
           return;
@@ -385,15 +394,11 @@ export function App() {
         }
 
         if (tileBatches.length === 0) {
-          setStatusMessage(
-            `Contact map rendered at ${uiState.contact.resolution}, ${formatViewportLabel(viewport)}`,
-          );
+          setStatusMessage(renderedStatusMessage);
           return;
         }
         if (visibleReady) {
-          setStatusMessage(
-            `Contact map rendered at ${uiState.contact.resolution}, ${formatViewportLabel(viewport)}`,
-          );
+          setStatusMessage(renderedStatusMessage);
         }
 
         for (const batch of tileBatches) {
@@ -458,6 +463,7 @@ export function App() {
             viewport,
             resolution: targetResolution,
             tileSizeBins,
+            totalSpanBp,
             scope: tileScope,
             cache: nextCache,
             cacheKeyForTile,
@@ -480,9 +486,7 @@ export function App() {
 
           if (batch.kind === "visible" && updatedTileWorld.missingVisibleTiles.length === 0) {
             visibleReady = true;
-            setStatusMessage(
-              `Contact map rendered at ${uiState.contact.resolution}, ${formatViewportLabel(viewport)}`,
-            );
+            setStatusMessage(renderedStatusMessage);
           }
           if (
             batch.kind === "visible"
@@ -499,9 +503,11 @@ export function App() {
         ) {
           return;
         }
-        if (!visibleReady) {
-          setStatusMessage(`Contact map render failed: ${String(error)}`);
-        }
+        setStatusMessage(
+          visibleReady
+            ? renderedStatusMessage
+            : `Contact map render failed: ${String(error)}`,
+        );
         dispatchUi({
           type: "appendLog",
           message: `${visibleReady ? "Contact prefetch" : "Contact map render"} failed: ${String(error)}`,
@@ -555,7 +561,7 @@ export function App() {
     })
       .then((overviewMap) => {
         if (!cancelled) {
-          setOverviewContactMap(overviewMap);
+          setOverviewContactMap({ ...overviewMap, normalization });
         }
       })
       .catch((error) => {
@@ -722,6 +728,10 @@ export function App() {
       setPafText("");
       setPafImported(Boolean(importedDataset.paf_path));
       dispatchUi({ type: "setAssemblyBlocks", blocks: importedDataset.agp_layout.blocks });
+      dispatchUi({
+        type: "fitContactViewport",
+        totalSpanMb: importedDataset.agp_layout.totalSpan / 1_000_000,
+      });
       setStatusMessage("Example dataset loaded with coverage and PAF");
       dispatchUi({
         type: "appendLog",
@@ -735,6 +745,10 @@ export function App() {
       setPafText(example.pafText);
       setPafImported(true);
       dispatchUi({ type: "setAssemblyBlocks", blocks: example.dataset.agp_layout.blocks });
+      dispatchUi({
+        type: "fitContactViewport",
+        totalSpanMb: example.dataset.agp_layout.totalSpan / 1_000_000,
+      });
       setStatusMessage("Example dataset loaded with coverage and PAF in browser preview");
       dispatchUi({
         type: "appendLog",
@@ -764,6 +778,10 @@ export function App() {
       }),
     }));
     dispatchUi({ type: "setAssemblyBlocks", blocks: agpLayout.blocks });
+    dispatchUi({
+      type: "fitContactViewport",
+      totalSpanMb: agpLayout.totalSpan / 1_000_000,
+    });
     setStatusMessage(`AGP imported: ${file.name}`);
     dispatchUi({ type: "appendLog", message: `AGP imported: ${file.name}` });
   }

@@ -2,6 +2,7 @@ pub mod agp;
 pub mod assembly;
 pub mod contact_cache;
 pub mod contact_map;
+pub mod contact_normalization;
 pub mod source_contact_cache;
 pub mod cool;
 pub mod coords;

@@ -313,6 +313,16 @@ interface ContactOverviewProps {
   onUiAction: (action: UiAction) => void;
 }
 
+export function contactOverviewMapForDisplayedNormalization(
+  contactMap: ContactMapView | null,
+  overviewContactMap: ContactMapView | null,
+): ContactMapView | null {
+  if (overviewContactMap?.normalization === contactMap?.normalization) {
+    return overviewContactMap;
+  }
+  return contactMap;
+}
+
 function ContactOverview({ contactMap, overviewContactMap, dataset, uiState, onUiAction }: ContactOverviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const totalSpanBp = Math.max(1, dataset?.agp_layout.totalSpan ?? contactMap?.viewport.xEnd ?? 200_000_000);
@@ -337,8 +347,18 @@ function ContactOverview({ contactMap, overviewContactMap, dataset, uiState, onU
   const windowTop = Math.min(100 - windowHeight, Math.max(0, centerRatio.y * 100 - windowHeight / 2));
 
   useEffect(() => {
-    drawOverviewHeatmap(canvasRef.current, overviewContactMap ?? contactMap, uiState, totalSpanBp);
-  }, [contactMap, overviewContactMap, totalSpanBp]);
+    drawOverviewHeatmap(
+      canvasRef.current,
+      contactOverviewMapForDisplayedNormalization(contactMap, overviewContactMap),
+      uiState,
+      totalSpanBp,
+    );
+  }, [
+    contactMap,
+    overviewContactMap,
+    totalSpanBp,
+    uiState.contact.colorScale.log,
+  ]);
 
   function ratioFromEvent(event: React.PointerEvent<HTMLDivElement>) {
     const bounds = event.currentTarget.getBoundingClientRect();

@@ -54,7 +54,7 @@ describe("buildCenteredContactViewport", () => {
     });
   });
 
-  it("fits the long screen axis to the genome without stretching chromosome squares", () => {
+  it("keeps scale beyond the genome edge and leaves the uncovered field empty", () => {
     expect(buildCenteredContactViewport({
       centerMb: 150,
       totalSpanBp: 300_000_000,
@@ -63,9 +63,9 @@ describe("buildCenteredContactViewport", () => {
       viewportHeightPx: 800,
     })).toEqual({
       xStart: 0,
-      xEnd: 300_000_000,
-      yStart: 50_000_000,
-      yEnd: 250_000_000,
+      xEnd: 450_000_000,
+      yStart: 0,
+      yEnd: 300_000_000,
     });
   });
 

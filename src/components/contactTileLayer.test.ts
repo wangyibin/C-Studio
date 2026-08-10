@@ -94,4 +94,33 @@ describe("contactTileCanvasBox", () => {
     expect(markup).toContain("left:0%;top:50%");
     expect(markup).toContain("left:50%;top:0%");
   });
+
+  it("positions existing tiles against a live resized viewport instead of a stale response viewport", () => {
+    const markup = renderToStaticMarkup(
+      createElement(ContactTileLayer, {
+        contactMap: {
+          resolution: 1_000,
+          viewport: { xStart: 0, xEnd: 512_000, yStart: 0, yEnd: 512_000 },
+          cells: [],
+          tileSizeBins: 256,
+          tiles: [],
+          cachedTiles: [{
+            tileX: 0,
+            tileY: 1,
+            cells: [{ xBin: 4, yBin: 260, count: 5 }],
+          }],
+        },
+        viewport: { xStart: 0, xEnd: 1_024_000, yStart: 0, yEnd: 512_000 },
+        uiState: createInitialUiState("ready"),
+        layerRef: createRef<HTMLDivElement>(),
+        onPointerDown: () => undefined,
+        onPointerMove: () => undefined,
+        onPointerUp: () => undefined,
+        onPointerCancel: () => undefined,
+      }),
+    );
+
+    expect(markup).toContain("left:0%;top:50%;width:25%;height:50%");
+    expect(markup).toContain("left:25%;top:0%;width:25%;height:50%");
+  });
 });

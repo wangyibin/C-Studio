@@ -55,8 +55,9 @@ export function buildCenteredContactViewport({
 
 /**
  * Keep one genomic scale on both screen axes. The shorter pixel axis uses the
- * requested span; the longer axis shows proportionally more sequence. When a
- * whole-genome fit would exceed either boundary, both spans shrink together.
+ * requested span; the longer axis shows proportionally more sequence. The
+ * spans may extend beyond the genome so resizing the screen never changes the
+ * genomic scale. Callers render the uncovered area as empty canvas.
  */
 export function contactViewportAxisSpans(
   totalSpanBp: number,
@@ -66,18 +67,17 @@ export function contactViewportAxisSpans(
 ): ContactViewportAxisSpans {
   const safeTotalSpan = Number.isFinite(totalSpanBp) ? Math.max(1, totalSpanBp) : 1;
   const safeWindowSize = Number.isFinite(windowSizeBp)
-    ? Math.min(Math.max(1, windowSizeBp), safeTotalSpan)
+    ? Math.max(1, windowSizeBp)
     : safeTotalSpan;
   const safeWidthPx = Number.isFinite(viewportWidthPx) ? Math.max(1, viewportWidthPx) : 1;
   const safeHeightPx = Number.isFinite(viewportHeightPx) ? Math.max(1, viewportHeightPx) : 1;
   const shortestSidePx = Math.min(safeWidthPx, safeHeightPx);
   const rawXSpan = safeWindowSize * (safeWidthPx / shortestSidePx);
   const rawYSpan = safeWindowSize * (safeHeightPx / shortestSidePx);
-  const fitScale = Math.min(1, safeTotalSpan / rawXSpan, safeTotalSpan / rawYSpan);
 
   return {
-    xSpanBp: Math.min(safeTotalSpan, Math.max(1, Math.round(rawXSpan * fitScale))),
-    ySpanBp: Math.min(safeTotalSpan, Math.max(1, Math.round(rawYSpan * fitScale))),
+    xSpanBp: Math.max(1, Math.round(rawXSpan)),
+    ySpanBp: Math.max(1, Math.round(rawYSpan)),
   };
 }
 

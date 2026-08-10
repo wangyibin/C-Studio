@@ -193,13 +193,24 @@ export function contactTilesForViewport(
   viewport: ContactViewport,
   resolution: number,
   tileSizeBins: number,
+  totalSpanBp?: number,
 ): ContactMapTileKey[] {
   const safeResolution = Math.max(1, Math.round(resolution));
   const safeTileSizeBins = Math.max(1, Math.round(tileSizeBins));
-  const xStartBin = Math.floor(Math.max(0, viewport.xStart) / safeResolution);
-  const xEndBin = Math.max(xStartBin + 1, Math.ceil(Math.max(0, viewport.xEnd) / safeResolution));
-  const yStartBin = Math.floor(Math.max(0, viewport.yStart) / safeResolution);
-  const yEndBin = Math.max(yStartBin + 1, Math.ceil(Math.max(0, viewport.yEnd) / safeResolution));
+  const maximumCoordinate = Number.isFinite(totalSpanBp)
+    ? Math.max(1, Math.round(totalSpanBp!))
+    : Number.POSITIVE_INFINITY;
+  const xStart = Math.min(maximumCoordinate, Math.max(0, viewport.xStart));
+  const xEnd = Math.min(maximumCoordinate, Math.max(0, viewport.xEnd));
+  const yStart = Math.min(maximumCoordinate, Math.max(0, viewport.yStart));
+  const yEnd = Math.min(maximumCoordinate, Math.max(0, viewport.yEnd));
+  if (xEnd <= xStart || yEnd <= yStart) {
+    return [];
+  }
+  const xStartBin = Math.floor(xStart / safeResolution);
+  const xEndBin = Math.max(xStartBin + 1, Math.ceil(xEnd / safeResolution));
+  const yStartBin = Math.floor(yStart / safeResolution);
+  const yEndBin = Math.max(yStartBin + 1, Math.ceil(yEnd / safeResolution));
   const minTileX = Math.floor(xStartBin / safeTileSizeBins);
   const maxTileX = Math.floor((xEndBin - 1) / safeTileSizeBins);
   const minTileY = Math.floor(yStartBin / safeTileSizeBins);

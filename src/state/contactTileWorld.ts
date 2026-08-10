@@ -15,6 +15,7 @@ export interface ContactTileWorldInput {
   viewport: ContactViewport;
   resolution: number;
   tileSizeBins: number;
+  totalSpanBp?: number;
   scope: string;
   cache: Map<string, ContactMapTile>;
   cacheKeyForTile?: ContactTileCacheKeyResolver;
@@ -42,12 +43,22 @@ export function buildContactTileWorld({
   viewport,
   resolution,
   tileSizeBins,
+  totalSpanBp,
   scope,
   cache,
   cacheKeyForTile = (tile) => contactTileCacheKey(scope, tile),
 }: ContactTileWorldInput): ContactTileWorld {
-  const visibleTiles = contactTilesForViewport(viewport, resolution, tileSizeBins);
-  const prefetchTiles = padTileKeys(visibleTiles, contactTileWorldPrefetchPadding);
+  const visibleTiles = contactTilesForViewport(
+    viewport,
+    resolution,
+    tileSizeBins,
+    totalSpanBp,
+  );
+  const maximumTileIndex = Number.isFinite(totalSpanBp)
+    ? Math.max(0, Math.ceil(totalSpanBp! / Math.max(1, resolution * tileSizeBins)) - 1)
+    : Number.POSITIVE_INFINITY;
+  const prefetchTiles = padTileKeys(visibleTiles, contactTileWorldPrefetchPadding)
+    .filter((tile) => tile.tileX <= maximumTileIndex && tile.tileY <= maximumTileIndex);
   const cachedVisibleTiles = visibleTiles
     .map((tile) => cache.get(cacheKeyForTile(tile)))
     .filter((tile): tile is ContactMapTile => Boolean(tile));

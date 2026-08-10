@@ -2,7 +2,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { createInitialUiState } from "../state/uiState";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
-import { InspectorPanel } from "./InspectorPanel";
+import {
+  contactOverviewMapForDisplayedNormalization,
+  InspectorPanel,
+} from "./InspectorPanel";
 
 const status: AppStatus = {
   engine: "test",
@@ -32,6 +35,25 @@ const contactMap: ContactMapView = {
 };
 
 describe("InspectorPanel", () => {
+  it("does not show an overview from a different normalization", () => {
+    const rawMap = { ...contactMap, normalization: "raw" as const };
+    const iceOverview = {
+      ...contactMap,
+      normalization: "ice" as const,
+      cells: [{ xBin: 0, yBin: 0, count: 24 }],
+    };
+
+    expect(
+      contactOverviewMapForDisplayedNormalization(rawMap, iceOverview),
+    ).toBe(rawMap);
+    expect(
+      contactOverviewMapForDisplayedNormalization(
+        { ...rawMap, normalization: "ice" },
+        iceOverview,
+      ),
+    ).toBe(iceOverview);
+  });
+
   it("binds the overview to the active contact map", () => {
     const uiState = createInitialUiState("ready");
 

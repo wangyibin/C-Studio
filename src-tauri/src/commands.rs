@@ -145,9 +145,47 @@ struct ContactTileCacheKey {
     path: String,
     resolution: u64,
     tile_size_bins: u64,
+    normalization: ContactNormalizationRequest,
     projection_fingerprint: String,
     tile_x: u64,
     tile_y: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactNormalizationRequest {
+    #[default]
+    Raw,
+    Ice,
+    Kr,
+    Vc,
+    VcSqrt,
+}
+
+impl ContactNormalizationRequest {
+    fn cache_key(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Ice => "ice",
+            Self::Kr => "kr",
+            Self::Vc => "vc",
+            Self::VcSqrt => "vc_sqrt",
+        }
+    }
+}
+
+impl From<ContactNormalizationRequest>
+    for cstudio_core::contact_normalization::ContactNormalization
+{
+    fn from(value: ContactNormalizationRequest) -> Self {
+        match value {
+            ContactNormalizationRequest::Raw => Self::Raw,
+            ContactNormalizationRequest::Ice => Self::Ice,
+            ContactNormalizationRequest::Kr => Self::Kr,
+            ContactNormalizationRequest::Vc => Self::Vc,
+            ContactNormalizationRequest::VcSqrt => Self::VcSqrt,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -214,6 +252,8 @@ pub struct ContactMapViewFromCoolRequest {
     pub cool_path: String,
     pub base_resolution: u64,
     pub target_resolution: u64,
+    #[serde(default)]
+    pub normalization: ContactNormalizationRequest,
     pub viewport: ContactMapViewportRequest,
     pub layout_blocks: Vec<ContactMapLayoutBlockRequest>,
 }
@@ -227,6 +267,8 @@ pub struct ContactMapTilesFromCoolRequest {
     pub base_resolution: u64,
     pub target_resolution: u64,
     pub tile_size_bins: u64,
+    #[serde(default)]
+    pub normalization: ContactNormalizationRequest,
     pub tiles: Vec<ContactMapTileKeyRequest>,
     pub layout_blocks: Vec<ContactMapLayoutBlockRequest>,
 }
@@ -646,6 +688,7 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
             path: request.cool_path.clone(),
             resolution: request.target_resolution,
             tile_size_bins: request.tile_size_bins,
+            normalization: request.normalization,
             projection_fingerprint: format!(
                 "{}:{}",
                 axis_fingerprints
@@ -765,13 +808,20 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0);
             format!(
-                "{}|{}|{}",
+                "{}|{}|{}|normalization={}",
                 request.cool_path,
                 metadata.len(),
-                modified_nanos
+                modified_nanos,
+                request.normalization.cache_key(),
             )
         })
-        .unwrap_or_else(|_| request.cool_path.clone());
+        .unwrap_or_else(|_| {
+            format!(
+                "{}|normalization={}",
+                request.cool_path,
+                request.normalization.cache_key(),
+            )
+        });
     let source_cache_keys = source_windows.as_ref().map(|source_windows| {
         SourceContactCache::keys_for_windows(
             &source_cache_path,
@@ -810,11 +860,11 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
             .as_deref()
             .unwrap_or(source_ranges.as_slice());
         ensure_contact_tile_request_active(should_cancel)?;
-        let contacts =
-            cstudio_core::cool::read_cool_contacts_for_source_ranges_at_resolution_cancellable(
+        let contacts = cstudio_core::cool::read_cool_contacts_for_source_ranges_at_resolution_with_normalization_cancellable(
                 &request.cool_path,
                 read_ranges,
                 Some(request.target_resolution),
+                request.normalization.into(),
                 should_cancel,
             )
             .map_err(|error| error.to_string())?;
@@ -901,6 +951,7 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
                     path: request.cool_path.clone(),
                     resolution: request.target_resolution,
                     tile_size_bins: request.tile_size_bins,
+                    normalization: request.normalization,
                     projection_fingerprint: format!(
                         "{}:{}",
                         axis_fingerprints
@@ -989,6 +1040,8 @@ fn build_contact_map_view_from_cool_with_cache(
     request: ContactMapViewFromCoolRequest,
     cache: &Mutex<ContactCache>,
 ) -> Result<ContactMapViewResponse, String> {
+    let cool_path = request.cool_path.clone();
+    let normalization = request.normalization;
     let query = contact_map_query_from_parts(
         request.base_resolution,
         request.target_resolution,
@@ -1003,7 +1056,7 @@ fn build_contact_map_view_from_cool_with_cache(
         .into_iter()
         .collect::<Vec<_>>();
     let key = ContactCacheKey {
-        path: request.cool_path,
+        path: format!("{}|normalization={}", cool_path, normalization.cache_key(),),
         resolution: request.target_resolution,
         source_ids,
     };
@@ -1020,12 +1073,14 @@ fn build_contact_map_view_from_cool_with_cache(
         }
     }
 
-    let contacts = cstudio_core::cool::read_cool_contacts_for_sources_at_resolution(
-        &key.path,
-        &key.source_ids,
-        Some(key.resolution),
-    )
-    .map_err(|error| error.to_string())?;
+    let contacts =
+        cstudio_core::cool::read_cool_contacts_for_sources_at_resolution_with_normalization(
+            &cool_path,
+            &key.source_ids,
+            Some(key.resolution),
+            normalization.into(),
+        )
+        .map_err(|error| error.to_string())?;
 
     let view = {
         let mut cache = cache
@@ -1982,7 +2037,8 @@ mod tests {
         build_synteny_view, get_app_status, BedGraphRecordRequest, ContactMapBinRequest,
         ContactMapLayoutBlockRequest, ContactMapTileKeyRequest, ContactMapTilesFromCoolRequest,
         ContactMapViewFromCoolRequest, ContactMapViewRequest, ContactMapViewportRequest,
-        CoverageViewFromBedGraphRequest, CoverageViewRequest, PafRecordRequest, SyntenyViewRequest,
+        ContactNormalizationRequest, CoverageViewFromBedGraphRequest, CoverageViewRequest,
+        PafRecordRequest, SyntenyViewRequest,
     };
 
     #[test]
@@ -1998,6 +2054,59 @@ mod tests {
             status.supported_operations,
             vec!["split", "move", "flip", "copy"]
         );
+    }
+
+    #[test]
+    fn contact_normalization_request_uses_stable_wire_values() {
+        for (wire_value, expected) in [
+            ("raw", ContactNormalizationRequest::Raw),
+            ("ice", ContactNormalizationRequest::Ice),
+            ("kr", ContactNormalizationRequest::Kr),
+            ("vc", ContactNormalizationRequest::Vc),
+            ("vc_sqrt", ContactNormalizationRequest::VcSqrt),
+        ] {
+            let parsed: ContactNormalizationRequest =
+                serde_json::from_str(format!("\"{wire_value}\"").as_str())
+                    .expect("known normalization wire value");
+            assert_eq!(parsed, expected);
+        }
+        assert!(serde_json::from_str::<ContactNormalizationRequest>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn omitted_contact_normalization_defaults_to_raw() {
+        let request: ContactMapTilesFromCoolRequest = serde_json::from_value(serde_json::json!({
+            "requestId": 1,
+            "generation": 1,
+            "coolPath": "/tmp/input.cool",
+            "baseResolution": 1_000,
+            "targetResolution": 10_000,
+            "tileSizeBins": 256,
+            "tiles": [],
+            "layoutBlocks": [],
+        }))
+        .expect("legacy request without normalization");
+
+        assert_eq!(request.normalization, ContactNormalizationRequest::Raw);
+    }
+
+    #[test]
+    fn contact_tile_cache_identity_includes_normalization() {
+        let raw = super::ContactTileCacheKey {
+            path: "/tmp/input.cool".to_string(),
+            resolution: 10_000,
+            tile_size_bins: 256,
+            normalization: ContactNormalizationRequest::Raw,
+            projection_fingerprint: "same-layout".to_string(),
+            tile_x: 1,
+            tile_y: 2,
+        };
+        let kr = super::ContactTileCacheKey {
+            normalization: ContactNormalizationRequest::Kr,
+            ..raw.clone()
+        };
+
+        assert_ne!(raw, kr);
     }
 
     #[test]
@@ -2057,6 +2166,7 @@ mod tests {
                 base_resolution: 1_000,
                 target_resolution: 1_000,
                 tile_size_bins: 256,
+                normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![ContactMapTileKeyRequest {
                     tile_x: 0,
                     tile_y: 0,
@@ -2173,6 +2283,7 @@ mod tests {
                 cool_path: summary.cool_path,
                 base_resolution: 1_000,
                 target_resolution: 10_000,
+                normalization: ContactNormalizationRequest::Raw,
                 viewport: ContactMapViewportRequest {
                     x_start: 0,
                     x_end: summary.agp_layout.total_span,
@@ -2324,6 +2435,7 @@ mod tests {
                 path: cool_path.clone(),
                 resolution: target_resolution,
                 tile_size_bins,
+                normalization: ContactNormalizationRequest::Raw,
                 projection_fingerprint: super::contact_tile_projection_fingerprint(
                     unaffected_tile.tile_x,
                     unaffected_tile.tile_y,
@@ -2343,6 +2455,7 @@ mod tests {
                 base_resolution: target_resolution,
                 target_resolution,
                 tile_size_bins,
+                normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![unaffected_tile],
                 layout_blocks: inserted.clone(),
             },
@@ -2374,6 +2487,7 @@ mod tests {
                 path: cool_path.clone(),
                 resolution: target_resolution,
                 tile_size_bins,
+                normalization: ContactNormalizationRequest::Raw,
                 projection_fingerprint: old_affected_fingerprint,
                 tile_x: affected_tile.tile_x,
                 tile_y: affected_tile.tile_y,
@@ -2392,6 +2506,7 @@ mod tests {
                 base_resolution: target_resolution,
                 target_resolution,
                 tile_size_bins,
+                normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![affected_tile],
                 layout_blocks: inserted,
             },
@@ -2429,6 +2544,7 @@ mod tests {
                 path: cool_path.clone(),
                 resolution: target_resolution,
                 tile_size_bins,
+                normalization: ContactNormalizationRequest::Raw,
                 projection_fingerprint: super::contact_tile_projection_fingerprint(
                     1,
                     1,
@@ -2450,6 +2566,7 @@ mod tests {
                 base_resolution: 1_000,
                 target_resolution,
                 tile_size_bins,
+                normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![
                     ContactMapTileKeyRequest {
                         tile_x: 0,
@@ -2514,6 +2631,7 @@ mod tests {
                 base_resolution: 1_000,
                 target_resolution: 10_000,
                 tile_size_bins: 256,
+                normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![
                     ContactMapTileKeyRequest {
                         tile_x: 10_000,
@@ -2555,6 +2673,7 @@ mod tests {
                 base_resolution: 1_000,
                 target_resolution: 10_000,
                 tile_size_bins: 256,
+                normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![
                     ContactMapTileKeyRequest {
                         tile_x: 10_000,
@@ -2610,6 +2729,7 @@ mod tests {
                 base_resolution: 1_000,
                 target_resolution,
                 tile_size_bins,
+                normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![ContactMapTileKeyRequest {
                     tile_x: 0,
                     tile_y: 0,
@@ -2632,6 +2752,7 @@ mod tests {
                 base_resolution: 1_000,
                 target_resolution,
                 tile_size_bins,
+                normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![ContactMapTileKeyRequest {
                     tile_x: 1,
                     tile_y: 1,

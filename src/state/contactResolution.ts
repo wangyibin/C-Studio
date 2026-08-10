@@ -107,16 +107,14 @@ export function clampContactResolutionToViewport(
 
 export function contactWholeGenomeViewportSpanMb(
   totalSpanMb: number,
-  viewportWidthPx: number,
-  viewportHeightPx: number,
+  _viewportWidthPx: number,
+  _viewportHeightPx: number,
 ) {
-  const safeTotalSpanMb = sanitizeTotalSpanMb(totalSpanMb);
-  const safeWidthPx = sanitizeViewportSizePx(viewportWidthPx);
-  const safeHeightPx = sanitizeViewportSizePx(viewportHeightPx);
-
-  return safeTotalSpanMb
-    * Math.min(safeWidthPx, safeHeightPx)
-    / Math.max(safeWidthPx, safeHeightPx);
+  // The heatmap itself is a square. Fitting the whole genome therefore means
+  // placing that square on the viewport's shorter side and leaving any surplus
+  // on the longer side empty; cropping one axis to fill a rectangle would no
+  // longer be a whole-map view.
+  return sanitizeTotalSpanMb(totalSpanMb);
 }
 
 /**

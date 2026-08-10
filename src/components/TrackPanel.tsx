@@ -18,6 +18,7 @@ import type { UiAction, UiState } from "../state/uiState";
 
 interface TrackPanelProps {
   coverageView: CoverageView | null;
+  viewport?: ContactViewport;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
@@ -66,7 +67,13 @@ const minimumCoverageMultiplier = 1;
 const maximumCoverageMultiplier = 100;
 const coverageDragThresholdPx = 4;
 
-export function TrackPanel({ coverageView, onContextMenu, onUiAction, uiState }: TrackPanelProps) {
+export function TrackPanel({
+  coverageView: sourceCoverageView,
+  onContextMenu,
+  onUiAction,
+  uiState,
+  viewport,
+}: TrackPanelProps) {
   const [scaleOverride, setScaleOverride] = useState<CoverageScaleDomain | null>(null);
   const [automaticMultiplier, setAutomaticMultiplier] = useState(defaultCoverageMultiplier);
   const [automaticMultiplierInput, setAutomaticMultiplierInput] = useState(
@@ -77,6 +84,18 @@ export function TrackPanel({ coverageView, onContextMenu, onUiAction, uiState }:
   const coverageSelectionDragRef = useRef<CoverageSelectionDrag | null>(null);
   const lastDragSelectionSignatureRef = useRef("");
   const suppressCoverageClickRef = useRef(false);
+  const coverageView = useMemo(() => (
+    sourceCoverageView && viewport
+      ? {
+          ...sourceCoverageView,
+          viewport: {
+            ...viewport,
+            yStart: sourceCoverageView.viewport.yStart,
+            yEnd: sourceCoverageView.viewport.yEnd,
+          },
+        }
+      : sourceCoverageView
+  ), [sourceCoverageView, viewport]);
   const bars = useMemo(
     () => buildCoverageTrackBars(coverageView, uiState.assembly.blocks),
     [coverageView, uiState.assembly.blocks],

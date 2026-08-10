@@ -89,6 +89,21 @@ describe("contact tile requests", () => {
     ]);
   });
 
+  it("does not request tiles in the empty field beyond the genome", () => {
+    expect(
+      contactTilesForViewport(
+        { xStart: 0, xEnd: 1_024_000, yStart: 0, yEnd: 1_024_000 },
+        1_000,
+        256,
+        500_000,
+      ),
+    ).toEqual([
+      { tileX: 0, tileY: 0 },
+      { tileX: 0, tileY: 1 },
+      { tileX: 1, tileY: 1 },
+    ]);
+  });
+
   it("bounds visible tiles by the measured viewport after selecting 5 kb", () => {
     let state = createInitialUiState("ready");
     state = reduceUiState(state, {

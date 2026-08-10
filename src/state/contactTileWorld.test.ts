@@ -99,6 +99,24 @@ describe("contact tile world", () => {
     expect(plan.prefetchBatches.flat()).not.toContainEqual({ tileX: 0, tileY: 1 });
   });
 
+  it("bounds visible and prefetched tiles at the genome edge while the viewport shows empty field", () => {
+    const world = buildContactTileWorld({
+      viewport: { xStart: 0, xEnd: 1_024_000, yStart: 0, yEnd: 1_024_000 },
+      resolution: 1_000,
+      tileSizeBins: 256,
+      totalSpanBp: 500_000,
+      scope,
+      cache: new Map(),
+    });
+
+    expect(world.visibleTiles).toEqual([
+      { tileX: 0, tileY: 0 },
+      { tileX: 0, tileY: 1 },
+      { tileX: 1, tileY: 1 },
+    ]);
+    expect(world.prefetchTiles.every((tile) => tile.tileX <= 1 && tile.tileY <= 1)).toBe(true);
+  });
+
   it("prioritizes the on-screen center below the diagonal after tile canonicalization", () => {
     const tileSpan = 256_000;
     const belowDiagonalWorld = buildContactTileWorld({

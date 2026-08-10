@@ -1,17 +1,23 @@
 import { createRef } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { createInitialUiState } from "../state/uiState";
+import type { ContactMapView } from "../App";
+import { createInitialUiState, type UiState } from "../state/uiState";
 import { AppShell } from "./AppShell";
 
-function renderShell(rightCollapsed = false) {
+function renderShell(
+  rightCollapsed = false,
+  contactMap: ContactMapView | null = null,
+  normalization: UiState["normalization"] = "None (Raw)",
+) {
   const uiState = createInitialUiState("Ready");
   uiState.layout.rightCollapsed = rightCollapsed;
+  uiState.normalization = normalization;
 
   return renderToStaticMarkup(
     <AppShell
       dataset={null}
-      contactMap={null}
+      contactMap={contactMap}
       overviewContactMap={null}
       syntenyView={null}
       coverageView={null}
@@ -79,5 +85,25 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).not.toContain('aria-label="Inspector"');
     expect(markup).toContain('class="workspace right-collapsed"');
     expect(markup).toContain('aria-label="Contact map viewport"');
+  });
+
+  it("shows which normalization is still displayed during an async mode switch", () => {
+    const rawMap: ContactMapView = {
+      resolution: 10_000,
+      normalization: "raw",
+      viewport: { xStart: 0, xEnd: 10_000, yStart: 0, yEnd: 10_000 },
+      cells: [],
+    };
+    const pendingMarkup = renderShell(false, rawMap, "ICE (Balanced)");
+    const appliedMarkup = renderShell(
+      false,
+      { ...rawMap, normalization: "ice" },
+      "ICE (Balanced)",
+    );
+
+    expect(pendingMarkup).toContain(
+      "Normalization: ICE (Balanced) (showing None (Raw))",
+    );
+    expect(appliedMarkup).not.toContain("showing None (Raw)");
   });
 });

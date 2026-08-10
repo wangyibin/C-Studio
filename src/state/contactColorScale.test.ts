@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
+  contactAutoColorScaleKey,
   contactCountSampleForColorScale,
   estimateContactColorScale,
   normalizeContactValue,
 } from "./contactColorScale";
+
+describe("contactAutoColorScaleKey", () => {
+  it("keeps a shared comparison scale for one dataset and resolution", () => {
+    expect(contactAutoColorScaleKey("/tmp/input.cool", 10_000, 256, false)).toBe(
+      "/tmp/input.cool|10000|256|linear",
+    );
+    expect(contactAutoColorScaleKey("/tmp/input.cool", 10_000, 256, true)).toBe(
+      "/tmp/input.cool|10000|256|log",
+    );
+  });
+});
 
 describe("estimateContactColorScale", () => {
   it("uses Juicebox's nearest-index P95 as the automatic threshold", () => {

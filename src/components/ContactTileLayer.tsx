@@ -10,6 +10,7 @@ import type { UiState } from "../state/uiState";
 
 interface ContactTileLayerProps {
   contactMap: ContactMapView | null;
+  viewport?: ContactViewport;
   uiState: UiState;
   layerRef: React.RefObject<HTMLDivElement>;
   onPointerDown: (event: React.PointerEvent<HTMLDivElement>) => void;
@@ -37,6 +38,7 @@ export function ContactTileLayer({
   onPointerMove,
   onPointerUp,
   uiState,
+  viewport,
 }: ContactTileLayerProps) {
   const rawTiles = contactMap?.cachedTiles ?? contactMap?.tiles;
   const previewTiles = contactMap?.previewTiles;
@@ -68,6 +70,7 @@ export function ContactTileLayer({
                 tileSizeBins={tileSizeBins}
                 transpose={false}
                 uiState={uiState}
+                viewport={viewport ?? contactMap.viewport}
               />,
             ];
             if (tile.tileX !== tile.tileY) {
@@ -79,6 +82,7 @@ export function ContactTileLayer({
                   tileSizeBins={tileSizeBins}
                   transpose
                   uiState={uiState}
+                  viewport={viewport ?? contactMap.viewport}
                 />,
               );
             }
@@ -139,12 +143,14 @@ function ContactTileCanvas({
   tileSizeBins,
   transpose,
   uiState,
+  viewport,
 }: {
   contactMap: ContactMapView;
   tile: ContactMapTile;
   tileSizeBins: number;
   transpose: boolean;
   uiState: UiState;
+  viewport: ContactViewport;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const box = contactTileCanvasBox({
@@ -152,7 +158,7 @@ function ContactTileCanvas({
     tileY: transpose ? tile.tileX : tile.tileY,
     resolution: contactMap.resolution,
     tileSizeBins,
-    viewport: contactMap.viewport,
+    viewport,
     viewportPixelSize: 100,
   });
 
