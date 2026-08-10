@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  availableContactResolutions,
+  contactNormalizationForBackend,
   contactResolutions,
   createInitialUiState,
+  normalizations,
   overviewRatioToViewportCenterMb,
   reduceUiState,
 } from "./uiState";
@@ -44,6 +47,19 @@ describe("reduceUiState", () => {
     const state = createInitialUiState("Browser preview mode");
 
     expect(state.layout.bottomCollapsed).toBe(true);
+  });
+
+  it("maps normalization labels to stable backend values", () => {
+    expect(normalizations.map((normalization) => [
+      normalization,
+      contactNormalizationForBackend(normalization),
+    ])).toEqual([
+      ["None (Raw)", "raw"],
+      ["ICE (Balanced)", "ice"],
+      ["KR (Balanced)", "kr"],
+      ["VC (Coverage)", "vc"],
+      ["VC_SQRT", "vc_sqrt"],
+    ]);
   });
 
   it("selects toolbar controls and records readable log entries", () => {
@@ -121,7 +137,7 @@ describe("reduceUiState", () => {
     let state = createInitialUiState("Browser preview mode");
 
     expect(state.contact.colormap).toBe("Reds");
-    expect(state.contact.resolution).toBe("2 Mb");
+    expect(state.contact.resolution).toBe("500 kb");
     expect(contactResolutions).toEqual([
       "2.5 Mb",
       "2 Mb",
@@ -143,13 +159,13 @@ describe("reduceUiState", () => {
     state = reduceUiState(state, { type: "setColorScale", field: "max", value: 250 });
     state = reduceUiState(state, { type: "toggleColorScaleLog" });
 
-    expect(state.contact.resolution).toBe("1 Mb");
+    expect(state.contact.resolution).toBe("250 kb");
     expect(state.contact.viewportCenterMb).toBe(125);
     expect(state.contact.colormap).toBe("Viridis");
     expect(state.contact.colorScale).toEqual({ log: true, min: 0.05, max: 250, auto: true });
   });
 
-  it("sets contact map resolution directly and clamps a whole-span viewport", () => {
+  it("uses the dynamic fitted level for the whole map", () => {
     let state = createInitialUiState("Browser preview mode");
 
     state = reduceUiState(state, { type: "setContactResolution", resolution: "500 kb" });
@@ -161,7 +177,7 @@ describe("reduceUiState", () => {
     expect(state.logEntries[state.logEntries.length - 1]?.message).toBe("Contact resolution set to 500 kb");
   });
 
-  it("uses the measured 536 px viewport when manually selecting 50 kb", () => {
+  it("keeps manual resolution bins at one CSS pixel", () => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, {
       type: "setContactViewportMetrics",
@@ -177,7 +193,7 @@ describe("reduceUiState", () => {
     expect(state.contact.viewportCenterYMb).toBe(100);
   });
 
-  it("clamps a manual 2 Mb selection to the finite loaded span", () => {
+  it("clamps resolutions coarser than the fitted whole-map level", () => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, {
       type: "setContactViewportMetrics",
@@ -188,7 +204,7 @@ describe("reduceUiState", () => {
     state = reduceUiState(state, { type: "setContactResolution", resolution: "50 kb" });
     state = reduceUiState(state, { type: "setContactResolution", resolution: "2 Mb" });
 
-    expect(state.contact.resolution).toBe("2 Mb");
+    expect(state.contact.resolution).toBe("500 kb");
     expect(state.contact.viewportSpanMb).toBe(196.84);
     expect(Number.isFinite(state.contact.viewportSpanMb)).toBe(true);
     expect(state.contact.viewportCenterMb).toBe(98.42);
@@ -213,6 +229,40 @@ describe("reduceUiState", () => {
       totalSpanMb: 196.84,
     });
     expect(unchanged).toBe(state);
+  });
+
+  it("keeps a fitted view fitted when the loaded assembly span grows", () => {
+    let state = createInitialUiState("Browser preview mode");
+
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 640,
+      viewportWidthPx: 640,
+      viewportHeightPx: 640,
+      totalSpanMb: 500,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(500);
+    expect(state.contact.viewportCenterXMb).toBe(250);
+    expect(state.contact.viewportCenterYMb).toBe(250);
+    expect(state.contact.resolution).toBe("1 Mb");
+  });
+
+  it("does not reset an already zoomed view when viewport metrics change", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "250 kb" });
+
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 640,
+      viewportWidthPx: 640,
+      viewportHeightPx: 640,
+      totalSpanMb: 500,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(160);
+    expect(state.contact.viewportCenterXMb).toBe(98.42);
+    expect(state.contact.resolution).toBe("250 kb");
   });
 
   it("fits and immediately zooms a wide viewport without stretching chromosome blocks", () => {
@@ -255,6 +305,35 @@ describe("reduceUiState", () => {
       totalSpanMb: 300,
     });
     expect(state.contact.viewportSpanMb).toBeLessThan(200);
+  });
+
+  it("chooses a dynamic whole-map level for a rectangular viewport", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 800,
+      viewportWidthPx: 1200,
+      viewportHeightPx: 800,
+      totalSpanMb: 300,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(200);
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(availableContactResolutions(state.contact)).toEqual([
+      "250 kb",
+      "100 kb",
+      "50 kb",
+      "25 kb",
+      "10 kb",
+      "5 kb",
+    ]);
+
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "2 Mb" });
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSpanMb).toBe(200);
+
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "100 kb" });
+    expect(state.contact.viewportSpanMb).toBe(80);
   });
 
   it("keeps manual color ranges until auto range is restored", () => {
@@ -317,7 +396,7 @@ describe("reduceUiState", () => {
     state = reduceUiState(state, { type: "setContactResolution", resolution: "250 kb" });
     state = reduceUiState(state, { type: "setColorScale", field: "min", value: 1.5 });
     state = reduceUiState(state, { type: "setColorScale", field: "max", value: 12 });
-    state = reduceUiState(state, { type: "setContactResolution", resolution: "2 Mb" });
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "500 kb" });
 
     expect(state.contact.colorScale.min).toBe(0.2);
     expect(state.contact.colorScale.max).toBe(8);
@@ -508,6 +587,62 @@ describe("reduceUiState", () => {
     expect(state.contact.resolution).toBe("500 kb");
   });
 
+  it("steps an unlocked double-click to the next data level at one CSS pixel per bin", () => {
+    let state = createInitialUiState("Browser preview mode");
+
+    state = reduceUiState(state, {
+      type: "zoomContactViewport",
+      direction: "in",
+      focusRatioX: 0.5,
+      focusRatioY: 0.5,
+      snapToResolution: true,
+      totalSpanMb: 200,
+    });
+
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSpanMb).toBe(160);
+    expect(
+      state.contact.viewportSizePx
+        * 0.25
+        / state.contact.viewportSpanMb,
+    ).toBe(1);
+  });
+
+  it("keeps the data level fixed when a locked double-click changes pixels per bin", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "250 kb" });
+    state = reduceUiState(state, { type: "toggleContactResolutionLock" });
+
+    state = reduceUiState(state, {
+      type: "zoomContactViewport",
+      direction: "in",
+      focusRatioX: 0.5,
+      focusRatioY: 0.5,
+      snapToResolution: true,
+      totalSpanMb: 200,
+    });
+
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSpanMb).toBe(80);
+  });
+
+  it("returns to the sole whole-genome resolution when zooming all the way out", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "500 kb" });
+
+    state = reduceUiState(state, {
+      type: "zoomContactViewport",
+      direction: "out",
+      focusRatioX: 0.5,
+      focusRatioY: 0.5,
+      scaleFactor: 0.01,
+      totalSpanMb: 200,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(200);
+    expect(state.contact.resolution).toBe("500 kb");
+  });
+
   it("zooms without resetting an off-diagonal y viewport", () => {
     let state = createInitialUiState("Browser preview mode");
 
@@ -552,6 +687,22 @@ describe("reduceUiState", () => {
     state = reduceUiState(state, { type: "toggleContactResolutionLock" });
     expect(state.contact.resolutionLocked).toBe(false);
     expect(state.logEntries[state.logEntries.length - 1]?.message).toBe("Contact resolution unlocked");
+  });
+
+  it("does not let a locked finer resolution zoom out below one pixel per bin", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "250 kb" });
+    state = reduceUiState(state, { type: "toggleContactResolutionLock" });
+
+    state = reduceUiState(state, {
+      type: "zoomContactViewport",
+      direction: "out",
+      scaleFactor: 0.01,
+      totalSpanMb: 200,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(160);
+    expect(state.contact.resolution).toBe("250 kb");
   });
 
   it("keeps both genome coordinates under the pointer stable during incremental wheel zoom", () => {

@@ -1,4 +1,5 @@
-import type { ContactMapCell, ContactMapView } from "../App";
+import type { ContactMapCell, ContactMapTile, ContactMapView } from "../App";
+import { contactTileKey } from "./contactTiles";
 import type { ContactMapLayoutBlock } from "./importers";
 
 export const maxDrawableContactCells = 120_000;
@@ -9,10 +10,16 @@ export function contactCellsForViewport(
   maxCells = maxDrawableContactCells,
 ): ContactMapCell[] {
   const tileSizeBins = contactMap.tileSizeBins ?? 256;
-  const tiles = contactMap.cachedTiles ?? contactMap.tiles;
-  if (!tiles) {
+  const hasTileLayers = contactMap.cachedTiles !== undefined
+    || contactMap.tiles !== undefined
+    || contactMap.previewTiles !== undefined;
+  if (!hasTileLayers) {
     return thinContactCellsForDrawing(contactMap.cells, maxCells);
   }
+  const tiles = contactTilesWithPreviewFallback(
+    contactMap.cachedTiles ?? contactMap.tiles ?? [],
+    contactMap.previewTiles ?? [],
+  );
 
   return thinContactCellsForDrawing(tiles.flatMap((tile) => {
     const tileStartX = tile.tileX * tileSizeBins * contactMap.resolution;
@@ -37,23 +44,54 @@ export function displayContactMapForPendingLayer(
   previousContactMap: ContactMapView | null,
   visibleLayerComplete = true,
 ): ContactMapView {
-  if (!visibleLayerComplete && previousContactMap) {
+  const hasPendingVisibleTiles = pendingContactMap.cells.length > 0
+    || (pendingContactMap.tiles?.length ?? 0) > 0
+    || (pendingContactMap.previewTiles?.length ?? 0) > 0;
+  if (hasPendingVisibleTiles || !previousContactMap) {
+    return pendingContactMap;
+  }
+
+  const layersAreCompatible = !visibleLayerComplete
+    && pendingContactMap.resolution === previousContactMap.resolution
+    && (pendingContactMap.tileSizeBins ?? 256) === (previousContactMap.tileSizeBins ?? 256)
+    && pendingContactMap.layoutScope !== undefined
+    && pendingContactMap.layoutScope === previousContactMap.layoutScope;
+  if (layersAreCompatible) {
     return {
       ...previousContactMap,
       viewport: pendingContactMap.viewport,
     };
   }
 
-  const hasPendingCells = pendingContactMap.cells.length > 0
-    || (pendingContactMap.tiles?.length ?? 0) > 0;
-  if (hasPendingCells || !previousContactMap) {
-    return pendingContactMap;
-  }
+  return pendingContactMap;
+}
 
-  return {
-    ...previousContactMap,
-    viewport: pendingContactMap.viewport,
-  };
+/** Returns whether a resolution/layout transition needs a retained front buffer. */
+export function shouldHoldPreviousContactMapFrame(
+  previousContactMap: ContactMapView | null,
+  nextResolution: number,
+  nextTileSizeBins: number,
+  nextLayoutScope: string,
+): boolean {
+  return Boolean(
+    previousContactMap
+    && (
+      previousContactMap.resolution !== nextResolution
+      || (previousContactMap.tileSizeBins ?? 256) !== nextTileSizeBins
+      || previousContactMap.layoutScope !== nextLayoutScope
+    ),
+  );
+}
+
+/**
+ * Resolution and layout transitions use double buffering: keep the previous
+ * complete generation visible until every tile in the new viewport is ready.
+ */
+export function shouldPublishContactMapLayer(
+  holdsPreviousCompleteFrame: boolean,
+  visibleLayerComplete: boolean,
+): boolean {
+  return !holdsPreviousCompleteFrame || visibleLayerComplete;
 }
 
 /**
@@ -69,17 +107,11 @@ export function reprojectContactMapLayout(
   if (!isLayoutPermutation(previousBlocks, nextBlocks)) {
     return null;
   }
-  if (
-    !isBinAlignedLayout(previousBlocks, contactMap.resolution)
-    || !isBinAlignedLayout(nextBlocks, contactMap.resolution)
-  ) {
-    return null;
-  }
-
-  const sourceCells = contactCellsForViewport(contactMap);
-  if (sourceCells.length > maxInteractivePreviewContactCells) {
-    return null;
-  }
+  // This is a display-only preview, so bins crossing a contig boundary may be
+  // approximated by their center and corrected by authoritative tiles later.
+  // Deterministic thinning keeps the synchronous edit path bounded even for a
+  // very dense map.
+  const sourceCells = contactCellsForViewport(contactMap, maxInteractivePreviewContactCells);
 
   const nextById = new Map(nextBlocks.map((block) => [block.id, block]));
   const aggregate = new Map<string, ContactMapCell>();
@@ -102,17 +134,61 @@ export function reprojectContactMapLayout(
     }
   }
 
+  const cells = [...aggregate.values()];
+  const tileSizeBins = contactMap.tileSizeBins ?? 256;
   return {
     resolution: contactMap.resolution,
     viewport: contactMap.viewport,
-    cells: [...aggregate.values()],
+    cells,
+    tileSizeBins,
+    previewTiles: contactPreviewTilesFromCells(cells, tileSizeBins),
+    layoutBlocks: nextBlocks,
   };
 }
 
-function isBinAlignedLayout(blocks: ContactMapLayoutBlock[], resolution: number) {
-  return blocks.every(
-    (block) => block.visualStart % resolution === 0 && block.visualEnd % resolution === 0,
+/**
+ * Composes one display layer without contaminating the authoritative cache.
+ * Exact tiles always win, including exact empty tiles, so each backend arrival
+ * replaces only the matching preview canvas.
+ */
+export function contactTilesWithPreviewFallback(
+  authoritativeTiles: ContactMapTile[],
+  previewTiles: ContactMapTile[],
+): ContactMapTile[] {
+  const tilesByKey = new Map<string, ContactMapTile>();
+  for (const tile of previewTiles) {
+    tilesByKey.set(contactTileKey(tile), tile);
+  }
+  for (const tile of authoritativeTiles) {
+    tilesByKey.set(contactTileKey(tile), tile);
+  }
+  return [...tilesByKey.values()].sort(
+    (left, right) => left.tileY - right.tileY || left.tileX - right.tileX,
   );
+}
+
+export function contactPreviewTilesForMissing(
+  previewTiles: ContactMapTile[],
+  missingTiles: Array<{ tileX: number; tileY: number }>,
+): ContactMapTile[] {
+  const missingKeys = new Set(missingTiles.map(contactTileKey));
+  return previewTiles.filter((tile) => missingKeys.has(contactTileKey(tile)));
+}
+
+function contactPreviewTilesFromCells(cells: ContactMapCell[], tileSizeBins: number) {
+  const tilesByKey = new Map<string, ContactMapTile>();
+  for (const cell of cells) {
+    const tileX = Math.floor(cell.xBin / tileSizeBins);
+    const tileY = Math.floor(cell.yBin / tileSizeBins);
+    const key = contactTileKey({ tileX, tileY });
+    const existing = tilesByKey.get(key);
+    if (existing) {
+      existing.cells.push(cell);
+    } else {
+      tilesByKey.set(key, { tileX, tileY, cells: [cell] });
+    }
+  }
+  return [...tilesByKey.values()];
 }
 
 function isLayoutPermutation(

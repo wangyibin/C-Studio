@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  assemblyContigSelectionIntent,
   buildAssemblyEditModel,
   contigIdsInScreenSelection,
   groupAssemblyBlocksByChromosome,
@@ -100,6 +101,57 @@ describe("assemblyEditing", () => {
 
     expect(selection).toEqual({ kind: "contigs", ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"] });
     expect(selectChromosome(selection, "Chr02", false)).toEqual({ kind: "chromosome", id: "Chr02" });
+  });
+
+  it("builds shared plain, range, toggle, and clear selection intents", () => {
+    const orderedBlocks: ContactMapLayoutBlock[] = [1, 2, 3, 4, 5, 6].map((index) => ({
+      id: `contig-${index}`,
+      objectId: "Chr01",
+      sourceId: `ctg${index}`,
+      sourceStart: 0,
+      sourceEnd: 100,
+      visualStart: (index - 1) * 100,
+      visualEnd: index * 100,
+      orientation: "+",
+    }));
+    const none = { shiftKey: false, metaKey: false, ctrlKey: false };
+
+    expect(assemblyContigSelectionIntent(orderedBlocks, null, null, "contig-2", none)).toEqual({
+      type: "select",
+      id: "contig-2",
+      additive: false,
+      anchorId: "contig-2",
+    });
+    expect(assemblyContigSelectionIntent(
+      orderedBlocks,
+      { kind: "contigs", ids: ["contig-2"] },
+      "contig-2",
+      "contig-6",
+      { ...none, shiftKey: true },
+    )).toEqual({
+      type: "select-range",
+      ids: ["contig-2", "contig-3", "contig-4", "contig-5", "contig-6"],
+      anchorId: "contig-2",
+    });
+    expect(assemblyContigSelectionIntent(
+      orderedBlocks,
+      { kind: "contigs", ids: ["contig-2"] },
+      "contig-2",
+      "contig-6",
+      { ...none, metaKey: true },
+    )).toEqual({
+      type: "select",
+      id: "contig-6",
+      additive: true,
+      anchorId: "contig-6",
+    });
+    expect(assemblyContigSelectionIntent(
+      orderedBlocks,
+      { kind: "contigs", ids: ["contig-2", "contig-3"] },
+      "contig-2",
+      "contig-3",
+      { ...none, shiftKey: true },
+    )).toEqual({ type: "clear", anchorId: null });
   });
 
   it("toggles selected contigs off during additive selection", () => {

@@ -1063,6 +1063,18 @@ button {
   image-rendering: pixelated;
 }
 
+.contact-map canvas.contact-layout-raster-preview {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: block;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  pointer-events: none;
+  image-rendering: pixelated;
+}
+
 .legacy-pixi-host {
   display: none;
 }
@@ -1406,6 +1418,11 @@ button {
   transform: translate(8px, 8px);
 }
 
+.context-menu.fixed-context-menu {
+  position: fixed;
+  z-index: 80;
+}
+
 .context-menu button {
   height: 30px;
   border: 0;
@@ -1714,8 +1731,17 @@ button {
   min-height: 0;
 }
 
+.synteny-view {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
 .synteny-canvas {
   position: relative;
+  height: 100%;
+  min-height: 150px;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1744,8 +1770,83 @@ button {
   writing-mode: vertical-rl;
 }
 
+.synteny-query-track {
+  position: absolute;
+  z-index: 5;
+  top: 28px;
+  right: 8px;
+  left: 8px;
+  height: 10px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--surface) 74%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 80%, transparent);
+}
+
+.synteny-chromosome-band,
+.synteny-contig-segment {
+  position: absolute;
+  top: 0;
+  height: 100%;
+}
+
+.synteny-chromosome-band {
+  z-index: 1;
+  border-right: 1px solid color-mix(in srgb, var(--accent) 65%, var(--border));
+  border-left: 1px solid color-mix(in srgb, var(--accent) 65%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  pointer-events: none;
+}
+
+.synteny-contig-segment {
+  z-index: 2;
+  min-width: 2px;
+  padding: 0;
+  border: 0;
+  border-right: 1px solid color-mix(in srgb, var(--text) 18%, transparent);
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.synteny-contig-segment:hover,
+.synteny-contig-segment:focus-visible {
+  background: color-mix(in srgb, var(--accent) 34%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--accent) 72%, white);
+  outline-offset: 1px;
+}
+
+.synteny-contig-segment.selected {
+  background: color-mix(in srgb, var(--accent) 62%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 70%, white);
+}
+
+.synteny-target-lane {
+  position: absolute;
+  z-index: 1;
+  right: 8px;
+  left: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  background: color-mix(in srgb, var(--surface) 24%, transparent);
+  pointer-events: none;
+}
+
+.synteny-target-lane span {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  max-width: 45%;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .dotplot-segment {
   position: absolute;
+  z-index: 3;
   display: block;
   min-width: 8px;
   padding: 0;
@@ -2387,23 +2488,19 @@ summary:focus-visible,
   padding: 0;
 }
 
-.heatmap-tool-picker,
 .heatmap-selection-actions {
   gap: 0;
 }
 
-.heatmap-tool-picker .heatmap-toolbar-button,
 .heatmap-selection-actions .heatmap-toolbar-button {
   border-radius: 0;
   border-right-width: 0;
 }
 
-.heatmap-tool-picker .heatmap-toolbar-button:first-child,
 .heatmap-selection-actions .heatmap-toolbar-button:first-child {
   border-radius: 6px 0 0 6px;
 }
 
-.heatmap-tool-picker .heatmap-toolbar-button:last-child,
 .heatmap-selection-actions .heatmap-toolbar-button:last-child {
   border-radius: 0 6px 6px 0;
   border-right-width: 1px;

@@ -8,6 +8,7 @@ export interface SyntenyBlockView {
   visualStart: number;
   visualEnd: number;
   targetId: string;
+  targetLength: number;
   targetStart: number;
   targetEnd: number;
   strand: string;
@@ -45,21 +46,47 @@ export interface SyntenyViewRequest {
 
 interface BuildSyntenyViewRequestInput {
   pafText: string;
-  centerMb: number;
-  totalSpanBp: number;
+  viewport: ContactViewport;
   layoutBlocks: ContactMapLayoutBlock[];
+}
+
+interface BuildSyntenyViewportInput {
+  centerXMb: number;
+  totalSpanBp: number;
+  windowSizeBp: number;
+  viewportWidthPx: number;
+  viewportHeightPx: number;
+}
+
+export function buildSyntenyViewport({
+  centerXMb,
+  totalSpanBp,
+  windowSizeBp,
+  viewportWidthPx,
+  viewportHeightPx,
+}: BuildSyntenyViewportInput): ContactViewport {
+  return buildCenteredContactViewport({
+    centerMb: centerXMb,
+    centerXMb,
+    // Synteny has one assembly axis. Mirror X into the unused response Y
+    // fields instead of coupling the view to an off-diagonal heatmap Y pan.
+    centerYMb: centerXMb,
+    totalSpanBp,
+    windowSizeBp,
+    viewportWidthPx,
+    viewportHeightPx,
+  });
 }
 
 export function buildSyntenyViewRequest({
   pafText,
-  centerMb,
-  totalSpanBp,
+  viewport,
   layoutBlocks,
 }: BuildSyntenyViewRequestInput): SyntenyViewRequest {
   const preview = buildPafSyntenyPreview(pafText);
 
   return {
-    viewport: buildCenteredContactViewport({ centerMb, totalSpanBp }),
+    viewport,
     layoutBlocks,
     pafRecords: preview.records.map((record) => ({
       queryName: record.queryName,
@@ -129,6 +156,7 @@ export function buildBrowserSyntenyView(request: SyntenyViewRequest): SyntenyVie
         visualStart,
         visualEnd,
         targetId: record.targetName,
+        targetLength: record.targetLen,
         targetStart,
         targetEnd,
         strand,

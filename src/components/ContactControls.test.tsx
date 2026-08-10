@@ -97,6 +97,8 @@ describe("ContactControls", () => {
     expect(markup).toContain('aria-label="Lock resolution"');
     expect(markup).toContain('aria-pressed="false"');
     expect(markup).toContain('title="Lock resolution during zoom"');
+    expect(markup).toContain('<span>500 KB</span>');
+    expect(markup).not.toContain('<span>2.5 MB</span>');
   });
 
   it("shows a visible and accessible locked resolution state", () => {
@@ -110,7 +112,7 @@ describe("ContactControls", () => {
     expect(markup).toContain('class="range-lock locked"');
     expect(markup).toContain('aria-label="Unlock resolution"');
     expect(markup).toContain('aria-pressed="true"');
-    expect(markup).toContain('title="Resolution locked at 2 Mb"');
+    expect(markup).toContain('title="Resolution locked at 500 kb"');
   });
 
 });

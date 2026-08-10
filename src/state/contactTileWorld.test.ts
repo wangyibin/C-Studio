@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { ContactMapTile } from "../App";
-import { contactTileCacheKey } from "./contactTiles";
+import type { ContactMapLayoutBlock } from "./importers";
+import {
+  contactTileCacheKey,
+  contactTileKey,
+  createContactTileCacheKeyResolver,
+} from "./contactTiles";
 import {
   buildContactTileWorld,
   buildContactTileLoadPlan,
@@ -84,12 +89,89 @@ describe("contact tile world", () => {
       scope,
       cache: new Map(),
     });
-    const plan = buildContactTileLoadPlan(world, 5, 2);
+    const plan = buildContactTileLoadPlan(world, 5, 2, 4);
 
     expect(plan.visibleBatches.flat()).toHaveLength(world.missingVisibleTiles.length);
     expect(plan.visibleBatches.every((batch) => batch.length <= 2)).toBe(true);
     expect(plan.prefetchBatches.flat()).toHaveLength(5);
-    expect(plan.prefetchBatches.every((batch) => batch.length <= 2)).toBe(true);
+    expect(plan.prefetchBatches.every((batch) => batch.length <= 4)).toBe(true);
+    expect(plan.visibleBatches.length).toBeGreaterThan(1);
     expect(plan.prefetchBatches.flat()).not.toContainEqual({ tileX: 0, tileY: 1 });
+  });
+
+  it("prioritizes the on-screen center below the diagonal after tile canonicalization", () => {
+    const tileSpan = 256_000;
+    const belowDiagonalWorld = buildContactTileWorld({
+      viewport: {
+        xStart: 10 * tileSpan,
+        xEnd: 13 * tileSpan,
+        yStart: 0,
+        yEnd: 3 * tileSpan,
+      },
+      resolution: 1_000,
+      tileSizeBins: 256,
+      scope,
+      cache: new Map(),
+    });
+    const plan = buildContactTileLoadPlan(belowDiagonalWorld, 0, 1, 4);
+
+    expect(plan.visibleBatches[0]).toEqual([{ tileX: 1, tileY: 11 }]);
+  });
+
+  it("projects only locally valid cached tiles after flip and insertion edits", () => {
+    const layout = (order: string[], reverseSource?: string): ContactMapLayoutBlock[] => (
+      order.map((sourceId, index) => ({
+        id: `block-${sourceId}`,
+        objectId: "Chr01",
+        sourceId,
+        sourceStart: 0,
+        sourceEnd: 100,
+        visualStart: index * 100,
+        visualEnd: (index + 1) * 100,
+        orientation: sourceId === reverseSource ? "-" : "+",
+      }))
+    );
+    const sources = ["A", "B", "C", "D", "E", "F"];
+    const before = layout(sources);
+    const beforeKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", before);
+    const cache = new Map<string, ContactMapTile>();
+    for (let tileY = 0; tileY < 6; tileY += 1) {
+      for (let tileX = 0; tileX <= tileY; tileX += 1) {
+        const tile = { tileX, tileY, cells: [] };
+        cache.set(beforeKey(tile), tile);
+      }
+    }
+    const buildEditedWorld = (blocks: ContactMapLayoutBlock[]) => buildContactTileWorld({
+      viewport: { xStart: 0, xEnd: 600, yStart: 0, yEnd: 600 },
+      resolution: 10,
+      tileSizeBins: 10,
+      scope: "new-render-revision",
+      cache,
+      cacheKeyForTile: createContactTileCacheKeyResolver(
+        "/tmp/input.cool",
+        10,
+        10,
+        "raw",
+        blocks,
+      ),
+    });
+
+    const flipped = buildEditedWorld(layout(sources, "B"));
+    expect(flipped.cachedVisibleTiles).toHaveLength(15);
+    expect(flipped.missingVisibleTiles.map(contactTileKey)).toEqual([
+      "0:1", "1:1", "1:2", "1:3", "1:4", "1:5",
+    ]);
+
+    const inserted = buildEditedWorld(layout(["A", "C", "D", "B", "E", "F"]));
+    expect(inserted.cachedVisibleTiles).toHaveLength(6);
+    expect(inserted.missingVisibleTiles).toHaveLength(15);
+
+    const labelsOnly = buildEditedWorld(before.map((block, index) => ({
+      ...block,
+      id: `renamed-${index}`,
+      objectId: index === 1 ? "Chr02" : block.objectId,
+    })));
+    expect(labelsOnly.cachedVisibleTiles).toHaveLength(21);
+    expect(labelsOnly.missingVisibleTiles).toEqual([]);
   });
 });

@@ -8,7 +8,7 @@ function openingButton(markup: string, ariaLabel: string) {
 }
 
 describe("HeatmapToolbar", () => {
-  it("renders the complete expert toolbar without the inert grid control", () => {
+  it("renders the compact expert toolbar without the editing tool picker", () => {
     const uiState = createInitialUiState("ready");
     const markup = renderToStaticMarkup(
       <HeatmapToolbar uiState={uiState} onUiAction={() => undefined} totalSpanMb={200} />,
@@ -16,10 +16,14 @@ describe("HeatmapToolbar", () => {
 
     expect(markup).toContain('role="toolbar"');
     expect(markup).toContain('aria-label="Heatmap tools"');
-    expect(markup).toContain('aria-label="Select tool"');
-    expect(markup).toContain('aria-label="Split tool"');
-    expect(markup).toContain('aria-label="Move tool"');
+    expect(markup).not.toContain('aria-label="Editing tools"');
+    expect(markup).not.toContain('aria-label="Select tool"');
+    expect(markup).not.toContain('aria-label="Split tool"');
+    expect(markup).not.toContain('aria-label="Move tool"');
     expect(markup).toContain('aria-label="Contact map resolution"');
+    expect(markup).toContain('<span class="heatmap-resolution-value" aria-live="polite">500 kb</span>');
+    expect(markup).toContain('class="heatmap-resolution-range" type="range" min="0" max="6"');
+    expect(markup).not.toContain('aria-valuetext="2.5 Mb"');
     expect(markup).toContain('aria-label="Color range minimum"');
     expect(markup).toContain('aria-label="Color range maximum"');
     expect(markup).toContain('aria-label="Contact map normalization"');
@@ -30,16 +34,14 @@ describe("HeatmapToolbar", () => {
     expect(markup).not.toContain("Grid");
   });
 
-  it("exposes pressed states and disables selection actions when nothing is selected", () => {
+  it("disables selection actions when nothing is selected", () => {
     const uiState = createInitialUiState("ready");
     uiState.selectedTool = "split";
     const markup = renderToStaticMarkup(
       <HeatmapToolbar uiState={uiState} onUiAction={() => undefined} totalSpanMb={200} />,
     );
 
-    expect(openingButton(markup, "Select tool")).toContain('aria-pressed="false"');
-    expect(openingButton(markup, "Split tool")).toContain('aria-pressed="true"');
-    expect(openingButton(markup, "Move tool")).toContain('aria-pressed="false"');
+    expect(markup).not.toContain('aria-label="Split tool"');
     expect(openingButton(markup, "Reverse selection")).toContain('disabled=""');
     expect(openingButton(markup, "Copy selection")).toContain('disabled=""');
     expect(openingButton(markup, "Lock resolution")).toContain('aria-pressed="false"');

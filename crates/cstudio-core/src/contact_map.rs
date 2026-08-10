@@ -134,12 +134,28 @@ where
     I: IntoIterator<Item = C>,
     C: ContactMapContact,
 {
+    build_contact_map_view_from_contacts_cancellable(query, contacts, &|| false)
+}
+
+pub fn build_contact_map_view_from_contacts_cancellable<I, C>(
+    query: &ContactMapQuery,
+    contacts: I,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<ContactMapView>
+where
+    I: IntoIterator<Item = C>,
+    C: ContactMapContact,
+{
     validate_query(query)?;
+    ensure_not_cancelled(should_cancel)?;
 
     let block_index = LayoutBlockIndex::new(&query.layout_blocks);
     let mut aggregate: HashMap<(u64, u64), f64> = HashMap::new();
 
-    for contact in contacts {
+    for (contact_index, contact) in contacts.into_iter().enumerate() {
+        if contact_index % 4_096 == 0 {
+            ensure_not_cancelled(should_cancel)?;
+        }
         let x_positions = block_index.visual_positions(contact.source1(), contact.start1());
         if x_positions.is_empty() {
             continue;
@@ -168,6 +184,7 @@ where
         }
     }
 
+    ensure_not_cancelled(should_cancel)?;
     let mut cells: Vec<ContactMapCell> = aggregate
         .into_iter()
         .map(|((x_bin, y_bin), count)| ContactMapCell {
@@ -176,13 +193,23 @@ where
             count,
         })
         .collect();
+    ensure_not_cancelled(should_cancel)?;
     cells.sort_by_key(|cell| (cell.x_bin, cell.y_bin));
+    ensure_not_cancelled(should_cancel)?;
 
     Ok(ContactMapView {
         resolution: query.target_resolution,
         viewport: query.viewport,
         cells,
     })
+}
+
+fn ensure_not_cancelled(should_cancel: &dyn Fn() -> bool) -> CStudioResult<()> {
+    if should_cancel() {
+        Err(CStudioError::RequestCancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_query(query: &ContactMapQuery) -> CStudioResult<()> {
@@ -277,13 +304,55 @@ impl Viewport {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::{
         agp::Orientation,
         contact_map::{
-            build_contact_map_view, build_contact_map_view_from_refs, ContactBin, ContactMapQuery,
-            LayoutBlock, Viewport,
+            build_contact_map_view, build_contact_map_view_from_contacts_cancellable,
+            build_contact_map_view_from_refs, ContactBin, ContactMapQuery, LayoutBlock, Viewport,
         },
+        CStudioError,
     };
+
+    #[test]
+    fn cancellation_stops_before_consuming_contact_aggregation_input() {
+        let consumed = AtomicUsize::new(0);
+        let contacts = std::iter::from_fn(|| {
+            consumed.fetch_add(1, Ordering::SeqCst);
+            Some(ContactBin {
+                source1: "contig-a".to_string(),
+                start1: 0,
+                source2: "contig-a".to_string(),
+                start2: 0,
+                count: 1.0,
+            })
+        });
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 1_000,
+                y_start: 0,
+                y_end: 1_000,
+            },
+            layout_blocks: vec![LayoutBlock {
+                id: "block-a".to_string(),
+                source_id: "contig-a".to_string(),
+                source_start: 0,
+                source_end: 1_000,
+                visual_start: 0,
+                orientation: Orientation::Forward,
+            }],
+        };
+
+        let error = build_contact_map_view_from_contacts_cancellable(&query, contacts, &|| true)
+            .expect_err("cancelled aggregation should not consume contacts");
+
+        assert_eq!(error, CStudioError::RequestCancelled);
+        assert_eq!(consumed.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn aggregates_source_contacts_into_target_resolution_cells_for_layout_blocks() {

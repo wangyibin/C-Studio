@@ -13,6 +13,7 @@ const status: AppStatus = {
 const dataset: ExampleDatasetSummary = {
   agp_path: "assembly.agp",
   mcool_path: "map.mcool",
+  paf_path: null,
   agp_lines: 1,
   agp_objects: 1,
   agp_components: 1,
@@ -44,6 +45,9 @@ describe("InspectorPanel", () => {
         uiState={uiState}
         onUiAction={() => undefined}
         syntenyView={null}
+        assemblyBlocks={uiState.assembly.blocks}
+        selectedAssemblyBlockIds={[]}
+        onSelectSyntenyBlock={() => undefined}
         pafText=""
         onPafTextChange={() => undefined}
       />,
@@ -100,6 +104,9 @@ describe("InspectorPanel", () => {
         uiState={uiState}
         onUiAction={() => undefined}
         syntenyView={null}
+        assemblyBlocks={uiState.assembly.blocks}
+        selectedAssemblyBlockIds={uiState.assembly.selection.ids}
+        onSelectSyntenyBlock={() => undefined}
         pafText=""
         onPafTextChange={() => undefined}
       />,

@@ -5,11 +5,42 @@ import { createInitialUiState, reduceUiState } from "./uiState";
 import {
   canonicalContactTile,
   contactTileCacheKey,
+  contactTileDataScope,
   contactTileKey,
+  contactTileProjectionFingerprint,
   contactTileScope,
   contactTilesForViewport,
+  createContactTileCacheKeyResolver,
   missingContactTiles,
 } from "./contactTiles";
+
+const localInvalidationSources = ["A", "B", "C", "D", "E", "F"];
+
+function localInvalidationLayout(
+  order = localInvalidationSources,
+  reverseSource?: string,
+): ContactMapLayoutBlock[] {
+  return order.map((sourceId, index) => ({
+    id: `block-${sourceId}`,
+    objectId: "Chr01",
+    sourceId,
+    sourceStart: 0,
+    sourceEnd: 100,
+    visualStart: index * 100,
+    visualEnd: (index + 1) * 100,
+    orientation: sourceId === reverseSource ? "-" : "+",
+  }));
+}
+
+function canonicalTileGrid(size: number) {
+  const tiles = [];
+  for (let tileY = 0; tileY < size; tileY += 1) {
+    for (let tileX = 0; tileX <= tileY; tileX += 1) {
+      tiles.push({ tileX, tileY });
+    }
+  }
+  return tiles;
+}
 
 describe("contact tile requests", () => {
   it("covers only tiles intersecting the viewport", () => {
@@ -109,8 +140,20 @@ describe("contact tile requests", () => {
         orientation: "+",
       },
     ];
-    const lowResolutionScope = contactTileScope("/tmp/input.mcool", 10_000, 256, layoutBlocks);
-    const highResolutionScope = contactTileScope("/tmp/input.mcool", 50_000, 256, layoutBlocks);
+    const lowResolutionScope = contactTileScope(
+      "/tmp/input.mcool",
+      10_000,
+      256,
+      "raw",
+      layoutBlocks,
+    );
+    const highResolutionScope = contactTileScope(
+      "/tmp/input.mcool",
+      50_000,
+      256,
+      "raw",
+      layoutBlocks,
+    );
     const cachedTile = { tileX: 0, tileY: 0, cells: [] };
     const cache = new Map([[contactTileCacheKey(lowResolutionScope, cachedTile), cachedTile]]);
 
@@ -118,8 +161,32 @@ describe("contact tile requests", () => {
     expect(lowResolutionScope).not.toEqual(highResolutionScope);
   });
 
+  it("isolates data scopes, render scopes, and tile cache keys by normalization", () => {
+    const layoutBlocks = localInvalidationLayout();
+    const normalizationModes = ["raw", "ice", "kr", "vc", "vc_sqrt"] as const;
+    const dataScopes = normalizationModes.map((normalization) =>
+      contactTileDataScope("/tmp/input.mcool", 10_000, 256, normalization)
+    );
+    const renderScopes = normalizationModes.map((normalization) =>
+      contactTileScope("/tmp/input.mcool", 10_000, 256, normalization, layoutBlocks)
+    );
+    const tileCacheKeys = normalizationModes.map((normalization) =>
+      createContactTileCacheKeyResolver(
+        "/tmp/input.mcool",
+        10_000,
+        256,
+        normalization,
+        layoutBlocks,
+      )({ tileX: 0, tileY: 1 })
+    );
+
+    expect(new Set(dataScopes).size).toBe(normalizationModes.length);
+    expect(new Set(renderScopes).size).toBe(normalizationModes.length);
+    expect(new Set(tileCacheKeys).size).toBe(normalizationModes.length);
+  });
+
   it("changes scope when AGP layout changes", () => {
-    const first = contactTileScope("/tmp/input.mcool", 10_000, 256, [
+    const first = contactTileScope("/tmp/input.mcool", 10_000, 256, "raw", [
       {
         id: "block-1",
         objectId: "Chr01",
@@ -131,7 +198,7 @@ describe("contact tile requests", () => {
         orientation: "+",
       },
     ]);
-    const flipped = contactTileScope("/tmp/input.mcool", 10_000, 256, [
+    const flipped = contactTileScope("/tmp/input.mcool", 10_000, 256, "raw", [
       {
         id: "block-1",
         objectId: "Chr01",
@@ -160,8 +227,65 @@ describe("contact tile requests", () => {
       orientation: "+" as const,
     }));
 
-    const scope = contactTileScope("/tmp/input.mcool", 10_000, 256, fragmented);
+    const scope = contactTileScope("/tmp/input.mcool", 10_000, 256, "raw", fragmented);
     expect(scope.length).toBeLessThan(100);
-    expect(contactTileScope("/tmp/input.mcool", 10_000, 256, fragmented)).toBe(scope);
+    expect(contactTileScope("/tmp/input.mcool", 10_000, 256, "raw", fragmented)).toBe(scope);
+  });
+
+  it("invalidates only the selected contig row and column after a flip", () => {
+    const before = localInvalidationLayout();
+    const after = localInvalidationLayout(localInvalidationSources, "B");
+    const beforeKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", before);
+    const afterKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", after);
+    const changed = canonicalTileGrid(6)
+      .filter((tile) => beforeKey(tile) !== afterKey(tile))
+      .map(contactTileKey);
+
+    expect(changed).toEqual(["0:1", "1:1", "1:2", "1:3", "1:4", "1:5"]);
+    expect(contactTileScope("/tmp/input.cool", 10, 10, "raw", before))
+      .not.toBe(contactTileScope("/tmp/input.cool", 10, 10, "raw", after));
+  });
+
+  it("invalidates only the old-to-new insertion corridor and its crossings", () => {
+    const before = localInvalidationLayout();
+    const after = localInvalidationLayout(["A", "C", "D", "B", "E", "F"]);
+    const beforeKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", before);
+    const afterKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", after);
+    const reused = canonicalTileGrid(6)
+      .filter((tile) => beforeKey(tile) === afterKey(tile))
+      .map(contactTileKey);
+
+    expect(reused).toEqual(["0:0", "0:4", "4:4", "0:5", "4:5", "5:5"]);
+  });
+
+  it("does not invalidate heatmap tiles for object or block label-only changes", () => {
+    const before = localInvalidationLayout();
+    const after = before.map((block, index) => ({
+      ...block,
+      id: `renamed-${index}`,
+      objectId: index === 1 ? "Chr02" : block.objectId,
+    }));
+    const beforeKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", before);
+    const afterKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", after);
+
+    expect(canonicalTileGrid(6).every((tile) => beforeKey(tile) === afterKey(tile))).toBe(true);
+    expect(contactTileScope("/tmp/input.cool", 10, 10, "raw", before))
+      .toBe(contactTileScope("/tmp/input.cool", 10, 10, "raw", after));
+  });
+
+  it("uses the pinned UTF-8 tile projection fingerprint shared with Rust", () => {
+    const layout: ContactMapLayoutBlock[] = [{
+      id: "ignored-id",
+      objectId: "Chr01",
+      sourceId: "片段|β",
+      sourceStart: 7,
+      sourceEnd: 107,
+      visualStart: 0,
+      visualEnd: 999,
+      orientation: "?",
+    }];
+
+    expect(contactTileProjectionFingerprint({ tileX: 0, tileY: 0 }, 10, 10, layout))
+      .toBe("dd226eb70d454d8c:dd226eb70d454d8c");
   });
 });

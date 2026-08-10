@@ -7,6 +7,7 @@ pub enum CStudioError {
     InvalidCopyMetadata(String),
     InvalidAgp(String),
     InvalidContactMapQuery(String),
+    RequestCancelled,
 }
 
 pub type CStudioResult<T> = Result<T, CStudioError>;
@@ -31,6 +32,7 @@ impl fmt::Display for CStudioError {
             Self::InvalidContactMapQuery(message) => {
                 write!(f, "invalid contact map query: {message}")
             }
+            Self::RequestCancelled => write!(f, "contact tile request cancelled"),
         }
     }
 }

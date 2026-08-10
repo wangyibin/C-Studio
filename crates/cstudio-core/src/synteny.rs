@@ -87,6 +87,7 @@ pub struct SyntenyBlock {
     pub visual_start: u64,
     pub visual_end: u64,
     pub target_id: String,
+    pub target_length: u64,
     pub target_start: u64,
     pub target_end: u64,
     pub strand: char,
@@ -206,6 +207,7 @@ fn map_overlap_to_segment(
         visual_start,
         visual_end,
         target_id: record.target_name.clone(),
+        target_length: record.target_len,
         target_start,
         target_end,
         strand,
@@ -419,6 +421,7 @@ mod tests {
         assert_eq!(view.blocks[0].visual_start, 0);
         assert_eq!(view.blocks[0].visual_end, 2_000);
         assert_eq!(view.blocks[0].target_id, "mono1");
+        assert_eq!(view.blocks[0].target_length, 50_000);
         assert_eq!(view.blocks[0].target_start, 10_000);
         assert_eq!(view.blocks[0].target_end, 12_000);
         assert_eq!(view.blocks[0].alignment_count, 2);

@@ -3,7 +3,11 @@ import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import { contactColorCss } from "../state/contactColor";
 import { estimateContactColorScale, normalizeContactValue, type ContactColorScale } from "../state/contactColorScale";
 import { groupAssemblyBlocksByChromosome } from "../state/assemblyEditing";
-import { SyntenyDotplot } from "./SyntenyDotplot";
+import type { ContactMapLayoutBlock } from "../state/importers";
+import {
+  SyntenyDotplot,
+  type SyntenySelectionModifiers,
+} from "./SyntenyDotplot";
 import type { SyntenyView } from "../state/syntenyView";
 import type { UiAction, UiState } from "../state/uiState";
 
@@ -16,6 +20,9 @@ interface InspectorPanelProps {
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   syntenyView: SyntenyView | null;
+  assemblyBlocks: ContactMapLayoutBlock[];
+  selectedAssemblyBlockIds: string[];
+  onSelectSyntenyBlock: (assemblyBlockId: string, modifiers: SyntenySelectionModifiers) => void;
   pafText: string;
   onPafTextChange: (value: string) => void;
 }
@@ -29,6 +36,9 @@ export function InspectorPanel({
   uiState,
   onUiAction,
   syntenyView,
+  assemblyBlocks,
+  selectedAssemblyBlockIds,
+  onSelectSyntenyBlock,
   pafText,
   onPafTextChange,
 }: InspectorPanelProps) {
@@ -63,12 +73,11 @@ export function InspectorPanel({
           <SyntenyPreview
             syntenyView={syntenyView}
             onExpand={() => onUiAction({ type: "setSyntenySplitOpen", open: true })}
-            selectedAssemblyBlockIds={
-              uiState.assembly.selection?.kind === "contigs" ? uiState.assembly.selection.ids : []
-            }
-            onSelectBlock={(id, additive) =>
-              onUiAction({ type: "selectAssemblyContig", id, additive })
-            }
+            assemblyBlocks={assemblyBlocks}
+            selectedAssemblyBlockIds={selectedAssemblyBlockIds}
+            onSelectBlock={onSelectSyntenyBlock}
+            uiState={uiState}
+            onUiAction={onUiAction}
           />
         )}
       </section>
@@ -452,24 +461,33 @@ function drawOverviewCell(
 
 interface SyntenyPreviewProps {
   syntenyView: SyntenyView | null;
+  assemblyBlocks: ContactMapLayoutBlock[];
   onExpand: () => void;
-  onSelectBlock: (assemblyBlockId: string, additive: boolean) => void;
+  onSelectBlock: (assemblyBlockId: string, modifiers: SyntenySelectionModifiers) => void;
   selectedAssemblyBlockIds: string[];
+  uiState: UiState;
+  onUiAction: (action: UiAction) => void;
 }
 
 function SyntenyPreview({
   syntenyView,
+  assemblyBlocks,
   onExpand,
   onSelectBlock,
   selectedAssemblyBlockIds,
+  uiState,
+  onUiAction,
 }: SyntenyPreviewProps) {
   return (
     <div className="synteny-panel">
       <SyntenyDotplot
         syntenyView={syntenyView}
+        assemblyBlocks={assemblyBlocks}
         onDoubleClick={onExpand}
         onSelectBlock={onSelectBlock}
         selectedAssemblyBlockIds={selectedAssemblyBlockIds}
+        uiState={uiState}
+        onUiAction={onUiAction}
       />
     </div>
   );

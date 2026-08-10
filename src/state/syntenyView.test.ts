@@ -1,12 +1,36 @@
 import { describe, expect, it } from "vitest";
-import { buildBrowserSyntenyView, buildSyntenyViewRequest } from "./syntenyView";
+import {
+  buildBrowserSyntenyView,
+  buildSyntenyViewRequest,
+  buildSyntenyViewport,
+} from "./syntenyView";
 
 describe("buildSyntenyViewRequest", () => {
-  it("builds backend synteny requests from PAF text and the current overview viewport", () => {
+  it("matches the heatmap X center, zoom span, and aspect ratio", () => {
+    expect(buildSyntenyViewport({
+      centerXMb: 120,
+      totalSpanBp: 300_000_000,
+      windowSizeBp: 40_000_000,
+      viewportWidthPx: 1_200,
+      viewportHeightPx: 600,
+    })).toEqual({
+      xStart: 80_000_000,
+      xEnd: 160_000_000,
+      yStart: 100_000_000,
+      yEnd: 140_000_000,
+    });
+  });
+
+  it("uses the exact heatmap X viewport for backend synteny requests", () => {
+    const viewport = {
+      xStart: 90_000_000,
+      xEnd: 130_000_000,
+      yStart: 10_000_000,
+      yEnd: 70_000_000,
+    };
     const request = buildSyntenyViewRequest({
       pafText: "ctgA\t1000\t100\t500\t+\tchr1\t2000\t700\t1100\t380\t400\t60",
-      centerMb: 150,
-      totalSpanBp: 300_000_000,
+      viewport,
       layoutBlocks: [
         {
           id: "block-1",
@@ -21,12 +45,7 @@ describe("buildSyntenyViewRequest", () => {
       ],
     });
 
-    expect(request.viewport).toEqual({
-      xStart: 50_000_000,
-      xEnd: 250_000_000,
-      yStart: 50_000_000,
-      yEnd: 250_000_000,
-    });
+    expect(request.viewport).toBe(viewport);
     expect(request.layoutBlocks).toHaveLength(1);
     expect(request.pafRecords[0]).toMatchObject({
       queryName: "ctgA",
@@ -34,6 +53,7 @@ describe("buildSyntenyViewRequest", () => {
       queryStart: 100,
       queryEnd: 500,
       targetName: "chr1",
+      targetLen: 2000,
       mapq: 60,
     });
   });
@@ -41,8 +61,7 @@ describe("buildSyntenyViewRequest", () => {
   it("projects each copied assembly instance into its edited visual position", () => {
     const request = buildSyntenyViewRequest({
       pafText: "ctgA\t1000\t100\t500\t+\tchr1\t2000\t700\t1100\t380\t400\t60",
-      centerMb: 0.001,
-      totalSpanBp: 2_000,
+      viewport: { xStart: 0, xEnd: 2_000, yStart: 0, yEnd: 2_000 },
       layoutBlocks: [
         {
           id: "block-original",
@@ -73,10 +92,11 @@ describe("buildSyntenyViewRequest", () => {
       block.assemblyBlockId,
       block.visualStart,
       block.visualEnd,
+      block.targetLength,
       block.strand,
     ])).toEqual([
-      ["block-original", 100, 500, "+"],
-      ["block-copy", 1500, 1900, "-"],
+      ["block-original", 100, 500, 2000, "+"],
+      ["block-copy", 1500, 1900, 2000, "-"],
     ]);
   });
 });

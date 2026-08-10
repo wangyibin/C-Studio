@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { ContactMapTile, ContactMapView } from "../App";
 import { contactColorCss } from "../state/contactColor";
 import { normalizeContactValue } from "../state/contactColorScale";
+import { contactTilesWithPreviewFallback } from "../state/contactMapView";
 import { contactRenderGeometry } from "../state/contactRenderGeometry";
 import { canonicalContactTile, contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
@@ -26,6 +27,8 @@ interface ContactTileCanvasBoxInput {
   viewportPixelSize: number;
 }
 
+const usePrePaintEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
+
 export function ContactTileLayer({
   contactMap,
   layerRef,
@@ -36,7 +39,14 @@ export function ContactTileLayer({
   uiState,
 }: ContactTileLayerProps) {
   const rawTiles = contactMap?.cachedTiles ?? contactMap?.tiles;
-  const tiles = useMemo(() => canonicalTilesForRendering(rawTiles ?? []), [rawTiles]);
+  const previewTiles = contactMap?.previewTiles;
+  const tiles = useMemo(
+    () => canonicalTilesForRendering(contactTilesWithPreviewFallback(
+      rawTiles ?? [],
+      previewTiles ?? [],
+    )),
+    [previewTiles, rawTiles],
+  );
   const tileSizeBins = contactMap?.tileSizeBins ?? 256;
 
   return (
@@ -146,7 +156,7 @@ function ContactTileCanvas({
     viewportPixelSize: 100,
   });
 
-  useEffect(() => {
+  usePrePaintEffect(() => {
     drawTileCanvas(canvasRef.current, contactMap.resolution, tile, tileSizeBins, transpose, uiState);
   }, [contactMap.resolution, tile, tileSizeBins, transpose, uiState.contact.colormap, uiState.contact.colorScale]);
 

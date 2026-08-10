@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   chooseContactResolutionForBpPerPixel,
   chooseContactResolutionForSpan,
+  contactResolutionLevelsForViewport,
   contactResolutionToBasePairs,
   contactViewportSpanForResolution,
   minimumContactViewportSpanMb,
+  wholeGenomeContactResolutionForViewport,
 } from "./contactResolution";
 
 describe("contactResolutionToBasePairs", () => {
@@ -40,9 +42,44 @@ describe("chooseContactResolutionForSpan", () => {
 });
 
 describe("Juicebox contact viewport geometry", () => {
-  it("resets manual selections to one pixel per bin and clamps to the loaded span", () => {
-    expect(contactViewportSpanForResolution("50 kb", 536, 200)).toBe(26.8);
-    expect(contactViewportSpanForResolution("2 Mb", 536, 196.84)).toBe(196.84);
+  it("chooses the whole-map resolution from genome span and viewport size", () => {
+    const wholeGenomeSpanMb = 196.84;
+
+    expect(wholeGenomeContactResolutionForViewport(wholeGenomeSpanMb, 536)).toBe("500 kb");
+    expect(wholeGenomeContactResolutionForViewport(400, 800)).toBe("500 kb");
+    expect(wholeGenomeContactResolutionForViewport(30, 800)).toBe("50 kb");
+    expect(contactResolutionLevelsForViewport(wholeGenomeSpanMb, 536)).toEqual([
+      "500 kb",
+      "250 kb",
+      "100 kb",
+      "50 kb",
+      "25 kb",
+      "10 kb",
+      "5 kb",
+    ]);
+  });
+
+  it("keeps finer-resolution bins at one CSS pixel while their viewport zooms in", () => {
+    const wholeGenomeSpanMb = 196.84;
+
+    expect(contactViewportSpanForResolution("500 kb", 536, wholeGenomeSpanMb)).toBe(196.84);
+    expect(contactViewportSpanForResolution("250 kb", 536, wholeGenomeSpanMb)).toBe(134);
+    expect(contactViewportSpanForResolution("100 kb", 536, wholeGenomeSpanMb)).toBe(53.6);
+    expect(contactViewportSpanForResolution("50 kb", 536, wholeGenomeSpanMb)).toBe(26.8);
+
+    const activeLevels = contactResolutionLevelsForViewport(wholeGenomeSpanMb, 536);
+    const spans = activeLevels.map((resolution) => (
+      contactViewportSpanForResolution(resolution, 536, wholeGenomeSpanMb)
+    ));
+    for (let index = 1; index < spans.length; index += 1) {
+      expect(spans[index]).toBeLessThan(spans[index - 1] ?? Infinity);
+    }
+  });
+
+  it("keeps the one-pixel-per-bin bound for very large assemblies", () => {
+    expect(contactViewportSpanForResolution("2.5 Mb", 536, 10_000)).toBe(10_000);
+    expect(contactViewportSpanForResolution("2 Mb", 536, 10_000)).toBe(1_072);
+    expect(contactViewportSpanForResolution("1 Mb", 536, 10_000)).toBe(536);
   });
 
   it("derives the superzoom floor from Juicebox's 128 px per-bin cap", () => {

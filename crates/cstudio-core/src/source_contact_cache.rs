@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     contact_map::{
-        build_contact_map_view_from_contacts, ContactBin, ContactMapContact, ContactMapQuery,
-        ContactMapView,
+        build_contact_map_view_from_contacts_cancellable, ContactBin, ContactMapContact,
+        ContactMapQuery, ContactMapView,
     },
     CStudioResult,
 };
@@ -93,6 +93,23 @@ impl SourceContactCache {
         windows: &[SourceWindow],
         contacts: &[ContactBin],
     ) {
+        self.insert_contacts_for_windows_cancellable(path, resolution, windows, contacts, &|| {
+            false
+        })
+        .expect("a non-cancellable source cache insertion cannot be cancelled");
+    }
+
+    pub fn insert_contacts_for_windows_cancellable(
+        &mut self,
+        path: &str,
+        resolution: u64,
+        windows: &[SourceWindow],
+        contacts: &[ContactBin],
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CStudioResult<()> {
+        if should_cancel() {
+            return Err(crate::CStudioError::RequestCancelled);
+        }
         let keys = Self::keys_for_windows(path, resolution, windows);
         let mut contacts_by_key = keys
             .iter()
@@ -100,7 +117,10 @@ impl SourceContactCache {
             .map(|key| (key, Vec::new()))
             .collect::<HashMap<_, Vec<CachedSourceContact>>>();
 
-        for contact in contacts {
+        for (contact_index, contact) in contacts.iter().enumerate() {
+            if contact_index % 4_096 == 0 && should_cancel() {
+                return Err(crate::CStudioError::RequestCancelled);
+            }
             let Some(first_window) = window_for_position(windows, &contact.source1, contact.start1)
             else {
                 continue;
@@ -130,9 +150,16 @@ impl SourceContactCache {
             }
         }
 
-        for (key, entry_contacts) in contacts_by_key {
+        if should_cancel() {
+            return Err(crate::CStudioError::RequestCancelled);
+        }
+        for (entry_index, (key, entry_contacts)) in contacts_by_key.into_iter().enumerate() {
+            if entry_index % 128 == 0 && should_cancel() {
+                return Err(crate::CStudioError::RequestCancelled);
+            }
             self.insert_entry(key, entry_contacts);
         }
+        Ok(())
     }
 
     pub fn build_cached_view(
@@ -140,6 +167,18 @@ impl SourceContactCache {
         keys: &[SourceContactCacheKey],
         query: &ContactMapQuery,
     ) -> CStudioResult<Option<ContactMapView>> {
+        self.build_cached_view_cancellable(keys, query, &|| false)
+    }
+
+    pub fn build_cached_view_cancellable(
+        &mut self,
+        keys: &[SourceContactCacheKey],
+        query: &ContactMapQuery,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CStudioResult<Option<ContactMapView>> {
+        if should_cancel() {
+            return Err(crate::CStudioError::RequestCancelled);
+        }
         if !self.contains_all(keys) {
             return Ok(None);
         }
@@ -161,7 +200,7 @@ impl SourceContactCache {
                 .iter()
                 .map(move |contact| CachedSourceContactRef { key, contact })
         });
-        build_contact_map_view_from_contacts(query, contacts).map(Some)
+        build_contact_map_view_from_contacts_cancellable(query, contacts, should_cancel).map(Some)
     }
 
     pub fn used_bytes(&self) -> usize {
@@ -243,6 +282,18 @@ pub fn source_windows_for_ranges(
     source_ranges: &[(String, u64, u64)],
     window_size: u64,
 ) -> Vec<SourceWindow> {
+    source_windows_for_ranges_with_limit(source_ranges, window_size, usize::MAX)
+        .expect("an unbounded source-window request cannot exceed its limit")
+}
+
+/// Build unique, sorted cache windows without allowing an oversized request to
+/// allocate every possible window first. `None` means the number of unique
+/// windows exceeded `max_windows`.
+pub fn source_windows_for_ranges_with_limit(
+    source_ranges: &[(String, u64, u64)],
+    window_size: u64,
+    max_windows: usize,
+) -> Option<Vec<SourceWindow>> {
     let window_size = window_size.max(1);
     let mut windows = HashSet::new();
     for (source_id, range_start, range_end) in source_ranges {
@@ -252,11 +303,14 @@ pub fn source_windows_for_ranges(
         let mut start = range_start / window_size * window_size;
         while start < *range_end {
             let end = start.saturating_add(window_size);
-            windows.insert(SourceWindow {
+            let inserted = windows.insert(SourceWindow {
                 source_id: source_id.clone(),
                 start,
                 end,
             });
+            if inserted && windows.len() > max_windows {
+                return None;
+            }
             if end <= start {
                 break;
             }
@@ -265,7 +319,7 @@ pub fn source_windows_for_ranges(
     }
     let mut windows = windows.into_iter().collect::<Vec<_>>();
     windows.sort();
-    windows
+    Some(windows)
 }
 
 fn window_for_position<'a>(
@@ -418,5 +472,20 @@ mod tests {
 
         assert_eq!(cache.entry_count(), 0);
         assert_eq!(cache.used_bytes(), 0);
+    }
+
+    #[test]
+    fn bounds_source_window_allocation_before_cache_pair_expansion() {
+        let ranges = vec![
+            ("ctg-a".to_string(), 0, 250),
+            ("ctg-a".to_string(), 50, 150),
+        ];
+
+        let within_limit = source_windows_for_ranges_with_limit(&ranges, 100, 3)
+            .expect("three unique windows fit the limit");
+        let over_limit = source_windows_for_ranges_with_limit(&ranges, 100, 2);
+
+        assert_eq!(within_limit.len(), 3);
+        assert!(over_limit.is_none());
     }
 }

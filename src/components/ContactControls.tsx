@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Check, Lock, Settings, Sparkles, Unlock } from "lucide-react";
 import type { UiAction, UiState } from "../state/uiState";
-import { contactResolutions, normalizations } from "../state/uiState";
+import { availableContactResolutions, normalizations } from "../state/uiState";
 
 interface ContactControlsProps {
   uiState: UiState;
@@ -9,7 +9,16 @@ interface ContactControlsProps {
   onLoadExample: () => void;
 }
 
-const resolutionTicks = ["2.5 MB", "500 KB", "100 KB", "25 KB", "5 KB"];
+function resolutionTickLabels(resolutions: readonly string[]) {
+  if (resolutions.length <= 5) {
+    return resolutions.map((resolution) => resolution.toUpperCase());
+  }
+
+  const lastIndex = resolutions.length - 1;
+  return [0, 0.25, 0.5, 0.75, 1].map((ratio) => (
+    resolutions[Math.round(lastIndex * ratio)]?.toUpperCase() ?? ""
+  ));
+}
 
 function formatColorScaleTick(value: number) {
   return Number(value.toFixed(2)).toLocaleString();
@@ -22,8 +31,10 @@ function colorSliderUpperBound(min: number, max: number) {
 }
 
 export function ContactControls({ onLoadExample, onUiAction, uiState }: ContactControlsProps) {
-  const resolutionIndex = contactResolutions.indexOf(uiState.contact.resolution);
+  const resolutionOptions = availableContactResolutions(uiState.contact);
+  const resolutionIndex = resolutionOptions.indexOf(uiState.contact.resolution);
   const safeResolutionIndex = Math.max(0, resolutionIndex);
+  const resolutionTicks = resolutionTickLabels(resolutionOptions);
   const colorScaleMin = uiState.contact.colorScale.min;
   const colorScaleMax = uiState.contact.colorScale.max;
   const colorScaleMid = (colorScaleMin + colorScaleMax) / 2;
@@ -35,7 +46,7 @@ export function ContactControls({ onLoadExample, onUiAction, uiState }: ContactC
 
   useEffect(() => {
     setDraftResolutionIndex(safeResolutionIndex);
-  }, [safeResolutionIndex]);
+  }, [resolutionOptions.length, safeResolutionIndex]);
 
   useEffect(() => {
     setDraftMin(String(colorScaleMin));
@@ -69,8 +80,8 @@ export function ContactControls({ onLoadExample, onUiAction, uiState }: ContactC
   }
 
   function commitResolution(rawIndex = draftResolutionIndex) {
-    const nextIndex = Math.min(contactResolutions.length - 1, Math.max(0, rawIndex));
-    const resolution = contactResolutions[nextIndex];
+    const nextIndex = Math.min(resolutionOptions.length - 1, Math.max(0, rawIndex));
+    const resolution = resolutionOptions[nextIndex];
     if (resolution && resolution !== uiState.contact.resolution) {
       onUiAction({ type: "setContactResolution", resolution });
     }
@@ -93,7 +104,7 @@ export function ContactControls({ onLoadExample, onUiAction, uiState }: ContactC
             className="resolution-range"
             type="range"
             min="0"
-            max={contactResolutions.length - 1}
+            max={resolutionOptions.length - 1}
             step="1"
             value={draftResolutionIndex}
             onChange={(event) => setDraftResolutionIndex(Number(event.target.value))}

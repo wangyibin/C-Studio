@@ -11,11 +11,20 @@ import {
 } from "../state/assemblyEditing";
 import { contactColorCss } from "../state/contactColor";
 import { normalizeContactValue } from "../state/contactColorScale";
+import {
+  buildContactLayoutRasterPlan,
+  contactLayoutRasterPlanCoversViewport,
+} from "../state/contactLayoutPreview";
 import { contactCellsForViewport } from "../state/contactMapView";
 import { contactRenderGeometry } from "../state/contactRenderGeometry";
 import { buildCenteredContactViewport, type ContactViewport } from "../state/contactViewport";
 import type { CoverageView } from "../state/coverageView";
 import type { UiAction, UiState } from "../state/uiState";
+import {
+  AssemblyContextMenu,
+  type AssemblyContextMenuPosition,
+} from "./AssemblyContextMenu";
+import { ContactLayoutRasterPreview } from "./ContactLayoutRasterPreview";
 import { ContactTileLayer } from "./ContactTileLayer";
 import { GenomeAxisNavigator } from "./GenomeAxisNavigator";
 import { TrackPanel } from "./TrackPanel";
@@ -26,13 +35,6 @@ interface ContactMapViewportProps {
   coverageView: CoverageView | null;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
-}
-
-interface ContextMenuState {
-  x: number;
-  y: number;
-  mapX: number;
-  mapY: number;
 }
 
 interface DragState {
@@ -242,7 +244,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   const latestUiStateRef = useRef(uiState);
   latestContactMapRef.current = contactMap;
   latestUiStateRef.current = uiState;
-  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [contextMenu, setContextMenu] = useState<AssemblyContextMenuPosition | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
   const panAnimationFrameRef = useRef<number | null>(null);
@@ -255,7 +257,9 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     visualPosition: null,
   });
   const hasContactMap = Boolean(dataset?.mcool_path);
-  const usesTiledRenderer = Boolean(contactMap?.tiles || contactMap?.cachedTiles);
+  const usesTiledRenderer = Boolean(
+    contactMap?.tiles || contactMap?.cachedTiles || contactMap?.previewTiles,
+  );
   const contactSize = dataset?.mcool_size_bytes ? formatBytes(dataset.mcool_size_bytes) : null;
   const hasCoverageTrack = Boolean(dataset?.coverage_path);
   const liveViewport = buildCenteredContactViewport({
@@ -276,13 +280,39 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   const viewportYCenterMb = (viewportYStartMb + viewportYEndMb) / 2 || uiState.contact.viewportCenterYMb;
   const viewportXSpanMb = Math.max(0.000001, viewportXEndMb - viewportXStartMb);
   const viewportYSpanMb = Math.max(0.000001, viewportYEndMb - viewportYStartMb);
-  // Keep annotations and pixels on the same layout generation. While a new
-  // layout is loading, contactMap can intentionally be the last complete
-  // layer, so its matching box snapshot must remain visible as well.
-  const assemblyBlocks = contactMap?.layoutBlocks
-    ?? (uiState.assembly.blocks.length > 0
-      ? uiState.assembly.blocks
-      : dataset?.agp_layout.blocks ?? []);
+  const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
+    ? uiState.assembly.blocks
+    : dataset?.agp_layout.blocks ?? [];
+  const layoutRasterPlan = useMemo(
+    () => contactMap?.layoutBlocks
+      ? buildContactLayoutRasterPlan(contactMap.layoutBlocks, activeAssemblyBlocks)
+      : null,
+    [activeAssemblyBlocks, contactMap?.layoutBlocks],
+  );
+  const showsLayoutRasterPreview = Boolean(
+    usesTiledRenderer
+    && contactMap?.visibleLayerComplete
+    && layoutRasterPlan?.changesPixels
+    && contactLayoutRasterPlanCoversViewport(
+      layoutRasterPlan,
+      contactMap.viewport.xStart,
+      contactMap.viewport.xEnd,
+    )
+    && contactLayoutRasterPlanCoversViewport(
+      layoutRasterPlan,
+      contactMap.viewport.yStart,
+      contactMap.viewport.yEnd,
+    ),
+  );
+  // During a pure move/reverse, pixels and annotations switch to the edited
+  // geometry together via the raster preview. If a complete preview cannot be
+  // produced (for example, data moved in from outside the viewport), retain
+  // the matching authoritative layout until the new visible layer is ready.
+  const assemblyBlocks = layoutRasterPlan && (
+    !layoutRasterPlan.changesPixels || showsLayoutRasterPreview
+  )
+    ? activeAssemblyBlocks
+    : contactMap?.layoutBlocks ?? activeAssemblyBlocks;
   const assemblyModel = useMemo(() => buildAssemblyEditModel(assemblyBlocks), [assemblyBlocks]);
   const selectedAssemblyBlockIds = useMemo(
     () => selectedBlockIds(assemblyModel, uiState.assembly.selection),
@@ -503,8 +533,6 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     setContextMenu({
       x: mapX,
       y: mapY,
-      mapX,
-      mapY,
     });
   }
 
@@ -717,10 +745,6 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   }
 
   function handleAssemblyDoubleClick(event: React.MouseEvent<HTMLDivElement>) {
-    if (!contactMap) {
-      return;
-    }
-
     const bounds = event.currentTarget.getBoundingClientRect();
     const focusRatioX = bounds.width > 0 ? (event.clientX - bounds.left) / bounds.width : 0.5;
     const focusRatioY = bounds.height > 0 ? (event.clientY - bounds.top) / bounds.height : 0.5;
@@ -730,6 +754,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
       direction: "in",
       focusRatioX,
       focusRatioY,
+      snapToResolution: true,
       totalSpanMb,
     });
   }
@@ -1059,6 +1084,21 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
                 aria-label={hasContactMap ? "Imported contact map" : "Contact map canvas placeholder"}
               />
             )}
+            {showsLayoutRasterPreview && contactMap && layoutRasterPlan ? (
+              <ContactLayoutRasterPreview
+                sourceLayerRef={contactTileLayerRef}
+                segments={layoutRasterPlan.segments}
+                viewport={contactMap.viewport}
+                sourceRevision={[
+                  contactMap.layoutScope,
+                  contactMap.resolution,
+                  uiState.contact.colormap,
+                  uiState.contact.colorScale.min,
+                  uiState.contact.colorScale.max,
+                  uiState.contact.colorScale.log,
+                ].join("|")}
+              />
+            ) : null}
           </div>
           <AssemblyOverlay
             overlayLayerRef={assemblyOverlayLayerRef}
@@ -1101,84 +1141,12 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
           />
         </div>
         {contextMenu ? (
-          <div
-            className="context-menu"
-            style={{
-              left: contextMenu.x,
-              top: contextMenu.y,
-            }}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <button
-              type="button"
-              disabled={!uiState.assembly.selection}
-              onClick={() => {
-                onUiAction({ type: "clearAssemblySelection" });
-                setContextMenu(null);
-              }}
-            >
-              Deselect
-            </button>
-            <button
-              type="button"
-              disabled={!uiState.assembly.selection}
-              onClick={() => {
-                onUiAction({ type: "reverseAssemblySelection" });
-                setContextMenu(null);
-              }}
-            >
-              Reverse / rotate selection
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                onUiAction({ type: "copyAssemblySelection" });
-                setContextMenu(null);
-              }}
-            >
-              Copy
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                onUiAction({ type: "moveAssemblySelectionToDebris" });
-                setContextMenu(null);
-              }}
-            >
-              Move to debris
-            </button>
-            <button
-              type="button"
-              disabled={uiState.assembly.selection?.kind !== "contigs"
-                || uiState.assembly.selection.ids.length === 0}
-              onClick={() => {
-                onUiAction({ type: "addAssemblyChromosomeBoundaries" });
-                setContextMenu(null);
-              }}
-            >
-              Add chr boundaries
-            </button>
-            <button
-              type="button"
-              disabled={uiState.operationHistory.length === 0}
-              onClick={() => {
-                onUiAction({ type: "undo" });
-                setContextMenu(null);
-              }}
-            >
-              Undo
-            </button>
-            <button
-              type="button"
-              disabled={uiState.redoStack.length === 0}
-              onClick={() => {
-                onUiAction({ type: "redo" });
-                setContextMenu(null);
-              }}
-            >
-              Redo
-            </button>
-          </div>
+          <AssemblyContextMenu
+            position={contextMenu}
+            uiState={uiState}
+            onUiAction={onUiAction}
+            onClose={() => setContextMenu(null)}
+          />
         ) : null}
         <div className="genome-navigator-shell genome-navigator-y">
           <span className="genome-navigator-label" aria-hidden="true">Y</span>

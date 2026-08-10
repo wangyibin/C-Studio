@@ -11,6 +11,10 @@ import {
 import { useEffect, useRef } from "react";
 import type { RefObject } from "react";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
+import {
+  assemblyContigSelectionIntent,
+  selectedBlockIds,
+} from "../state/assemblyEditing";
 import type { CoverageView } from "../state/coverageView";
 import type { SyntenyView } from "../state/syntenyView";
 import type { UiAction, UiState } from "../state/uiState";
@@ -21,7 +25,10 @@ import {
 import { ContactMapViewport } from "./ContactMapViewport";
 import { HeatmapToolbar } from "./HeatmapToolbar";
 import { InspectorPanel } from "./InspectorPanel";
-import { SyntenyDotplot } from "./SyntenyDotplot";
+import {
+  SyntenyDotplot,
+  type SyntenySelectionModifiers,
+} from "./SyntenyDotplot";
 
 interface AppShellProps {
   dataset: ExampleDatasetSummary | null;
@@ -88,10 +95,14 @@ export function AppShell({
     chromosome: boolean;
     contig: boolean;
   } | null>(null);
+  const syntenySelectionAnchorRef = useRef<string | null>(null);
   const agpImported = Boolean(dataset?.agp_path);
   const contactImported = Boolean(dataset?.mcool_path || dataset?.cool_path);
   const coverageImported = Boolean(dataset?.coverage_path);
-  const activeAssemblyTotalBp = uiState.assembly.blocks.reduce(
+  const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
+    ? uiState.assembly.blocks
+    : dataset?.agp_layout.blocks ?? [];
+  const activeAssemblyTotalBp = activeAssemblyBlocks.reduce(
     (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
     0,
   );
@@ -103,6 +114,28 @@ export function AppShell({
       || uiState.contact.totalSpanMb * 1_000_000
     ) / 1_000_000,
   );
+  const selectedAssemblyBlockIds = selectedBlockIds(
+    activeAssemblyBlocks,
+    uiState.assembly.selection,
+  );
+
+  function selectSyntenyBlock(id: string, modifiers: SyntenySelectionModifiers) {
+    const intent = assemblyContigSelectionIntent(
+      activeAssemblyBlocks,
+      uiState.assembly.selection,
+      syntenySelectionAnchorRef.current,
+      id,
+      modifiers,
+    );
+    syntenySelectionAnchorRef.current = intent.anchorId;
+    if (intent.type === "clear") {
+      onUiAction({ type: "clearAssemblySelection" });
+    } else if (intent.type === "select-range") {
+      onUiAction({ type: "selectAssemblyContigs", ids: intent.ids });
+    } else {
+      onUiAction({ type: "selectAssemblyContig", id: intent.id, additive: intent.additive });
+    }
+  }
 
   useEffect(() => {
     function handleJuiceboxShortcut(event: KeyboardEvent) {
@@ -357,12 +390,11 @@ export function AppShell({
                   </div>
                   <SyntenyDotplot
                     syntenyView={syntenyView}
-                    selectedAssemblyBlockIds={
-                      uiState.assembly.selection?.kind === "contigs" ? uiState.assembly.selection.ids : []
-                    }
-                    onSelectBlock={(id, additive) =>
-                      onUiAction({ type: "selectAssemblyContig", id, additive })
-                    }
+                    assemblyBlocks={activeAssemblyBlocks}
+                    selectedAssemblyBlockIds={selectedAssemblyBlockIds}
+                    onSelectBlock={selectSyntenyBlock}
+                    uiState={uiState}
+                    onUiAction={onUiAction}
                   />
                 </aside>
               ) : null}
@@ -380,6 +412,9 @@ export function AppShell({
             uiState={uiState}
             onUiAction={onUiAction}
             syntenyView={syntenyView}
+            assemblyBlocks={activeAssemblyBlocks}
+            selectedAssemblyBlockIds={selectedAssemblyBlockIds}
+            onSelectSyntenyBlock={selectSyntenyBlock}
             pafText={pafText}
             onPafTextChange={onPafTextChange}
           />

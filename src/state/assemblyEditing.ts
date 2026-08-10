@@ -28,6 +28,17 @@ export type AssemblyHit =
   | { kind: "contig"; id: string }
   | { kind: "chromosome-boundary"; id: string };
 
+export interface AssemblySelectionModifiers {
+  shiftKey: boolean;
+  metaKey: boolean;
+  ctrlKey: boolean;
+}
+
+export type AssemblyContigSelectionIntent =
+  | { type: "clear"; anchorId: null }
+  | { type: "select"; id: string; additive: boolean; anchorId: string }
+  | { type: "select-range"; ids: string[]; anchorId: string };
+
 export interface MapPoint {
   x: number;
   y: number;
@@ -98,6 +109,59 @@ export function selectContig(
 export function selectContigs(ids: string[]): AssemblySelection | null {
   const uniqueIds = [...new Set(ids)];
   return uniqueIds.length > 0 ? { kind: "contigs", ids: uniqueIds } : null;
+}
+
+export function assemblyContigIdsBetween(
+  blocks: ContactMapLayoutBlock[],
+  anchorId: string,
+  targetId: string,
+) {
+  const orderedBlocks = [...blocks].sort((left, right) => (
+    left.visualStart - right.visualStart || left.visualEnd - right.visualEnd
+  ));
+  const anchorIndex = orderedBlocks.findIndex((block) => block.id === anchorId);
+  const targetIndex = orderedBlocks.findIndex((block) => block.id === targetId);
+  if (targetIndex < 0) {
+    return [];
+  }
+  if (anchorIndex < 0) {
+    return [targetId];
+  }
+
+  const startIndex = Math.min(anchorIndex, targetIndex);
+  const endIndex = Math.max(anchorIndex, targetIndex);
+  return orderedBlocks.slice(startIndex, endIndex + 1).map((block) => block.id);
+}
+
+export function assemblyContigSelectionIntent(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+  anchorId: string | null,
+  targetId: string,
+  modifiers: AssemblySelectionModifiers,
+): AssemblyContigSelectionIntent {
+  const selected = new Set(selectedBlockIds(blocks, selection));
+  if (modifiers.metaKey || modifiers.ctrlKey) {
+    return { type: "select", id: targetId, additive: true, anchorId: targetId };
+  }
+
+  if (modifiers.shiftKey && selected.has(targetId)) {
+    return { type: "clear", anchorId: null };
+  }
+
+  if (modifiers.shiftKey) {
+    const effectiveAnchor = anchorId
+      ?? (selection?.kind === "contigs" ? selection.ids[selection.ids.length - 1] ?? null : null);
+    if (effectiveAnchor) {
+      return {
+        type: "select-range",
+        ids: assemblyContigIdsBetween(blocks, effectiveAnchor, targetId),
+        anchorId: effectiveAnchor,
+      };
+    }
+  }
+
+  return { type: "select", id: targetId, additive: false, anchorId: targetId };
 }
 
 export function isContigSelected(selection: AssemblySelection | null, id: string) {

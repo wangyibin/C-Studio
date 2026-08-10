@@ -18,6 +18,7 @@ export const contactResolutionLevels: readonly ContactResolution[] = [
 ];
 
 export const maxContactPixelSize = 128;
+export const defaultContactBinSizePx = 1;
 
 export function contactResolutionToBasePairs(resolution: ContactResolution) {
   const [amount, unit] = resolution.split(" ");
@@ -57,19 +58,97 @@ export function chooseContactResolutionForSpan(
 }
 
 /**
- * Juicebox's manual resolution selector resets pixels-per-bin to
- * max(1, minPixelSize). For the square whole-assembly view this reduces to the
- * selected bin span at one pixel per bin, capped by the loaded assembly span.
+ * Select the finest available bin that can still cover the fitted viewport
+ * without making a bin smaller than the default one-CSS-pixel point.
+ */
+export function wholeGenomeContactResolutionForViewport(
+  wholeGenomeViewportSpanMb: number,
+  viewportSizePx: number,
+): ContactResolution {
+  const bpPerPixel = (
+    sanitizeTotalSpanMb(wholeGenomeViewportSpanMb) * 1_000_000
+  ) / sanitizeViewportSizePx(viewportSizePx);
+
+  return chooseContactResolutionForBpPerPixel(bpPerPixel * defaultContactBinSizePx);
+}
+
+/**
+ * Coarser bins than the fitted whole-genome level only enlarge the same full
+ * view. Excluding that plateau leaves one whole-map level followed by true
+ * zoom levels, while preserving the dataset's resolution order.
+ */
+export function contactResolutionLevelsForViewport(
+  wholeGenomeViewportSpanMb: number,
+  viewportSizePx: number,
+): readonly ContactResolution[] {
+  const wholeGenomeResolution = wholeGenomeContactResolutionForViewport(
+    wholeGenomeViewportSpanMb,
+    viewportSizePx,
+  );
+  const firstResolutionIndex = contactResolutionLevels.indexOf(wholeGenomeResolution);
+
+  return firstResolutionIndex < 0
+    ? contactResolutionLevels
+    : contactResolutionLevels.slice(firstResolutionIndex);
+}
+
+export function clampContactResolutionToViewport(
+  resolution: ContactResolution,
+  wholeGenomeViewportSpanMb: number,
+  viewportSizePx: number,
+): ContactResolution {
+  const levels = contactResolutionLevelsForViewport(
+    wholeGenomeViewportSpanMb,
+    viewportSizePx,
+  );
+
+  return levels.includes(resolution) ? resolution : levels[0] ?? resolution;
+}
+
+export function contactWholeGenomeViewportSpanMb(
+  totalSpanMb: number,
+  viewportWidthPx: number,
+  viewportHeightPx: number,
+) {
+  const safeTotalSpanMb = sanitizeTotalSpanMb(totalSpanMb);
+  const safeWidthPx = sanitizeViewportSizePx(viewportWidthPx);
+  const safeHeightPx = sanitizeViewportSizePx(viewportHeightPx);
+
+  return safeTotalSpanMb
+    * Math.min(safeWidthPx, safeHeightPx)
+    / Math.max(safeWidthPx, safeHeightPx);
+}
+
+/**
+ * Juicebox-style default geometry: each matrix bin is approximately one CSS
+ * pixel. The fitted level is capped by the complete heatmap span; every finer
+ * level therefore shrinks the genomic window while retaining the same point
+ * size on screen.
+ *
+ * `wholeGenomeViewportSpanMb` is the fitted span along the viewport's shorter
+ * axis. For a rectangular viewport callers should derive it from both canvas
+ * dimensions before calling this helper.
  */
 export function contactViewportSpanForResolution(
   resolution: ContactResolution,
   viewportSizePx: number,
-  totalSpanMb: number,
+  wholeGenomeViewportSpanMb: number,
 ) {
-  const safeTotalSpanMb = sanitizeTotalSpanMb(totalSpanMb);
-  const binSizeMb = contactResolutionToBasePairs(resolution) / 1_000_000;
+  const safeWholeGenomeSpanMb = sanitizeTotalSpanMb(wholeGenomeViewportSpanMb);
+  const wholeGenomeResolution = wholeGenomeContactResolutionForViewport(
+    safeWholeGenomeSpanMb,
+    viewportSizePx,
+  );
+  if (resolution === wholeGenomeResolution) {
+    return safeWholeGenomeSpanMb;
+  }
 
-  return Math.min(safeTotalSpanMb, sanitizeViewportSizePx(viewportSizePx) * binSizeMb);
+  const binSizeMb = contactResolutionToBasePairs(resolution) / 1_000_000;
+  const onePointPerBinSpanMb = (
+    sanitizeViewportSizePx(viewportSizePx) * binSizeMb
+  ) / defaultContactBinSizePx;
+
+  return Math.min(safeWholeGenomeSpanMb, onePointPerBinSpanMb);
 }
 
 export function minimumContactViewportSpanMb(

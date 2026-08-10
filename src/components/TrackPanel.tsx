@@ -6,7 +6,11 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Eye, EyeOff, SlidersHorizontal } from "lucide-react";
-import { buildAssemblyEditModel, selectedBlockIds } from "../state/assemblyEditing";
+import {
+  assemblyContigIdsBetween,
+  buildAssemblyEditModel,
+  selectedBlockIds,
+} from "../state/assemblyEditing";
 import type { ContactViewport } from "../state/contactViewport";
 import type { CoverageView } from "../state/coverageView";
 import type { ContactMapLayoutBlock } from "../state/importers";
@@ -528,21 +532,7 @@ export function coverageContigIdsBetween(
   anchorId: string,
   targetId: string,
 ) {
-  const orderedBlocks = [...blocks].sort((left, right) => (
-    left.visualStart - right.visualStart || left.visualEnd - right.visualEnd
-  ));
-  const anchorIndex = orderedBlocks.findIndex((block) => block.id === anchorId);
-  const targetIndex = orderedBlocks.findIndex((block) => block.id === targetId);
-  if (targetIndex < 0) {
-    return [];
-  }
-  if (anchorIndex < 0) {
-    return [targetId];
-  }
-
-  const startIndex = Math.min(anchorIndex, targetIndex);
-  const endIndex = Math.max(anchorIndex, targetIndex);
-  return orderedBlocks.slice(startIndex, endIndex + 1).map((block) => block.id);
+  return assemblyContigIdsBetween(blocks, anchorId, targetId);
 }
 
 export function coverageContigIdsInRatioRange(

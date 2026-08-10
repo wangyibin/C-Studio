@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
 const viewportSource = readFileSync(new URL("./ContactMapViewport.tsx", import.meta.url), "utf8");
+const contextMenuSource = readFileSync(new URL("./AssemblyContextMenu.tsx", import.meta.url), "utf8");
 const appSource = readFileSync(new URL("../App.tsx", import.meta.url), "utf8");
 const confirmedStylesStart = styles.lastIndexOf(":root {");
 const confirmedRedesignStyles = confirmedStylesStart >= 0 ? styles.slice(confirmedStylesStart) : styles;
@@ -104,9 +105,10 @@ describe("confirmed contact map layout styles", () => {
   });
 
   it("offers Deselect from the shared heatmap and coverage context menu", () => {
-    expect(viewportSource).toContain("Deselect");
+    expect(contextMenuSource).toContain("Deselect");
+    expect(viewportSource).toContain("<AssemblyContextMenu");
     expect(viewportSource).toContain('onContextMenu={openContextMenu}');
-    expect(viewportSource).toContain('onUiAction({ type: "clearAssemblySelection" });');
+    expect(contextMenuSource).toContain('run({ type: "clearAssemblySelection" })');
   });
 
   it("hides edit handles while Shift is acting as the range-selection modifier", () => {

@@ -5,6 +5,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(commands::ContactCacheState::default())
         .manage(commands::ContactTileCacheState::default())
+        .manage(commands::ContactTileRequestState::default())
         .manage(commands::SourceContactCacheState::default())
         .manage(commands::CoverageCacheState::default())
         .manage(commands::SyntenyCacheState::default())
@@ -17,6 +18,7 @@ pub fn run() {
             commands::save_agp_file,
             commands::build_contact_map_view,
             commands::build_contact_map_view_from_cool,
+            commands::begin_contact_tile_generation,
             commands::get_contact_map_tiles_from_cool,
             commands::build_coverage_view,
             commands::build_coverage_view_from_bedgraph,
