@@ -164,6 +164,11 @@ where
         if y_positions.is_empty() {
             continue;
         }
+        // A copied layout placement does not create new source observations.
+        // Treat every matching placement pair as one equally likely assignment
+        // of the original contact so projection conserves the observed signal.
+        let assignment_count = x_positions.len() as f64 * y_positions.len() as f64;
+        let projected_count = contact.count() / assignment_count;
 
         for x in &x_positions {
             for y in &y_positions {
@@ -179,7 +184,7 @@ where
                 let x_bin = visual_x / query.target_resolution;
                 let y_bin = visual_y / query.target_resolution;
 
-                *aggregate.entry((x_bin, y_bin)).or_insert(0.0) += contact.count();
+                *aggregate.entry((x_bin, y_bin)).or_insert(0.0) += projected_count;
             }
         }
     }
@@ -572,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn expands_contacts_for_copied_layout_blocks_sharing_source_ids() {
+    fn shares_contacts_equally_across_copied_layout_blocks() {
         let query = ContactMapQuery {
             base_resolution: 1_000,
             target_resolution: 1_000,
@@ -624,8 +629,122 @@ mod tests {
                 .iter()
                 .map(|cell| (cell.x_bin, cell.y_bin, cell.count))
                 .collect::<Vec<_>>(),
-            vec![(0, 1, 5.0), (1, 2, 5.0)]
+            vec![(0, 1, 2.5), (1, 2, 2.5)]
         );
+        assert_eq!(view.cells.iter().map(|cell| cell.count).sum::<f64>(), 5.0);
+    }
+
+    #[test]
+    fn shares_contacts_by_the_local_copy_number_at_each_endpoint() {
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 7_000,
+                y_start: 0,
+                y_end: 7_000,
+            },
+            layout_blocks: vec![
+                LayoutBlock {
+                    id: "a-1".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 0,
+                    source_end: 1_000,
+                    visual_start: 0,
+                    orientation: Orientation::Forward,
+                },
+                LayoutBlock {
+                    id: "a-2".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 0,
+                    source_end: 1_000,
+                    visual_start: 1_000,
+                    orientation: Orientation::Forward,
+                },
+                LayoutBlock {
+                    id: "b-1".to_string(),
+                    source_id: "contig-b".to_string(),
+                    source_start: 0,
+                    source_end: 1_000,
+                    visual_start: 2_000,
+                    orientation: Orientation::Forward,
+                },
+                LayoutBlock {
+                    id: "b-2".to_string(),
+                    source_id: "contig-b".to_string(),
+                    source_start: 0,
+                    source_end: 1_000,
+                    visual_start: 3_000,
+                    orientation: Orientation::Forward,
+                },
+                LayoutBlock {
+                    id: "b-3".to_string(),
+                    source_id: "contig-b".to_string(),
+                    source_start: 0,
+                    source_end: 1_000,
+                    visual_start: 4_000,
+                    orientation: Orientation::Forward,
+                },
+            ],
+        };
+        let contacts = vec![ContactBin {
+            source1: "contig-a".to_string(),
+            start1: 0,
+            source2: "contig-b".to_string(),
+            start2: 0,
+            count: 12.0,
+        }];
+
+        let view = build_contact_map_view(&query, contacts).expect("valid query");
+
+        assert_eq!(view.cells.len(), 6);
+        assert!(view.cells.iter().all(|cell| cell.count == 2.0));
+        assert_eq!(view.cells.iter().map(|cell| cell.count).sum::<f64>(), 12.0);
+    }
+
+    #[test]
+    fn deleting_a_copy_restores_the_full_contact_share_to_the_remaining_placement() {
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 2_000,
+                y_start: 0,
+                y_end: 2_000,
+            },
+            layout_blocks: vec![
+                LayoutBlock {
+                    id: "remaining-a".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 0,
+                    source_end: 1_000,
+                    visual_start: 0,
+                    orientation: Orientation::Forward,
+                },
+                LayoutBlock {
+                    id: "b".to_string(),
+                    source_id: "contig-b".to_string(),
+                    source_start: 0,
+                    source_end: 1_000,
+                    visual_start: 1_000,
+                    orientation: Orientation::Forward,
+                },
+            ],
+        };
+        let contacts = vec![ContactBin {
+            source1: "contig-a".to_string(),
+            start1: 0,
+            source2: "contig-b".to_string(),
+            start2: 0,
+            count: 8.0,
+        }];
+
+        let view = build_contact_map_view(&query, contacts).expect("valid query");
+
+        assert_eq!(view.cells.len(), 1);
+        assert_eq!(view.cells[0].count, 8.0);
     }
 
     #[test]

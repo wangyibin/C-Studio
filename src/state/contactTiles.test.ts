@@ -288,6 +288,24 @@ describe("contact tile requests", () => {
       .toBe(contactTileScope("/tmp/input.cool", 10, 10, "raw", after));
   });
 
+  it("invalidates source-related tiles when a copy outside the tile changes signal shares", () => {
+    const before = localInvalidationLayout();
+    const after = [
+      ...before,
+      {
+        ...before[0],
+        id: "block-A-copy",
+        visualStart: 600,
+        visualEnd: 700,
+      },
+    ];
+    const beforeKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", before);
+    const afterKey = createContactTileCacheKeyResolver("/tmp/input.cool", 10, 10, "raw", after);
+
+    expect(beforeKey({ tileX: 0, tileY: 1 })).not.toBe(afterKey({ tileX: 0, tileY: 1 }));
+    expect(beforeKey({ tileX: 1, tileY: 1 })).toBe(afterKey({ tileX: 1, tileY: 1 }));
+  });
+
   it("uses the pinned UTF-8 tile projection fingerprint shared with Rust", () => {
     const layout: ContactMapLayoutBlock[] = [{
       id: "ignored-id",
@@ -301,6 +319,6 @@ describe("contact tile requests", () => {
     }];
 
     expect(contactTileProjectionFingerprint({ tileX: 0, tileY: 0 }, 10, 10, layout))
-      .toBe("dd226eb70d454d8c:dd226eb70d454d8c");
+      .toBe("ac570d514b060508:ac570d514b060508");
   });
 });

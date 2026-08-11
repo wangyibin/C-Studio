@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn copied_layout_block_projects_the_same_cached_source_twice() {
+    fn copied_layout_blocks_share_the_same_cached_source_coverage() {
         let mut cache = CoverageCache::new();
         let cache_key = key(1);
         cache.insert_records(cache_key.clone(), vec![BedGraphRecord {
@@ -159,7 +159,7 @@ mod tests {
         ).unwrap().unwrap();
 
         assert_eq!(view.bins.iter().map(|bin| bin.x_bin).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
-        assert!(view.bins.iter().all(|bin| bin.value == 7.0));
+        assert!(view.bins.iter().all(|bin| bin.value == 3.5));
     }
 
     #[test]

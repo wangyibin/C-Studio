@@ -20,10 +20,17 @@ const utf8Encoder = new TextEncoder();
 interface ProjectionBlock {
   visualStart: number;
   visualEnd: number;
+  sourceId: string;
   sourceBytes: Uint8Array;
   sourceStart: number;
   sourceEnd: number;
   reverse: boolean;
+  sourceShares: SourceShare[];
+}
+
+interface SourceShare {
+  sourceStart: number;
+  sourceEnd: number;
 }
 
 interface ProjectionSegment {
@@ -33,6 +40,7 @@ interface ProjectionSegment {
   sourceStart: number;
   sourceEnd: number;
   reverse: boolean;
+  sourceShares: SourceShare[];
 }
 
 export type ContactTileCacheKeyResolver = (tile: ContactMapTileKey) => string;
@@ -92,9 +100,9 @@ export function contactTileScope(
 
 /**
  * Returns the layout identity for one canonical 2D tile. Each axis is hashed
- * independently from only the source projection intersecting that axis tile.
- * A flip therefore changes one row/column, while a move changes only the
- * old-to-new corridor and its crossings.
+ * from the source projection intersecting that axis tile and the copy-share
+ * intervals affecting it. A flip therefore changes one row/column, while a
+ * move changes only the old-to-new corridor and its crossings.
  */
 export function contactTileProjectionFingerprint(
   tile: ContactMapTileKey,
@@ -242,29 +250,37 @@ function projectionBlocksForLayout(layoutBlocks: ContactMapLayoutBlock[]): Proje
     return cached;
   }
 
-  const projectionBlocks = layoutBlocks
-    .map((block): ProjectionBlock | null => {
-      const sourceStart = safeCoordinate(block.sourceStart);
-      const sourceEnd = safeCoordinate(block.sourceEnd);
-      const visualStart = safeCoordinate(block.visualStart);
-      const span = sourceEnd - sourceStart;
-      if (span <= 0) {
-        return null;
-      }
-      const sourceId = String(block.sourceId);
-      return {
-        visualStart,
-        // Derive this from the source span exactly as the Rust renderer does;
-        // visualEnd and object/id labels do not participate in contact pixels.
-        visualEnd: visualStart + span,
-        sourceBytes: utf8Encoder.encode(sourceId),
-        sourceStart,
-        sourceEnd,
-        reverse: isReverseOrientation(String(block.orientation)),
-      };
-    })
-    .filter((block): block is ProjectionBlock => block !== null)
-    .sort(compareProjectionBlocks);
+  const projectionBlocks: ProjectionBlock[] = [];
+  const sourceSharesById = new Map<string, SourceShare[]>();
+  for (const block of layoutBlocks) {
+    const sourceStart = safeCoordinate(block.sourceStart);
+    const sourceEnd = safeCoordinate(block.sourceEnd);
+    const visualStart = safeCoordinate(block.visualStart);
+    const span = sourceEnd - sourceStart;
+    if (span <= 0) {
+      continue;
+    }
+    const sourceId = String(block.sourceId);
+    const sourceShares = sourceSharesById.get(sourceId) ?? [];
+    sourceShares.push({ sourceStart, sourceEnd });
+    sourceSharesById.set(sourceId, sourceShares);
+    projectionBlocks.push({
+      visualStart,
+      // Derive this from the source span exactly as the Rust renderer does;
+      // visualEnd and object/id labels do not participate in contact pixels.
+      visualEnd: visualStart + span,
+      sourceId,
+      sourceBytes: utf8Encoder.encode(sourceId),
+      sourceStart,
+      sourceEnd,
+      reverse: isReverseOrientation(String(block.orientation)),
+      sourceShares,
+    });
+  }
+  for (const sourceShares of sourceSharesById.values()) {
+    sourceShares.sort(compareSourceShares);
+  }
+  projectionBlocks.sort(compareProjectionBlocks);
   projectionBlockCache.set(layoutBlocks, projectionBlocks);
   return projectionBlocks;
 }
@@ -301,7 +317,17 @@ function projectionAxisFingerprint(
           ? block.sourceEnd - startOffset
           : block.sourceStart + endOffset,
         reverse: block.reverse,
+        sourceShares: [],
       });
+      const segment = segments[segments.length - 1];
+      segment.sourceShares = block.sourceShares
+        .filter((share) => (
+          share.sourceStart < segment.sourceEnd && share.sourceEnd > segment.sourceStart
+        ))
+        .map((share) => ({
+          sourceStart: Math.max(share.sourceStart, segment.sourceStart),
+          sourceEnd: Math.min(share.sourceEnd, segment.sourceEnd),
+        }));
     }
   }
   segments.sort(compareProjectionSegments);
@@ -317,7 +343,7 @@ function projectionAxisFingerprint(
       remaining >>= 8n;
     }
   };
-  for (const byte of [0x43, 0x53, 0x54, 0x4c, 0x01]) {
+  for (const byte of [0x43, 0x53, 0x54, 0x4c, 0x02]) {
     writeByte(byte);
   }
   writeU64(segments.length);
@@ -330,6 +356,11 @@ function projectionAxisFingerprint(
     writeU64(segment.sourceBytes.length);
     for (const byte of segment.sourceBytes) {
       writeByte(byte);
+    }
+    writeU64(segment.sourceShares.length);
+    for (const share of segment.sourceShares) {
+      writeU64(share.sourceStart);
+      writeU64(share.sourceEnd);
     }
   }
   return hash.toString(16).padStart(16, "0");
@@ -351,6 +382,10 @@ function compareProjectionSegments(left: ProjectionSegment, right: ProjectionSeg
     || left.sourceStart - right.sourceStart
     || left.sourceEnd - right.sourceEnd
     || Number(left.reverse) - Number(right.reverse);
+}
+
+function compareSourceShares(left: SourceShare, right: SourceShare): number {
+  return left.sourceStart - right.sourceStart || left.sourceEnd - right.sourceEnd;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {

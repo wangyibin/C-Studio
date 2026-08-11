@@ -32,13 +32,16 @@ export function juiceboxShortcutIntent({
   const menuModifier = ctrlKey || metaKey;
   const normalizedKey = key.toLowerCase();
   if (menuModifier) {
-    if (shiftKey) {
-      return null;
+    if (normalizedKey === "z") {
+      return shiftKey ? "redo" : "undo";
     }
-    if (normalizedKey === "u") {
+    if (!shiftKey && normalizedKey === "y" && ctrlKey && !metaKey) {
+      return "redo";
+    }
+    if (!shiftKey && normalizedKey === "u") {
       return "undo";
     }
-    if (normalizedKey === "r") {
+    if (!shiftKey && normalizedKey === "r") {
       return "redo";
     }
     return null;

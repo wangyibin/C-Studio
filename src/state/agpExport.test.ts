@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { addChromosomeBoundariesToSelection } from "./assemblyEditing";
+import {
+  addChromosomeBoundariesToSelection,
+  deleteGapsBetweenSelection,
+  reverseSelection,
+  splitContigAtVisualPosition,
+} from "./assemblyEditing";
 import { exportAgpText } from "./agpExport";
-import type { ContactMapLayoutBlock } from "./importers";
+import { parseAgpLayout, type ContactMapLayoutBlock } from "./importers";
 
 describe("exportAgpText", () => {
   it("serializes edited layout blocks as 9-column AGP component rows", () => {
@@ -73,5 +78,80 @@ describe("exportAgpText", () => {
         "",
       ].join("\n"),
     );
+  });
+
+  it("round-trips component runs and exact N/U gap metadata", () => {
+    const source = [
+      "ChrA\t1\t10\t1\tW\tctg1\t11\t20\t+",
+      "ChrA\t11\t20\t2\tF\tctg2\t21\t30\t-",
+      "ChrA\t21\t25\t3\tN\t5\tscaffold\tno\tna",
+      "ChrA\t26\t35\t4\tW\tctg3\t1\t10\t?",
+      "ChrA\t36\t135\t5\tU\t100\tcontig\tyes\tmap",
+      "ChrA\t136\t145\t6\tW\tctg4\t1\t10\t+",
+      "ChrB\t1\t8\t1\tW\tctg5\t3\t10\t+",
+    ].join("\n");
+
+    const parsed = parseAgpLayout(source);
+    const exported = exportAgpText(parsed.blocks);
+
+    expect(exported).toBe(`${source}\n`);
+
+    const reparsed = parseAgpLayout(exported);
+    expect(reparsed.totalSpan).toBe(parsed.totalSpan);
+    expect(reparsed.blocks).toEqual(parsed.blocks);
+    expect(reparsed.blocks.map((block) => block.assemblyBlockId)).toEqual([
+      "ChrA_block_1",
+      "ChrA_block_1",
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it("round-trips 0/na orientations and leaves them unchanged when reversing", () => {
+    const source = [
+      "ChrO\t1\t10\t1\tW\tctgZero\t11\t20\t0",
+      "ChrO\t11\t20\t2\tF\tctgNa\t31\t40\tna",
+    ].join("\n");
+    const parsed = parseAgpLayout(source);
+
+    expect(exportAgpText(parsed.blocks)).toBe(`${source}\n`);
+
+    const reversed = reverseSelection(parsed.blocks, { kind: "chromosome", id: "ChrO" });
+    expect(reversed.map((block) => [block.sourceId, block.orientation])).toEqual([
+      ["ctgNa", "na"],
+      ["ctgZero", "0"],
+    ]);
+    expect(exportAgpText(reversed)).toBe([
+      "ChrO\t1\t10\t1\tF\tctgNa\t31\t40\tna",
+      "ChrO\t11\t20\t2\tW\tctgZero\t11\t20\t0",
+      "",
+    ].join("\n"));
+  });
+
+  it("exports a split-contig gap and restores the original component when joined", () => {
+    const imported = parseAgpLayout([
+      "Chr01\t1\t100\t1\tW\tctgA\t1\t100\t+",
+      "Chr01\t101\t200\t2\tW\tctgB\t1\t100\t+",
+    ].join("\n"));
+    const split = splitContigAtVisualPosition(imported.blocks, "Chr01:2:ctgB", 150);
+
+    expect(exportAgpText(split)).toBe([
+      "Chr01\t1\t100\t1\tW\tctgA\t1\t100\t+",
+      "Chr01\t101\t150\t2\tW\tctgB:1-50\t1\t50\t+",
+      "Chr01\t151\t250\t3\tU\t100\tcontig\tno\tna",
+      "Chr01\t251\t300\t4\tW\tctgB:51-100\t51\t100\t+",
+      "",
+    ].join("\n"));
+
+    const joined = deleteGapsBetweenSelection(split, {
+      kind: "contigs",
+      ids: ["Chr01_block_1", "Chr01:2:ctgB:right"],
+    });
+    expect(exportAgpText(joined)).toBe([
+      "Chr01\t1\t100\t1\tW\tctgA\t1\t100\t+",
+      "Chr01\t101\t200\t2\tW\tctgB\t1\t100\t+",
+      "",
+    ].join("\n"));
   });
 });

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     fs,
     sync::{Arc, Condvar, Mutex, OnceLock},
     time::{Duration, UNIX_EPOCH},
@@ -39,6 +39,7 @@ struct CoolIndex {
     prefix: String,
     chrom_names: Vec<String>,
     bin_chrom_ids: Vec<i32>,
+    chrom_offsets: Vec<usize>,
     bin_starts: Vec<u64>,
     bin1_offsets: Vec<u64>,
     bytes: usize,
@@ -173,40 +174,12 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
         should_cancel,
     )?;
     let source_range_index = SourceRangeIndex::new(source_ranges);
-
-    let mut bin_to_source = Vec::with_capacity(index.bin_chrom_ids.len());
-    let mut selected_bins = HashSet::new();
-    for (bin_id, (chrom_id, start)) in index
-        .bin_chrom_ids
-        .iter()
-        .zip(index.bin_starts.iter())
-        .enumerate()
-    {
-        if bin_id % 4_096 == 0 {
-            ensure_not_cancelled(should_cancel)?;
-        }
-        let chrom_index: usize = (*chrom_id).try_into().map_err(|_| {
-            CStudioError::InvalidContactMapQuery(format!(
-                ".cool bin {bin_id} has negative chrom id {chrom_id}"
-            ))
-        })?;
-        let source_id = index.chrom_names.get(chrom_index).ok_or_else(|| {
-            CStudioError::InvalidContactMapQuery(format!(
-                ".cool bin {bin_id} references missing chrom id {chrom_id}"
-            ))
-        })?;
-
-        if source_range_index.contains(source_id, *start) {
-            selected_bins.insert(bin_id as u64);
-        }
-
-        bin_to_source.push((chrom_index, *start));
-    }
+    let selected_bins = SelectedBinIndex::new(&index, &source_range_index, should_cancel)?;
 
     let mut contacts = Vec::new();
     ensure_not_cancelled(should_cancel)?;
-    let pixel_ranges = pixel_ranges_for_selected_bins_cancellable(
-        &selected_bins,
+    let pixel_ranges = pixel_ranges_for_selected_bin_ranges_cancellable(
+        selected_bins.ranges(),
         &index.bin1_offsets,
         should_cancel,
     )?;
@@ -243,7 +216,7 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
                 if pixel_index % 16_384 == 0 {
                     ensure_not_cancelled(should_cancel)?;
                 }
-                if !selected_bins.contains(&bin1) || !selected_bins.contains(&bin2) {
+                if !selected_bins.contains(bin1) || !selected_bins.contains(bin2) {
                     continue;
                 }
                 let Some(count) = normalized_contact_count(
@@ -255,24 +228,14 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
                     continue;
                 };
 
-                let (source1_index, start1) =
-                    bin_to_source.get(bin1 as usize).ok_or_else(|| {
-                        CStudioError::InvalidContactMapQuery(format!(
-                            ".cool pixel references missing bin1_id {bin1}"
-                        ))
-                    })?;
-                let (source2_index, start2) =
-                    bin_to_source.get(bin2 as usize).ok_or_else(|| {
-                        CStudioError::InvalidContactMapQuery(format!(
-                            ".cool pixel references missing bin2_id {bin2}"
-                        ))
-                    })?;
+                let (source1_index, start1) = bin_source_and_start(&index, bin1, "bin1_id")?;
+                let (source2_index, start2) = bin_source_and_start(&index, bin2, "bin2_id")?;
 
                 contacts.push(ContactBin {
-                    source1: index.chrom_names[*source1_index].clone(),
-                    start1: *start1,
-                    source2: index.chrom_names[*source2_index].clone(),
-                    start2: *start2,
+                    source1: index.chrom_names[source1_index].clone(),
+                    start1,
+                    source2: index.chrom_names[source2_index].clone(),
+                    start2,
                     count,
                 });
             }
@@ -327,18 +290,142 @@ impl SourceRangeIndex {
         }
     }
 
-    fn contains(&self, source: &str, position: u64) -> bool {
-        if self.select_all {
-            return true;
+    fn ranges(&self, source: &str) -> Option<&[(u64, u64)]> {
+        self.by_source.get(source).map(Vec::as_slice)
+    }
+}
+
+#[derive(Debug)]
+enum SelectedBinMembership {
+    All { bin_count: usize },
+    Partial { bin_count: usize, words: Vec<u64> },
+}
+
+#[derive(Debug)]
+struct SelectedBinIndex {
+    ranges: Vec<(usize, usize)>,
+    membership: SelectedBinMembership,
+}
+
+impl SelectedBinIndex {
+    fn new(
+        index: &CoolIndex,
+        source_ranges: &SourceRangeIndex,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CStudioResult<Self> {
+        ensure_not_cancelled(should_cancel)?;
+        let bin_count = index.bin_starts.len();
+        if source_ranges.select_all {
+            return Ok(Self::all(bin_count));
         }
-        let Some(ranges) = self.by_source.get(source) else {
+
+        let mut ranges = Vec::new();
+        for (chrom_index, source) in index.chrom_names.iter().enumerate() {
+            if chrom_index % 256 == 0 {
+                ensure_not_cancelled(should_cancel)?;
+            }
+            let Some(source_ranges) = source_ranges.ranges(source) else {
+                continue;
+            };
+            let chrom_start = index.chrom_offsets[chrom_index];
+            let chrom_end = index.chrom_offsets[chrom_index + 1];
+            let starts = &index.bin_starts[chrom_start..chrom_end];
+
+            for &(source_start, source_end) in source_ranges {
+                let selected_start =
+                    chrom_start + starts.partition_point(|position| *position < source_start);
+                let selected_end =
+                    chrom_start + starts.partition_point(|position| *position < source_end);
+                push_merged_bin_range(&mut ranges, selected_start, selected_end);
+            }
+        }
+        ensure_not_cancelled(should_cancel)?;
+
+        if ranges.as_slice() == [(0, bin_count)] {
+            return Ok(Self::all(bin_count));
+        }
+
+        let mut words = vec![0_u64; bin_count.saturating_add(63) / 64];
+        let mut selected_count = 0_usize;
+        for &(start, end) in &ranges {
+            for bin in start..end {
+                if selected_count & 4_095 == 0 {
+                    ensure_not_cancelled(should_cancel)?;
+                }
+                words[bin / 64] |= 1_u64 << (bin % 64);
+                selected_count += 1;
+            }
+        }
+
+        Ok(Self {
+            ranges,
+            membership: SelectedBinMembership::Partial { bin_count, words },
+        })
+    }
+
+    fn all(bin_count: usize) -> Self {
+        Self {
+            ranges: (bin_count > 0)
+                .then_some((0, bin_count))
+                .into_iter()
+                .collect(),
+            membership: SelectedBinMembership::All { bin_count },
+        }
+    }
+
+    fn contains(&self, bin_id: u64) -> bool {
+        let Ok(bin) = usize::try_from(bin_id) else {
             return false;
         };
-        let index = ranges.partition_point(|(_, end)| *end <= position);
-        ranges
-            .get(index)
-            .is_some_and(|(start, end)| position >= *start && position < *end)
+        match &self.membership {
+            SelectedBinMembership::All { bin_count } => bin < *bin_count,
+            SelectedBinMembership::Partial { bin_count, words } => {
+                bin < *bin_count && words[bin / 64] & (1_u64 << (bin % 64)) != 0
+            }
+        }
     }
+
+    fn ranges(&self) -> &[(usize, usize)] {
+        &self.ranges
+    }
+}
+
+fn push_merged_bin_range(ranges: &mut Vec<(usize, usize)>, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    if let Some((_, previous_end)) = ranges.last_mut() {
+        if start <= *previous_end {
+            *previous_end = (*previous_end).max(end);
+            return;
+        }
+    }
+    ranges.push((start, end));
+}
+
+fn bin_source_and_start(
+    index: &CoolIndex,
+    bin_id: u64,
+    pixel_column: &str,
+) -> CStudioResult<(usize, u64)> {
+    let bin_index: usize = bin_id.try_into().map_err(|_| {
+        CStudioError::InvalidContactMapQuery(format!(
+            ".cool pixel {pixel_column} {bin_id} exceeds this platform's index range"
+        ))
+    })?;
+    let start = index.bin_starts.get(bin_index).copied().ok_or_else(|| {
+        CStudioError::InvalidContactMapQuery(format!(
+            ".cool pixel references missing {pixel_column} {bin_id}"
+        ))
+    })?;
+    let chrom_id = index.bin_chrom_ids.get(bin_index).copied().ok_or_else(|| {
+        CStudioError::InvalidContactMapQuery(format!(
+            ".cool pixel references missing {pixel_column} {bin_id}"
+        ))
+    })?;
+    let chrom_index = validated_bin_chrom_index(bin_index, chrom_id, index.chrom_names.len())?;
+
+    Ok((chrom_index, start))
 }
 
 fn cached_cool_index(
@@ -379,16 +466,33 @@ fn cached_cool_index(
         ));
     }
     ensure_not_cancelled(should_cancel)?;
+    let chrom_offset_path = format!("{prefix}indexes/chrom_offset");
+    let stored_chrom_offsets = if file.link_exists(&chrom_offset_path) {
+        Some(read_u64_dataset(file, &chrom_offset_path)?)
+    } else {
+        None
+    };
+    let chrom_offsets = resolve_chrom_offsets(
+        chrom_names.len(),
+        &bin_chrom_ids,
+        stored_chrom_offsets.as_deref(),
+        should_cancel,
+    )?;
+    validate_bin_starts_by_chrom(&bin_starts, &chrom_offsets, should_cancel)?;
+    ensure_not_cancelled(should_cancel)?;
     let bin1_offsets = read_u64_dataset(file, &format!("{prefix}indexes/bin1_offset"))?;
+    validate_bin1_offsets(&bin1_offsets, bin_starts.len(), should_cancel)?;
     ensure_not_cancelled(should_cancel)?;
     let bytes = chrom_names.iter().map(String::capacity).sum::<usize>()
         + bin_chrom_ids.capacity() * std::mem::size_of::<i32>()
+        + chrom_offsets.capacity() * std::mem::size_of::<usize>()
         + bin_starts.capacity() * std::mem::size_of::<u64>()
         + bin1_offsets.capacity() * std::mem::size_of::<u64>();
     let index = Arc::new(CoolIndex {
         prefix,
         chrom_names,
         bin_chrom_ids,
+        chrom_offsets,
         bin_starts,
         bin1_offsets,
         bytes,
@@ -407,6 +511,180 @@ fn cached_cool_index(
         }
     }
     Ok(index)
+}
+
+fn resolve_chrom_offsets(
+    chrom_count: usize,
+    bin_chrom_ids: &[i32],
+    stored_offsets: Option<&[u64]>,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Vec<usize>> {
+    let Some(stored_offsets) = stored_offsets else {
+        let mut counts = vec![0_usize; chrom_count];
+        let mut previous_chrom = None;
+        for (bin_index, chrom_id) in bin_chrom_ids.iter().copied().enumerate() {
+            if bin_index % 4_096 == 0 {
+                ensure_not_cancelled(should_cancel)?;
+            }
+            let chrom_index = validated_bin_chrom_index(bin_index, chrom_id, chrom_count)?;
+            if previous_chrom.is_some_and(|previous| previous > chrom_index) {
+                return Err(CStudioError::InvalidContactMapQuery(format!(
+                    ".cool bins/chrom must be nondecreasing; bin {bin_index} has chrom id {chrom_id} after {}",
+                    previous_chrom.unwrap_or(chrom_index),
+                )));
+            }
+            counts[chrom_index] += 1;
+            previous_chrom = Some(chrom_index);
+        }
+        let mut offsets = Vec::with_capacity(chrom_count + 1);
+        offsets.push(0);
+        for count in counts {
+            offsets.push(offsets.last().copied().unwrap_or(0) + count);
+        }
+        return Ok(offsets);
+    };
+
+    if stored_offsets.len() != chrom_count + 1 {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool indexes/chrom_offset has {} values for {chrom_count} chromosomes; expected {}",
+            stored_offsets.len(),
+            chrom_count + 1,
+        )));
+    }
+
+    let offsets = stored_offsets
+        .iter()
+        .enumerate()
+        .map(|(offset_index, offset)| {
+            usize::try_from(*offset).map_err(|_| {
+                CStudioError::InvalidContactMapQuery(format!(
+                    ".cool indexes/chrom_offset value {offset} at index {offset_index} exceeds this platform's index range"
+                ))
+            })
+        })
+        .collect::<CStudioResult<Vec<_>>>()?;
+    if offsets.first().copied() != Some(0) {
+        return Err(CStudioError::InvalidContactMapQuery(
+            ".cool indexes/chrom_offset must start at 0".to_string(),
+        ));
+    }
+    if offsets.last().copied() != Some(bin_chrom_ids.len()) {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool indexes/chrom_offset must end at the bin count {}; found {}",
+            bin_chrom_ids.len(),
+            offsets.last().copied().unwrap_or(0),
+        )));
+    }
+    for (offset_index, offset) in offsets.iter().copied().enumerate() {
+        if offset > bin_chrom_ids.len() {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool indexes/chrom_offset value {offset} at index {offset_index} exceeds the bin count {}",
+                bin_chrom_ids.len(),
+            )));
+        }
+    }
+    for (chrom_index, pair) in offsets.windows(2).enumerate() {
+        if pair[0] > pair[1] {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool indexes/chrom_offset decreases from {} to {} at chromosome {chrom_index}",
+                pair[0], pair[1],
+            )));
+        }
+    }
+    for (chrom_index, pair) in offsets.windows(2).enumerate() {
+        for (bin_index, chrom_id) in bin_chrom_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .take(pair[1])
+            .skip(pair[0])
+        {
+            if bin_index % 4_096 == 0 {
+                ensure_not_cancelled(should_cancel)?;
+            }
+            let actual_chrom = validated_bin_chrom_index(bin_index, chrom_id, chrom_count)?;
+            if actual_chrom != chrom_index {
+                return Err(CStudioError::InvalidContactMapQuery(format!(
+                    ".cool indexes/chrom_offset assigns bin {bin_index} to chrom {chrom_index}, but bins/chrom contains {actual_chrom}"
+                )));
+            }
+        }
+    }
+
+    Ok(offsets)
+}
+
+fn validated_bin_chrom_index(
+    bin_index: usize,
+    chrom_id: i32,
+    chrom_count: usize,
+) -> CStudioResult<usize> {
+    let chrom_index: usize = chrom_id.try_into().map_err(|_| {
+        CStudioError::InvalidContactMapQuery(format!(
+            ".cool bin {bin_index} has negative chrom id {chrom_id}"
+        ))
+    })?;
+    if chrom_index >= chrom_count {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool bin {bin_index} references missing chrom id {chrom_id}"
+        )));
+    }
+    Ok(chrom_index)
+}
+
+fn validate_bin_starts_by_chrom(
+    bin_starts: &[u64],
+    chrom_offsets: &[usize],
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<()> {
+    for (chrom_index, offsets) in chrom_offsets.windows(2).enumerate() {
+        if chrom_index % 256 == 0 {
+            ensure_not_cancelled(should_cancel)?;
+        }
+        for (local_index, starts) in bin_starts[offsets[0]..offsets[1]].windows(2).enumerate() {
+            if local_index % 4_096 == 0 {
+                ensure_not_cancelled(should_cancel)?;
+            }
+            if starts[0] > starts[1] {
+                let bin_index = offsets[0] + local_index + 1;
+                return Err(CStudioError::InvalidContactMapQuery(format!(
+                    ".cool bins/start must be nondecreasing within chrom {chrom_index}; bin {bin_index} starts at {} after {}",
+                    starts[1], starts[0],
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_bin1_offsets(
+    bin1_offsets: &[u64],
+    bin_count: usize,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<()> {
+    let expected_len = bin_count.checked_add(1).ok_or_else(|| {
+        CStudioError::InvalidContactMapQuery(
+            ".cool bin count exceeds this platform's index range".to_string(),
+        )
+    })?;
+    if bin1_offsets.len() != expected_len {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool indexes/bin1_offset has {} values for {bin_count} bins; expected {expected_len}",
+            bin1_offsets.len(),
+        )));
+    }
+    for (offset_index, offsets) in bin1_offsets.windows(2).enumerate() {
+        if offset_index % 4_096 == 0 {
+            ensure_not_cancelled(should_cancel)?;
+        }
+        if offsets[0] > offsets[1] {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool indexes/bin1_offset decreases from {} to {} at bin {offset_index}",
+                offsets[0], offsets[1],
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn cool_index_cache_key(path: &str, resolution: Option<u64>) -> CoolIndexCacheKey {
@@ -445,7 +723,7 @@ fn cached_normalization_weights(
         let values = if let Some(values) = read_stored_normalization_weights(
             file,
             &index.prefix,
-            index.bin_chrom_ids.len(),
+            index.bin_starts.len(),
             normalization,
             should_cancel,
         )? {
@@ -455,12 +733,12 @@ fn cached_normalization_weights(
             compute_normalization_weights(&matrix, normalization, should_cancel)?
         };
         ensure_not_cancelled(should_cancel)?;
-        if values.len() != index.bin_chrom_ids.len() {
+        if values.len() != index.bin_starts.len() {
             return Err(CStudioError::InvalidContactMapQuery(format!(
                 ".cool {} normalization has {} weights for {} bins",
                 normalization.as_str(),
                 values.len(),
-                index.bin_chrom_ids.len(),
+                index.bin_starts.len(),
             )));
         }
         Ok(values)
@@ -696,7 +974,7 @@ fn read_normalization_matrix(
         counts.extend(chunk_counts);
     }
 
-    SparseContactMatrix::new(index.bin_chrom_ids.len(), bin1, bin2, counts)
+    SparseContactMatrix::new(index.bin_starts.len(), bin1, bin2, counts)
 }
 
 fn normalized_contact_count(
@@ -731,45 +1009,57 @@ fn ensure_not_cancelled(should_cancel: &dyn Fn() -> bool) -> CStudioResult<()> {
 }
 
 #[cfg(test)]
-fn pixel_ranges_for_selected_bins(
-    selected_bins: &HashSet<u64>,
+fn pixel_ranges_for_selected_bin_ranges(
+    selected_bin_ranges: &[(usize, usize)],
     bin1_offsets: &[u64],
 ) -> CStudioResult<Vec<(usize, usize)>> {
-    pixel_ranges_for_selected_bins_cancellable(selected_bins, bin1_offsets, &|| false)
+    pixel_ranges_for_selected_bin_ranges_cancellable(selected_bin_ranges, bin1_offsets, &|| false)
 }
 
-fn pixel_ranges_for_selected_bins_cancellable(
-    selected_bins: &HashSet<u64>,
+fn pixel_ranges_for_selected_bin_ranges_cancellable(
+    selected_bin_ranges: &[(usize, usize)],
     bin1_offsets: &[u64],
     should_cancel: &dyn Fn() -> bool,
 ) -> CStudioResult<Vec<(usize, usize)>> {
     ensure_not_cancelled(should_cancel)?;
-    let mut selected_bins = selected_bins.iter().copied().collect::<Vec<_>>();
-    selected_bins.sort_unstable();
-    ensure_not_cancelled(should_cancel)?;
-
     let mut ranges = Vec::new();
-    for (selected_index, bin_id) in selected_bins.into_iter().enumerate() {
+    for (selected_index, &(bin_start, bin_end)) in selected_bin_ranges.iter().enumerate() {
         if selected_index % 4_096 == 0 {
             ensure_not_cancelled(should_cancel)?;
         }
-        let bin_index = bin_id as usize;
-        let Some(&start) = bin1_offsets.get(bin_index) else {
+        if bin_start >= bin_end {
+            continue;
+        }
+        let Some(&start) = bin1_offsets.get(bin_start) else {
             return Err(CStudioError::InvalidContactMapQuery(format!(
-                ".cool indexes/bin1_offset missing start for bin {bin_id}"
+                ".cool indexes/bin1_offset missing start for bin {bin_start}"
             )));
         };
-        let Some(&end) = bin1_offsets.get(bin_index + 1) else {
+        let Some(&end) = bin1_offsets.get(bin_end) else {
             return Err(CStudioError::InvalidContactMapQuery(format!(
-                ".cool indexes/bin1_offset missing end for bin {bin_id}"
+                ".cool indexes/bin1_offset missing end for bin {}",
+                bin_end - 1,
             )));
         };
         if start == end {
             continue;
         }
+        if start > end {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool indexes/bin1_offset decreases from {start} to {end} across bins {bin_start}..{bin_end}"
+            )));
+        }
 
-        let start = start as usize;
-        let end = end as usize;
+        let start: usize = start.try_into().map_err(|_| {
+            CStudioError::InvalidContactMapQuery(format!(
+                ".cool pixel offset {start} exceeds this platform's index range"
+            ))
+        })?;
+        let end: usize = end.try_into().map_err(|_| {
+            CStudioError::InvalidContactMapQuery(format!(
+                ".cool pixel offset {end} exceeds this platform's index range"
+            ))
+        })?;
         if let Some((_, last_end)) = ranges.last_mut() {
             if start <= *last_end {
                 *last_end = (*last_end).max(end);
@@ -916,7 +1206,6 @@ fn cool_error(error: hdf5::Error) -> CStudioError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
         path::PathBuf,
         sync::{
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -930,11 +1219,12 @@ mod tests {
 
     use super::{
         cached_normalization_vector, normalized_contact_count,
-        read_cool_contacts_for_source_ranges_at_resolution,
+        pixel_ranges_for_selected_bin_ranges, read_cool_contacts_for_source_ranges_at_resolution,
         read_cool_contacts_for_source_ranges_at_resolution_cancellable,
         read_cool_contacts_for_sources,
-        read_cool_contacts_for_sources_at_resolution_with_normalization, CoolIndexCacheKey,
-        CoolNormalizationCacheKey,
+        read_cool_contacts_for_sources_at_resolution_with_normalization, resolve_chrom_offsets,
+        validate_bin1_offsets, CoolIndex, CoolIndexCacheKey, CoolNormalizationCacheKey,
+        SelectedBinIndex, SourceRangeIndex,
     };
     use crate::{contact_normalization::ContactNormalization, CStudioError, CStudioResult};
 
@@ -966,7 +1256,19 @@ mod tests {
             Self::create(None, None)
         }
 
+        fn with_chrom_offsets(chrom_offsets: &[u64]) -> Self {
+            Self::create_with_chrom_offsets(None, None, Some(chrom_offsets))
+        }
+
         fn create(weight: Option<&[f64]>, divisive: Option<&[f64]>) -> Self {
+            Self::create_with_chrom_offsets(weight, divisive, None)
+        }
+
+        fn create_with_chrom_offsets(
+            weight: Option<&[f64]>,
+            divisive: Option<&[f64]>,
+            chrom_offsets: Option<&[u64]>,
+        ) -> Self {
             let id = NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "cstudio-normalization-{}-{id}.cool",
@@ -998,6 +1300,12 @@ mod tests {
                 .with_data(&[0_u64, 2, 3])
                 .create("indexes/bin1_offset")
                 .expect("write bin offsets");
+            if let Some(chrom_offsets) = chrom_offsets {
+                file.new_dataset_builder()
+                    .with_data(chrom_offsets)
+                    .create("indexes/chrom_offset")
+                    .expect("write chromosome offsets");
+            }
             file.new_dataset_builder()
                 .with_data(&[0_u64, 0, 1])
                 .create("pixels/bin1_id")
@@ -1063,6 +1371,80 @@ mod tests {
         assert!(contacts
             .iter()
             .all(|contact| contact.start1 < 100_000 && contact.start2 < 100_000));
+    }
+
+    #[test]
+    fn reads_valid_chrom_offsets_and_falls_back_when_the_dataset_is_missing() {
+        let indexed = TestCoolFile::with_chrom_offsets(&[0, 2]);
+        let fallback = TestCoolFile::without_weights();
+
+        for file in [&indexed, &fallback] {
+            let contacts = read_cool_contacts_for_sources(file.path(), &["chr1".to_string()])
+                .expect("valid or derived chromosome offsets");
+            assert_eq!(contacts.len(), 3);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_stored_chrom_offsets() {
+        let file = TestCoolFile::with_chrom_offsets(&[0, 1]);
+        let error = read_cool_contacts_for_sources(file.path(), &["chr1".to_string()])
+            .expect_err("stored chromosome offsets must cover every bin");
+
+        assert!(error.to_string().contains("indexes/chrom_offset"));
+        assert!(error.to_string().contains("bin count 2"));
+    }
+
+    #[test]
+    fn validates_and_derives_chrom_offsets() {
+        let bin_chrom_ids = [0, 0, 2];
+        assert_eq!(
+            resolve_chrom_offsets(3, &bin_chrom_ids, Some(&[0, 2, 2, 3]), &|| false)
+                .expect("valid stored offsets"),
+            vec![0, 2, 2, 3],
+        );
+        assert_eq!(
+            resolve_chrom_offsets(3, &bin_chrom_ids, None, &|| false).expect("derived offsets"),
+            vec![0, 2, 2, 3],
+        );
+
+        for malformed in [
+            &[0, 3][..],
+            &[1, 2, 3][..],
+            &[0, 2, 2][..],
+            &[0, 4, 3][..],
+            &[0, 1, 3][..],
+        ] {
+            let error = resolve_chrom_offsets(2, &[0, 0, 1], Some(malformed), &|| false)
+                .expect_err("malformed stored offsets");
+            assert!(error.to_string().contains("indexes/chrom_offset"));
+        }
+    }
+
+    #[test]
+    fn selects_half_open_boundaries_across_duplicate_chrom_names() {
+        let index = CoolIndex {
+            prefix: String::new(),
+            chrom_names: vec!["duplicate".to_string(), "duplicate".to_string()],
+            bin_chrom_ids: vec![0, 0, 1, 1],
+            chrom_offsets: vec![0, 2, 4],
+            bin_starts: vec![0, 100, 0, 100],
+            bin1_offsets: vec![0; 5],
+            bytes: 0,
+        };
+        let first = SourceRangeIndex::new(&[("duplicate".to_string(), 0, 100)]);
+        let first =
+            SelectedBinIndex::new(&index, &first, &|| false).expect("select duplicate chromosomes");
+        assert_eq!(first.ranges(), &[(0, 1), (2, 3)]);
+        assert!(first.contains(0));
+        assert!(!first.contains(1));
+        assert!(first.contains(2));
+        assert!(!first.contains(3));
+
+        let second = SourceRangeIndex::new(&[("duplicate".to_string(), 100, 101)]);
+        let second =
+            SelectedBinIndex::new(&index, &second, &|| false).expect("include the lower boundary");
+        assert_eq!(second.ranges(), &[(1, 2), (3, 4)]);
     }
 
     #[test]
@@ -1286,10 +1668,21 @@ mod tests {
 
     #[test]
     fn merges_adjacent_pixel_ranges_for_selected_bins() {
-        let selected_bins = HashSet::from([1, 2, 4]);
-        let ranges = super::pixel_ranges_for_selected_bins(&selected_bins, &[0, 5, 8, 12, 20, 25])
-            .expect("valid bin offsets");
+        let ranges =
+            pixel_ranges_for_selected_bin_ranges(&[(1, 3), (4, 5)], &[0, 5, 8, 12, 20, 25])
+                .expect("valid bin offsets");
 
         assert_eq!(ranges, vec![(5, 12), (20, 25)]);
+    }
+
+    #[test]
+    fn validates_bin1_offsets_before_merging_selected_bin_ranges() {
+        validate_bin1_offsets(&[0, 3, 3, 8], 3, &|| false).expect("valid bin offsets");
+
+        for malformed in [&[0, 3, 8][..], &[0, 5, 4, 8][..]] {
+            let error = validate_bin1_offsets(malformed, 3, &|| false)
+                .expect_err("malformed bin offsets must be rejected");
+            assert!(error.to_string().contains("indexes/bin1_offset"));
+        }
     }
 }

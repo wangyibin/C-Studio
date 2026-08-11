@@ -5,11 +5,19 @@ import { describe, expect, it } from "vitest";
 const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
 const viewportSource = readFileSync(new URL("./ContactMapViewport.tsx", import.meta.url), "utf8");
 const contextMenuSource = readFileSync(new URL("./AssemblyContextMenu.tsx", import.meta.url), "utf8");
+const inspectorSource = readFileSync(new URL("./InspectorPanel.tsx", import.meta.url), "utf8");
 const appSource = readFileSync(new URL("../App.tsx", import.meta.url), "utf8");
 const confirmedStylesStart = styles.lastIndexOf(":root {");
 const confirmedRedesignStyles = confirmedStylesStart >= 0 ? styles.slice(confirmedStylesStart) : styles;
 
 describe("confirmed contact map layout styles", () => {
+  it("provides a responsive draggable inspector column", () => {
+    expect(confirmedRedesignStyles).toContain("var(--inspector-width, 326px)");
+    expect(confirmedRedesignStyles).toContain(".inspector-resize-handle");
+    expect(confirmedRedesignStyles).toContain("cursor: col-resize;");
+    expect(confirmedRedesignStyles).toContain("touch-action: none;");
+  });
+
   it("lets the outer heatmap stage consume independent available width and height", () => {
     expect(confirmedRedesignStyles).toContain(
       "grid-template-columns: 58px minmax(0, 1fr) 42px;",
@@ -38,6 +46,18 @@ describe("confirmed contact map layout styles", () => {
     );
     expect(styles).toMatch(
       /\.coverage-chromosome-grid\s*\{[\s\S]*?pointer-events:\s*none;/,
+    );
+    expect(styles).toMatch(
+      /\.coverage-reference-line\s*\{[\s\S]*?border-top:\s*1px dashed/,
+    );
+    expect(styles).toMatch(
+      /\.coverage-reference-line\s*\{[\s\S]*?rgba\(58, 58, 60, 0\.82\)/,
+    );
+    expect(styles).toMatch(
+      /\.coverage-visibility-control\s*\{[^}]*left:\s*12px;/,
+    );
+    expect(styles).toMatch(
+      /\.coverage-scale-control\s*\{[^}]*left:\s*12px;/,
     );
     expect(styles).not.toContain(
       "repeating-linear-gradient(90deg, transparent 0 9.9%",
@@ -111,9 +131,103 @@ describe("confirmed contact map layout styles", () => {
     expect(contextMenuSource).toContain('run({ type: "clearAssemblySelection" })');
   });
 
+  it("shows and wires the curation shortcuts without direct destructive deletion", () => {
+    expect(contextMenuSource).toContain("keyboardShortcutLabels");
+    expect(contextMenuSource).toContain("<kbd>{shortcuts.rename}</kbd>");
+    expect(contextMenuSource).toContain("<kbd>{shortcuts.copy}</kbd>");
+    expect(contextMenuSource).toContain("<kbd>{shortcuts.moveToDebris}</kbd>");
+    expect(contextMenuSource).toContain("<kbd>{shortcuts.deleteContig}</kbd>");
+    expect(viewportSource).toContain("assemblyShortcutIntent");
+    expect(viewportSource).toContain('openShortcutMenu("rename")');
+    expect(viewportSource).toContain('openShortcutMenu("delete")');
+    expect(viewportSource).toContain("deleteConfirmationOpenRef.current");
+  });
+
+  it("lets context-menu rows grow with wrapped labels instead of overlapping", () => {
+    expect(styles).toMatch(
+      /\.context-menu\s*\{[^}]*grid-auto-rows:\s*minmax\(32px, auto\);[^}]*width:\s*218px;/,
+    );
+    expect(styles).toMatch(
+      /\.context-menu button\s*\{[^}]*min-height:\s*32px;[^}]*height:\s*auto;[^}]*font-size:\s*13px;[^}]*line-height:\s*1\.25;[^}]*overflow-wrap:\s*anywhere;/,
+    );
+  });
+
+  it("reflows selected chromosome contigs without hiding their names", () => {
+    expect(styles).toMatch(
+      /\.selection-group\.selected \.selection-group-list\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit, minmax\(84px, 1fr\)\);/,
+    );
+    expect(styles).toMatch(
+      /\.selection-group\.selected \.selection-contig-label\s*\{[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*normal;/,
+    );
+    expect(styles).toMatch(
+      /\.selection-group\.selected \.selection-chip\s*\{[^}]*height:\s*auto;[^}]*padding:\s*5px;/,
+    );
+  });
+
+  it("renames a chromosome inline from its inspector header", () => {
+    expect(inspectorSource).toContain("onDoubleClick={() => beginChromosomeRename(group.id)}");
+    expect(inspectorSource).toContain('aria-label={`Rename chromosome ${group.id}`}');
+    expect(inspectorSource).toContain("assemblyRenameValidationError");
+    expect(inspectorSource).toContain('onUiAction({ type: "renameAssemblySelection", name })');
+    expect(inspectorSource).toContain('if (event.key === "Escape")');
+  });
+
+  it("offers gap deletion only through the shared block-aware context menu", () => {
+    expect(contextMenuSource).toContain("hasDeletableGap");
+    expect(contextMenuSource).toContain("Delete gap / join blocks");
+    expect(contextMenuSource).toContain('run({ type: "deleteAssemblyGaps" })');
+  });
+
+  it("requires explicit confirmation before deleting selected contigs", () => {
+    expect(contextMenuSource).toContain("Delete contig…");
+    expect(contextMenuSource).toContain('role="alertdialog"');
+    expect(contextMenuSource).toContain("It will not be kept in debris");
+    expect(contextMenuSource).toContain("Only copy — none remain");
+    expect(contextMenuSource).toContain("copies removed — none remain");
+    expect(contextMenuSource).toContain("copies remain");
+    expect(contextMenuSource).toContain("Split copy · ${details.currentCopy.blocks.length} segments");
+    expect(contextMenuSource).toContain("remaining copy is split");
+    expect(contextMenuSource).toContain('run({ type: "deleteAssemblySelection" })');
+    expect(contextMenuSource).toContain("canDeleteContigs");
+  });
+
+  it("offers chromosome-boundary removal only when the selection encloses a boundary", () => {
+    expect(contextMenuSource).toContain("hasRemovableChromosomeBoundary");
+    expect(contextMenuSource).toContain("Remove chr boundaries");
+    expect(contextMenuSource).toContain('run({ type: "removeAssemblyChromosomeBoundaries" })');
+  });
+
+  it("offers an inline rename action for one selected contig or chromosome", () => {
+    expect(contextMenuSource).toContain("Rename…");
+    expect(contextMenuSource).toContain("assemblyRenameTarget");
+    expect(contextMenuSource).toContain('run({ type: "renameAssemblySelection"');
+    expect(contextMenuSource).toContain("New ${renameTarget.kind} name");
+    expect(viewportSource).toContain("isEditableShortcutTarget(event.target)");
+  });
+
   it("hides edit handles while Shift is acting as the range-selection modifier", () => {
     expect(styles).toMatch(
-      /\.shift-selection-active \.assembly-rotate-button,[\s\S]*?\.shift-selection-active \.assembly-resize-handle,[\s\S]*?\.shift-selection-active \.contig-handle,[\s\S]*?\.shift-selection-active \.assembly-insert-marker\s*\{[\s\S]*?visibility:\s*hidden;[\s\S]*?pointer-events:\s*none !important;/,
+      /\.shift-selection-active \.assembly-rotate-button,[\s\S]*?\.shift-selection-active \.assembly-resize-handle,[\s\S]*?\.shift-selection-active \.contig-handle,[\s\S]*?\.shift-selection-active \.assembly-cut-marker,[\s\S]*?\.shift-selection-active \.assembly-insert-marker\s*\{[\s\S]*?visibility:\s*hidden;[\s\S]*?pointer-events:\s*none !important;/,
     );
+  });
+
+  it("renders the insertion arrow in black", () => {
+    expect(styles).toMatch(
+      /\.assembly-insert-marker\s*\{[^}]*color:\s*#000;/,
+    );
+  });
+
+  it("renders a frameless cut marker with upper-left scissors and an exact cut point", () => {
+    expect(styles).toMatch(
+      /\.assembly-cut-marker\s*\{[^}]*background:\s*transparent;[^}]*border:\s*0;[^}]*box-shadow:\s*none;/,
+    );
+    expect(styles).toMatch(
+      /\.assembly-cut-marker > svg\s*\{[^}]*rotate\(-135deg\);/,
+    );
+    expect(styles).toMatch(
+      /\.assembly-overlay\.cut-preview-active,[\s\S]*?\.assembly-overlay\.cut-preview-active \.assembly-box\s*\{[^}]*cursor:\s*none;/,
+    );
+    expect(styles).toMatch(/\.assembly-cut-guide\s*\{[^}]*background:\s*#facc15;/);
+    expect(styles).toMatch(/\.assembly-cut-point\s*\{[^}]*background:\s*#facc15;/);
   });
 });

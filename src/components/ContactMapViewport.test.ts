@@ -1,11 +1,19 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import type { ExampleDatasetSummary } from "../App";
+import { createInitialUiState } from "../state/uiState";
 import {
+  assemblyCutTargetAtScreenPoint,
   assemblyShiftClickIntent,
+  ContactMapViewport,
   contactCanvasBackingSizeFromBounds,
   contactViewportForAxisNavigator,
   contactViewportSizePxFromBounds,
   contactWheelPanIntent,
+  historyPreviewBoxes,
 } from "./ContactMapViewport";
+import { buildAssemblyEditModel } from "../state/assemblyEditing";
 
 const bounds = {
   width: 400,
@@ -101,6 +109,51 @@ describe("contactWheelPanIntent", () => {
   });
 });
 
+describe("historyPreviewBoxes", () => {
+  it("projects affected before and after contigs into the visible heatmap", () => {
+    const beforeBlock = {
+      id: "Chr01:1:ctg1",
+      objectId: "Chr01",
+      sourceId: "ctg1",
+      sourceStart: 0,
+      sourceEnd: 100,
+      visualStart: 100,
+      visualEnd: 200,
+      orientation: "+" as const,
+    };
+    const afterBlock = {
+      ...beforeBlock,
+      visualStart: 500,
+      visualEnd: 600,
+      orientation: "-" as const,
+    };
+    const boxes = historyPreviewBoxes({
+      id: 1,
+      type: "move",
+      label: "Selection moved",
+      position: { x: 0, y: 0 },
+      beforeAssembly: { blocks: [beforeBlock], selection: null },
+      afterAssembly: { blocks: [afterBlock], selection: null },
+      impact: {
+        blockIds: [beforeBlock.id],
+        sourceIds: ["ctg1"],
+        chromosomeIds: ["Chr01"],
+        selection: null,
+      },
+    }, {
+      xStart: 0,
+      xEnd: 1_000,
+      yStart: 0,
+      yEnd: 1_000,
+    });
+
+    expect(boxes).toEqual([
+      expect.objectContaining({ phase: "before", leftPercent: 10, topPercent: 10, orientation: "+" }),
+      expect.objectContaining({ phase: "after", leftPercent: 50, topPercent: 50, orientation: "-" }),
+    ]);
+  });
+});
+
 describe("contactViewportSizePxFromBounds", () => {
   it("reports the shortest visible side for square viewport resolution decisions", () => {
     expect(contactViewportSizePxFromBounds({ width: 536, height: 640 })).toBe(536);
@@ -191,18 +244,20 @@ describe("contactCanvasBackingSizeFromBounds", () => {
 });
 
 describe("assemblyShiftClickIntent", () => {
-  it("adds a new contig or clears when the Shift-click hit is already selected", () => {
+  it("replaces selection on Shift-click and reserves multi-select for dragging", () => {
     expect(assemblyShiftClickIntent(true, { kind: "contig", id: "ctg2" })).toEqual({
       type: "select-contig",
       id: "ctg2",
-      additive: true,
+      additive: false,
     });
     expect(assemblyShiftClickIntent(true, { kind: "chromosome-boundary", id: "Chr02" })).toEqual({
       type: "select-chromosome",
       id: "Chr02",
     });
     expect(assemblyShiftClickIntent(true, { kind: "contig", id: "ctg2" }, true)).toEqual({
-      type: "clear-selection",
+      type: "select-contig",
+      id: "ctg2",
+      additive: false,
     });
   });
 
@@ -217,5 +272,146 @@ describe("assemblyShiftClickIntent", () => {
       id: "Chr02",
     });
     expect(assemblyShiftClickIntent(false, null)).toEqual({ type: "clear-selection" });
+  });
+});
+
+describe("assemblyCutTargetAtScreenPoint", () => {
+  const compactContig = {
+    id: "Chr01:1:ctg1",
+    objectId: "Chr01",
+    sourceId: "ctg1",
+    sourceStart: 0,
+    sourceEnd: 16,
+    visualStart: 10,
+    visualEnd: 26,
+    orientation: "+" as const,
+  };
+
+  it("keeps the cut affordance reachable for a selected compact contig", () => {
+    expect(assemblyCutTargetAtScreenPoint({
+      model: buildAssemblyEditModel([compactContig]),
+      selectedIds: new Set([compactContig.id]),
+      point: { x: 18, y: 18 },
+      widthPx: 100,
+      heightPx: 100,
+      viewportXStart: 0,
+      viewportXEnd: 100,
+      viewportYStart: 0,
+      viewportYEnd: 100,
+    })).toEqual({ blockId: compactContig.id, visualPosition: 18 });
+  });
+
+  it("does not expose the cut affordance outside the diagonal or for an unselected contig", () => {
+    const model = buildAssemblyEditModel([compactContig]);
+    const input = {
+      model,
+      selectedIds: new Set([compactContig.id]),
+      widthPx: 100,
+      heightPx: 100,
+      viewportXStart: 0,
+      viewportXEnd: 100,
+      viewportYStart: 0,
+      viewportYEnd: 100,
+    };
+
+    expect(assemblyCutTargetAtScreenPoint({ ...input, point: { x: 12, y: 23 } })).toBeNull();
+    expect(assemblyCutTargetAtScreenPoint({
+      ...input,
+      selectedIds: new Set(),
+      point: { x: 18, y: 18 },
+    })).toBeNull();
+  });
+});
+
+describe("assembly overlay hierarchy", () => {
+  it("renders atomic block boxes, child outlines only for composites, and a direct singleton", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.assembly.blocks = [
+      {
+        id: "Chr01:1:ctg1",
+        objectId: "Chr01",
+        sourceId: "ctg1",
+        sourceStart: 0,
+        sourceEnd: 100,
+        visualStart: 0,
+        visualEnd: 100,
+        orientation: "+",
+        assemblyBlockId: "Chr01_block_1",
+      },
+      {
+        id: "Chr01:2:ctg2",
+        objectId: "Chr01",
+        sourceId: "ctg2",
+        sourceStart: 0,
+        sourceEnd: 100,
+        visualStart: 100,
+        visualEnd: 200,
+        orientation: "+",
+        assemblyBlockId: "Chr01_block_1",
+      },
+      {
+        id: "Chr01:4:ctg3",
+        objectId: "Chr01",
+        sourceId: "ctg3",
+        sourceStart: 0,
+        sourceEnd: 100,
+        visualStart: 300,
+        visualEnd: 400,
+        orientation: "-",
+        gapBefore: {
+          componentType: "U",
+          length: 100,
+          gapType: "contig",
+          linkage: "yes",
+          linkageEvidence: "map",
+        },
+      },
+    ];
+    const dataset: ExampleDatasetSummary = {
+      agp_path: "assembly.agp",
+      mcool_path: "",
+      cool_path: "",
+      paf_path: null,
+      coverage_path: null,
+      agp_lines: 4,
+      agp_objects: 1,
+      agp_components: 3,
+      agp_gaps: 1,
+      max_object_span: 400,
+      mcool_size_bytes: 0,
+      agp_layout: { blocks: uiState.assembly.blocks, totalSpan: 400 },
+    };
+
+    const markup = renderToStaticMarkup(
+      createElement(ContactMapViewport, {
+        dataset,
+        contactMap: null,
+        coverageView: null,
+        uiState,
+        onUiAction: () => undefined,
+      }),
+    );
+
+    expect(markup.match(/composite-block-box/g)).toHaveLength(1);
+    expect(markup.match(/singleton-contig-box/g)).toHaveLength(1);
+    expect(markup.match(/contig-child-box/g)).toHaveLength(2);
+    expect(markup).toContain('data-block-id="Chr01_block_1"');
+    expect(markup).toContain('title="Chr01_block_1 · 2 contigs"');
+    expect(markup).not.toContain('data-contig-id="Chr01:4:ctg3"');
+
+    uiState.assembly.showBlockBoxes = false;
+    const contigOnlyMarkup = renderToStaticMarkup(
+      createElement(ContactMapViewport, {
+        dataset,
+        contactMap: null,
+        coverageView: null,
+        uiState,
+        onUiAction: () => undefined,
+      }),
+    );
+
+    expect(contigOnlyMarkup).not.toContain("composite-block-box");
+    expect(contigOnlyMarkup.match(/singleton-contig-box/g)).toHaveLength(1);
+    expect(contigOnlyMarkup.match(/contig-child-box/g)).toHaveLength(2);
   });
 });

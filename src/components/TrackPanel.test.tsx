@@ -8,11 +8,11 @@ import {
   buildCoverageTrackBars,
   coverageAutoScaleDomain,
   coverageBlockIdAtRatio,
-  coverageContigIdsBetween,
   coverageContigIdsInRatioRange,
   coverageRatioWindowStyle,
+  coverageReferenceDepth,
+  coverageReferenceMultiples,
   coverageSelectionIsAdditive,
-  coverageShiftClickClearsSelection,
   coverageValueHeightRatio,
   normalizeCoverageMultiplier,
   TrackPanel,
@@ -92,10 +92,19 @@ describe("TrackPanel", () => {
     expect(markup).toContain('aria-label="Coverage maximum"');
     expect(markup).toContain('aria-label="Coverage automatic multiplier"');
     expect(markup).toContain('data-scale-min="0"');
-    expect(markup).toContain('data-scale-max="60"');
-    expect(markup).toContain('data-auto-multiplier="2"');
-    expect(markup).toContain('Auto 2×');
-    expect(markup).toContain('Shift-click selects a continuous range');
+    expect(markup).toContain('data-scale-max="52.5"');
+    expect(markup).toContain('data-auto-multiplier="2.5"');
+    expect(markup).toContain('data-coverage-reference-depth="21"');
+    expect(markup).toContain('class="coverage-reference-lines"');
+    expect(markup).toContain('class="coverage-axis-labels"');
+    expect(markup).toContain('class="coverage-axis-label coverage-axis-label-1x"');
+    expect(markup).toContain('class="coverage-axis-label coverage-axis-label-2x"');
+    expect(markup).toContain('data-coverage-multiple="1"');
+    expect(markup).toContain('data-coverage-multiple="2"');
+    expect(markup).not.toContain('<small>1×</small>');
+    expect(markup).not.toContain('<small>2×</small>');
+    expect(markup).toContain('Auto 2.5×');
+    expect(markup).toContain('Shift-drag selects multiple contigs');
     expect(markup).toContain('aria-label="Select ctgA in coverage"');
     expect(markup).toContain('aria-pressed="true"');
     expect(markup).toContain('data-block-id="Chr01:1:ctgA"');
@@ -130,21 +139,73 @@ describe("TrackPanel", () => {
     ]);
   });
 
-  it("defaults to 2 times automatic headroom and accepts a custom multiplier", () => {
+  it("defaults to 2.5 times automatic headroom and accepts a custom multiplier", () => {
     const automatic = coverageAutoScaleDomain([12, 30]);
 
-    expect(automatic).toEqual({ min: 0, max: 60 });
-    expect(coverageValueHeightRatio(30, automatic)).toBeCloseTo(0.5);
-    expect(coverageAutoScaleDomain([])).toEqual({ min: 0, max: 2 });
-    expect(coverageAutoScaleDomain([12, 30], 2.5)).toEqual({ min: 0, max: 75 });
-    expect(coverageAutoScaleDomain([12, 30], 1.25)).toEqual({ min: 0, max: 37.5 });
-    expect(coverageAutoScaleDomain([12, 30], 0.5)).toEqual({ min: 0, max: 30 });
-    expect(coverageAutoScaleDomain([12, 30], Number.NaN)).toEqual({ min: 0, max: 60 });
+    expect(automatic).toEqual({ min: 0, max: 52.5 });
+    expect(coverageValueHeightRatio(21, automatic)).toBeCloseTo(0.4);
+    expect(coverageAutoScaleDomain([])).toEqual({ min: 0, max: 2.5 });
+    expect(coverageAutoScaleDomain([12, 30], 2.5)).toEqual({ min: 0, max: 52.5 });
+    expect(coverageAutoScaleDomain([12, 30], 1.25)).toEqual({ min: 0, max: 26.25 });
+    expect(coverageAutoScaleDomain([12, 30], 0.5)).toEqual({ min: 0, max: 21 });
+    expect(coverageAutoScaleDomain([12, 30], Number.NaN)).toEqual({ min: 0, max: 52.5 });
     expect(normalizeCoverageMultiplier(200)).toBe(100);
     expect(normalizeCoverageMultiplier(Number.NaN, 3)).toBe(3);
     expect(coverageValueHeightRatio(5, { min: 10, max: 20 })).toBe(0);
     expect(coverageValueHeightRatio(15, { min: 10, max: 20 })).toBe(0.5);
     expect(coverageValueHeightRatio(30, { min: 10, max: 20 })).toBe(1);
+  });
+
+  it("uses the current visible non-zero median for 1x", () => {
+    expect(coverageReferenceDepth([0, 7, 8, 9, 30])).toBe(8.5);
+    expect(coverageReferenceDepth([0, 8, 10, 30])).toBe(10);
+    expect(coverageReferenceDepth([0, Number.NaN, Number.POSITIVE_INFINITY])).toBeNull();
+  });
+
+  it("adds 3x only for a sustained high-depth signal and ignores isolated spikes", () => {
+    const normalDepth = Array.from({ length: 100 }, () => 10);
+    expect(coverageReferenceMultiples([...normalDepth, 1_000])).toEqual([1, 2]);
+
+    const threeCopyDepth = [
+      ...Array.from({ length: 90 }, () => 10),
+      ...Array.from({ length: 10 }, () => 32),
+    ];
+    expect(coverageReferenceMultiples(threeCopyDepth)).toEqual([1, 2, 3]);
+    expect(coverageAutoScaleDomain(threeCopyDepth)).toEqual({ min: 0, max: 32.5 });
+  });
+
+  it("renders the adaptive 3x line only when the visible track sustains that depth", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.assembly.blocks = [{
+      id: "Chr01:1:ctgA",
+      objectId: "Chr01",
+      sourceId: "ctgA",
+      sourceStart: 0,
+      sourceEnd: 100,
+      visualStart: 0,
+      visualEnd: 100,
+      orientation: "+",
+    }];
+    const values = [
+      ...Array.from({ length: 90 }, () => 10),
+      ...Array.from({ length: 10 }, () => 32),
+    ];
+    const markup = renderToStaticMarkup(
+      <TrackPanel
+        coverageView={{
+          resolution: 1,
+          viewport: { xStart: 0, xEnd: 100, yStart: 0, yEnd: 1 },
+          bins: values.map((value, xBin) => ({ xBin, value })),
+        }}
+        uiState={uiState}
+        onUiAction={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('class="coverage-axis-label coverage-axis-label-3x"');
+    expect(markup).toContain('class="coverage-reference-line coverage-reference-3x"');
+    expect(markup).toContain('data-coverage-multiple="3"');
+    expect(markup).not.toContain('data-coverage-multiple="4"');
   });
 
   it("projects only real chromosome boundaries into the coverage viewport", () => {
@@ -307,29 +368,14 @@ describe("TrackPanel", () => {
     )).toBe("C");
   });
 
-  it("uses Shift for ranges and Command or Control for discrete toggles", () => {
+  it("reserves Shift for drag selection and Command or Control for discrete toggles", () => {
     expect(coverageSelectionIsAdditive({ shiftKey: false, metaKey: false, ctrlKey: false })).toBe(false);
     expect(coverageSelectionIsAdditive({ shiftKey: true, metaKey: false, ctrlKey: false })).toBe(false);
     expect(coverageSelectionIsAdditive({ shiftKey: false, metaKey: true, ctrlKey: false })).toBe(true);
     expect(coverageSelectionIsAdditive({ shiftKey: false, metaKey: false, ctrlKey: true })).toBe(true);
-    expect(coverageShiftClickClearsSelection(
-      new Set(["contig-3"]),
-      "contig-3",
-      { shiftKey: true, metaKey: false, ctrlKey: false },
-    )).toBe(true);
-    expect(coverageShiftClickClearsSelection(
-      new Set(["contig-3"]),
-      "contig-4",
-      { shiftKey: true, metaKey: false, ctrlKey: false },
-    )).toBe(false);
-    expect(coverageShiftClickClearsSelection(
-      new Set(["contig-3"]),
-      "contig-3",
-      { shiftKey: true, metaKey: true, ctrlKey: false },
-    )).toBe(false);
   });
 
-  it("selects every ordered contig between two Shift-click endpoints", () => {
+  it("selects every ordered contig covered by a Shift-drag window", () => {
     const blocks = Array.from({ length: 6 }, (_, index) => ({
       id: `contig-${index + 1}`,
       objectId: "Chr01",
@@ -340,11 +386,12 @@ describe("TrackPanel", () => {
       visualEnd: (index + 1) * 10,
       orientation: "+" as const,
     }));
-    const allIds = blocks.map((block) => block.id);
-
-    expect(coverageContigIdsBetween(blocks, "contig-1", "contig-6")).toEqual(allIds);
-    expect(coverageContigIdsBetween(blocks, "contig-6", "contig-1")).toEqual(allIds);
-    expect(coverageContigIdsBetween(blocks, "missing", "contig-6")).toEqual(["contig-6"]);
+    expect(coverageContigIdsInRatioRange(
+      { xStart: 0, xEnd: 60, yStart: 0, yEnd: 1 },
+      blocks,
+      0,
+      1,
+    )).toEqual(blocks.map((block) => block.id));
   });
 
   it("selects every contig intersecting a Shift-drag window in either direction", () => {

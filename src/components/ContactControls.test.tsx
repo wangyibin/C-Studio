@@ -115,4 +115,18 @@ describe("ContactControls", () => {
     expect(markup).toContain('title="Resolution locked at 500 kb"');
   });
 
+  it("offers independent chromosome, block, and child-contig box controls", () => {
+    const uiState = createInitialUiState("ready");
+
+    const markup = renderToStaticMarkup(
+      <ContactControls uiState={uiState} onUiAction={() => undefined} onLoadExample={() => undefined} />,
+    );
+
+    expect(markup).toContain("Chromosome boxes");
+    expect(markup).toContain("Block boxes");
+    expect(markup).toContain("Contig boxes");
+    expect(markup).toContain('class="box-swatch block-swatch"');
+    expect(markup).toContain('class="box-swatch contig-swatch"');
+  });
+
 });

@@ -8,8 +8,13 @@ import {
   Redo2,
   Undo2,
 } from "lucide-react";
-import { useEffect, useRef } from "react";
-import type { RefObject } from "react";
+import { useEffect, useRef, useState } from "react";
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+  RefObject,
+} from "react";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   assemblyContigSelectionIntent,
@@ -27,6 +32,7 @@ import {
   isEditableShortcutTarget,
   juiceboxShortcutIntent,
 } from "../state/juiceboxShortcuts";
+import { keyboardShortcutLabels } from "../state/keyboardShortcutLabels";
 import { ContactMapViewport } from "./ContactMapViewport";
 import { HeatmapToolbar } from "./HeatmapToolbar";
 import { InspectorPanel } from "./InspectorPanel";
@@ -59,6 +65,26 @@ interface AppShellProps {
   statusMessage: string;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
+}
+
+export const inspectorPanelMinWidth = 260;
+export const inspectorPanelMaxWidth = 520;
+const inspectorPanelDefaultWidth = 326;
+const inspectorPanelCompactWidth = 276;
+const inspectorPanelKeyboardStep = 16;
+
+export function clampInspectorPanelWidth(width: number, workspaceWidth: number) {
+  const responsiveMaximum = Math.max(
+    inspectorPanelMinWidth,
+    Math.min(inspectorPanelMaxWidth, workspaceWidth * 0.45),
+  );
+  return Math.round(Math.min(responsiveMaximum, Math.max(inspectorPanelMinWidth, width)));
+}
+
+function defaultInspectorPanelWidth() {
+  return typeof window !== "undefined" && window.innerWidth <= 1180
+    ? inspectorPanelCompactWidth
+    : inspectorPanelDefaultWidth;
 }
 
 function fileName(path: string | undefined, fallback: string) {
@@ -94,10 +120,19 @@ export function AppShell({
   statusMessage,
   uiState,
 }: AppShellProps) {
+  const shortcuts = keyboardShortcutLabels();
+  const workspaceRef = useRef<HTMLElement>(null);
+  const inspectorResizeRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
+  const [inspectorWidth, setInspectorWidth] = useState<number | null>(null);
   const addDataMenuRef = useRef<HTMLDetailsElement>(null);
   const appMenuRef = useRef<HTMLDetailsElement>(null);
   const hiddenAssemblyOverlaysRef = useRef<{
     chromosome: boolean;
+    block: boolean;
     contig: boolean;
   } | null>(null);
   const syntenySelectionAnchorRef = useRef<string | null>(null);
@@ -131,6 +166,65 @@ export function AppShell({
       ? ` (showing ${contactNormalizationLabel(displayedContactNormalization)})`
       : "";
 
+  function workspaceWidth() {
+    return workspaceRef.current?.clientWidth
+      ?? (typeof window === "undefined" ? 1_200 : window.innerWidth);
+  }
+
+  function currentInspectorWidth() {
+    return workspaceRef.current
+      ?.querySelector<HTMLElement>(".inspector")
+      ?.getBoundingClientRect().width
+      ?? inspectorWidth
+      ?? defaultInspectorPanelWidth();
+  }
+
+  function setClampedInspectorWidth(width: number) {
+    setInspectorWidth(clampInspectorPanelWidth(width, workspaceWidth()));
+  }
+
+  function beginInspectorResize(event: ReactPointerEvent<HTMLButtonElement>) {
+    inspectorResizeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: currentInspectorWidth(),
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    document.documentElement.classList.add("inspector-resizing");
+  }
+
+  function resizeInspector(event: ReactPointerEvent<HTMLButtonElement>) {
+    const resize = inspectorResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) {
+      return;
+    }
+    setClampedInspectorWidth(resize.startWidth + resize.startX - event.clientX);
+  }
+
+  function endInspectorResize(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (inspectorResizeRef.current?.pointerId !== event.pointerId) {
+      return;
+    }
+    inspectorResizeRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    document.documentElement.classList.remove("inspector-resizing");
+  }
+
+  function handleInspectorResizeKey(event: ReactKeyboardEvent<HTMLButtonElement>) {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      setClampedInspectorWidth(currentInspectorWidth() + inspectorPanelKeyboardStep);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      setClampedInspectorWidth(currentInspectorWidth() - inspectorPanelKeyboardStep);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      setInspectorWidth(null);
+    }
+  }
+
   function selectSyntenyBlock(id: string, modifiers: SyntenySelectionModifiers) {
     const intent = assemblyContigSelectionIntent(
       activeAssemblyBlocks,
@@ -147,6 +241,11 @@ export function AppShell({
     } else {
       onUiAction({ type: "selectAssemblyContig", id: intent.id, additive: intent.additive });
     }
+  }
+
+  function selectSyntenyBlocks(ids: string[]) {
+    syntenySelectionAnchorRef.current = null;
+    onUiAction({ type: "selectAssemblyContigs", ids });
   }
 
   useEffect(() => {
@@ -189,15 +288,17 @@ export function AppShell({
         return;
       }
 
-      const { showChromosomeBoxes, showContigBoxes } = uiState.assembly;
-      if (showChromosomeBoxes || showContigBoxes) {
+      const { showChromosomeBoxes, showBlockBoxes, showContigBoxes } = uiState.assembly;
+      if (showChromosomeBoxes || showBlockBoxes || showContigBoxes) {
         hiddenAssemblyOverlaysRef.current = {
           chromosome: showChromosomeBoxes,
+          block: showBlockBoxes,
           contig: showContigBoxes,
         };
         onUiAction({
           type: "setAssemblyOverlayVisibility",
           chromosome: false,
+          block: false,
           contig: false,
         });
         return;
@@ -205,12 +306,14 @@ export function AppShell({
 
       const overlaysToRestore = hiddenAssemblyOverlaysRef.current ?? {
         chromosome: true,
+        block: true,
         contig: true,
       };
       hiddenAssemblyOverlaysRef.current = null;
       onUiAction({
         type: "setAssemblyOverlayVisibility",
         chromosome: overlaysToRestore.chromosome,
+        block: overlaysToRestore.block,
         contig: overlaysToRestore.contig,
       });
     }
@@ -218,6 +321,10 @@ export function AppShell({
     window.addEventListener("keydown", handleJuiceboxShortcut, true);
     return () => window.removeEventListener("keydown", handleJuiceboxShortcut, true);
   }, [onUiAction, uiState.assembly, uiState.operationHistory.length, uiState.redoStack.length]);
+
+  useEffect(() => () => {
+    document.documentElement.classList.remove("inspector-resizing");
+  }, []);
 
   function runAddDataAction(action: () => void) {
     addDataMenuRef.current?.removeAttribute("open");
@@ -321,8 +428,8 @@ export function AppShell({
               className="global-icon-button"
               type="button"
               aria-label="Undo"
-              aria-keyshortcuts="Control+U Meta+U"
-              title="Undo (⌘U / Ctrl+U)"
+              aria-keyshortcuts="Control+Z Meta+Z Control+U Meta+U"
+              title={`Undo (${shortcuts.undo}; Juicebox: ${shortcuts.legacyUndo})`}
               disabled={uiState.operationHistory.length === 0}
               onClick={() => onUiAction({ type: "undo" })}
             >
@@ -332,8 +439,8 @@ export function AppShell({
               className="global-icon-button"
               type="button"
               aria-label="Redo"
-              aria-keyshortcuts="Control+R Meta+R"
-              title="Redo (⌘R / Ctrl+R)"
+              aria-keyshortcuts="Meta+Shift+Z Control+Y Control+R Meta+R"
+              title={`Redo (${shortcuts.redo}; Juicebox: ${shortcuts.legacyRedo})`}
               disabled={uiState.redoStack.length === 0}
               onClick={() => onUiAction({ type: "redo" })}
             >
@@ -368,6 +475,24 @@ export function AppShell({
                 <p><span>Core</span><strong>{status.engine}</strong></p>
                 <p><span>Coordinates</span><strong>{status.coordinate_convention}</strong></p>
                 <p><span>Status</span><strong>{statusMessage}</strong></p>
+                <span className="popover-divider" aria-hidden="true" />
+                <section className="app-shortcuts" aria-label="Keyboard shortcuts">
+                  <h3>Keyboard shortcuts</h3>
+                  <dl>
+                    <div><dt>Undo</dt><dd>{shortcuts.undo}</dd></div>
+                    <div><dt>Redo</dt><dd>{shortcuts.redo}</dd></div>
+                    <div><dt>Rename</dt><dd>{shortcuts.rename}</dd></div>
+                    <div><dt>Reverse / rotate</dt><dd>{shortcuts.reverse}</dd></div>
+                    <div><dt>Copy</dt><dd>{shortcuts.copy}</dd></div>
+                    <div><dt>Move to debris</dt><dd>{shortcuts.moveToDebris}</dd></div>
+                    <div><dt>Delete gap / join</dt><dd>{shortcuts.deleteGap}</dd></div>
+                    <div><dt>Delete contig</dt><dd>{shortcuts.deleteContig}</dd></div>
+                    <div><dt>Deselect / cancel</dt><dd>Esc</dd></div>
+                    <div><dt>Toggle annotations</dt><dd>F2</dd></div>
+                    <div><dt>Toggle inspector</dt><dd>F9</dd></div>
+                    <div><dt>Open data menu</dt><dd>F10</dd></div>
+                  </dl>
+                </section>
               </div>
             </details>
           </div>
@@ -376,7 +501,13 @@ export function AppShell({
         <HeatmapToolbar uiState={uiState} onUiAction={onUiAction} totalSpanMb={totalSpanMb} />
       </header>
 
-      <section className={`workspace${uiState.layout.rightCollapsed ? " right-collapsed" : ""}`}>
+      <section
+        ref={workspaceRef}
+        className={`workspace${uiState.layout.rightCollapsed ? " right-collapsed" : ""}`}
+        style={inspectorWidth === null
+          ? undefined
+          : ({ "--inspector-width": `${inspectorWidth}px` } as CSSProperties)}
+      >
         <section className="center-workspace" aria-label="Assembly contact map workspace">
           <section className="map-stack">
             <section className={`main-view${uiState.layout.syntenySplitOpen ? " split-open" : ""}`}>
@@ -402,9 +533,11 @@ export function AppShell({
                   </div>
                   <SyntenyDotplot
                     syntenyView={syntenyView}
+                    totalSpanMb={totalSpanMb}
                     assemblyBlocks={activeAssemblyBlocks}
                     selectedAssemblyBlockIds={selectedAssemblyBlockIds}
                     onSelectBlock={selectSyntenyBlock}
+                    onSelectBlocks={selectSyntenyBlocks}
                     uiState={uiState}
                     onUiAction={onUiAction}
                   />
@@ -415,21 +548,39 @@ export function AppShell({
         </section>
 
         {uiState.layout.rightCollapsed ? null : (
-          <InspectorPanel
-            dataset={dataset}
-            contactMap={contactMap}
-            overviewContactMap={overviewContactMap}
-            status={status}
-            statusMessage={statusMessage}
-            uiState={uiState}
-            onUiAction={onUiAction}
-            syntenyView={syntenyView}
-            assemblyBlocks={activeAssemblyBlocks}
-            selectedAssemblyBlockIds={selectedAssemblyBlockIds}
-            onSelectSyntenyBlock={selectSyntenyBlock}
-            pafText={pafText}
-            onPafTextChange={onPafTextChange}
-          />
+          <>
+            <button
+              type="button"
+              className="inspector-resize-handle"
+              role="separator"
+              aria-label="Resize inspector"
+              aria-orientation="vertical"
+              aria-valuemin={inspectorPanelMinWidth}
+              aria-valuemax={inspectorPanelMaxWidth}
+              aria-valuenow={Math.round(inspectorWidth ?? defaultInspectorPanelWidth())}
+              title="Drag to resize inspector; double-click to reset"
+              onPointerDown={beginInspectorResize}
+              onPointerMove={resizeInspector}
+              onPointerUp={endInspectorResize}
+              onPointerCancel={endInspectorResize}
+              onDoubleClick={() => setInspectorWidth(null)}
+              onKeyDown={handleInspectorResizeKey}
+            />
+            <InspectorPanel
+              dataset={dataset}
+              contactMap={contactMap}
+              overviewContactMap={overviewContactMap}
+              status={status}
+              statusMessage={statusMessage}
+              uiState={uiState}
+              onUiAction={onUiAction}
+              syntenyView={syntenyView}
+              assemblyBlocks={activeAssemblyBlocks}
+              selectedAssemblyBlockIds={selectedAssemblyBlockIds}
+              pafText={pafText}
+              onPafTextChange={onPafTextChange}
+            />
+          </>
         )}
       </section>
 

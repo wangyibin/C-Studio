@@ -22,8 +22,12 @@ describe("juiceboxShortcutIntent", () => {
     expect(shortcut({ key: "F10" })).toBe("open-file-menu");
     expect(shortcut({ key: "u", metaKey: true })).toBe("undo");
     expect(shortcut({ key: "U", ctrlKey: true })).toBe("undo");
+    expect(shortcut({ key: "z", metaKey: true })).toBe("undo");
+    expect(shortcut({ key: "Z", ctrlKey: true })).toBe("undo");
     expect(shortcut({ key: "r", metaKey: true })).toBe("redo");
     expect(shortcut({ key: "R", ctrlKey: true })).toBe("redo");
+    expect(shortcut({ key: "z", metaKey: true, shiftKey: true })).toBe("redo");
+    expect(shortcut({ key: "y", ctrlKey: true })).toBe("redo");
   });
 
   it("does not consume unsupported Juicebox functions or browser text-entry keys", () => {
@@ -33,6 +37,7 @@ describe("juiceboxShortcutIntent", () => {
     expect(shortcut({ key: "u" })).toBeNull();
     expect(shortcut({ key: "r", altKey: true })).toBeNull();
     expect(shortcut({ key: "r", ctrlKey: true, shiftKey: true })).toBeNull();
+    expect(shortcut({ key: "y", metaKey: true })).toBeNull();
     expect(shortcut({ key: "F2", repeat: true })).toBeNull();
     expect(shortcut({ key: "F9", editable: true })).toBeNull();
   });

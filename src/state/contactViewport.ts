@@ -92,6 +92,37 @@ export function buildWholeGenomeContactViewport(totalSpanBp: number): ContactVie
   };
 }
 
+export function horizontalViewportDragDeltaMb(
+  deltaXPx: number,
+  widthPx: number,
+  viewport: Pick<ContactViewport, "xStart" | "xEnd">,
+) {
+  if (!Number.isFinite(deltaXPx) || !Number.isFinite(widthPx) || widthPx <= 0) {
+    return 0;
+  }
+  const spanBp = viewport.xEnd - viewport.xStart;
+  if (!Number.isFinite(spanBp) || spanBp <= 0) {
+    return 0;
+  }
+  return -(deltaXPx / widthPx) * (spanBp / 1_000_000);
+}
+
+export function horizontalViewportFocusRatio(
+  clientX: number,
+  leftPx: number,
+  widthPx: number,
+) {
+  if (
+    !Number.isFinite(clientX)
+    || !Number.isFinite(leftPx)
+    || !Number.isFinite(widthPx)
+    || widthPx <= 0
+  ) {
+    return 0.5;
+  }
+  return clamp((clientX - leftPx) / widthPx, 0, 1);
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }

@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, PointerEvent } from "react";
+import { createPortal } from "react-dom";
 
 export type GenomeAxis = "x" | "y";
 
@@ -55,6 +56,12 @@ interface AxisPointerPosition {
   clientX: number;
   clientY: number;
   currentTarget: HTMLDivElement;
+}
+
+interface HoveredGenomeSegment {
+  objectId: string;
+  clientX: number;
+  clientY: number;
 }
 
 const MB = 1_000_000;
@@ -234,6 +241,19 @@ export function centerRatioForKey(
   return clampCenterRatio(nextCenter, safeSpanRatio);
 }
 
+export function genomeSegmentAtRatio(
+  segments: readonly GenomeSegment[],
+  ratio: number,
+) {
+  const safeRatio = clamp(ratio, 0, 1);
+  return segments.find((segment, index) => (
+    safeRatio >= segment.startRatio
+    && (safeRatio < segment.endRatio || (
+      index === segments.length - 1 && safeRatio <= segment.endRatio
+    ))
+  )) ?? null;
+}
+
 function ratioFromPointer(
   event: AxisPointerPosition,
   axis: GenomeAxis,
@@ -275,6 +295,7 @@ export function GenomeAxisNavigator({
   const dragSession = useRef<DragSession | null>(null);
   const [previewCenterRatio, setPreviewCenterRatio] = useState<number | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [hoveredSegment, setHoveredSegment] = useState<HoveredGenomeSegment | null>(null);
   const displayedCenterMb = previewCenterRatio === null
     ? controlledWindow.centerMb
     : previewCenterRatio * safeTotalSpanMb;
@@ -305,12 +326,19 @@ export function GenomeAxisNavigator({
 
   function handlePointerMove(event: PointerEvent<HTMLDivElement>) {
     const drag = dragSession.current;
+    const pointerRatio = ratioFromPointer(event, axis);
     if (!drag || drag.pointerId !== event.pointerId) {
+      const segment = genomeSegmentAtRatio(segments, pointerRatio);
+      setHoveredSegment(segment ? {
+        objectId: segment.objectId,
+        clientX: event.clientX,
+        clientY: event.clientY,
+      } : null);
       return;
     }
 
     event.preventDefault();
-    const pointerRatio = ratioFromPointer(event, axis);
+    setHoveredSegment(null);
     const pointerDelta = pointerRatio - drag.startPointerRatio;
     const nextCenterRatio = clampCenterRatio(
       drag.startCenterRatio + pointerDelta,
@@ -395,9 +423,26 @@ export function GenomeAxisNavigator({
       onPointerCancel={(event) => finishPointerDrag(event, false)}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
+      onPointerLeave={() => {
+        if (!dragSession.current) {
+          setHoveredSegment(null);
+        }
+      }}
       onPointerUp={(event) => finishPointerDrag(event, true)}
       onLostPointerCapture={(event) => finishPointerDrag(event, false)}
     >
+      {hoveredSegment && !isDragging && typeof document !== "undefined"
+        ? createPortal(
+            <span
+              className={`genome-axis-hover-label axis-${axis}`}
+              aria-hidden="true"
+              style={{ left: hoveredSegment.clientX, top: hoveredSegment.clientY }}
+            >
+              {hoveredSegment.objectId}
+            </span>,
+            document.body,
+          )
+        : null}
       <svg
         className="genome-axis-rail"
         viewBox={viewBox}
@@ -427,6 +472,16 @@ export function GenomeAxisNavigator({
                 width={span}
                 height="16"
                 rx="0.7"
+                onPointerEnter={(event) => setHoveredSegment({
+                  objectId: segment.objectId,
+                  clientX: event.clientX,
+                  clientY: event.clientY,
+                })}
+                onPointerLeave={() => {
+                  if (!dragSession.current) {
+                    setHoveredSegment(null);
+                  }
+                }}
               >
                 <title>{`${segment.objectId}: ${formatMb(segment.startMb)}–${formatMb(segment.endMb)} Mb`}</title>
               </rect>
@@ -440,6 +495,16 @@ export function GenomeAxisNavigator({
                 width="16"
                 height={span}
                 rx="0.7"
+                onPointerEnter={(event) => setHoveredSegment({
+                  objectId: segment.objectId,
+                  clientX: event.clientX,
+                  clientY: event.clientY,
+                })}
+                onPointerLeave={() => {
+                  if (!dragSession.current) {
+                    setHoveredSegment(null);
+                  }
+                }}
               >
                 <title>{`${segment.objectId}: ${formatMb(segment.startMb)}–${formatMb(segment.endMb)} Mb`}</title>
               </rect>

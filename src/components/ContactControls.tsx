@@ -266,6 +266,18 @@ export function ContactControls({ onLoadExample, onUiAction, uiState }: ContactC
         <button
           className="check-row overlay-toggle-row"
           type="button"
+          aria-pressed={uiState.assembly.showBlockBoxes}
+          onClick={() => onUiAction({ type: "toggleAssemblyOverlay", overlay: "block" })}
+        >
+          <span className={`fake-check ${uiState.assembly.showBlockBoxes ? "checked" : ""}`}>
+            {uiState.assembly.showBlockBoxes ? <Check size={12} /> : null}
+          </span>
+          <span className="box-swatch block-swatch" />
+          Block boxes
+        </button>
+        <button
+          className="check-row overlay-toggle-row"
+          type="button"
           aria-pressed={uiState.assembly.showContigBoxes}
           onClick={() => onUiAction({ type: "toggleAssemblyOverlay", overlay: "contig" })}
         >

@@ -9,6 +9,7 @@ import {
   overviewRatioToViewportCenterMb,
   reduceUiState,
 } from "./uiState";
+import type { ContactMapLayoutBlock } from "./importers";
 
 describe("reduceUiState", () => {
   const assemblyBlocks = [
@@ -41,6 +42,64 @@ describe("reduceUiState", () => {
       visualStart: 250,
       visualEnd: 330,
       orientation: "+" as const,
+    },
+  ];
+
+  const structuredAssemblyBlocks: ContactMapLayoutBlock[] = [
+    {
+      id: "Chr01:1:ctgA",
+      objectId: "Chr01",
+      sourceId: "ctgA",
+      sourceStart: 0,
+      sourceEnd: 100,
+      visualStart: 0,
+      visualEnd: 100,
+      orientation: "+",
+      componentType: "W",
+      assemblyBlockId: "Chr01_block_1",
+    },
+    {
+      id: "Chr01:2:ctgB",
+      objectId: "Chr01",
+      sourceId: "ctgB",
+      sourceStart: 0,
+      sourceEnd: 50,
+      visualStart: 100,
+      visualEnd: 150,
+      orientation: "-",
+      componentType: "W",
+      assemblyBlockId: "Chr01_block_1",
+    },
+    {
+      id: "Chr01:4:ctgC",
+      objectId: "Chr01",
+      sourceId: "ctgC",
+      sourceStart: 0,
+      sourceEnd: 60,
+      visualStart: 190,
+      visualEnd: 250,
+      orientation: "+",
+      componentType: "W",
+      assemblyBlockId: null,
+      gapBefore: {
+        componentType: "U",
+        length: 40,
+        gapType: "contig",
+        linkage: "yes",
+        linkageEvidence: "map",
+      },
+    },
+    {
+      id: "Chr02:1:ctgD",
+      objectId: "Chr02",
+      sourceId: "ctgD",
+      sourceStart: 0,
+      sourceEnd: 80,
+      visualStart: 250,
+      visualEnd: 330,
+      orientation: "+",
+      componentType: "W",
+      assemblyBlockId: null,
     },
   ];
 
@@ -121,6 +180,79 @@ describe("reduceUiState", () => {
     expect(state.redoStack).toEqual([]);
   });
 
+  it("deletes selected contigs through undoable assembly history", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:2:ctg2",
+      additive: false,
+    });
+    state = reduceUiState(state, { type: "deleteAssemblySelection" });
+
+    expect(state.assembly.blocks.map((block) => block.id)).toEqual([
+      "Chr01:1:ctg1",
+      "Chr02:1:ctg3",
+    ]);
+    expect(state.assembly.selection).toBeNull();
+    expect(state.operationHistory[state.operationHistory.length - 1]).toMatchObject({
+      type: "delete_contig",
+      label: "1 contig deleted",
+    });
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks).toHaveLength(3);
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01:2:ctg2"],
+    });
+
+    state = reduceUiState(state, { type: "redo" });
+    expect(state.assembly.blocks.map((block) => block.id)).toEqual([
+      "Chr01:1:ctg1",
+      "Chr02:1:ctg3",
+    ]);
+  });
+
+  it("renames contigs and chromosomes through undoable assembly history", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:1:ctg1",
+      additive: false,
+    });
+    state = reduceUiState(state, {
+      type: "renameAssemblySelection",
+      name: "contig_alpha",
+    });
+
+    expect(state.assembly.blocks[0]).toMatchObject({
+      sourceId: "ctg1",
+      displayName: "contig_alpha",
+    });
+    expect(state.operationHistory[state.operationHistory.length - 1]).toMatchObject({
+      type: "rename",
+      label: "Contig renamed to contig_alpha",
+    });
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks[0]?.displayName).toBeUndefined();
+    state = reduceUiState(state, { type: "redo" });
+    expect(state.assembly.blocks[0]?.displayName).toBe("contig_alpha");
+
+    state = reduceUiState(state, { type: "selectAssemblyChromosome", id: "Chr01" });
+    state = reduceUiState(state, {
+      type: "renameAssemblySelection",
+      name: "ChrA",
+    });
+    expect(state.assembly.blocks.slice(0, 2).map((block) => block.objectId)).toEqual([
+      "ChrA",
+      "ChrA",
+    ]);
+    expect(state.assembly.selection).toEqual({ kind: "chromosome", id: "ChrA" });
+  });
+
   it("toggles tracks, resizes AGP blocks, and collapses panels", () => {
     let state = createInitialUiState("Browser preview mode");
 
@@ -167,6 +299,43 @@ describe("reduceUiState", () => {
     expect(state.contact.viewportCenterMb).toBe(125);
     expect(state.contact.colormap).toBe("Viridis");
     expect(state.contact.colorScale).toEqual({ log: true, min: 0.05, max: 250, auto: true });
+  });
+
+  it("pans to X and Y contigs without changing zoom and selects both contigs", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = {
+      ...state,
+      contact: {
+        ...state.contact,
+        viewportSpanMb: 80,
+        resolution: "250 kb",
+        colorScale: { log: true, min: 0.1, max: 40, auto: false },
+      },
+    };
+
+    state = reduceUiState(state, {
+      type: "jumpContactViewportToRegions",
+      xCenterBp: 50_000_000,
+      yCenterBp: 150_000_000,
+      selectedBlockIds: ["Chr01:1:ctg1", "Chr02:1:ctg3"],
+      totalSpanMb: 200,
+      label: "X ctgA; Y ctgB:0-20000000",
+    });
+
+    expect(state.contact.viewportCenterXMb).toBe(50);
+    expect(state.contact.viewportCenterYMb).toBe(150);
+    expect(state.contact.viewportCenterMb).toBe(100);
+    expect(state.contact.viewportSpanMb).toBe(80);
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.colorScale).toEqual({ log: true, min: 0.1, max: 40, auto: false });
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01:1:ctg1", "Chr02:1:ctg3"],
+    });
+    expect(state.logEntries[state.logEntries.length - 1]?.message).toBe(
+      "Contact viewport jumped to X ctgA; Y ctgB:0-20000000",
+    );
   });
 
   it("uses the dynamic fitted level for the whole map", () => {
@@ -968,7 +1137,39 @@ describe("reduceUiState", () => {
     expect(state.assembly.blocks).toEqual(assemblyBlocks);
     expect(state.assembly.selection).toEqual({ kind: "contigs", ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"] });
     expect(state.assembly.showChromosomeBoxes).toBe(true);
+    expect(state.assembly.showBlockBoxes).toBe(true);
     expect(state.assembly.showContigBoxes).toBe(true);
+  });
+
+  it("maps child-contig selection onto its parent assembly block", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: structuredAssemblyBlocks });
+
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:2:ctgB",
+      additive: false,
+    });
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01_block_1"],
+    });
+
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:1:ctgA",
+      additive: true,
+    });
+    expect(state.assembly.selection).toBeNull();
+
+    state = reduceUiState(state, {
+      type: "selectAssemblyContigs",
+      ids: ["Chr01:1:ctgA", "Chr01:2:ctgB", "Chr01:4:ctgC"],
+    });
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01_block_1", "Chr01:4:ctgC"],
+    });
   });
 
   it("expands a selected chromosome before additively toggling contigs", () => {
@@ -1016,42 +1217,55 @@ describe("reduceUiState", () => {
     expect(state.assembly.selection).toBeNull();
   });
 
-  it("toggles chromosome and contig heatmap boxes independently", () => {
+  it("toggles chromosome, block, and contig heatmap boxes independently", () => {
     let state = createInitialUiState("Browser preview mode");
 
     state = reduceUiState(state, { type: "toggleAssemblyOverlay", overlay: "chromosome" });
     expect(state.assembly.showChromosomeBoxes).toBe(false);
+    expect(state.assembly.showBlockBoxes).toBe(true);
+    expect(state.assembly.showContigBoxes).toBe(true);
+
+    state = reduceUiState(state, { type: "toggleAssemblyOverlay", overlay: "block" });
+    expect(state.assembly.showChromosomeBoxes).toBe(false);
+    expect(state.assembly.showBlockBoxes).toBe(false);
     expect(state.assembly.showContigBoxes).toBe(true);
 
     state = reduceUiState(state, { type: "toggleAssemblyOverlay", overlay: "contig" });
     expect(state.assembly.showChromosomeBoxes).toBe(false);
+    expect(state.assembly.showBlockBoxes).toBe(false);
     expect(state.assembly.showContigBoxes).toBe(false);
 
     state = reduceUiState(state, { type: "toggleAssemblyOverlay", overlay: "chromosome" });
     expect(state.assembly.showChromosomeBoxes).toBe(true);
+    expect(state.assembly.showBlockBoxes).toBe(false);
     expect(state.assembly.showContigBoxes).toBe(false);
   });
 
-  it("sets both heatmap annotation layers together for the F2 shortcut", () => {
+  it("sets all heatmap annotation layers together for the F2 shortcut", () => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, { type: "toggleAssemblyOverlay", overlay: "contig" });
     expect(state.assembly.showChromosomeBoxes).toBe(true);
+    expect(state.assembly.showBlockBoxes).toBe(true);
     expect(state.assembly.showContigBoxes).toBe(false);
 
     state = reduceUiState(state, {
       type: "setAssemblyOverlayVisibility",
       chromosome: false,
+      block: false,
       contig: false,
     });
     expect(state.assembly.showChromosomeBoxes).toBe(false);
+    expect(state.assembly.showBlockBoxes).toBe(false);
     expect(state.assembly.showContigBoxes).toBe(false);
 
     state = reduceUiState(state, {
       type: "setAssemblyOverlayVisibility",
       chromosome: true,
+      block: true,
       contig: false,
     });
     expect(state.assembly.showChromosomeBoxes).toBe(true);
+    expect(state.assembly.showBlockBoxes).toBe(true);
     expect(state.assembly.showContigBoxes).toBe(false);
   });
 
@@ -1181,6 +1395,42 @@ describe("reduceUiState", () => {
     expect(state.assembly.selection).toBeNull();
   });
 
+  it("keeps a split segment selected precisely and copies only that interval", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setAssemblyBlocks",
+      blocks: structuredAssemblyBlocks,
+    });
+    state = reduceUiState(state, {
+      type: "splitAssemblyContig",
+      blockId: "Chr01:2:ctgB",
+      visualPosition: 125,
+    });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:2:ctgB:left",
+      additive: false,
+    });
+
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01:2:ctgB:left"],
+    });
+
+    state = reduceUiState(state, { type: "copyAssemblySelection" });
+
+    expect(state.assembly.blocks.filter((block) => block.sourceId === "ctgA")).toHaveLength(1);
+    expect(state.assembly.blocks.filter((block) => (
+      block.sourceId === "ctgB" && block.sourceStart === 25 && block.sourceEnd === 50
+    ))).toHaveLength(2);
+    expect(state.assembly.blocks.filter((block) => (
+      block.sourceId === "ctgB" && block.sourceStart === 0 && block.sourceEnd === 25
+    ))).toHaveLength(1);
+    expect(state.assembly.blocks.filter((block) => (
+      block.displayName === "ctgB:26-50"
+    ))).toHaveLength(2);
+  });
+
   it("copies the selected contig before a coverage target and exits selection", () => {
     let state = createInitialUiState("Browser preview mode");
 
@@ -1231,6 +1481,26 @@ describe("reduceUiState", () => {
     ]);
     expect(state.assembly.selection).toBeNull();
     expect(state.logEntries[state.logEntries.length - 1]?.message).toBe("Chromosome boundaries added");
+  });
+
+  it("removes a chromosome boundary enclosed by the selected blocks", () => {
+    let state = createInitialUiState("Browser preview mode");
+
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, { type: "selectAssemblyContig", id: "Chr01:2:ctg2", additive: false });
+    state = reduceUiState(state, { type: "selectAssemblyContig", id: "Chr02:1:ctg3", additive: true });
+    state = reduceUiState(state, { type: "removeAssemblyChromosomeBoundaries" });
+
+    expect(state.assembly.blocks.map((block) => block.objectId)).toEqual([
+      "Chr01",
+      "Chr01",
+      "Chr01",
+    ]);
+    expect(state.assembly.selection).toBeNull();
+    expect(state.operationHistory[state.operationHistory.length - 1]).toMatchObject({
+      type: "remove_chr_boundaries",
+      label: "Chromosome boundaries removed",
+    });
   });
 
   it("records and restores a three-way chromosome boundary split", () => {
@@ -1316,11 +1586,87 @@ describe("reduceUiState", () => {
 
     expect(state.assembly.blocks.map((block) => [block.id, block.sourceStart, block.sourceEnd])).toEqual([
       ["Chr01:1:ctg1", 0, 100],
-      ["Chr01:2:ctg2:left", 0, 75],
-      ["Chr01:2:ctg2:right", 75, 150],
+      ["Chr01:2:ctg2:left", 75, 150],
+      ["Chr01:2:ctg2:right", 0, 75],
       ["Chr02:1:ctg3", 0, 80],
     ]);
+    expect(state.assembly.blocks[2]?.gapBefore).toEqual({
+      componentType: "U",
+      length: 100,
+      gapType: "contig",
+      linkage: "no",
+      linkageEvidence: "na",
+    });
     expect(state.assembly.selection).toBeNull();
+
+    const liveGap = state.assembly.blocks[2]?.gapBefore;
+    expect(liveGap).toBeDefined();
+    if (liveGap) {
+      liveGap.length = 999;
+    }
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks).toEqual(assemblyBlocks);
+
+    state = reduceUiState(state, { type: "redo" });
+    expect(state.assembly.blocks[2]?.gapBefore?.length).toBe(100);
+  });
+
+  it("deletes a selected gap, merges blocks, and restores cloned gap metadata on undo", () => {
+    const imported = structuredAssemblyBlocks.map((block) => ({
+      ...block,
+      gapBefore: block.gapBefore ? { ...block.gapBefore } : undefined,
+    }));
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: imported });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:2:ctgB",
+      additive: false,
+    });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:4:ctgC",
+      additive: true,
+    });
+
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01_block_1", "Chr01:4:ctgC"],
+    });
+    state = reduceUiState(state, { type: "deleteAssemblyGaps" });
+
+    expect(state.assembly.blocks[2]?.gapBefore).toBeUndefined();
+    expect(state.assembly.blocks.slice(0, 3).map((block) => block.assemblyBlockId)).toEqual([
+      "Chr01_block_1",
+      "Chr01_block_1",
+      "Chr01_block_1",
+    ]);
+    expect(state.assembly.selection).toBeNull();
+    expect(state.operationHistory[state.operationHistory.length - 1]).toMatchObject({
+      label: "Gap deleted; blocks joined",
+    });
+
+    const importedGap = imported[2]?.gapBefore;
+    expect(importedGap).toBeDefined();
+    if (importedGap) {
+      importedGap.length = 999;
+    }
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks[2]?.gapBefore?.length).toBe(40);
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01_block_1", "Chr01:4:ctgC"],
+    });
+
+    state = reduceUiState(state, { type: "redo" });
+    expect(state.assembly.blocks[2]?.gapBefore).toBeUndefined();
+    expect(state.assembly.blocks.slice(0, 3).map((block) => block.assemblyBlockId)).toEqual([
+      "Chr01_block_1",
+      "Chr01_block_1",
+      "Chr01_block_1",
+    ]);
   });
 
   it("keeps the selection when an edit cannot be applied", () => {
@@ -1336,7 +1682,10 @@ describe("reduceUiState", () => {
     });
 
     expect(state).toBe(beforeInvalidSplit);
-    expect(state.assembly.selection).toEqual({ kind: "contigs", ids: ["Chr01:2:ctg2"] });
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01:2:ctg2"],
+    });
     expect(state.operationHistory).toHaveLength(0);
   });
 
@@ -1372,5 +1721,123 @@ describe("reduceUiState", () => {
       "Chr02:1:ctg3",
     ]);
     expect(state.assembly.selection).toBeNull();
+  });
+
+  it("records affected chromosomes and contigs for history entries", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContigs",
+      ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"],
+    });
+    state = reduceUiState(state, { type: "reverseAssemblySelection" });
+
+    expect(state.operationHistory[0]?.impact).toEqual({
+      blockIds: ["Chr01:1:ctg1", "Chr01:2:ctg2"],
+      sourceIds: ["ctg1", "ctg2"],
+      chromosomeIds: ["Chr01"],
+      selection: { kind: "contigs", ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"] },
+    });
+  });
+
+  it("focuses a history object without changing the current resolution or span", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:2:ctg2",
+      additive: false,
+    });
+    state = reduceUiState(state, { type: "reverseAssemblySelection" });
+    const historyId = state.operationHistory[0]?.id ?? -1;
+    const resolution = state.contact.resolution;
+    const viewportSpanMb = state.contact.viewportSpanMb;
+
+    state = reduceUiState(state, { type: "focusHistoryOperation", id: historyId });
+
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01:2:ctg2"],
+      exact: true,
+    });
+    expect(state.contact.viewportCenterXMb).toBeCloseTo(0.000175);
+    expect(state.contact.viewportCenterYMb).toBeCloseTo(0.000175);
+    expect(state.contact.resolution).toBe(resolution);
+    expect(state.contact.viewportSpanMb).toBe(viewportSpanMb);
+  });
+
+  it("undoes directly to a chosen history entry and keeps later entries as a gray redo branch", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, { type: "selectAssemblyContig", id: "Chr01:1:ctg1", additive: false });
+    state = reduceUiState(state, { type: "reverseAssemblySelection" });
+    const targetId = state.operationHistory[0]?.id ?? -1;
+    const targetBlocks = state.assembly.blocks;
+    state = reduceUiState(state, { type: "selectAssemblyContig", id: "Chr01:2:ctg2", additive: false });
+    state = reduceUiState(state, { type: "copyAssemblySelection" });
+    state = reduceUiState(state, { type: "selectAssemblyContig", id: "Chr02:1:ctg3", additive: false });
+    state = reduceUiState(state, { type: "reverseAssemblySelection" });
+
+    state = reduceUiState(state, { type: "undoToHistoryOperation", id: targetId });
+
+    expect(state.assembly.blocks).toEqual(targetBlocks);
+    expect(state.operationHistory.map((operation) => operation.id)).toEqual([targetId]);
+    expect(state.redoStack.map((operation) => operation.label)).toEqual([
+      "Selection reversed",
+      "Selection copied",
+    ]);
+
+    state = reduceUiState(state, { type: "redo" });
+    expect(state.operationHistory.map((operation) => operation.label)).toEqual([
+      "Selection reversed",
+      "Selection copied",
+    ]);
+  });
+
+  it("sets and clears the hovered history preview", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "previewHistoryOperation", id: 7 });
+    expect(state.historyPreviewOperationId).toBe(7);
+    state = reduceUiState(state, { type: "previewHistoryOperation", id: null });
+    expect(state.historyPreviewOperationId).toBeNull();
+  });
+
+  it("starts a fresh undo history when a new assembly is loaded", () => {
+    let state = createInitialUiState("Browser preview mode");
+    const nextAssembly = [{
+      ...assemblyBlocks[0],
+      id: "ChrNew:1:new-contig",
+      objectId: "ChrNew",
+      sourceId: "new-contig",
+    }];
+
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:1:ctg1",
+      additive: false,
+    });
+    state = reduceUiState(state, { type: "copyAssemblySelection" });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:2:ctg2",
+      additive: false,
+    });
+    state = reduceUiState(state, { type: "reverseAssemblySelection" });
+    state = reduceUiState(state, { type: "undo" });
+
+    expect(state.operationHistory).toHaveLength(1);
+    expect(state.redoStack).toHaveLength(1);
+    expect(state.assembly.selection).not.toBeNull();
+
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: nextAssembly });
+
+    expect(state.assembly.blocks).toEqual(nextAssembly);
+    expect(state.assembly.selection).toBeNull();
+    expect(state.operationHistory).toEqual([]);
+    expect(state.redoStack).toEqual([]);
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks).toEqual(nextAssembly);
   });
 });

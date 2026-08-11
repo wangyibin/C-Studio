@@ -1,0 +1,54 @@
+export type DesktopShortcutPlatform = "mac" | "windows";
+
+export interface KeyboardShortcutLabels {
+  undo: string;
+  redo: string;
+  legacyUndo: string;
+  legacyRedo: string;
+  rename: string;
+  reverse: string;
+  copy: string;
+  moveToDebris: string;
+  deleteGap: string;
+  deleteContig: string;
+}
+
+export function detectDesktopShortcutPlatform(
+  platform = typeof navigator === "undefined"
+    ? ""
+    : `${navigator.platform} ${navigator.userAgent}`,
+): DesktopShortcutPlatform {
+  return /Mac|iPhone|iPad|iPod/i.test(platform) ? "mac" : "windows";
+}
+
+export function keyboardShortcutLabels(
+  platform = detectDesktopShortcutPlatform(),
+): KeyboardShortcutLabels {
+  if (platform === "mac") {
+    return {
+      undo: "⌘Z",
+      redo: "⇧⌘Z",
+      legacyUndo: "⌘U",
+      legacyRedo: "⌘R",
+      rename: "⌘E",
+      reverse: "⇧⌘R",
+      copy: "⌘D",
+      moveToDebris: "⇧⌘D",
+      deleteGap: "⌘J",
+      deleteContig: "⇧⌫",
+    };
+  }
+
+  return {
+    undo: "Ctrl+Z",
+    redo: "Ctrl+Y",
+    legacyUndo: "Ctrl+U",
+    legacyRedo: "Ctrl+R",
+    rename: "Ctrl+E",
+    reverse: "Ctrl+Shift+R",
+    copy: "Ctrl+D",
+    moveToDebris: "Ctrl+Shift+D",
+    deleteGap: "Ctrl+J",
+    deleteContig: "Shift+Del",
+  };
+}

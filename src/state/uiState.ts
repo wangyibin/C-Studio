@@ -1,9 +1,15 @@
 import {
   addChromosomeBoundariesToSelection,
+  assemblyUnitIdForContig,
   copySelection,
   copySelectionBefore,
+  deleteContigSelection,
+  deleteGapsBetweenSelection,
   moveSelectionBefore,
   moveSelectionToDebris,
+  removeChromosomeBoundariesFromSelection,
+  assemblyRenameTarget,
+  renameAssemblySelection,
   reverseSelection,
   selectChromosome,
   selectContig,
@@ -49,11 +55,17 @@ export type Normalization =
   | "VC_SQRT";
 export type ContactNormalization = "raw" | "ice" | "kr" | "vc" | "vc_sqrt";
 export type ContextOperationType =
+  | "delete_contig"
   | "move_to_debris"
   | "remove_chr_boundaries"
   | "add_chr_boundaries"
   | "copy_new"
-  | "copy_to_group";
+  | "copy_to_group"
+  | "reverse"
+  | "move"
+  | "split_contig"
+  | "delete_gap"
+  | "rename";
 
 export interface LogEntry {
   time: string;
@@ -62,6 +74,13 @@ export interface LogEntry {
 
 export interface AssemblyHistorySnapshot {
   blocks: ContactMapLayoutBlock[];
+  selection: AssemblySelection | null;
+}
+
+export interface OperationImpact {
+  blockIds: string[];
+  sourceIds: string[];
+  chromosomeIds: string[];
   selection: AssemblySelection | null;
 }
 
@@ -75,6 +94,7 @@ export interface OperationRecord {
   };
   beforeAssembly?: AssemblyHistorySnapshot;
   afterAssembly?: AssemblyHistorySnapshot;
+  impact?: OperationImpact;
 }
 
 export type TrackId = "coverage" | "agp";
@@ -94,6 +114,7 @@ export interface UiState {
   operationHistory: OperationRecord[];
   redoStack: OperationRecord[];
   nextOperationId: number;
+  historyPreviewOperationId: number | null;
   tracks: {
     coverageVisible: boolean;
     agpVisible: boolean;
@@ -125,6 +146,7 @@ export interface UiState {
     blocks: ContactMapLayoutBlock[];
     selection: AssemblySelection | null;
     showChromosomeBoxes: boolean;
+    showBlockBoxes: boolean;
     showContigBoxes: boolean;
   };
 }
@@ -145,6 +167,9 @@ export type UiAction =
     }
   | { type: "undo" }
   | { type: "redo" }
+  | { type: "undoToHistoryOperation"; id: number }
+  | { type: "focusHistoryOperation"; id: number }
+  | { type: "previewHistoryOperation"; id: number | null }
   | { type: "toggleTrackVisibility"; track: TrackId }
   | { type: "setAgpBlockWidth"; index: number; width: number }
   | { type: "toggleLayoutPanel"; panel: LayoutPanel }
@@ -161,6 +186,14 @@ export type UiAction =
     }
   | { type: "setContactJumpTarget"; valueMb: number }
   | { type: "jumpContactViewport" }
+  | {
+      type: "jumpContactViewportToRegions";
+      xCenterBp: number;
+      yCenterBp: number;
+      selectedBlockIds: string[];
+      totalSpanMb: number;
+      label: string;
+    }
   | { type: "panContactViewport"; deltaMb?: number; deltaXMb?: number; deltaYMb?: number }
   | {
       type: "zoomContactViewport";
@@ -190,8 +223,8 @@ export type UiAction =
   | { type: "resetColorScaleAuto" }
   | { type: "toggleColorScaleLog" }
   | { type: "setAssemblyBlocks"; blocks: ContactMapLayoutBlock[] }
-  | { type: "toggleAssemblyOverlay"; overlay: "chromosome" | "contig" }
-  | { type: "setAssemblyOverlayVisibility"; chromosome: boolean; contig: boolean }
+  | { type: "toggleAssemblyOverlay"; overlay: "chromosome" | "block" | "contig" }
+  | { type: "setAssemblyOverlayVisibility"; chromosome: boolean; block?: boolean; contig: boolean }
   | { type: "selectAssemblyContig"; id: string; additive: boolean }
   | { type: "selectAssemblyContigs"; ids: string[] }
   | { type: "selectAssemblyChromosome"; id: string }
@@ -199,11 +232,15 @@ export type UiAction =
   | { type: "reverseAssemblySelection" }
   | { type: "moveAssemblySelectionBefore"; targetBlockId: string | null }
   | { type: "moveAssemblySelectionToDebris" }
+  | { type: "deleteAssemblySelection" }
   | { type: "addAssemblyChromosomeBoundaries" }
+  | { type: "removeAssemblyChromosomeBoundaries" }
   | { type: "copyAssemblySelection" }
   | { type: "copyAssemblySelectionBefore"; targetBlockId: string }
   | { type: "copyAssemblyContig"; id: string }
   | { type: "splitAssemblyContig"; blockId: string; visualPosition: number }
+  | { type: "deleteAssemblyGaps" }
+  | { type: "renameAssemblySelection"; name: string }
   | { type: "appendLog"; message: string };
 
 export const resolutions: Resolution[] = ["10 kb", "25 kb", "50 kb", "100 kb"];
@@ -291,6 +328,7 @@ export function createInitialUiState(initialMessage: string): UiState {
     operationHistory: [],
     redoStack: [],
     nextOperationId: 1,
+    historyPreviewOperationId: null,
     tracks: {
       coverageVisible: true,
       agpVisible: true,
@@ -327,6 +365,7 @@ export function createInitialUiState(initialMessage: string): UiState {
       blocks: [],
       selection: null,
       showChromosomeBoxes: true,
+      showBlockBoxes: true,
       showContigBoxes: true,
     },
   };
@@ -385,6 +424,7 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           ...state,
           operationHistory: state.operationHistory.slice(0, -1),
           redoStack: [...state.redoStack, operation],
+          historyPreviewOperationId: null,
           assembly: operation.beforeAssembly
             ? {
                 ...state.assembly,
@@ -407,6 +447,7 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           ...state,
           operationHistory: [...state.operationHistory, operation],
           redoStack: state.redoStack.slice(0, -1),
+          historyPreviewOperationId: null,
           assembly: operation.afterAssembly
             ? {
                 ...state.assembly,
@@ -418,6 +459,58 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         `Redo: ${operation.label}`,
       );
     }
+    case "undoToHistoryOperation": {
+      const operationIndex = state.operationHistory.findIndex((operation) => operation.id === action.id);
+      if (operationIndex < 0 || operationIndex === state.operationHistory.length - 1) {
+        return state;
+      }
+
+      const operation = state.operationHistory[operationIndex];
+      const operationsToUndo = state.operationHistory.slice(operationIndex + 1);
+      return withLog(
+        {
+          ...state,
+          operationHistory: state.operationHistory.slice(0, operationIndex + 1),
+          redoStack: [...state.redoStack, ...operationsToUndo.reverse()],
+          historyPreviewOperationId: null,
+          assembly: operation.afterAssembly
+            ? {
+                ...state.assembly,
+                blocks: operation.afterAssembly.blocks,
+                selection: operation.afterAssembly.selection,
+              }
+            : state.assembly,
+        },
+        `Undo to: ${operation.label}`,
+      );
+    }
+    case "focusHistoryOperation": {
+      const operation = [...state.operationHistory, ...state.redoStack]
+        .find((candidate) => candidate.id === action.id);
+      const focus = operation ? historyOperationFocus(state.assembly.blocks, operation) : null;
+      if (!focus) {
+        return state;
+      }
+
+      return {
+        ...state,
+        contact: {
+          ...state.contact,
+          viewportCenterMb: focus.centerMb,
+          viewportCenterXMb: focus.centerMb,
+          viewportCenterYMb: focus.centerMb,
+          jumpTargetMb: focus.centerMb,
+        },
+        assembly: {
+          ...state.assembly,
+          selection: focus.selection,
+        },
+      };
+    }
+    case "previewHistoryOperation":
+      return state.historyPreviewOperationId === action.id
+        ? state
+        : { ...state, historyPreviewOperationId: action.id };
     case "toggleTrackVisibility": {
       const key = action.track === "coverage" ? "coverageVisible" : "agpVisible";
       const visible = !state.tracks[key];
@@ -616,6 +709,56 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         },
         `Contact viewport jumped to ${state.contact.jumpTargetMb} Mb`,
       );
+    case "jumpContactViewportToRegions": {
+      const totalSpanMb = sanitizeContactTotalSpanMb(action.totalSpanMb);
+      const viewportWidthPx = sanitizeContactViewportSizePx(state.contact.viewportWidthPx);
+      const viewportHeightPx = sanitizeContactViewportSizePx(state.contact.viewportHeightPx);
+      const viewportSpanMb = Number.isFinite(state.contact.viewportSpanMb)
+        ? Math.max(0.000001, state.contact.viewportSpanMb)
+        : totalSpanMb;
+      const axisSpans = contactViewportAxisSpansMb(
+        viewportSpanMb,
+        totalSpanMb,
+        viewportWidthPx,
+        viewportHeightPx,
+      );
+      const viewportCenterXMb = clampContactViewportCenter(
+        action.xCenterBp / 1_000_000,
+        axisSpans.xSpanMb,
+        totalSpanMb,
+      );
+      const viewportCenterYMb = clampContactViewportCenter(
+        action.yCenterBp / 1_000_000,
+        axisSpans.ySpanMb,
+        totalSpanMb,
+      );
+      const viewportCenterMb = roundContactViewportMb(
+        (viewportCenterXMb + viewportCenterYMb) / 2,
+      );
+      const selectedUnitIds = [...new Set(action.selectedBlockIds.map((id) => (
+        assemblyUnitIdForContig(state.assembly.blocks, id)
+      )))];
+
+      return withLog(
+        {
+          ...state,
+          assembly: {
+            ...state.assembly,
+            selection: selectContigs(selectedUnitIds),
+          },
+          contact: {
+            ...state.contact,
+            totalSpanMb,
+            viewportSpanMb,
+            viewportCenterMb,
+            viewportCenterXMb,
+            viewportCenterYMb,
+            jumpTargetMb: viewportCenterXMb,
+          },
+        },
+        `Contact viewport jumped to ${action.label}`,
+      );
+    }
     case "panContactViewport": {
       const deltaXMb = action.deltaXMb ?? action.deltaMb ?? 0;
       const deltaYMb = action.deltaYMb ?? action.deltaMb ?? 0;
@@ -1033,13 +1176,21 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
     case "setAssemblyBlocks":
       return {
         ...state,
+        operationHistory: [],
+        redoStack: [],
+        historyPreviewOperationId: null,
         assembly: {
           ...state.assembly,
           blocks: action.blocks,
+          selection: null,
         },
       };
     case "toggleAssemblyOverlay": {
-      const key = action.overlay === "chromosome" ? "showChromosomeBoxes" : "showContigBoxes";
+      const key = action.overlay === "chromosome"
+        ? "showChromosomeBoxes"
+        : action.overlay === "block"
+          ? "showBlockBoxes"
+          : "showContigBoxes";
       const visible = !state.assembly[key];
       return withLog(
         {
@@ -1053,8 +1204,10 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
       );
     }
     case "setAssemblyOverlayVisibility": {
+      const blockVisible = action.block ?? action.contig;
       if (
         state.assembly.showChromosomeBoxes === action.chromosome
+        && state.assembly.showBlockBoxes === blockVisible
         && state.assembly.showContigBoxes === action.contig
       ) {
         return state;
@@ -1065,21 +1218,29 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           assembly: {
             ...state.assembly,
             showChromosomeBoxes: action.chromosome,
+            showBlockBoxes: blockVisible,
             showContigBoxes: action.contig,
           },
         },
-        `Heatmap annotations ${action.chromosome || action.contig ? "shown" : "hidden"}`,
+        `Heatmap annotations ${action.chromosome || blockVisible || action.contig ? "shown" : "hidden"}`,
       );
     }
     case "selectAssemblyContig": {
+      const unitId = assemblyUnitIdForContig(state.assembly.blocks, action.id);
       const priorSelection = action.additive && state.assembly.selection?.kind === "chromosome"
-        ? { kind: "contigs" as const, ids: selectedBlockIds(state.assembly.blocks, state.assembly.selection) }
+        ? {
+            kind: "contigs" as const,
+            ids: [...new Set(
+              selectedBlockIds(state.assembly.blocks, state.assembly.selection)
+                .map((id) => assemblyUnitIdForContig(state.assembly.blocks, id)),
+            )],
+          }
         : state.assembly.selection;
       return {
         ...state,
         assembly: {
           ...state.assembly,
-          selection: selectContig(priorSelection, action.id, action.additive),
+          selection: selectContig(priorSelection, unitId, action.additive),
         },
       };
     }
@@ -1088,7 +1249,9 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         ...state,
         assembly: {
           ...state.assembly,
-          selection: selectContigs(action.ids),
+          selection: selectContigs(action.ids.map((id) => (
+            assemblyUnitIdForContig(state.assembly.blocks, id)
+          ))),
         },
       };
     case "selectAssemblyChromosome":
@@ -1115,7 +1278,7 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           selection: null,
         },
         "Selection reversed",
-        "move_to_debris",
+        "reverse",
       );
     case "moveAssemblySelectionBefore":
       return withAssemblyHistory(
@@ -1129,7 +1292,7 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           selection: null,
         },
         "Selection moved",
-        "move_to_debris",
+        "move",
       );
     case "moveAssemblySelectionToDebris":
       return withAssemblyHistory(
@@ -1141,6 +1304,21 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         "Selection moved to debris",
         "move_to_debris",
       );
+    case "deleteAssemblySelection": {
+      const deletedCount = selectedBlockIds(
+        state.assembly.blocks,
+        state.assembly.selection,
+      ).length;
+      return withAssemblyHistory(
+        state,
+        {
+          blocks: deleteContigSelection(state.assembly.blocks, state.assembly.selection),
+          selection: null,
+        },
+        `${deletedCount} ${deletedCount === 1 ? "contig" : "contigs"} deleted`,
+        "delete_contig",
+      );
+    }
     case "addAssemblyChromosomeBoundaries":
       return withAssemblyHistory(
         state,
@@ -1150,6 +1328,19 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         },
         "Chromosome boundaries added",
         "add_chr_boundaries",
+      );
+    case "removeAssemblyChromosomeBoundaries":
+      return withAssemblyHistory(
+        state,
+        {
+          blocks: removeChromosomeBoundariesFromSelection(
+            state.assembly.blocks,
+            state.assembly.selection,
+          ),
+          selection: null,
+        },
+        "Chromosome boundaries removed",
+        "remove_chr_boundaries",
       );
     case "copyAssemblySelection":
       return withAssemblyHistory(
@@ -1203,8 +1394,40 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           blocks,
           selection: null,
         },
-        "Contig split",
-        "remove_chr_boundaries",
+        "Contig split with 100 bp gap",
+        "split_contig",
+      );
+    }
+    case "deleteAssemblyGaps":
+      return withAssemblyHistory(
+        state,
+        {
+          blocks: deleteGapsBetweenSelection(
+            state.assembly.blocks,
+            state.assembly.selection,
+          ),
+          selection: null,
+        },
+        "Gap deleted; blocks joined",
+        "delete_gap",
+      );
+    case "renameAssemblySelection": {
+      const target = assemblyRenameTarget(state.assembly.blocks, state.assembly.selection);
+      const name = action.name.trim();
+      const blocks = renameAssemblySelection(
+        state.assembly.blocks,
+        state.assembly.selection,
+        name,
+      );
+      const selection = blocks !== state.assembly.blocks
+        && target?.kind === "chromosome"
+        ? { kind: "chromosome" as const, id: name }
+        : state.assembly.selection;
+      return withAssemblyHistory(
+        state,
+        { blocks, selection },
+        target ? `${capitalize(target.kind)} renamed to ${name}` : "Selection renamed",
+        "rename",
       );
     }
     case "appendLog":
@@ -1225,13 +1448,16 @@ function withAssemblyHistory(
     return state;
   }
 
+  const beforeAssembly = snapshotAssembly(state.assembly);
+  const afterAssembly = snapshotAssembly({ ...state.assembly, ...assembly });
   const operation: OperationRecord = {
     id: state.nextOperationId,
     type,
     label,
     position: { x: 0, y: 0 },
-    beforeAssembly: snapshotAssembly(state.assembly),
-    afterAssembly: snapshotAssembly({ ...state.assembly, ...assembly }),
+    beforeAssembly,
+    afterAssembly,
+    impact: operationImpact(beforeAssembly, afterAssembly),
   };
 
   return withLog(
@@ -1239,6 +1465,7 @@ function withAssemblyHistory(
       ...state,
       operationHistory: [...state.operationHistory, operation],
       redoStack: [],
+      historyPreviewOperationId: null,
       nextOperationId: state.nextOperationId + 1,
       assembly: {
         ...state.assembly,
@@ -1249,10 +1476,114 @@ function withAssemblyHistory(
   );
 }
 
+function operationImpact(
+  before: AssemblyHistorySnapshot,
+  after: AssemblyHistorySnapshot,
+): OperationImpact {
+  const selectedIds = new Set(selectedBlockIds(before.blocks, before.selection));
+  const sourceIds = new Set(
+    before.blocks
+      .filter((block) => selectedIds.has(block.id))
+      .map((block) => block.sourceId),
+  );
+
+  if (sourceIds.size === 0) {
+    const allSourceIds = new Set([
+      ...before.blocks.map((block) => block.sourceId),
+      ...after.blocks.map((block) => block.sourceId),
+    ]);
+    for (const sourceId of allSourceIds) {
+      if (sourceLayoutSignature(before.blocks, sourceId) !== sourceLayoutSignature(after.blocks, sourceId)) {
+        sourceIds.add(sourceId);
+      }
+    }
+  }
+
+  const impactedBeforeBlocks = before.blocks.filter((block) => (
+    selectedIds.has(block.id) || sourceIds.has(block.sourceId)
+  ));
+  const impactedAfterBlocks = after.blocks.filter((block) => sourceIds.has(block.sourceId));
+  return {
+    blockIds: [...new Set([...impactedBeforeBlocks, ...impactedAfterBlocks].map((block) => block.id))],
+    sourceIds: [...sourceIds],
+    chromosomeIds: [...new Set(
+      [...impactedBeforeBlocks, ...impactedAfterBlocks].map((block) => block.objectId),
+    )],
+    selection: cloneAssemblySelection(before.selection),
+  };
+}
+
+function sourceLayoutSignature(blocks: ContactMapLayoutBlock[], sourceId: string) {
+  return JSON.stringify(
+    blocks
+      .filter((block) => block.sourceId === sourceId)
+      .map((block) => [
+        block.objectId,
+        block.sourceStart,
+        block.sourceEnd,
+        block.orientation,
+        block.assemblyBlockId,
+        block.copyInstanceId,
+      ])
+      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+  );
+}
+
+function cloneAssemblySelection(selection: AssemblySelection | null): AssemblySelection | null {
+  return selection
+    ? selection.kind === "contigs"
+      ? { ...selection, ids: [...selection.ids] }
+      : { ...selection }
+    : null;
+}
+
+function historyOperationFocus(
+  blocks: ContactMapLayoutBlock[],
+  operation: OperationRecord,
+): { centerMb: number; selection: AssemblySelection | null } | null {
+  const sourceIds = new Set(operation.impact?.sourceIds ?? []);
+  const blockIds = new Set(operation.impact?.blockIds ?? []);
+  const chromosomeIds = new Set(operation.impact?.chromosomeIds ?? []);
+  const hasSpecificTargets = sourceIds.size > 0 || blockIds.size > 0;
+  const affectedBlocks = blocks.filter((block) => (
+    sourceIds.has(block.sourceId)
+    || blockIds.has(block.id)
+    || (!hasSpecificTargets && chromosomeIds.has(block.objectId))
+  ));
+  const snapshotBlocks = [
+    ...(operation.afterAssembly?.blocks ?? []),
+    ...(operation.beforeAssembly?.blocks ?? []),
+  ].filter((block) => (
+    sourceIds.has(block.sourceId)
+    || blockIds.has(block.id)
+    || (!hasSpecificTargets && chromosomeIds.has(block.objectId))
+  ));
+  const focusBlocks = affectedBlocks.length > 0 ? affectedBlocks : snapshotBlocks;
+  if (focusBlocks.length === 0) {
+    return null;
+  }
+
+  const visualStart = Math.min(...focusBlocks.map((block) => block.visualStart));
+  const visualEnd = Math.max(...focusBlocks.map((block) => block.visualEnd));
+  const currentChromosomes = [...new Set(affectedBlocks.map((block) => block.objectId))];
+  const selection = affectedBlocks.length === 0
+    ? null
+    : operation.impact?.selection?.kind === "chromosome" && currentChromosomes.length === 1
+      ? selectChromosome(null, currentChromosomes[0], false)
+      : { kind: "contigs" as const, ids: affectedBlocks.map((block) => block.id), exact: true };
+  return {
+    centerMb: (visualStart + visualEnd) / 2 / 1_000_000,
+    selection,
+  };
+}
+
 function snapshotAssembly(assembly: Pick<UiState["assembly"], "blocks" | "selection">): AssemblyHistorySnapshot {
   return {
-    blocks: assembly.blocks.map((block) => ({ ...block })),
-    selection: assembly.selection ? { ...assembly.selection } : null,
+    blocks: assembly.blocks.map((block) => ({
+      ...block,
+      gapBefore: block.gapBefore ? { ...block.gapBefore } : undefined,
+    })),
+    selection: cloneAssemblySelection(assembly.selection),
   };
 }
 

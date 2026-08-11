@@ -2,13 +2,18 @@ import { ArrowDownLeft, MoveDiagonal2, RotateCcw, Scissors } from "lucide-react"
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ContactMapCell, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
+  assemblyContigDisplayName,
+  assemblyRenameTarget,
   buildAssemblyEditModel,
   contigIdsInScreenSelection,
+  hasDeletableGap,
   hitTestAssemblyLayout,
   insertionTargetAtScreenPoint,
+  selectedBlockIds,
   type AssemblyEditModel,
   type AssemblyHit,
 } from "../state/assemblyEditing";
+import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
 import { contactColorCss } from "../state/contactColor";
 import { normalizeContactValue } from "../state/contactColorScale";
 import {
@@ -19,7 +24,9 @@ import { contactCellsForViewport } from "../state/contactMapView";
 import { contactRenderGeometry } from "../state/contactRenderGeometry";
 import { buildCenteredContactViewport, type ContactViewport } from "../state/contactViewport";
 import type { CoverageView } from "../state/coverageView";
-import type { UiAction, UiState } from "../state/uiState";
+import type { ContactMapLayoutBlock } from "../state/importers";
+import { isEditableShortcutTarget } from "../state/juiceboxShortcuts";
+import type { OperationRecord, UiAction, UiState } from "../state/uiState";
 import {
   AssemblyContextMenu,
   type AssemblyContextMenuPosition,
@@ -74,6 +81,22 @@ interface AssemblyPointerState {
   visualPosition: number | null;
 }
 
+interface AssemblyContextMenuState extends AssemblyContextMenuPosition {
+  initialMode: "default" | "rename" | "delete";
+}
+
+interface AssemblyCutTargetInput {
+  model: AssemblyEditModel;
+  selectedIds: ReadonlySet<string>;
+  point: { x: number; y: number };
+  widthPx: number;
+  heightPx: number;
+  viewportXStart: number;
+  viewportXEnd: number;
+  viewportYStart: number;
+  viewportYEnd: number;
+}
+
 const maxBufferedContactCells = 360_000;
 const shiftSelectionClassName = "shift-selection-active";
 const wheelLinePixels = 16;
@@ -105,19 +128,16 @@ export type AssemblyShiftClickIntent =
   | { type: "select-chromosome"; id: string };
 
 export function assemblyShiftClickIntent(
-  hasSelection: boolean,
+  _hasSelection: boolean,
   hit: AssemblyHit | null,
-  hitIsSelected = false,
+  _hitIsSelected = false,
 ): AssemblyShiftClickIntent {
   if (hit === null) {
     return { type: "clear-selection" };
   }
-  if (hitIsSelected) {
-    return { type: "clear-selection" };
-  }
 
   return hit.kind === "contig"
-    ? { type: "select-contig", id: hit.id, additive: hasSelection }
+    ? { type: "select-contig", id: hit.id, additive: false }
     : { type: "select-chromosome", id: hit.id };
 }
 
@@ -229,6 +249,79 @@ export function contactWheelPanIntent({
   };
 }
 
+/** Resolve a selected contig diagonal under the pointer, including compact boxes at whole-genome scale. */
+export function assemblyCutTargetAtScreenPoint({
+  model,
+  selectedIds,
+  point,
+  widthPx,
+  heightPx,
+  viewportXStart,
+  viewportXEnd,
+  viewportYStart,
+  viewportYEnd,
+}: AssemblyCutTargetInput): { blockId: string; visualPosition: number } | null {
+  const safeWidthPx = Math.max(1, widthPx);
+  const safeHeightPx = Math.max(1, heightPx);
+  const viewportXSpan = Math.max(1, viewportXEnd - viewportXStart);
+  const viewportYSpan = Math.max(1, viewportYEnd - viewportYStart);
+  const maxEdgeGuardPx = 18;
+  const diagonalTolerancePx = 8;
+
+  for (const block of model.blocks) {
+    if (!selectedIds.has(block.id)) {
+      continue;
+    }
+
+    const clippedXStart = Math.max(block.visualStart, viewportXStart);
+    const clippedXEnd = Math.min(block.visualEnd, viewportXEnd);
+    const clippedYStart = Math.max(block.visualStart, viewportYStart);
+    const clippedYEnd = Math.min(block.visualEnd, viewportYEnd);
+    if (clippedXStart >= clippedXEnd || clippedYStart >= clippedYEnd) {
+      continue;
+    }
+
+    const leftPx = ((clippedXStart - viewportXStart) / viewportXSpan) * safeWidthPx;
+    const topPx = ((clippedYStart - viewportYStart) / viewportYSpan) * safeHeightPx;
+    const blockWidthPx = Math.max(4, ((clippedXEnd - clippedXStart) / viewportXSpan) * safeWidthPx);
+    const blockHeightPx = Math.max(4, ((clippedYEnd - clippedYStart) / viewportYSpan) * safeHeightPx);
+    const localX = point.x - leftPx;
+    const localY = point.y - topPx;
+    const insideBox = localX >= 0 && localY >= 0 && localX <= blockWidthPx && localY <= blockHeightPx;
+    if (!insideBox) {
+      continue;
+    }
+
+    // The old fixed 18 px guard made every contig narrower than 36 px
+    // impossible to cut. Scale the guard down with compact boxes while still
+    // keeping the first and last 20% unavailable as unsafe split endpoints.
+    const edgeGuardPx = Math.min(
+      maxEdgeGuardPx,
+      Math.max(1, Math.min(blockWidthPx, blockHeightPx) * 0.2),
+    );
+    const farEnoughFromEnds = localX >= edgeGuardPx
+      && localY >= edgeGuardPx
+      && localX <= blockWidthPx - edgeGuardPx
+      && localY <= blockHeightPx - edgeGuardPx;
+    const normalizedDiagonalDistance = Math.abs(
+      localX / blockWidthPx - localY / blockHeightPx,
+    ) * Math.min(blockWidthPx, blockHeightPx);
+    if (farEnoughFromEnds && normalizedDiagonalDistance <= diagonalTolerancePx) {
+      return {
+        blockId: block.id,
+        visualPosition: visualPositionFromPointer(
+          point.x,
+          safeWidthPx,
+          viewportXStart,
+          viewportXEnd,
+        ),
+      };
+    }
+  }
+
+  return null;
+}
+
 function setShiftSelectionCursor(active: boolean) {
   document.documentElement.classList.toggle(shiftSelectionClassName, active);
 }
@@ -244,7 +337,12 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   const latestDisplayContactMapRef = useRef<ContactMapView | null>(null);
   const latestUiStateRef = useRef(uiState);
   latestUiStateRef.current = uiState;
-  const [contextMenu, setContextMenu] = useState<AssemblyContextMenuPosition | null>(null);
+  const [contextMenu, setContextMenu] = useState<AssemblyContextMenuState | null>(null);
+  const contextMenuRef = useRef(contextMenu);
+  contextMenuRef.current = contextMenu;
+  const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
+  const deleteConfirmationOpenRef = useRef(deleteConfirmationOpen);
+  deleteConfirmationOpenRef.current = deleteConfirmationOpen;
   const [dragState, setDragState] = useState<DragState | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
   const panAnimationFrameRef = useRef<number | null>(null);
@@ -296,6 +394,13 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     uiState.contact.viewportWidthPx,
   ]);
   const displayViewport = dragState?.previewViewport ?? liveViewport;
+  const historyPreviewOperation = useMemo(
+    () => uiState.historyPreviewOperationId === null
+      ? null
+      : [...uiState.operationHistory, ...uiState.redoStack]
+          .find((operation) => operation.id === uiState.historyPreviewOperationId) ?? null,
+    [uiState.historyPreviewOperationId, uiState.operationHistory, uiState.redoStack],
+  );
   const liveContactMap = useMemo(
     () => contactMap ? { ...contactMap, viewport: liveViewport } : null,
     [contactMap, liveViewport],
@@ -346,12 +451,27 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     : contactMap?.layoutBlocks ?? activeAssemblyBlocks;
   const assemblyModel = useMemo(() => buildAssemblyEditModel(assemblyBlocks), [assemblyBlocks]);
   const selectedAssemblyBlockIds = useMemo(
-    () => selectedBlockIds(assemblyModel, uiState.assembly.selection),
+    () => new Set(selectedBlockIds(assemblyModel.blocks, uiState.assembly.selection)),
     [assemblyModel, uiState.assembly.selection],
+  );
+  const selectedAssemblyUnitIds = useMemo(
+    () => new Set(
+      assemblyModel.assemblyBlocks
+        .filter((block) => block.contigIds.some((id) => selectedAssemblyBlockIds.has(id)))
+        .map((block) => block.id),
+    ),
+    [assemblyModel, selectedAssemblyBlockIds],
+  );
+  const visibleAssemblyContigs = useMemo(
+    () =>
+      assemblyModel.blocks.filter(
+        (block) => block.visualEnd > displayViewport.xStart && block.visualStart < displayViewport.xEnd,
+      ),
+    [assemblyModel, displayViewport.xStart, displayViewport.xEnd],
   );
   const visibleAssemblyBlocks = useMemo(
     () =>
-      assemblyModel.blocks.filter(
+      assemblyModel.assemblyBlocks.filter(
         (block) => block.visualEnd > displayViewport.xStart && block.visualStart < displayViewport.xEnd,
       ),
     [assemblyModel, displayViewport.xStart, displayViewport.xEnd],
@@ -378,10 +498,101 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   useEffect(() => {
     function closeContextMenu() {
       setContextMenu(null);
+      setDeleteConfirmationOpen(false);
+    }
+
+    function handleAssemblyShortcut(event: KeyboardEvent) {
+      const intent = assemblyShortcutIntent({
+        key: event.key,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        altKey: event.altKey,
+        shiftKey: event.shiftKey,
+        repeat: event.repeat,
+        editable: isEditableShortcutTarget(event.target),
+      });
+      if (!intent) {
+        return false;
+      }
+
+      const latestState = latestUiStateRef.current;
+      const selection = latestState.assembly.selection;
+      const hasSelection = selection !== null;
+      const openShortcutMenu = (initialMode: AssemblyContextMenuState["initialMode"]) => {
+        setContextMenu({
+          x: Math.max(8, window.innerWidth / 2 - 109),
+          y: Math.max(8, window.innerHeight / 2 - 120),
+          initialMode,
+        });
+      };
+      let action: UiAction | null = null;
+      if (intent === "rename") {
+        if (!assemblyRenameTarget(latestState.assembly.blocks, selection)) {
+          return false;
+        }
+        openShortcutMenu("rename");
+      } else if (intent === "delete-contig") {
+        if (
+          selection?.kind !== "contigs"
+          || selectedBlockIds(latestState.assembly.blocks, selection).length === 0
+        ) {
+          return false;
+        }
+        setDeleteConfirmationOpen(true);
+        openShortcutMenu("delete");
+      } else if (intent === "delete-gap") {
+        if (!hasDeletableGap(latestState.assembly.blocks, selection)) {
+          return false;
+        }
+        action = { type: "deleteAssemblyGaps" };
+      } else if (hasSelection) {
+        action = intent === "reverse"
+          ? { type: "reverseAssemblySelection" }
+          : intent === "copy"
+            ? { type: "copyAssemblySelection" }
+            : { type: "moveAssemblySelectionToDebris" };
+      } else {
+        return false;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (action) {
+        closeContextMenu();
+        onUiAction(action);
+      }
+      return true;
     }
 
     function handleKeyDown(event: KeyboardEvent) {
-      setContextMenu(null);
+      if (deleteConfirmationOpenRef.current) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          closeContextMenu();
+        }
+        return;
+      }
+      if (isEditableShortcutTarget(event.target)) {
+        if (event.key === "Escape") {
+          if (contextMenuRef.current) {
+            event.preventDefault();
+            closeContextMenu();
+            return;
+          }
+          onUiAction({ type: "clearAssemblySelection" });
+          dragStateRef.current = null;
+          resetPanTransform();
+          setDragState(null);
+          setAssemblySelectionDrag(null);
+          setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
+        }
+        return;
+      }
+      if (handleAssemblyShortcut(event)) {
+        return;
+      }
+      closeContextMenu();
       if (event.key === "Shift") {
         setShiftSelectionCursor(true);
         return;
@@ -551,13 +762,10 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   function openContextMenu(event: React.MouseEvent<HTMLDivElement>) {
     event.preventDefault();
 
-    const bounds = mapLayoutRef.current?.getBoundingClientRect();
-    const mapX = bounds ? event.clientX - bounds.left : event.clientX;
-    const mapY = bounds ? event.clientY - bounds.top : event.clientY;
-
     setContextMenu({
-      x: mapX,
-      y: mapY,
+      x: event.clientX,
+      y: event.clientY,
+      initialMode: "default",
     });
   }
 
@@ -893,41 +1101,24 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     const viewportXEnd = displayViewport.xEnd;
     const viewportYStart = displayViewport.yStart;
     const viewportYEnd = displayViewport.yEnd;
-    const viewportXSpan = Math.max(1, viewportXEnd - viewportXStart);
-    const viewportYSpan = Math.max(1, viewportYEnd - viewportYStart);
-    const handlePx = 18;
-    const diagonalTolerancePx = 8;
-
-    for (const block of assemblyModel.blocks) {
-      if (!selectedIds.has(block.id)) {
-        continue;
-      }
-
-      const clippedXStart = Math.max(block.visualStart, viewportXStart);
-      const clippedXEnd = Math.min(block.visualEnd, viewportXEnd);
-      const clippedYStart = Math.max(block.visualStart, viewportYStart);
-      const clippedYEnd = Math.min(block.visualEnd, viewportYEnd);
-      if (clippedXStart >= clippedXEnd || clippedYStart >= clippedYEnd) {
-        continue;
-      }
-
-      const leftPx = ((clippedXStart - viewportXStart) / viewportXSpan) * bounds.width;
-      const topPx = ((clippedYStart - viewportYStart) / viewportYSpan) * bounds.height;
-      const widthPx = Math.max(4, ((clippedXEnd - clippedXStart) / viewportXSpan) * bounds.width);
-      const heightPx = Math.max(4, ((clippedYEnd - clippedYStart) / viewportYSpan) * bounds.height);
-      const localX = point.x - leftPx;
-      const localY = point.y - topPx;
-      const insideBox = localX >= 0 && localY >= 0 && localX <= widthPx && localY <= heightPx;
-      if (!insideBox) {
-        continue;
-      }
-
-      const farEnoughFromEnds = localX > handlePx && localY > handlePx && localX < widthPx - handlePx && localY < heightPx - handlePx;
-      const normalizedDiagonalDistance = Math.abs(localX / widthPx - localY / heightPx) * Math.min(widthPx, heightPx);
-      if (farEnoughFromEnds && normalizedDiagonalDistance <= diagonalTolerancePx) {
-        setAssemblyPointerStateIfChanged({ kind: "cut", blockId: block.id, visualPosition: null });
-        return;
-      }
+    const cutTarget = assemblyCutTargetAtScreenPoint({
+      model: assemblyModel,
+      selectedIds,
+      point,
+      widthPx: bounds.width,
+      heightPx: bounds.height,
+      viewportXStart,
+      viewportXEnd,
+      viewportYStart,
+      viewportYEnd,
+    });
+    if (cutTarget) {
+      setAssemblyPointerStateIfChanged({
+        kind: "cut",
+        blockId: cutTarget.blockId,
+        visualPosition: cutTarget.visualPosition,
+      });
+      return;
     }
 
     const insertTargetId = insertionTargetAtScreenPoint(assemblyModel, selectedIds, point, {
@@ -982,7 +1173,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
           uiState.assembly.selection !== null,
           assemblySelectionDrag.startHit,
           assemblySelectionDrag.startHit?.kind === "contig"
-            ? selectedAssemblyBlockIds.has(assemblySelectionDrag.startHit.id)
+            ? selectedAssemblyUnitIds.has(assemblySelectionDrag.startHit.id)
             : assemblySelectionDrag.startHit?.kind === "chromosome-boundary"
               ? uiState.assembly.selection?.kind === "chromosome"
                 && uiState.assembly.selection.id === assemblySelectionDrag.startHit.id
@@ -1015,7 +1206,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
         );
         onUiAction({
           type: "selectAssemblyContigs",
-          ids: [...selectedAssemblyBlockIds, ...ids],
+          ids,
         });
       }
 
@@ -1070,6 +1261,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
           <TrackPanel
             coverageView={coverageView}
             viewport={displayViewport}
+            totalSpanMb={totalSpanMb}
             uiState={uiState}
             onUiAction={onUiAction}
             onContextMenu={openContextMenu}
@@ -1136,8 +1328,10 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
             viewportYEnd={displayViewport.yEnd}
             selection={uiState.assembly.selection}
             showChromosomeBoxes={uiState.assembly.showChromosomeBoxes}
+            showBlockBoxes={uiState.assembly.showBlockBoxes}
             showContigBoxes={uiState.assembly.showContigBoxes}
             visibleBlocks={visibleAssemblyBlocks}
+            visibleContigs={visibleAssemblyContigs}
             visibleChromosomes={visibleAssemblyChromosomes}
             selectionBox={assemblySelectionDrag ? {
               left: Math.min(assemblySelectionDrag.startLocalX, assemblySelectionDrag.currentLocalX),
@@ -1166,13 +1360,26 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
               }
             }}
           />
+          {historyPreviewOperation ? (
+            <HistoryOperationPreview
+              operation={historyPreviewOperation}
+              viewport={displayViewport}
+            />
+          ) : null}
         </div>
         {contextMenu ? (
           <AssemblyContextMenu
+            key={contextMenu.initialMode}
             position={contextMenu}
             uiState={uiState}
             onUiAction={onUiAction}
-            onClose={() => setContextMenu(null)}
+            initialMode={contextMenu.initialMode}
+            onDeleteConfirmationChange={setDeleteConfirmationOpen}
+            onClose={() => {
+              setContextMenu(null);
+              setDeleteConfirmationOpen(false);
+            }}
+            fixed
           />
         ) : null}
         <div className="genome-navigator-shell genome-navigator-y">
@@ -1209,6 +1416,96 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
   );
 }
 
+export interface HistoryPreviewBox {
+  key: string;
+  phase: "before" | "after";
+  leftPercent: number;
+  topPercent: number;
+  widthPercent: number;
+  heightPercent: number;
+  orientation: ContactMapLayoutBlock["orientation"];
+}
+
+export function historyPreviewBoxes(
+  operation: OperationRecord,
+  viewport: ContactViewport,
+): HistoryPreviewBox[] {
+  const impactedSourceIds = new Set(operation.impact?.sourceIds ?? []);
+  const impactedBlockIds = new Set(operation.impact?.blockIds ?? []);
+  const impactedChromosomeIds = new Set(operation.impact?.chromosomeIds ?? []);
+  const hasSpecificTargets = impactedSourceIds.size > 0 || impactedBlockIds.size > 0;
+  const xSpan = Math.max(1, viewport.xEnd - viewport.xStart);
+  const ySpan = Math.max(1, viewport.yEnd - viewport.yStart);
+
+  function project(
+    phase: HistoryPreviewBox["phase"],
+    blocks: ContactMapLayoutBlock[],
+  ): HistoryPreviewBox[] {
+    return blocks
+      .filter((block) => (
+        impactedSourceIds.has(block.sourceId)
+        || impactedBlockIds.has(block.id)
+        || (!hasSpecificTargets && impactedChromosomeIds.has(block.objectId))
+      ))
+      .map((block, index) => {
+        const xStart = Math.max(viewport.xStart, block.visualStart);
+        const xEnd = Math.min(viewport.xEnd, block.visualEnd);
+        const yStart = Math.max(viewport.yStart, block.visualStart);
+        const yEnd = Math.min(viewport.yEnd, block.visualEnd);
+        if (xEnd <= xStart || yEnd <= yStart) {
+          return null;
+        }
+        return {
+          key: `${phase}:${block.id}:${index}`,
+          phase,
+          leftPercent: ((xStart - viewport.xStart) / xSpan) * 100,
+          topPercent: ((yStart - viewport.yStart) / ySpan) * 100,
+          widthPercent: ((xEnd - xStart) / xSpan) * 100,
+          heightPercent: ((yEnd - yStart) / ySpan) * 100,
+          orientation: block.orientation,
+        } satisfies HistoryPreviewBox;
+      })
+      .filter((box): box is HistoryPreviewBox => box !== null);
+  }
+
+  return [
+    ...project("before", operation.beforeAssembly?.blocks ?? []),
+    ...project("after", operation.afterAssembly?.blocks ?? []),
+  ];
+}
+
+function HistoryOperationPreview({
+  operation,
+  viewport,
+}: {
+  operation: OperationRecord;
+  viewport: ContactViewport;
+}) {
+  const boxes = historyPreviewBoxes(operation, viewport);
+  return (
+    <div className="history-preview-overlay" aria-label="History before and after preview">
+      {boxes.map((box) => (
+        <span
+          key={box.key}
+          className={`history-preview-box ${box.phase} ${box.orientation === "-" ? "reverse" : "forward"}`}
+          style={{
+            left: `${box.leftPercent}%`,
+            top: `${box.topPercent}%`,
+            width: `${box.widthPercent}%`,
+            height: `${box.heightPercent}%`,
+          }}
+        >
+          <i aria-hidden="true" />
+        </span>
+      ))}
+      <span className="history-preview-legend">
+        <i className="before" /> Before
+        <i className="after" /> After
+      </span>
+    </div>
+  );
+}
+
 interface AssemblyOverlayProps {
   overlayLayerRef: React.RefObject<HTMLDivElement>;
   model: AssemblyEditModel;
@@ -1218,8 +1515,10 @@ interface AssemblyOverlayProps {
   viewportYEnd: number;
   selection: UiState["assembly"]["selection"];
   showChromosomeBoxes: boolean;
+  showBlockBoxes: boolean;
   showContigBoxes: boolean;
-  visibleBlocks: AssemblyEditModel["blocks"];
+  visibleBlocks: AssemblyEditModel["assemblyBlocks"];
+  visibleContigs: AssemblyEditModel["blocks"];
   visibleChromosomes: AssemblyEditModel["chromosomes"];
   selectionBox: { left: number; top: number; width: number; height: number } | null;
   pointerState: AssemblyPointerState;
@@ -1242,8 +1541,10 @@ function AssemblyOverlay({
   viewportYEnd,
   selection,
   showChromosomeBoxes,
+  showBlockBoxes,
   showContigBoxes,
   visibleBlocks,
+  visibleContigs,
   visibleChromosomes,
   selectionBox,
   pointerState,
@@ -1268,11 +1569,22 @@ function AssemblyOverlay({
     return null;
   }
 
-  const selectedIds = selectedBlockIds(model, selection);
-  const selectedBlocks = model.blocks.filter((block) => selectedIds.has(block.id));
-  const selectedIndexes = model.blocks
-    .map((block, index) => (selectedIds.has(block.id) ? index : -1))
+  const selectedContigIds = new Set(selectedBlockIds(model.blocks, selection));
+  const selectedUnitIds = new Set(
+    model.assemblyBlocks
+      .filter((block) => block.contigIds.some((id) => selectedContigIds.has(id)))
+      .map((block) => block.id),
+  );
+  const selectedBlocks = model.assemblyBlocks.filter((block) => selectedUnitIds.has(block.id));
+  const selectedIndexes = model.assemblyBlocks
+    .map((block, index) => (selectedUnitIds.has(block.id) ? index : -1))
     .filter((index) => index >= 0);
+  const contigsById = new Map(model.blocks.map((block) => [block.id, block]));
+  const unitByContigId = new Map(
+    model.assemblyBlocks.flatMap((block) => (
+      block.contigIds.map((contigId) => [contigId, block] as const)
+    )),
+  );
   const selectedGroupBox = selectedBlocks.length > 0
     ? intervalBox(
         Math.min(...selectedBlocks.map((block) => block.visualStart)),
@@ -1326,7 +1638,7 @@ function AssemblyOverlay({
     const endIndex = resizeState.side === "end"
       ? Math.max(pointerIndex, resizeState.fixedIndex)
       : resizeState.fixedIndex;
-    onResizeSelection(model.blocks.slice(startIndex, endIndex + 1).map((block) => block.id));
+    onResizeSelection(model.assemblyBlocks.slice(startIndex, endIndex + 1).map((block) => block.id));
   }
 
   function stopResizeSelection(event: React.PointerEvent<HTMLButtonElement>) {
@@ -1340,7 +1652,7 @@ function AssemblyOverlay({
 
   return (
     <div
-      className="assembly-overlay"
+      className={`assembly-overlay ${pointerState.kind === "cut" ? "cut-preview-active" : ""}`.trim()}
       onDoubleClick={onDoubleClick}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -1388,7 +1700,13 @@ function AssemblyOverlay({
           );
         })
           : null}
-        {showContigBoxes ? visibleBlocks.map((block) => {
+        {visibleBlocks.map((block) => {
+        const showPrimaryBox = block.isComposite
+          ? showBlockBoxes
+          : showBlockBoxes || showContigBoxes;
+        if (!showPrimaryBox) {
+          return null;
+        }
         const box = intervalBox(
           block.visualStart,
           block.visualEnd,
@@ -1402,15 +1720,73 @@ function AssemblyOverlay({
         if (!box) {
           return null;
         }
-        const selected = selectedIds.has(block.id);
+        const selected = selectedUnitIds.has(block.id);
+        const singletonContig = block.isComposite ? null : contigsById.get(block.contigIds[0] ?? "");
         return (
-          <span key={block.id} className={`assembly-box contig-box ${selected ? "selected" : ""}`} style={box} title={`${block.sourceId} ${block.orientation}`}>
-            {selected && pointerState.kind === "cut" && pointerState.blockId === block.id ? <span className="contig-handle cut-handle active"><Scissors size={11} /></span> : null}
-            {selected ? <span className="contig-frame" /> : null}
+          <span
+            key={block.id}
+            className={`assembly-box block-box ${block.isComposite ? "composite-block-box" : "singleton-contig-box"} ${selected ? "selected" : ""}`}
+            data-block-id={block.id}
+            style={box}
+            title={block.isComposite
+              ? `${block.id} · ${block.contigIds.length} contigs`
+              : `${singletonContig ? assemblyContigDisplayName(singletonContig) : block.id} ${singletonContig?.orientation ?? ""}`.trim()}
+          >
+            {selected ? <span className="block-frame" /> : null}
           </span>
         );
-      }) : null}
-        {selectedIds.size > 0 && pointerState.kind === "insert" && pointerState.visualPosition !== null ? (() => {
+      })}
+        {showContigBoxes ? visibleContigs.map((contig) => {
+          const unit = unitByContigId.get(contig.id);
+          if (!unit?.isComposite) {
+            return null;
+          }
+          const box = intervalBox(
+            contig.visualStart,
+            contig.visualEnd,
+            viewportXStart,
+            viewportXEnd,
+            viewportXSpan,
+            viewportYStart,
+            viewportYEnd,
+            viewportYSpan,
+          );
+          if (!box) {
+            return null;
+          }
+          const selected = selectedContigIds.has(contig.id);
+          return (
+            <span
+              key={contig.id}
+              className="assembly-box contig-child-box"
+              data-contig-id={contig.id}
+              style={box}
+              title={`${assemblyContigDisplayName(contig)} ${contig.orientation}`}
+            >
+            </span>
+          );
+        }) : null}
+        {(showBlockBoxes || showContigBoxes)
+          && pointerState.kind === "cut"
+          && pointerState.visualPosition !== null ? (() => {
+          const left = ((pointerState.visualPosition - viewportXStart) / viewportXSpan) * 100;
+          const top = ((pointerState.visualPosition - viewportYStart) / viewportYSpan) * 100;
+          return (
+            <span
+              className="assembly-cut-marker"
+              aria-hidden="true"
+              style={{
+                left: `clamp(10px, ${left}%, calc(100% - 10px))`,
+                top: `clamp(10px, ${top}%, calc(100% - 10px))`,
+              }}
+            >
+              <span className="assembly-cut-guide" />
+              <span className="assembly-cut-point" />
+              <Scissors size={17} strokeWidth={2.25} absoluteStrokeWidth />
+            </span>
+          );
+        })() : null}
+        {(showBlockBoxes || showContigBoxes) && selectedContigIds.size > 0 && pointerState.kind === "insert" && pointerState.visualPosition !== null ? (() => {
           const left = ((pointerState.visualPosition - viewportXStart) / viewportXSpan) * 100;
           const top = ((pointerState.visualPosition - viewportYStart) / viewportYSpan) * 100;
           return (
@@ -1425,7 +1801,7 @@ function AssemblyOverlay({
             </span>
           );
         })() : null}
-        {selectedGroupBox ? (
+        {(showBlockBoxes || showContigBoxes) && selectedGroupBox ? (
           <span className="assembly-selected-group" style={selectedGroupBox}>
             <button
               className="assembly-resize-handle start"
@@ -1456,8 +1832,8 @@ function AssemblyOverlay({
             <button
               className="assembly-rotate-button"
               type="button"
-              title="Reverse selected contig order and orientation"
-              aria-label="Reverse selected contig order and orientation"
+              title="Reverse selected block order and orientation"
+              aria-label="Reverse selected block order and orientation"
               onPointerDown={(event) => event.stopPropagation()}
               onDoubleClick={(event) => event.stopPropagation()}
               onClick={(event) => {
@@ -1477,8 +1853,8 @@ function AssemblyOverlay({
 function nearestAssemblyBlockIndex(model: AssemblyEditModel, visualPosition: number) {
   let nearestIndex = 0;
   let nearestDistance = Number.POSITIVE_INFINITY;
-  for (let index = 0; index < model.blocks.length; index += 1) {
-    const block = model.blocks[index];
+  for (let index = 0; index < model.assemblyBlocks.length; index += 1) {
+    const block = model.assemblyBlocks[index];
     if (visualPosition >= block.visualStart && visualPosition < block.visualEnd) {
       return index;
     }
@@ -1522,29 +1898,6 @@ function intervalBox(
     width: `${width}%`,
     height: `${height}%`,
   };
-}
-
-function selectedBlockIds(model: AssemblyEditModel, selection: UiState["assembly"]["selection"]) {
-  if (!selection) {
-    return new Set<string>();
-  }
-
-  if (selection.kind === "contigs") {
-    return new Set(selection.ids);
-  }
-
-  return new Set(
-    model.blocks.filter((block) => block.objectId === selection.id).map((block) => block.id),
-  );
-}
-
-function singleSelectedContig(uiState: UiState) {
-  const selection = uiState.assembly.selection;
-  if (selection?.kind !== "contigs" || selection.ids.length !== 1) {
-    return null;
-  }
-
-  return selection.ids[0];
 }
 
 function visualPositionFromPointer(

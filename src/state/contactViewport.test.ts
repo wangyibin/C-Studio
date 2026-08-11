@@ -3,6 +3,8 @@ import {
   buildCenteredContactViewport,
   buildWholeGenomeContactViewport,
   contactViewportAxisSpans,
+  horizontalViewportDragDeltaMb,
+  horizontalViewportFocusRatio,
 } from "./contactViewport";
 
 describe("buildCenteredContactViewport", () => {
@@ -76,5 +78,24 @@ describe("buildCenteredContactViewport", () => {
       yStart: 0,
       yEnd: 123_456_789,
     });
+  });
+});
+
+describe("horizontalViewportDragDeltaMb", () => {
+  it("uses grab-style horizontal panning and rejects invalid geometry", () => {
+    const viewport = { xStart: 100_000_000, xEnd: 300_000_000 };
+    expect(horizontalViewportDragDeltaMb(50, 400, viewport)).toBe(-25);
+    expect(horizontalViewportDragDeltaMb(-80, 400, viewport)).toBe(40);
+    expect(horizontalViewportDragDeltaMb(50, 0, viewport)).toBe(0);
+    expect(horizontalViewportDragDeltaMb(50, 400, { xStart: 10, xEnd: 10 })).toBe(0);
+  });
+});
+
+describe("horizontalViewportFocusRatio", () => {
+  it("maps the pointer into the horizontal viewport and clamps its edges", () => {
+    expect(horizontalViewportFocusRatio(250, 50, 400)).toBe(0.5);
+    expect(horizontalViewportFocusRatio(0, 50, 400)).toBe(0);
+    expect(horizontalViewportFocusRatio(500, 50, 400)).toBe(1);
+    expect(horizontalViewportFocusRatio(250, 50, 0)).toBe(0.5);
   });
 });

@@ -135,19 +135,22 @@ impl<'a> CoverageViewBuilder<'a> {
                     .visual_position(source)
                     .expect("overlap is inside block");
                 let x_bin = visual / self.query.display_resolution;
+                let (placement_count, next_placement_boundary) =
+                    placement_count_and_next_boundary(blocks, source, overlap_end);
+                let step =
+                    contiguous_step(block, source, overlap_end, self.query.display_resolution)
+                        .min(next_placement_boundary.saturating_sub(source))
+                        .max(1);
 
                 if x_bin < self.viewport_start_bin || x_bin > self.viewport_end_bin {
-                    source +=
-                        contiguous_step(block, source, overlap_end, self.query.display_resolution);
+                    source += step;
                     continue;
                 }
 
-                let step =
-                    contiguous_step(block, source, overlap_end, self.query.display_resolution);
                 self.aggregate
                     .entry(x_bin)
                     .or_default()
-                    .add(value, step);
+                    .add(value / placement_count as f64, step);
                 source += step;
             }
         }
@@ -172,6 +175,28 @@ impl<'a> CoverageViewBuilder<'a> {
             bins,
         }
     }
+}
+
+fn placement_count_and_next_boundary(
+    blocks: &[&LayoutBlock],
+    source: u64,
+    overlap_end: u64,
+) -> (usize, u64) {
+    let mut placement_count = 0;
+    let mut next_boundary = overlap_end;
+
+    for block in blocks {
+        if source >= block.source_start && source < block.source_end {
+            placement_count += 1;
+            next_boundary = next_boundary.min(block.source_end);
+        } else if block.source_start > source {
+            next_boundary = next_boundary.min(block.source_start);
+        }
+    }
+
+    // The caller only asks about coordinates inside its current block.
+    debug_assert!(placement_count > 0);
+    (placement_count.max(1), next_boundary)
 }
 
 fn validate_query(query: &CoverageQuery) -> CStudioResult<()> {
@@ -356,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicated_layout_blocks_reuse_source_coverage_without_mutating_records() {
+    fn duplicated_layout_blocks_share_source_coverage_without_mutating_records() {
         let query = CoverageQuery {
             display_resolution: 1_000,
             viewport: Viewport {
@@ -394,6 +419,85 @@ mod tests {
         let view = build_coverage_view(&query, records).expect("valid query");
 
         assert_eq!(view.bins.len(), 4);
+        assert!(view.bins.iter().all(|bin| bin.value == 25.0));
+    }
+
+    #[test]
+    fn partial_copy_boundaries_change_coverage_share_inside_a_display_bin() {
+        let query = CoverageQuery {
+            display_resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 3_000,
+                y_start: 0,
+                y_end: 1,
+            },
+            layout_blocks: vec![
+                LayoutBlock {
+                    id: "original".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 0,
+                    source_end: 2_000,
+                    visual_start: 0,
+                    orientation: Orientation::Forward,
+                },
+                LayoutBlock {
+                    id: "partial-copy".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 500,
+                    source_end: 1_500,
+                    visual_start: 2_000,
+                    orientation: Orientation::Forward,
+                },
+            ],
+        };
+        let records = vec![BedGraphRecord {
+            chrom: "contig-a".to_string(),
+            start: 0,
+            end: 2_000,
+            value: 60.0,
+        }];
+
+        let view = build_coverage_view(&query, records).expect("valid query");
+
+        assert_eq!(
+            view.bins
+                .iter()
+                .map(|bin| (bin.x_bin, bin.value))
+                .collect::<Vec<_>>(),
+            vec![(0, 45.0), (1, 45.0), (2, 30.0)]
+        );
+    }
+
+    #[test]
+    fn deleting_a_copy_restores_full_coverage_to_the_remaining_placement() {
+        let query = CoverageQuery {
+            display_resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 2_000,
+                y_start: 0,
+                y_end: 1,
+            },
+            layout_blocks: vec![LayoutBlock {
+                id: "remaining".to_string(),
+                source_id: "contig-a".to_string(),
+                source_start: 0,
+                source_end: 2_000,
+                visual_start: 0,
+                orientation: Orientation::Forward,
+            }],
+        };
+        let records = vec![BedGraphRecord {
+            chrom: "contig-a".to_string(),
+            start: 0,
+            end: 2_000,
+            value: 50.0,
+        }];
+
+        let view = build_coverage_view(&query, records).expect("valid query");
+
+        assert_eq!(view.bins.len(), 2);
         assert!(view.bins.iter().all(|bin| bin.value == 50.0));
     }
 

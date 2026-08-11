@@ -2,8 +2,9 @@ import { createRef } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { ContactMapView } from "../App";
+import { keyboardShortcutLabels } from "../state/keyboardShortcutLabels";
 import { createInitialUiState, type UiState } from "../state/uiState";
-import { AppShell } from "./AppShell";
+import { AppShell, clampInspectorPanelWidth } from "./AppShell";
 
 function renderShell(
   rightCollapsed = false,
@@ -50,6 +51,8 @@ function renderShell(
 describe("AppShell confirmed workspace", () => {
   it("renders the two-row toolbar and consolidates all data imports", () => {
     const markup = renderShell();
+    const shortcuts = keyboardShortcutLabels();
+    const otherRenameLabel = shortcuts.rename === "⌘E" ? "Ctrl+E" : "⌘E";
 
     expect(markup).toContain('class="app-toolbar-stack"');
     expect(markup).toContain('class="global-toolbar"');
@@ -60,8 +63,16 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain("Coverage track");
     expect(markup).toContain("Load example project");
     expect(markup).toContain('aria-keyshortcuts="F10"');
-    expect(markup).toContain('aria-keyshortcuts="Control+U Meta+U"');
-    expect(markup).toContain('aria-keyshortcuts="Control+R Meta+R"');
+    expect(markup).toContain('role="separator"');
+    expect(markup).toContain('aria-label="Resize inspector"');
+    expect(markup).toContain('aria-keyshortcuts="Control+Z Meta+Z Control+U Meta+U"');
+    expect(markup).toContain('aria-keyshortcuts="Meta+Shift+Z Control+Y Control+R Meta+R"');
+    expect(markup).toContain('aria-label="Keyboard shortcuts"');
+    expect(markup).toContain(`<dt>Rename</dt><dd>${shortcuts.rename}</dd>`);
+    expect(markup).toContain(`<dt>Move to debris</dt><dd>${shortcuts.moveToDebris}</dd>`);
+    expect(markup).not.toContain(`<dt>Rename</dt><dd>${otherRenameLabel}</dd>`);
+    expect(markup).toContain("Delete gap / join");
+    expect(markup).toContain(`<dt>Delete contig</dt><dd>${shortcuts.deleteContig}</dd>`);
   });
 
   it("removes the former side and bottom tool surfaces while wiring both genome axes", () => {
@@ -75,6 +86,8 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('class="map-axis-ticks map-axis-ticks-x"');
     expect(markup).toContain('class="map-axis-ticks map-axis-ticks-y"');
     expect(markup).toContain('aria-label="Inspector"');
+    expect(markup).toContain('aria-label="Block boxes"');
+    expect(markup).toContain('aria-label="Contig boxes"');
     expect(markup).toContain('aria-keyshortcuts="F2"');
     expect(markup).toContain('aria-keyshortcuts="F9"');
   });
@@ -83,8 +96,16 @@ describe("AppShell confirmed workspace", () => {
     const markup = renderShell(true);
 
     expect(markup).not.toContain('aria-label="Inspector"');
+    expect(markup).not.toContain('aria-label="Resize inspector"');
     expect(markup).toContain('class="workspace right-collapsed"');
     expect(markup).toContain('aria-label="Contact map viewport"');
+  });
+
+  it("clamps the resizable inspector without crowding out the heatmap", () => {
+    expect(clampInspectorPanelWidth(100, 1_400)).toBe(260);
+    expect(clampInspectorPanelWidth(420, 1_400)).toBe(420);
+    expect(clampInspectorPanelWidth(800, 1_400)).toBe(520);
+    expect(clampInspectorPanelWidth(500, 800)).toBe(360);
   });
 
   it("shows which normalization is still displayed during an async mode switch", () => {

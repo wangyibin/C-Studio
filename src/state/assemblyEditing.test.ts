@@ -1,9 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  assemblyContigDisplayName,
   assemblyContigSelectionIntent,
+  assemblyRenameTarget,
+  assemblyRenameValidationError,
   buildAssemblyEditModel,
   contigIdsInScreenSelection,
+  DEFAULT_INSERTED_GAP,
+  deleteContigSelection,
+  deleteGapsBetweenSelection,
   groupAssemblyBlocksByChromosome,
+  hasDeletableGap,
+  hasRemovableChromosomeBoundary,
   hitTestAssemblyLayout,
   insertionTargetAtScreenPoint,
   isContigSelected,
@@ -12,13 +20,17 @@ import {
   addChromosomeBoundariesToSelection,
   moveSelectionBefore,
   moveSelectionToDebris,
+  pointSelectsWholeChromosome,
   reverseSelection,
+  removeChromosomeBoundariesFromSelection,
+  renameAssemblySelection,
   selectChromosome,
   selectContig,
   selectContigs,
   splitContigAtVisualPosition,
 } from "./assemblyEditing";
-import type { ContactMapLayoutBlock } from "./importers";
+import { exportAgpText } from "./agpExport";
+import { parseAgpLayout, type ContactMapLayoutBlock } from "./importers";
 
 const blocks: ContactMapLayoutBlock[] = [
   {
@@ -53,7 +65,137 @@ const blocks: ContactMapLayoutBlock[] = [
   },
 ];
 
+const structuredBlocks: ContactMapLayoutBlock[] = [
+  {
+    id: "Chr01:1:ctgA",
+    objectId: "Chr01",
+    sourceId: "ctgA",
+    sourceStart: 0,
+    sourceEnd: 100,
+    visualStart: 0,
+    visualEnd: 100,
+    orientation: "+",
+    componentType: "W",
+    assemblyBlockId: "Chr01_block_1",
+  },
+  {
+    id: "Chr01:2:ctgB",
+    objectId: "Chr01",
+    sourceId: "ctgB",
+    sourceStart: 10,
+    sourceEnd: 60,
+    visualStart: 100,
+    visualEnd: 150,
+    orientation: "-",
+    componentType: "W",
+    assemblyBlockId: "Chr01_block_1",
+  },
+  {
+    id: "Chr01:4:ctgC",
+    objectId: "Chr01",
+    sourceId: "ctgC",
+    sourceStart: 0,
+    sourceEnd: 60,
+    visualStart: 190,
+    visualEnd: 250,
+    orientation: "+",
+    componentType: "W",
+    assemblyBlockId: null,
+    gapBefore: {
+      componentType: "U",
+      length: 40,
+      gapType: "contig",
+      linkage: "yes",
+      linkageEvidence: "map",
+    },
+  },
+  {
+    id: "Chr01:6:ctgD",
+    objectId: "Chr01",
+    sourceId: "ctgD",
+    sourceStart: 0,
+    sourceEnd: 30,
+    visualStart: 270,
+    visualEnd: 300,
+    orientation: "+",
+    componentType: "W",
+    assemblyBlockId: "Chr01_block_2",
+    gapBefore: {
+      componentType: "N",
+      length: 20,
+      gapType: "scaffold",
+      linkage: "no",
+      linkageEvidence: "na",
+    },
+  },
+  {
+    id: "Chr01:7:ctgE",
+    objectId: "Chr01",
+    sourceId: "ctgE",
+    sourceStart: 5,
+    sourceEnd: 75,
+    visualStart: 300,
+    visualEnd: 370,
+    orientation: "-",
+    componentType: "W",
+    assemblyBlockId: "Chr01_block_2",
+  },
+  {
+    id: "Chr02:1:ctgF",
+    objectId: "Chr02",
+    sourceId: "ctgF",
+    sourceStart: 0,
+    sourceEnd: 80,
+    visualStart: 370,
+    visualEnd: 450,
+    orientation: "+",
+    componentType: "W",
+    assemblyBlockId: null,
+  },
+];
+
 describe("assemblyEditing", () => {
+  it("renames a chromosome without changing its contig data ids", () => {
+    const selection = { kind: "chromosome" as const, id: "Chr01" };
+    const renamed = renameAssemblySelection(blocks, selection, "ChrA");
+
+    expect(renamed.map((block) => block.objectId)).toEqual(["ChrA", "ChrA", "Chr02"]);
+    expect(renamed.map((block) => block.sourceId)).toEqual(["ctg1", "ctg2", "ctg3"]);
+    expect(assemblyRenameValidationError(blocks, selection, "Chr02")).toBe(
+      "A chromosome already uses this name.",
+    );
+  });
+
+  it("renames one contig for display and AGP export while preserving its data lookup id", () => {
+    const selection = { kind: "contigs" as const, ids: ["Chr01:1:ctg1"] };
+    const renamed = renameAssemblySelection(blocks, selection, "contig_alpha");
+
+    expect(assemblyRenameTarget(blocks, selection)).toEqual({
+      kind: "contig",
+      currentName: "ctg1",
+    });
+    expect(renamed[0]).toMatchObject({
+      sourceId: "ctg1",
+      displayName: "contig_alpha",
+    });
+    expect(assemblyContigDisplayName(renamed[0]!)).toBe("contig_alpha");
+    expect(exportAgpText(renamed)).toContain("\tcontig_alpha\t1\t100\t+");
+    expect(assemblyRenameValidationError(blocks, selection, "ctg2")).toBe(
+      "A contig already uses this name.",
+    );
+  });
+
+  it("only offers rename for a single atomic contig or chromosome", () => {
+    expect(assemblyRenameTarget(structuredBlocks, {
+      kind: "contigs",
+      ids: ["Chr01_block_1"],
+    })).toBeNull();
+    expect(assemblyRenameTarget(blocks, {
+      kind: "contigs",
+      ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"],
+    })).toBeNull();
+  });
+
   it("builds chromosome boundaries from AGP object ids", () => {
     const model = buildAssemblyEditModel(blocks);
 
@@ -61,6 +203,80 @@ describe("assemblyEditing", () => {
       { id: "Chr01", visualStart: 0, visualEnd: 250, blockIds: ["Chr01:1:ctg1", "Chr01:2:ctg2"] },
       { id: "Chr02", visualStart: 250, visualEnd: 330, blockIds: ["Chr02:1:ctg3"] },
     ]);
+  });
+
+  it("builds composite blocks, explicit gaps, and bare singleton contigs", () => {
+    const model = buildAssemblyEditModel(structuredBlocks);
+
+    expect(model.assemblyBlocks).toEqual([
+      {
+        id: "Chr01_block_1",
+        objectId: "Chr01",
+        visualStart: 0,
+        visualEnd: 150,
+        contigIds: ["Chr01:1:ctgA", "Chr01:2:ctgB"],
+        isComposite: true,
+      },
+      {
+        id: "Chr01:4:ctgC",
+        objectId: "Chr01",
+        visualStart: 190,
+        visualEnd: 250,
+        contigIds: ["Chr01:4:ctgC"],
+        isComposite: false,
+      },
+      {
+        id: "Chr01_block_2",
+        objectId: "Chr01",
+        visualStart: 270,
+        visualEnd: 370,
+        contigIds: ["Chr01:6:ctgD", "Chr01:7:ctgE"],
+        isComposite: true,
+      },
+      {
+        id: "Chr02:1:ctgF",
+        objectId: "Chr02",
+        visualStart: 370,
+        visualEnd: 450,
+        contigIds: ["Chr02:1:ctgF"],
+        isComposite: false,
+      },
+    ]);
+    expect(model.gaps).toEqual([
+      {
+        id: "Chr01:gap-before:Chr01:4:ctgC",
+        objectId: "Chr01",
+        visualStart: 150,
+        visualEnd: 190,
+        leftBlockId: "Chr01_block_1",
+        rightBlockId: "Chr01:4:ctgC",
+        metadata: structuredBlocks[2]?.gapBefore,
+      },
+      {
+        id: "Chr01:gap-before:Chr01:6:ctgD",
+        objectId: "Chr01",
+        visualStart: 250,
+        visualEnd: 270,
+        leftBlockId: "Chr01:4:ctgC",
+        rightBlockId: "Chr01_block_2",
+        metadata: structuredBlocks[3]?.gapBefore,
+      },
+    ]);
+    expect(model.chromosomes).toEqual([
+      {
+        id: "Chr01",
+        visualStart: 0,
+        visualEnd: 370,
+        blockIds: ["Chr01_block_1", "Chr01:4:ctgC", "Chr01_block_2"],
+      },
+      {
+        id: "Chr02",
+        visualStart: 370,
+        visualEnd: 450,
+        blockIds: ["Chr02:1:ctgF"],
+      },
+    ]);
+    expect(model.totalSpan).toBe(450);
   });
 
   it("groups contigs by chromosome and tracks selected counts", () => {
@@ -103,7 +319,7 @@ describe("assemblyEditing", () => {
     expect(selectChromosome(selection, "Chr02", false)).toEqual({ kind: "chromosome", id: "Chr02" });
   });
 
-  it("builds shared plain, range, toggle, and clear selection intents", () => {
+  it("uses clicks for replacement and Command or Control for discrete toggles", () => {
     const orderedBlocks: ContactMapLayoutBlock[] = [1, 2, 3, 4, 5, 6].map((index) => ({
       id: `contig-${index}`,
       objectId: "Chr01",
@@ -129,9 +345,10 @@ describe("assemblyEditing", () => {
       "contig-6",
       { ...none, shiftKey: true },
     )).toEqual({
-      type: "select-range",
-      ids: ["contig-2", "contig-3", "contig-4", "contig-5", "contig-6"],
-      anchorId: "contig-2",
+      type: "select",
+      id: "contig-6",
+      additive: false,
+      anchorId: "contig-6",
     });
     expect(assemblyContigSelectionIntent(
       orderedBlocks,
@@ -151,7 +368,27 @@ describe("assemblyEditing", () => {
       "contig-2",
       "contig-3",
       { ...none, shiftKey: true },
-    )).toEqual({ type: "clear", anchorId: null });
+    )).toEqual({
+      type: "select",
+      id: "contig-3",
+      additive: false,
+      anchorId: "contig-3",
+    });
+  });
+
+  it("does not turn a Shift-click on a composite block into a range", () => {
+    expect(assemblyContigSelectionIntent(
+      structuredBlocks,
+      { kind: "contigs", ids: ["Chr01_block_1"] },
+      null,
+      "Chr01_block_2",
+      { shiftKey: true, metaKey: false, ctrlKey: false },
+    )).toEqual({
+      type: "select",
+      id: "Chr01_block_2",
+      additive: false,
+      anchorId: "Chr01_block_2",
+    });
   });
 
   it("toggles selected contigs off during additive selection", () => {
@@ -238,6 +475,78 @@ describe("assemblyEditing", () => {
     ]);
   });
 
+  it("preserves zero and na orientations while reversing their order", () => {
+    const unknownOrientations: ContactMapLayoutBlock[] = [
+      {
+        ...blocks[0]!,
+        id: "Chr01:1:zero",
+        sourceId: "zero",
+        orientation: "0" as ContactMapLayoutBlock["orientation"],
+      },
+      {
+        ...blocks[1]!,
+        id: "Chr01:2:na",
+        sourceId: "na",
+        orientation: "na" as ContactMapLayoutBlock["orientation"],
+      },
+    ];
+
+    const reversed = reverseSelection(unknownOrientations, {
+      kind: "chromosome",
+      id: "Chr01",
+    });
+
+    expect(reversed.map((block) => [block.sourceId, block.orientation])).toEqual([
+      ["na", "na"],
+      ["zero", "0"],
+    ]);
+  });
+
+  it("reverses a composite assembly block atomically", () => {
+    const reversed = reverseSelection(structuredBlocks, {
+      kind: "contigs",
+      ids: ["Chr01_block_1"],
+    });
+
+    expect(reversed.slice(0, 2).map((block) => [
+      block.id,
+      block.sourceId,
+      block.orientation,
+      block.assemblyBlockId,
+      block.visualStart,
+      block.visualEnd,
+    ])).toEqual([
+      ["Chr01:2:ctgB", "ctgB", "+", "Chr01_block_1", 0, 50],
+      ["Chr01:1:ctgA", "ctgA", "-", "Chr01_block_1", 50, 150],
+    ]);
+    expect(reversed[2]?.gapBefore).toEqual(structuredBlocks[2]?.gapBefore);
+  });
+
+  it("reverses structured internal gaps and rebuilds block ordinals", () => {
+    const reversed = reverseSelection(structuredBlocks, {
+      kind: "chromosome",
+      id: "Chr01",
+    });
+
+    expect(reversed.map((block) => [
+      block.sourceId,
+      block.orientation,
+      block.gapBefore?.length,
+      block.assemblyBlockId,
+      block.visualStart,
+      block.visualEnd,
+    ])).toEqual([
+      ["ctgE", "+", undefined, "Chr01_block_1", 0, 70],
+      ["ctgD", "-", undefined, "Chr01_block_1", 70, 100],
+      ["ctgC", "-", 20, null, 120, 180],
+      ["ctgB", "+", 40, "Chr01_block_2", 220, 270],
+      ["ctgA", "-", undefined, "Chr01_block_2", 270, 370],
+      ["ctgF", "+", undefined, null, 370, 450],
+    ]);
+    expect(reversed[2]?.gapBefore).toEqual(structuredBlocks[3]?.gapBefore);
+    expect(reversed[3]?.gapBefore).toEqual(structuredBlocks[2]?.gapBefore);
+  });
+
   it("moves selected contigs before a target contig and recomputes visual coordinates", () => {
     const moved = moveSelectionBefore(blocks, { kind: "contigs", ids: ["Chr02:1:ctg3"] }, "Chr01:2:ctg2");
 
@@ -270,6 +579,114 @@ describe("assemblyEditing", () => {
     )).toBe(blocks);
   });
 
+  it("moves a composite assembly block without separating its contigs", () => {
+    const moved = moveSelectionBefore(
+      structuredBlocks,
+      { kind: "contigs", ids: ["Chr01_block_1"] },
+      "Chr01_block_2",
+    );
+    const model = buildAssemblyEditModel(moved);
+
+    expect(moved.map((block) => block.sourceId)).toEqual([
+      "ctgC",
+      "ctgA",
+      "ctgB",
+      "ctgD",
+      "ctgE",
+      "ctgF",
+    ]);
+    expect(model.assemblyBlocks.map((block) => block.contigIds)).toEqual([
+      ["Chr01:4:ctgC"],
+      ["Chr01:1:ctgA", "Chr01:2:ctgB"],
+      ["Chr01:6:ctgD", "Chr01:7:ctgE"],
+      ["Chr02:1:ctgF"],
+    ]);
+    expect(moved.map((block) => block.gapBefore?.length)).toEqual([
+      undefined,
+      40,
+      undefined,
+      20,
+      undefined,
+      undefined,
+    ]);
+    expect(moved.map((block) => [block.visualStart, block.visualEnd])).toEqual([
+      [0, 60],
+      [100, 200],
+      [200, 250],
+      [270, 300],
+      [300, 370],
+      [370, 450],
+    ]);
+  });
+
+  it("does not reuse a displaced leading gap in a different chromosome", () => {
+    const multiObjectBlocks: ContactMapLayoutBlock[] = [
+      {
+        id: "Chr01:1:a",
+        objectId: "Chr01",
+        sourceId: "a",
+        sourceStart: 0,
+        sourceEnd: 10,
+        visualStart: 0,
+        visualEnd: 10,
+        orientation: "+",
+        componentType: "W",
+        assemblyBlockId: null,
+      },
+      {
+        id: "Chr01:3:b",
+        objectId: "Chr01",
+        sourceId: "b",
+        sourceStart: 0,
+        sourceEnd: 10,
+        visualStart: 50,
+        visualEnd: 60,
+        orientation: "+",
+        componentType: "W",
+        assemblyBlockId: null,
+        gapBefore: { ...structuredBlocks[2]!.gapBefore!, length: 40 },
+      },
+      {
+        id: "Chr02:1:c",
+        objectId: "Chr02",
+        sourceId: "c",
+        sourceStart: 0,
+        sourceEnd: 10,
+        visualStart: 60,
+        visualEnd: 70,
+        orientation: "+",
+        componentType: "W",
+        assemblyBlockId: null,
+      },
+      {
+        id: "Chr02:3:d",
+        objectId: "Chr02",
+        sourceId: "d",
+        sourceStart: 0,
+        sourceEnd: 10,
+        visualStart: 90,
+        visualEnd: 100,
+        orientation: "+",
+        componentType: "W",
+        assemblyBlockId: null,
+        gapBefore: { ...structuredBlocks[3]!.gapBefore!, length: 20 },
+      },
+    ];
+
+    const moved = moveSelectionBefore(
+      multiObjectBlocks,
+      { kind: "contigs", ids: ["Chr02:1:c"] },
+      "Chr01:3:b",
+    );
+
+    expect(moved.map((block) => [block.sourceId, block.objectId, block.gapBefore?.length])).toEqual([
+      ["a", "Chr01", undefined],
+      ["c", "Chr01", 100],
+      ["b", "Chr01", 40],
+      ["d", "Chr02", undefined],
+    ]);
+  });
+
   it("copies selected contigs after the source segment with stable copy ids", () => {
     const copied = copySelection(blocks, { kind: "contigs", ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"] });
 
@@ -279,6 +696,10 @@ describe("assemblyEditing", () => {
       ["Chr01:1:ctg1_d2", "ctg1", 250, 350],
       ["Chr01:2:ctg2_d2", "ctg2", 350, 500],
       ["Chr02:1:ctg3", "ctg3", 500, 580],
+    ]);
+    expect(copied.slice(2, 4).map((block) => block.copyInstanceId)).toEqual([
+      "Chr01:1:ctg1_d2",
+      "Chr01:2:ctg2_d2",
     ]);
   });
 
@@ -300,6 +721,61 @@ describe("assemblyEditing", () => {
     ]);
   });
 
+  it("copies a composite assembly block atomically while preserving source ids", () => {
+    const copied = copySelection(structuredBlocks, {
+      kind: "contigs",
+      ids: ["Chr01_block_1"],
+    });
+    const copiedModel = buildAssemblyEditModel(copied);
+    const copiedUnit = copiedModel.assemblyBlocks.find((block) => (
+      block.contigIds.includes("Chr01:1:ctgA_d2")
+    ));
+
+    expect(copied.slice(0, 4).map((block) => block.sourceId)).toEqual([
+      "ctgA",
+      "ctgB",
+      "ctgA",
+      "ctgB",
+    ]);
+    expect(copiedUnit).toMatchObject({
+      objectId: "Chr01",
+      contigIds: ["Chr01:1:ctgA_d2", "Chr01:2:ctgB_d2"],
+      isComposite: true,
+    });
+    expect(copied.filter((block) => copiedUnit?.contigIds.includes(block.id)).map((block) => (
+      block.assemblyBlockId
+    ))).toEqual([copiedUnit?.id, copiedUnit?.id]);
+  });
+
+  it("inserts multi-object copies inside each source object segment", () => {
+    const copied = copySelection(structuredBlocks, {
+      kind: "contigs",
+      ids: ["Chr01_block_1", "Chr02:1:ctgF"],
+    });
+
+    expect(copied.map((block) => [block.objectId, block.sourceId])).toEqual([
+      ["Chr01", "ctgA"],
+      ["Chr01", "ctgB"],
+      ["Chr01", "ctgA"],
+      ["Chr01", "ctgB"],
+      ["Chr01", "ctgC"],
+      ["Chr01", "ctgD"],
+      ["Chr01", "ctgE"],
+      ["Chr02", "ctgF"],
+      ["Chr02", "ctgF"],
+    ]);
+    expect(copied.reduce<string[]>((segments, block) => (
+      segments[segments.length - 1] === block.objectId
+        ? segments
+        : [...segments, block.objectId]
+    ), [])).toEqual(["Chr01", "Chr02"]);
+
+    const reparsed = parseAgpLayout(exportAgpText(copied));
+    expect(reparsed.blocks.map((block) => [block.objectId, block.sourceId])).toEqual(
+      copied.map((block) => [block.objectId, block.sourceId]),
+    );
+  });
+
   it("copies selected contigs before a target and adopts the target chromosome", () => {
     const copied = copySelectionBefore(
       blocks,
@@ -315,6 +791,28 @@ describe("assemblyEditing", () => {
     ]);
   });
 
+  it("moves a copied boundary gap behind the first unit of its target chromosome", () => {
+    const copied = copySelectionBefore(
+      structuredBlocks,
+      { kind: "contigs", ids: ["Chr01:4:ctgC"] },
+      "Chr02:1:ctgF",
+    );
+    const copiedContig = copied.find((block) => block.id === "Chr01:4:ctgC_d2");
+    const target = copied.find((block) => block.id === "Chr02:1:ctgF");
+
+    expect(copiedContig).toMatchObject({
+      objectId: "Chr02",
+      gapBefore: undefined,
+      visualStart: 370,
+      visualEnd: 430,
+    });
+    expect(target).toMatchObject({
+      gapBefore: structuredBlocks[2]?.gapBefore,
+      visualStart: 470,
+      visualEnd: 550,
+    });
+  });
+
   it("moves selected contigs to debris at the end of the layout", () => {
     const moved = moveSelectionToDebris(blocks, { kind: "contigs", ids: ["Chr01:2:ctg2"] });
 
@@ -322,6 +820,38 @@ describe("assemblyEditing", () => {
       ["Chr01:1:ctg1", "Chr01", 0, 100],
       ["Chr02:1:ctg3", "Chr02", 100, 180],
       ["Chr01:2:ctg2", "debris", 180, 330],
+    ]);
+  });
+
+  it("deletes only the selected contigs and closes the visual layout", () => {
+    const deleted = deleteContigSelection(
+      blocks,
+      { kind: "contigs", ids: ["Chr01:2:ctg2"] },
+    );
+
+    expect(deleted.map((block) => [
+      block.id,
+      block.objectId,
+      block.visualStart,
+      block.visualEnd,
+    ])).toEqual([
+      ["Chr01:1:ctg1", "Chr01", 0, 100],
+      ["Chr02:1:ctg3", "Chr02", 100, 180],
+    ]);
+    expect(deleteContigSelection(blocks, { kind: "chromosome", id: "Chr01" })).toBe(blocks);
+  });
+
+  it("deletes one selected split segment without deleting its sibling", () => {
+    const split = splitContigAtVisualPosition(blocks, "Chr01:1:ctg1", 50);
+    const deleted = deleteContigSelection(
+      split,
+      { kind: "contigs", ids: ["Chr01:1:ctg1:left"] },
+    );
+
+    expect(deleted.map((block) => [block.id, block.sourceStart, block.sourceEnd])).toEqual([
+      ["Chr01:1:ctg1:right", 50, 100],
+      ["Chr01:2:ctg2", 0, 150],
+      ["Chr02:1:ctg3", 0, 80],
     ]);
   });
 
@@ -337,6 +867,66 @@ describe("assemblyEditing", () => {
       "Chr01",
       "Chr01_d2",
       "Chr02",
+    ]);
+  });
+
+  it("removes chromosome boundaries enclosed by the selected blocks", () => {
+    const selection = {
+      kind: "contigs" as const,
+      ids: ["Chr01:2:ctg2", "Chr02:1:ctg3"],
+    };
+
+    expect(hasRemovableChromosomeBoundary(blocks, selection)).toBe(true);
+    const merged = removeChromosomeBoundariesFromSelection(blocks, selection);
+    expect(merged.map((block) => [block.id, block.objectId])).toEqual([
+      ["Chr01:1:ctg1", "Chr01"],
+      ["Chr01:2:ctg2", "Chr01"],
+      ["Chr02:1:ctg3", "Chr01"],
+    ]);
+    expect(merged.map((block) => block.orientation)).toEqual(["+", "-", "+"]);
+  });
+
+  it("retains a valid gap when structured chromosomes are joined", () => {
+    const selection = {
+      kind: "contigs" as const,
+      ids: ["Chr01:6:ctgD", "Chr02:1:ctgF"],
+    };
+    const merged = removeChromosomeBoundariesFromSelection(structuredBlocks, selection);
+    const joined = merged.find((block) => block.sourceId === "ctgF");
+
+    expect(joined?.objectId).toBe("Chr01");
+    expect(joined?.gapBefore).toEqual(DEFAULT_INSERTED_GAP);
+    expect(joined?.visualStart).toBe(470);
+  });
+
+  it("keeps the original layout when the selection contains no chromosome boundary", () => {
+    const selection = {
+      kind: "contigs" as const,
+      ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"],
+    };
+
+    expect(hasRemovableChromosomeBoundary(blocks, selection)).toBe(false);
+    expect(removeChromosomeBoundariesFromSelection(blocks, selection)).toBe(blocks);
+  });
+
+  it("removes gaps that become leading after chromosome retargeting", () => {
+    const bounded = addChromosomeBoundariesToSelection(structuredBlocks, {
+      kind: "contigs",
+      ids: ["Chr01:4:ctgC"],
+    });
+
+    expect(bounded.map((block) => [
+      block.sourceId,
+      block.objectId,
+      block.gapBefore?.length,
+      block.visualStart,
+    ])).toEqual([
+      ["ctgA", "Chr01", undefined, 0],
+      ["ctgB", "Chr01", undefined, 100],
+      ["ctgC", "Chr01_d2", undefined, 150],
+      ["ctgD", "Chr01_d3", undefined, 210],
+      ["ctgE", "Chr01_d3", undefined, 240],
+      ["ctgF", "Chr02", undefined, 310],
     ]);
   });
 
@@ -459,17 +1049,201 @@ describe("assemblyEditing", () => {
     })).toBe(blocks);
   });
 
-  it("splits a contig at a visual position into left and right source intervals", () => {
+  it("splits a reverse contig in visual order and inserts a default gap", () => {
     const split = splitContigAtVisualPosition(blocks, "Chr01:2:ctg2", 160);
 
     expect(split.map((block) => [block.id, block.sourceStart, block.sourceEnd, block.visualStart, block.visualEnd])).toEqual([
       ["Chr01:1:ctg1", 0, 100, 0, 100],
-      ["Chr01:2:ctg2:left", 0, 60, 100, 160],
-      ["Chr01:2:ctg2:right", 60, 150, 160, 250],
-      ["Chr02:1:ctg3", 0, 80, 250, 330],
+      ["Chr01:2:ctg2:left", 90, 150, 100, 160],
+      ["Chr01:2:ctg2:right", 0, 90, 260, 350],
+      ["Chr02:1:ctg3", 0, 80, 350, 430],
     ]);
     expect(split[1]?.orientation).toBe("-");
     expect(split[2]?.orientation).toBe("-");
+    expect(split.slice(1, 3).map((block) => block.displayName)).toEqual([
+      "ctg2:91-150",
+      "ctg2:1-90",
+    ]);
+    expect(split.slice(1, 3).every((block) => block.isSourceSegment)).toBe(true);
+    expect(split.slice(1, 3).map((block) => block.copyInstanceId)).toEqual([
+      "Chr01:2:ctg2",
+      "Chr01:2:ctg2",
+    ]);
+    expect(split[2]?.gapBefore).toEqual({
+      componentType: "U",
+      length: 100,
+      gapType: "contig",
+      linkage: "no",
+      linkageEvidence: "na",
+    });
+    expect(split.map((block) => block.assemblyBlockId ?? null)).toEqual([
+      "Chr01_block_1",
+      "Chr01_block_1",
+      null,
+      null,
+    ]);
+  });
+
+  it("splits a forward contig and preserves forward source interval order around the gap", () => {
+    const forward: ContactMapLayoutBlock[] = [{
+      id: "Chr03:1:ctgForward",
+      objectId: "Chr03",
+      sourceId: "ctgForward",
+      sourceStart: 10,
+      sourceEnd: 110,
+      visualStart: 0,
+      visualEnd: 100,
+      orientation: "+",
+      componentType: "W",
+      assemblyBlockId: null,
+    }];
+
+    const split = splitContigAtVisualPosition(forward, "Chr03:1:ctgForward", 40);
+
+    expect(split.map((block) => [
+      block.id,
+      block.sourceStart,
+      block.sourceEnd,
+      block.visualStart,
+      block.visualEnd,
+      block.assemblyBlockId ?? null,
+    ])).toEqual([
+      ["Chr03:1:ctgForward:left", 10, 50, 0, 40, null],
+      ["Chr03:1:ctgForward:right", 50, 110, 140, 200, null],
+    ]);
+    expect(split[1]?.gapBefore).toEqual({
+      componentType: "U",
+      length: 100,
+      gapType: "contig",
+      linkage: "no",
+      linkageEvidence: "na",
+    });
+    expect(split.map((block) => block.displayName)).toEqual([
+      "ctgForward:11-50",
+      "ctgForward:51-110",
+    ]);
+    expect(split.every((block) => block.isSourceSegment)).toBe(true);
+  });
+
+  it("copies only the selected half of a split contig inside a composite block", () => {
+    const split = splitContigAtVisualPosition(
+      structuredBlocks,
+      "Chr01:2:ctgB",
+      125,
+    );
+    const copied = copySelection(split, {
+      kind: "contigs",
+      ids: ["Chr01:2:ctgB:left"],
+    });
+
+    expect(copied.filter((block) => block.sourceId === "ctgA")).toHaveLength(1);
+    expect(copied.filter((block) => (
+      block.sourceId === "ctgB" && block.sourceStart === 35 && block.sourceEnd === 60
+    ))).toHaveLength(2);
+    expect(copied.filter((block) => (
+      block.sourceId === "ctgB" && block.sourceStart === 10 && block.sourceEnd === 35
+    ))).toHaveLength(1);
+    expect(copied.filter((block) => block.displayName === "ctgB:36-60")).toHaveLength(2);
+  });
+
+  it("deletes only a selected adjacent gap and rebuilds composite and singleton semantics", () => {
+    const selection = {
+      kind: "contigs" as const,
+      ids: ["Chr01_block_1", "Chr01:4:ctgC"],
+    };
+
+    expect(hasDeletableGap(structuredBlocks, selection)).toBe(true);
+    expect(hasDeletableGap(structuredBlocks, {
+      kind: "contigs",
+      ids: ["Chr01_block_1", "Chr01_block_2"],
+    })).toBe(false);
+
+    const joined = deleteGapsBetweenSelection(structuredBlocks, selection);
+    const model = buildAssemblyEditModel(joined);
+
+    expect(joined[2]?.gapBefore).toBeUndefined();
+    expect(joined.slice(0, 3).map((block) => block.assemblyBlockId)).toEqual([
+      "Chr01_block_1",
+      "Chr01_block_1",
+      "Chr01_block_1",
+    ]);
+    expect(model.assemblyBlocks.map((block) => ({
+      id: block.id,
+      contigIds: block.contigIds,
+      isComposite: block.isComposite,
+    }))).toEqual([
+      {
+        id: "Chr01_block_1",
+        contigIds: ["Chr01:1:ctgA", "Chr01:2:ctgB", "Chr01:4:ctgC"],
+        isComposite: true,
+      },
+      {
+        id: "Chr01_block_2",
+        contigIds: ["Chr01:6:ctgD", "Chr01:7:ctgE"],
+        isComposite: true,
+      },
+      {
+        id: "Chr02:1:ctgF",
+        contigIds: ["Chr02:1:ctgF"],
+        isComposite: false,
+      },
+    ]);
+    expect(joined[5]?.assemblyBlockId).toBeNull();
+  });
+
+  it("restores contiguous split siblings to their original contig when their gap is deleted", () => {
+    const split = splitContigAtVisualPosition(blocks, "Chr01:1:ctg1", 50);
+    const selection = {
+      kind: "contigs" as const,
+      ids: ["Chr01:1:ctg1:left", "Chr01:1:ctg1:right"],
+    };
+
+    expect(hasDeletableGap(split, selection)).toBe(true);
+    const joined = deleteGapsBetweenSelection(split, selection);
+
+    expect(joined).toHaveLength(blocks.length);
+    expect(joined[0]).toMatchObject({
+      id: "Chr01:1:ctg1",
+      sourceId: "ctg1",
+      sourceStart: 0,
+      sourceEnd: 100,
+      visualStart: 0,
+      visualEnd: 100,
+      isSourceSegment: false,
+    });
+    expect(joined[0]?.gapBefore).toBeUndefined();
+    expect(joined[0]?.displayName).toBeUndefined();
+    expect(joined.some((block) => block.id.endsWith(":left") || block.id.endsWith(":right"))).toBe(false);
+  });
+
+  it("restores a copied source segment to its pre-split segment identity", () => {
+    const sourceSegment: ContactMapLayoutBlock[] = [{
+      id: "Chr01:1:utg1_d2",
+      objectId: "Chr01",
+      sourceId: "utg1",
+      displayName: "utg1:1-50",
+      isSourceSegment: true,
+      copyInstanceId: "Chr01:1:utg1_d2",
+      sourceStart: 0,
+      sourceEnd: 50,
+      visualStart: 0,
+      visualEnd: 50,
+      orientation: "+",
+    }];
+    const split = splitContigAtVisualPosition(sourceSegment, "Chr01:1:utg1_d2", 25);
+    const joined = deleteGapsBetweenSelection(split, {
+      kind: "contigs",
+      ids: ["Chr01:1:utg1_d2:left", "Chr01:1:utg1_d2:right"],
+    });
+
+    expect(joined).toHaveLength(1);
+    expect(joined[0]).toMatchObject({
+      id: "Chr01:1:utg1_d2",
+      displayName: "utg1:1-50",
+      isSourceSegment: true,
+      sourceStart: 0,
+      sourceEnd: 50,
+    });
   });
 
   it("hit-tests contig body and chromosome boundaries in map pixels", () => {
@@ -485,6 +1259,24 @@ describe("assemblyEditing", () => {
     });
   });
 
+  it("hit-tests a split segment before its containing composite block", () => {
+    const split = splitContigAtVisualPosition(
+      structuredBlocks,
+      "Chr01:2:ctgB",
+      125,
+    );
+    const model = buildAssemblyEditModel(split);
+
+    expect(hitTestAssemblyLayout(
+      model,
+      { x: 110, y: 110 },
+      { sizePx: model.totalSpan, tolerancePx: 8 },
+    )).toEqual({
+      kind: "contig",
+      id: "Chr01:2:ctgB:left",
+    });
+  });
+
   it("hit-tests inside diagonal contig and chromosome boxes", () => {
     const model = buildAssemblyEditModel(blocks);
 
@@ -496,6 +1288,12 @@ describe("assemblyEditing", () => {
       kind: "chromosome-boundary",
       id: "Chr01",
     });
+    expect(hitTestAssemblyLayout(model, { x: 240, y: 20 }, { sizePx: 330, tolerancePx: 8 })).toEqual({
+      kind: "chromosome-boundary",
+      id: "Chr01",
+    });
+    expect(hitTestAssemblyLayout(model, { x: 20, y: 120 }, { sizePx: 330, tolerancePx: 8 })).toBeNull();
+    expect(pointSelectsWholeChromosome(model.chromosomes[0], 20, 120)).toBe(false);
   });
 
   it("hit-tests against the visible contact viewport when zoomed", () => {

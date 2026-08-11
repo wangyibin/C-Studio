@@ -6,6 +6,7 @@ import {
   centerRatioForKey,
   clamp,
   GenomeAxisNavigator,
+  genomeSegmentAtRatio,
 } from "./GenomeAxisNavigator";
 
 describe("GenomeAxisNavigator helpers", () => {
@@ -95,6 +96,18 @@ describe("GenomeAxisNavigator helpers", () => {
       ["Chr02:1", "Chr02"],
       ["Chr01:2", "Chr01"],
     ]);
+  });
+
+  it("resolves the hovered chromosome segment on either genome axis", () => {
+    const segments = buildGenomeSegments([
+      { id: "a", objectId: "Chr01", visualStart: 0, visualEnd: 60_000_000 },
+      { id: "b", objectId: "Chr02", visualStart: 60_000_000, visualEnd: 100_000_000 },
+    ], 100);
+
+    expect(genomeSegmentAtRatio(segments, 0.25)?.objectId).toBe("Chr01");
+    expect(genomeSegmentAtRatio(segments, 0.75)?.objectId).toBe("Chr02");
+    expect(genomeSegmentAtRatio(segments, 1)?.objectId).toBe("Chr02");
+    expect(genomeSegmentAtRatio([], 0.5)).toBeNull();
   });
 
   it("maps keyboard navigation to clamped center ratios", () => {

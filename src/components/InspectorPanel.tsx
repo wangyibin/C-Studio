@@ -2,14 +2,24 @@ import { useEffect, useRef, useState } from "react";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import { contactColorCss } from "../state/contactColor";
 import { estimateContactColorScale, normalizeContactValue, type ContactColorScale } from "../state/contactColorScale";
-import { groupAssemblyBlocksByChromosome } from "../state/assemblyEditing";
+import {
+  assemblyCopyInstanceId,
+  assemblyCopyIntervalGroups,
+  assemblyContigDisplayName,
+  assemblyRenameValidationError,
+  assemblyUnitId,
+  buildAssemblyEditModel,
+  groupAssemblyBlocksByChromosome,
+  selectedBlockIds,
+  type AssemblyBlockGroup,
+} from "../state/assemblyEditing";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import {
   SyntenyDotplot,
-  type SyntenySelectionModifiers,
 } from "./SyntenyDotplot";
 import type { SyntenyView } from "../state/syntenyView";
-import type { UiAction, UiState } from "../state/uiState";
+import type { OperationRecord, UiAction, UiState } from "../state/uiState";
+import { fitContextMenuToViewport } from "./AssemblyContextMenu";
 
 interface InspectorPanelProps {
   dataset: ExampleDatasetSummary | null;
@@ -22,7 +32,6 @@ interface InspectorPanelProps {
   syntenyView: SyntenyView | null;
   assemblyBlocks: ContactMapLayoutBlock[];
   selectedAssemblyBlockIds: string[];
-  onSelectSyntenyBlock: (assemblyBlockId: string, modifiers: SyntenySelectionModifiers) => void;
   pafText: string;
   onPafTextChange: (value: string) => void;
 }
@@ -38,13 +47,69 @@ export function InspectorPanel({
   syntenyView,
   assemblyBlocks,
   selectedAssemblyBlockIds,
-  onSelectSyntenyBlock,
   pafText,
   onPafTextChange,
 }: InspectorPanelProps) {
+  const [historyMenu, setHistoryMenu] = useState<{
+    id: number;
+    anchorX: number;
+    anchorY: number;
+    x: number;
+    y: number;
+  } | null>(null);
+  const historyMenuRef = useRef<HTMLDivElement>(null);
+  const timelineOperations = [
+    ...uiState.operationHistory.map((operation) => ({ operation, undone: false })),
+    ...[...uiState.redoStack].reverse().map((operation) => ({ operation, undone: true })),
+  ];
+
+  useEffect(() => {
+    if (!historyMenu || !historyMenuRef.current) {
+      return;
+    }
+    const bounds = historyMenuRef.current.getBoundingClientRect();
+    const fitted = fitContextMenuToViewport(
+      { x: historyMenu.anchorX, y: historyMenu.anchorY },
+      { width: bounds.width, height: bounds.height },
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    if (fitted.x !== historyMenu.x || fitted.y !== historyMenu.y) {
+      setHistoryMenu({ ...historyMenu, ...fitted });
+    }
+  }, [historyMenu]);
+
+  useEffect(() => {
+    if (!historyMenu) {
+      return;
+    }
+    function closeHistoryMenu(event: PointerEvent) {
+      if (!historyMenuRef.current?.contains(event.target as Node)) {
+        setHistoryMenu(null);
+      }
+    }
+    function handleHistoryMenuKey(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setHistoryMenu(null);
+      }
+    }
+    function closeHistoryMenuOnResize() {
+      setHistoryMenu(null);
+    }
+    window.addEventListener("pointerdown", closeHistoryMenu);
+    window.addEventListener("keydown", handleHistoryMenuKey);
+    window.addEventListener("resize", closeHistoryMenuOnResize);
+    return () => {
+      window.removeEventListener("pointerdown", closeHistoryMenu);
+      window.removeEventListener("keydown", handleHistoryMenuKey);
+      window.removeEventListener("resize", closeHistoryMenuOnResize);
+    };
+  }, [historyMenu]);
+
   return (
     <aside className="inspector" aria-label="Inspector">
-      <section className="overview-panel inspector-overview">
+      <section className={`overview-panel inspector-overview${
+        uiState.activeOverviewMode === "synteny" ? " synteny-overview-active" : ""
+      }`}>
         <div className="panel-tabs compact-tabs" role="tablist" aria-label="Overview mode">
           <button
             type="button"
@@ -75,7 +140,6 @@ export function InspectorPanel({
             onExpand={() => onUiAction({ type: "setSyntenySplitOpen", open: true })}
             assemblyBlocks={assemblyBlocks}
             selectedAssemblyBlockIds={selectedAssemblyBlockIds}
-            onSelectBlock={onSelectSyntenyBlock}
             uiState={uiState}
             onUiAction={onUiAction}
           />
@@ -89,21 +153,77 @@ export function InspectorPanel({
 
       <section>
         <h2>History</h2>
-        <p className="empty-state">{uiState.operationHistory.length} operations</p>
-        {uiState.operationHistory.length > 0 ? (
+        <p className="empty-state history-count">
+          {uiState.operationHistory.length} applied
+          {uiState.redoStack.length > 0 ? ` · ${uiState.redoStack.length} undone` : ""}
+        </p>
+        {timelineOperations.length > 0 ? (
           <ol className="operation-list">
-            {uiState.operationHistory.map((operation) => (
-              <li key={operation.id}>
-                <span>{operation.label}</span>
-                <small>
-                  {Math.round(operation.position.x)}, {Math.round(operation.position.y)}
-                </small>
+            {timelineOperations.map(({ operation, undone }, index) => (
+              <li
+                key={operation.id}
+                className={`${undone ? "undone" : "applied"}${
+                  !undone && index === uiState.operationHistory.length - 1 ? " current" : ""
+                }`}
+                onContextMenu={(event) => {
+                  if (undone) {
+                    return;
+                  }
+                  event.preventDefault();
+                  setHistoryMenu({
+                    id: operation.id,
+                    anchorX: event.clientX,
+                    anchorY: event.clientY,
+                    x: event.clientX,
+                    y: event.clientY,
+                  });
+                }}
+              >
+                <button
+                  type="button"
+                  className="history-entry-button"
+                  aria-label={`Focus ${operation.label}`}
+                  onClick={() => onUiAction({ type: "focusHistoryOperation", id: operation.id })}
+                  onMouseEnter={() => onUiAction({ type: "previewHistoryOperation", id: operation.id })}
+                  onMouseLeave={() => onUiAction({ type: "previewHistoryOperation", id: null })}
+                  onFocus={() => onUiAction({ type: "previewHistoryOperation", id: operation.id })}
+                  onBlur={() => onUiAction({ type: "previewHistoryOperation", id: null })}
+                >
+                  <span className="history-entry-heading">
+                    <strong>{operation.label}</strong>
+                    {undone ? <em>Undone</em> : null}
+                  </span>
+                  <small className="history-entry-object">{historyOperationObject(operation)}</small>
+                  <small>{historyOperationCounts(operation)}</small>
+                </button>
               </li>
             ))}
           </ol>
         ) : (
           <div className="history-empty">No operations yet</div>
         )}
+        {historyMenu ? (
+          <div
+            ref={historyMenuRef}
+            className="history-context-menu"
+            role="menu"
+            style={{ left: historyMenu.x, top: historyMenu.y }}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              disabled={historyMenu.id === uiState.operationHistory[
+                uiState.operationHistory.length - 1
+              ]?.id}
+              onClick={() => {
+                onUiAction({ type: "undoToHistoryOperation", id: historyMenu.id });
+                setHistoryMenu(null);
+              }}
+            >
+              Undo to here
+            </button>
+          </div>
+        ) : null}
       </section>
 
       <section>
@@ -172,6 +292,23 @@ export function InspectorPanel({
   );
 }
 
+export function historyOperationObject(operation: OperationRecord) {
+  const sourceIds = operation.impact?.sourceIds ?? [];
+  if (sourceIds.length === 0) {
+    return "Assembly";
+  }
+  const visible = sourceIds.slice(0, 2).join(", ");
+  return sourceIds.length > 2 ? `${visible} +${sourceIds.length - 2}` : visible;
+}
+
+export function historyOperationCounts(operation: OperationRecord) {
+  const chromosomeCount = new Set(operation.impact?.chromosomeIds ?? []).size;
+  const contigCount = new Set(operation.impact?.sourceIds ?? []).size;
+  return `${chromosomeCount} ${chromosomeCount === 1 ? "chromosome" : "chromosomes"} · ${contigCount} ${
+    contigCount === 1 ? "contig" : "contigs"
+  }`;
+}
+
 interface SelectionSummaryProps {
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
@@ -179,10 +316,16 @@ interface SelectionSummaryProps {
 
 function SelectionSummary({ uiState, onUiAction }: SelectionSummaryProps) {
   const selection = uiState.assembly.selection;
+  const model = buildAssemblyEditModel(uiState.assembly.blocks);
   const groups = groupAssemblyBlocksByChromosome(uiState.assembly.blocks, selection);
+  const selectedContigIds = new Set(selectedBlockIds(model.blocks, selection));
+  const selectedContigs = model.blocks.filter((block) => selectedContigIds.has(block.id));
+  const selectedBlocks = model.assemblyBlocks.filter((block) => (
+    block.contigIds.some((id) => selectedContigIds.has(id))
+  ));
 
   if (!selection) {
-    return <p className="empty-state">No contigs selected</p>;
+    return <p className="empty-state">No blocks selected</p>;
   }
 
   if (selection.kind === "chromosome") {
@@ -190,6 +333,9 @@ function SelectionSummary({ uiState, onUiAction }: SelectionSummaryProps) {
     const selectedCount = group?.selectedCount ?? 0;
     const totalCount = group?.totalCount ?? 0;
     const totalLength = group?.totalLength ?? 0;
+    const chromosomeContigCount = model.assemblyBlocks
+      .filter((block) => block.objectId === selection.id)
+      .reduce((count, block) => count + block.contigIds.length, 0);
     return (
       <div className="selection-summary">
         <dl>
@@ -202,84 +348,383 @@ function SelectionSummary({ uiState, onUiAction }: SelectionSummaryProps) {
             <dd>{selection.id}</dd>
           </div>
           <div>
-            <dt>Contigs</dt>
+            <dt>Blocks</dt>
             <dd>{selectedCount}/{totalCount}</dd>
+          </div>
+          <div>
+            <dt>Contigs</dt>
+            <dd>{chromosomeContigCount}</dd>
           </div>
           <div>
             <dt>Length</dt>
             <dd>{formatSpan(totalLength)}</dd>
           </div>
         </dl>
-        <ChromosomeGroupList groups={groups} selection={selection} onUiAction={onUiAction} />
+        <ChromosomeGroupList
+          groups={group ? [group] : []}
+          assemblyBlocks={model.assemblyBlocks}
+          contigs={model.blocks}
+          selection={selection}
+          onUiAction={onUiAction}
+        />
       </div>
     );
   }
 
-  const selectedBlocks = uiState.assembly.blocks.filter((block) => selection.ids.includes(block.id));
   const selectedGroups = groups.filter((group) => group.selectedCount > 0);
-  const selectedLength = selectedGroups.reduce((total, group) => total + group.selectedLength, 0);
+  const selectedLength = selectedBlocks.reduce(
+    (total, block) => total + Math.max(0, block.visualEnd - block.visualStart),
+    0,
+  );
+  const selectedContigLength = selectedContigs.reduce(
+    (total, block) => total + Math.max(0, block.visualEnd - block.visualStart),
+    0,
+  );
+  const selectedContig = selectedContigs.length === 1 ? selectedContigs[0] : null;
 
   return (
     <div className="selection-summary">
       <dl>
         <div>
           <dt>Type</dt>
-          <dd>Contigs</dd>
+          <dd>Blocks</dd>
         </div>
         <div>
           <dt>Selected</dt>
-          <dd>{selectedBlocks.length} contigs</dd>
+          <dd>{formatCount(selectedBlocks.length, "block")}</dd>
         </div>
         <div>
-          <dt>Groups</dt>
-          <dd>{selectedGroups.length} chromosomes</dd>
+          <dt>Contigs</dt>
+          <dd>{formatCount(selectedContigs.length, "contig")}</dd>
+        </div>
+        <div>
+          <dt>Chromosomes</dt>
+          <dd>{formatCount(selectedGroups.length, "chromosome")}</dd>
         </div>
         <div>
           <dt>Length</dt>
-          <dd>{formatSpan(selectedLength)}</dd>
+          <dd>{formatSpan(selectedContigLength || selectedLength)}</dd>
         </div>
       </dl>
-      <ChromosomeGroupList groups={groups} selection={selection} onUiAction={onUiAction} />
+      {selectedContig ? (
+        <ContigOccurrenceSummary
+          contig={selectedContig}
+          blocks={model.blocks}
+          onUiAction={onUiAction}
+        />
+      ) : null}
+      <ChromosomeGroupList
+        groups={selectedGroups}
+        assemblyBlocks={model.assemblyBlocks}
+        contigs={model.blocks}
+        selection={selection}
+        onUiAction={onUiAction}
+      />
     </div>
   );
 }
 
+interface ContigOccurrenceSummaryProps {
+  contig: ContactMapLayoutBlock;
+  blocks: ContactMapLayoutBlock[];
+  onUiAction: (action: UiAction) => void;
+}
+
+function ContigOccurrenceSummary({
+  contig,
+  blocks,
+  onUiAction,
+}: ContigOccurrenceSummaryProps) {
+  const copyGroups = assemblyCopyIntervalGroups(blocks, contig);
+  const currentCopyId = assemblyCopyInstanceId(contig);
+  const currentCopy = copyGroups.find((group) => group.id === currentCopyId);
+  const coveringCopyCount = copyGroups.filter((group) => group.coversInterval).length;
+  const siblingSegments = currentCopy?.blocks.filter((block) => block.id !== contig.id) ?? [];
+  const otherCopyGroups = copyGroups.filter((group) => (
+    group.id !== currentCopyId && group.overlappingBlocks.length > 0
+  ));
+
+  return (
+    <section className="contig-occurrences" aria-label="Contig occurrences">
+      <div className="contig-occurrence-heading">
+        <span>{assemblyContigDisplayName(contig)}</span>
+        <strong>{formatCount(coveringCopyCount, "copy", "copies")}</strong>
+      </div>
+      <dl>
+        <div>
+          <dt>Source interval</dt>
+          <dd>{contig.sourceId}:{formatGenomicInterval(contig.sourceStart, contig.sourceEnd)}</dd>
+        </div>
+        <div>
+          <dt>Current location</dt>
+          <dd>{formatContigLocation(contig)}</dd>
+        </div>
+      </dl>
+      <div className={`contig-current-copy-state${currentCopy?.isSplit ? " split" : ""}`}>
+        <span>Current copy</span>
+        <strong>{currentCopy?.isSplit
+          ? `Split copy · ${currentCopy.blocks.length} segments`
+          : "Unsplit copy"}</strong>
+      </div>
+      {currentCopy?.isSplit ? (
+        <ContigPlacementList
+          label="Other segments in this copy"
+          placements={siblingSegments}
+          emptyText="No other segments"
+          onUiAction={onUiAction}
+        />
+      ) : null}
+      <div className="contig-other-locations">
+        <span>Other copies</span>
+        {otherCopyGroups.length > 0 ? (
+          <div className="contig-copy-groups">
+            {otherCopyGroups.map((group) => (
+              <section
+                className={`contig-copy-group${group.isSplit ? " split" : ""}`}
+                key={group.id}
+              >
+                <div className="contig-copy-group-heading">
+                  <strong>{group.isSplit
+                    ? `Split copy · ${group.blocks.length} segments`
+                    : "Unsplit copy"}</strong>
+                  <small>{group.coversInterval ? "Covers current interval" : "Partial overlap"}</small>
+                </div>
+                <ContigPlacementItems
+                  placements={group.blocks}
+                  onUiAction={onUiAction}
+                />
+              </section>
+            ))}
+          </div>
+        ) : <small>No other copies</small>}
+      </div>
+    </section>
+  );
+}
+
+interface ContigPlacementListProps {
+  label: string;
+  placements: ContactMapLayoutBlock[];
+  emptyText: string;
+  onUiAction: (action: UiAction) => void;
+}
+
+function ContigPlacementList({
+  label,
+  placements,
+  emptyText,
+  onUiAction,
+}: ContigPlacementListProps) {
+  return (
+    <div className="contig-other-locations">
+      <span>{label}</span>
+      {placements.length > 0
+        ? <ContigPlacementItems placements={placements} onUiAction={onUiAction} />
+        : <small>{emptyText}</small>}
+    </div>
+  );
+}
+
+function ContigPlacementItems({
+  placements,
+  onUiAction,
+}: Pick<ContigPlacementListProps, "placements" | "onUiAction">) {
+  return (
+    <ol>
+      {placements.map((placement) => (
+        <li key={placement.id}>
+          <button
+            type="button"
+            aria-label={`Select ${assemblyContigDisplayName(placement)} at ${formatContigLocation(placement)}`}
+            onClick={() => onUiAction({
+              type: "selectAssemblyContig",
+              id: placement.id,
+              additive: false,
+            })}
+          >
+            <span>{assemblyContigDisplayName(placement)} · {placement.objectId}</span>
+            <small>
+              Source {formatGenomicInterval(placement.sourceStart, placement.sourceEnd)} bp
+              {` · Visual ${formatGenomicInterval(placement.visualStart, placement.visualEnd)} bp`}
+              {` · ${placement.orientation}`}
+            </small>
+          </button>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function formatGenomicInterval(start: number, end: number) {
+  return `${Math.max(0, start) + 1}-${Math.max(0, end)}`;
+}
+
+function formatContigLocation(contig: ContactMapLayoutBlock) {
+  return `${contig.objectId} · ${assemblyUnitId(contig)} · ${formatGenomicInterval(
+    contig.visualStart,
+    contig.visualEnd,
+  )} bp · ${contig.orientation}`;
+}
+
 interface ChromosomeGroupListProps {
   groups: ReturnType<typeof groupAssemblyBlocksByChromosome>;
+  assemblyBlocks: AssemblyBlockGroup[];
+  contigs: ContactMapLayoutBlock[];
   selection: UiState["assembly"]["selection"];
   onUiAction: (action: UiAction) => void;
 }
 
-function ChromosomeGroupList({ groups, selection, onUiAction }: ChromosomeGroupListProps) {
+function ChromosomeGroupList({
+  groups,
+  assemblyBlocks,
+  contigs,
+  selection,
+  onUiAction,
+}: ChromosomeGroupListProps) {
+  const [renamingChromosome, setRenamingChromosome] = useState<{
+    id: string;
+    value: string;
+    error: string | null;
+  } | null>(null);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const blocksById = new Map(assemblyBlocks.map((block) => [block.id, block]));
+  const contigsById = new Map(contigs.map((contig) => [contig.id, contig]));
+
+  useEffect(() => {
+    if (renamingChromosome) {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    }
+  }, [renamingChromosome?.id]);
+
+  const beginChromosomeRename = (id: string) => {
+    onUiAction({ type: "selectAssemblyChromosome", id });
+    setRenamingChromosome({ id, value: id, error: null });
+  };
+  const commitChromosomeRename = () => {
+    if (!renamingChromosome) {
+      return;
+    }
+    const name = renamingChromosome.value.trim();
+    const chromosomeSelection = {
+      kind: "chromosome" as const,
+      id: renamingChromosome.id,
+    };
+    const error = assemblyRenameValidationError(contigs, chromosomeSelection, name);
+    if (error) {
+      setRenamingChromosome({ ...renamingChromosome, error });
+      return;
+    }
+    if (name !== renamingChromosome.id) {
+      onUiAction({ type: "selectAssemblyChromosome", id: renamingChromosome.id });
+      onUiAction({ type: "renameAssemblySelection", name });
+    }
+    setRenamingChromosome(null);
+  };
+
   return (
     <div className="selection-groups">
       {groups.map((group) => (
         <article key={group.id} className={`selection-group ${selection?.kind === "chromosome" && selection.id === group.id ? "selected" : ""}`}>
-          <button
-            type="button"
-            className="selection-group-header"
-            onClick={() => onUiAction({ type: "selectAssemblyChromosome", id: group.id })}
-          >
-            <span>{group.id}</span>
-            <strong>
-              {group.selectedCount}/{group.totalCount}
-            </strong>
-          </button>
+          {renamingChromosome?.id === group.id ? (
+            <form
+              className="selection-group-header selection-group-rename-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                commitChromosomeRename();
+              }}
+            >
+              <input
+                ref={renameInputRef}
+                value={renamingChromosome.value}
+                aria-label={`Rename chromosome ${group.id}`}
+                aria-invalid={Boolean(renamingChromosome.error)}
+                onChange={(event) => setRenamingChromosome({
+                  ...renamingChromosome,
+                  value: event.target.value,
+                  error: null,
+                })}
+                onBlur={commitChromosomeRename}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setRenamingChromosome(null);
+                  }
+                }}
+              />
+              <strong>
+                {group.selectedCount}/{group.totalCount}
+              </strong>
+              {renamingChromosome.error ? (
+                <small className="selection-group-rename-error" role="alert">
+                  {renamingChromosome.error}
+                </small>
+              ) : null}
+            </form>
+          ) : (
+            <button
+              type="button"
+              className="selection-group-header"
+              title={`Double-click to rename ${group.id}`}
+              onClick={() => onUiAction({ type: "selectAssemblyChromosome", id: group.id })}
+              onDoubleClick={() => beginChromosomeRename(group.id)}
+            >
+              <span>{group.id}</span>
+              <strong>
+                {group.selectedCount}/{group.totalCount}
+              </strong>
+            </button>
+          )}
           <div className="selection-group-list">
-            {group.blockIds.map((blockId) => {
+            {group.blockIds.filter((blockId) => {
+              const block = blocksById.get(blockId);
+              return block ? isBlockSelected(selection, group.id, block) : false;
+            }).map((blockId) => {
+              const block = blocksById.get(blockId);
+              if (!block) {
+                return null;
+              }
+              const childContigs = block.contigIds
+                .map((id) => contigsById.get(id))
+                .filter((contig): contig is ContactMapLayoutBlock => Boolean(contig));
+              const label = block.isComposite
+                ? block.id
+                : childContigs[0] ? assemblyContigDisplayName(childContigs[0]) : block.id;
               return (
-                <button
+                <div
+                  className={`selection-block-entry${block.isComposite ? " composite" : ""}`}
                   key={blockId}
-                  type="button"
-                  className={`selection-chip ${isBlockSelected(selection, group.id, blockId) ? "selected" : ""}`}
-                  onClick={() => onUiAction({
-                    type: "selectAssemblyContig",
-                    id: blockId,
-                    additive: Boolean(selection?.kind === "contigs" && selection.ids.includes(blockId)),
-                  })}
                 >
-                  {blockId.split(":")[2] ?? blockId}
-                </button>
+                  <button
+                    type="button"
+                    className={`selection-chip ${isBlockSelected(selection, group.id, block) ? "selected" : ""}`}
+                    aria-label={`Select block ${label}`}
+                    title={label}
+                    onClick={() => onUiAction({
+                      type: "selectAssemblyContig",
+                      id: blockId,
+                      additive: Boolean(
+                        selection?.kind === "contigs"
+                        && (selection.ids.includes(blockId)
+                          || block.contigIds.some((id) => selection.ids.includes(id))),
+                      ),
+                    })}
+                  >
+                    <span className={block.isComposite ? undefined : "selection-contig-label"}>
+                      {label}
+                    </span>
+                    <small>{block.isComposite ? `${block.contigIds.length} contigs` : "contig"}</small>
+                  </button>
+                  {block.isComposite ? (
+                    <div className="selection-contig-children" aria-label={`Contigs in ${block.id}`}>
+                      {childContigs.map((contig) => (
+                        <span key={contig.id} title={`${assemblyContigDisplayName(contig)} ${contig.orientation}`}>
+                          {assemblyContigDisplayName(contig)}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               );
             })}
           </div>
@@ -289,10 +734,16 @@ function ChromosomeGroupList({ groups, selection, onUiAction }: ChromosomeGroupL
   );
 }
 
-function isBlockSelected(selection: UiState["assembly"]["selection"], groupId: string, blockId: string) {
+function isBlockSelected(
+  selection: UiState["assembly"]["selection"],
+  groupId: string,
+  block: AssemblyBlockGroup,
+) {
   return selection?.kind === "chromosome"
     ? selection.id === groupId
-    : selection?.kind === "contigs" && selection.ids.includes(blockId);
+    : selection?.kind === "contigs"
+      && (selection.ids.includes(block.id)
+        || block.contigIds.some((id) => selection.ids.includes(id)));
 }
 
 function formatSpan(bp: number) {
@@ -303,6 +754,10 @@ function formatSpan(bp: number) {
     return `${(bp / 1_000).toFixed(1)} kb`;
   }
   return `${bp} bp`;
+}
+
+function formatCount(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
 }
 
 interface ContactOverviewProps {
@@ -483,7 +938,6 @@ interface SyntenyPreviewProps {
   syntenyView: SyntenyView | null;
   assemblyBlocks: ContactMapLayoutBlock[];
   onExpand: () => void;
-  onSelectBlock: (assemblyBlockId: string, modifiers: SyntenySelectionModifiers) => void;
   selectedAssemblyBlockIds: string[];
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
@@ -493,7 +947,6 @@ function SyntenyPreview({
   syntenyView,
   assemblyBlocks,
   onExpand,
-  onSelectBlock,
   selectedAssemblyBlockIds,
   uiState,
   onUiAction,
@@ -503,8 +956,8 @@ function SyntenyPreview({
       <SyntenyDotplot
         syntenyView={syntenyView}
         assemblyBlocks={assemblyBlocks}
+        interactionMode="preview"
         onDoubleClick={onExpand}
-        onSelectBlock={onSelectBlock}
         selectedAssemblyBlockIds={selectedAssemblyBlockIds}
         uiState={uiState}
         onUiAction={onUiAction}

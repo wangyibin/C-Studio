@@ -7,8 +7,31 @@ export interface AssemblyChromosome {
   blockIds: string[];
 }
 
+export interface AssemblyBlockGroup {
+  id: string;
+  objectId: string;
+  visualStart: number;
+  visualEnd: number;
+  contigIds: string[];
+  isComposite: boolean;
+}
+
+export interface AssemblyGapRange {
+  id: string;
+  objectId: string;
+  visualStart: number;
+  visualEnd: number;
+  leftBlockId: string | null;
+  rightBlockId: string;
+  metadata: NonNullable<ContactMapLayoutBlock["gapBefore"]>;
+}
+
 export interface AssemblyEditModel {
+  /** Flat contig placements consumed by the contact/coverage/synteny projections. */
   blocks: ContactMapLayoutBlock[];
+  /** Atomic assembly blocks. Singleton blocks use their contig id directly. */
+  assemblyBlocks: AssemblyBlockGroup[];
+  gaps: AssemblyGapRange[];
   chromosomes: AssemblyChromosome[];
   totalSpan: number;
 }
@@ -21,8 +44,13 @@ export interface AssemblyChromosomeGroup extends AssemblyChromosome {
 }
 
 export type AssemblySelection =
-  | { kind: "contigs"; ids: string[] }
+  | { kind: "contigs"; ids: string[]; exact?: boolean }
   | { kind: "chromosome"; id: string };
+
+export interface AssemblyRenameTarget {
+  kind: "contig" | "chromosome";
+  currentName: string;
+}
 
 export type AssemblyHit =
   | { kind: "contig"; id: string }
@@ -64,11 +92,19 @@ export interface HitTestOptions {
 }
 
 const DEBRIS_OBJECT_ID = "debris";
+export const DEFAULT_INSERTED_GAP = {
+  componentType: "U" as const,
+  length: 100,
+  gapType: "contig",
+  linkage: "no",
+  linkageEvidence: "na",
+};
 
 export function buildAssemblyEditModel(blocks: ContactMapLayoutBlock[]): AssemblyEditModel {
+  const assemblyBlocks = buildAssemblyBlockGroups(blocks);
   const chromosomes = new Map<string, AssemblyChromosome>();
 
-  for (const block of blocks) {
+  for (const block of assemblyBlocks) {
     const chromosome = chromosomes.get(block.objectId) ?? {
       id: block.objectId,
       visualStart: block.visualStart,
@@ -84,9 +120,225 @@ export function buildAssemblyEditModel(blocks: ContactMapLayoutBlock[]): Assembl
 
   return {
     blocks,
+    assemblyBlocks,
+    gaps: buildAssemblyGapRanges(blocks, assemblyBlocks),
     chromosomes: [...chromosomes.values()].sort((left, right) => left.visualStart - right.visualStart),
     totalSpan: Math.max(0, ...blocks.map((block) => block.visualEnd)),
   };
+}
+
+export function assemblyUnitId(block: ContactMapLayoutBlock) {
+  return block.assemblyBlockId || block.id;
+}
+
+export function assemblyUnitIdForContig(
+  blocks: ContactMapLayoutBlock[],
+  contigOrBlockId: string,
+) {
+  const block = blocks.find((candidate) => candidate.id === contigOrBlockId);
+  if (!block) {
+    return contigOrBlockId;
+  }
+  return block.isSourceSegment ? block.id : assemblyUnitId(block);
+}
+
+export function assemblyContigDisplayName(block: ContactMapLayoutBlock) {
+  return block.displayName?.trim() || block.sourceId;
+}
+
+export function assemblyCopyInstanceId(block: ContactMapLayoutBlock) {
+  return block.copyInstanceId?.trim()
+    || block.id.replace(/(?::(?:left|right))+$/, "");
+}
+
+export interface AssemblyCopyIntervalGroup {
+  id: string;
+  blocks: ContactMapLayoutBlock[];
+  overlappingBlocks: ContactMapLayoutBlock[];
+  coversInterval: boolean;
+  isSplit: boolean;
+}
+
+export function assemblyCopyIntervalGroups(
+  blocks: ContactMapLayoutBlock[],
+  target: ContactMapLayoutBlock,
+): AssemblyCopyIntervalGroup[] {
+  const blocksByCopy = new Map<string, ContactMapLayoutBlock[]>();
+  for (const block of blocks) {
+    if (block.sourceId !== target.sourceId) {
+      continue;
+    }
+    const copyId = assemblyCopyInstanceId(block);
+    const copyBlocks = blocksByCopy.get(copyId) ?? [];
+    copyBlocks.push(block);
+    blocksByCopy.set(copyId, copyBlocks);
+  }
+
+  return [...blocksByCopy].map(([id, copyBlocks]) => {
+    const orderedBlocks = [...copyBlocks].sort((left, right) => (
+      left.sourceStart - right.sourceStart
+      || left.sourceEnd - right.sourceEnd
+      || left.visualStart - right.visualStart
+    ));
+    const overlappingBlocks = orderedBlocks.filter((block) => (
+      block.sourceEnd > target.sourceStart && block.sourceStart < target.sourceEnd
+    ));
+    let coveredUntil = target.sourceStart;
+    let coversInterval = false;
+    for (const block of overlappingBlocks) {
+      const intervalStart = Math.max(target.sourceStart, block.sourceStart);
+      const intervalEnd = Math.min(target.sourceEnd, block.sourceEnd);
+      if (intervalStart > coveredUntil) {
+        break;
+      }
+      coveredUntil = Math.max(coveredUntil, intervalEnd);
+      if (coveredUntil >= target.sourceEnd) {
+        coversInterval = true;
+        break;
+      }
+    }
+    return {
+      id,
+      blocks: orderedBlocks,
+      overlappingBlocks,
+      coversInterval,
+      isSplit: orderedBlocks.length > 1,
+    };
+  }).sort((left, right) => (
+    Math.min(...left.blocks.map((block) => block.visualStart))
+    - Math.min(...right.blocks.map((block) => block.visualStart))
+  ));
+}
+
+export function assemblyRenameTarget(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+): AssemblyRenameTarget | null {
+  if (selection?.kind === "chromosome") {
+    return blocks.some((block) => block.objectId === selection.id)
+      ? { kind: "chromosome", currentName: selection.id }
+      : null;
+  }
+  if (selection?.kind !== "contigs" || selection.ids.length !== 1) {
+    return null;
+  }
+
+  const selectedIds = selectedBlockIds(blocks, selection);
+  if (selectedIds.length !== 1) {
+    return null;
+  }
+  const selectedBlock = blocks.find((block) => block.id === selectedIds[0]);
+  return selectedBlock
+    ? { kind: "contig", currentName: assemblyContigDisplayName(selectedBlock) }
+    : null;
+}
+
+export function assemblyRenameValidationError(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+  requestedName: string,
+): string | null {
+  const target = assemblyRenameTarget(blocks, selection);
+  if (!target) {
+    return "Select one contig or one chromosome to rename.";
+  }
+  const name = requestedName.trim();
+  if (!name) {
+    return "Name cannot be empty.";
+  }
+  if (/\s/.test(name)) {
+    return "AGP names cannot contain whitespace.";
+  }
+  if (name === target.currentName) {
+    return null;
+  }
+  if (target.kind === "chromosome") {
+    return blocks.some((block) => block.objectId === name)
+      ? "A chromosome already uses this name."
+      : null;
+  }
+
+  const selectedIds = new Set(selectedBlockIds(blocks, selection));
+  return blocks.some((block) => (
+    !selectedIds.has(block.id) && assemblyContigDisplayName(block) === name
+  ))
+    ? "A contig already uses this name."
+    : null;
+}
+
+export function renameAssemblySelection(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+  requestedName: string,
+): ContactMapLayoutBlock[] {
+  const target = assemblyRenameTarget(blocks, selection);
+  const name = requestedName.trim();
+  if (
+    !target
+    || assemblyRenameValidationError(blocks, selection, name)
+    || name === target.currentName
+  ) {
+    return blocks;
+  }
+
+  if (target.kind === "chromosome") {
+    return blocks.map((block) => block.objectId === target.currentName
+      ? { ...block, objectId: name }
+      : block);
+  }
+
+  const selectedIds = new Set(selectedBlockIds(blocks, selection));
+  return blocks.map((block) => {
+    if (!selectedIds.has(block.id)) {
+      return block;
+    }
+    return {
+      ...block,
+      displayName: name === block.sourceId ? undefined : name,
+    };
+  });
+}
+
+function buildAssemblyBlockGroups(blocks: ContactMapLayoutBlock[]): AssemblyBlockGroup[] {
+  return orderedAssemblyUnits(blocks).map((unit) => ({
+    id: unit.id,
+    objectId: unit.objectId,
+    visualStart: Math.min(...unit.blocks.map((block) => block.visualStart)),
+    visualEnd: Math.max(...unit.blocks.map((block) => block.visualEnd)),
+    contigIds: unit.blocks.map((block) => block.id),
+    isComposite: unit.blocks.length > 1,
+  }));
+}
+
+function buildAssemblyGapRanges(
+  blocks: ContactMapLayoutBlock[],
+  assemblyBlocks: AssemblyBlockGroup[],
+): AssemblyGapRange[] {
+  const unitByContigId = new Map(
+    assemblyBlocks.flatMap((block) => block.contigIds.map((contigId) => [contigId, block.id] as const)),
+  );
+  const gaps: AssemblyGapRange[] = [];
+
+  blocks.forEach((block, index) => {
+    const gap = block.gapBefore;
+    if (!gap || gap.length <= 0) {
+      return;
+    }
+    const previous = index > 0 && blocks[index - 1]?.objectId === block.objectId
+      ? blocks[index - 1]
+      : null;
+    gaps.push({
+      id: `${block.objectId}:gap-before:${block.id}`,
+      objectId: block.objectId,
+      visualStart: block.visualStart - gap.length,
+      visualEnd: block.visualStart,
+      leftBlockId: previous ? unitByContigId.get(previous.id) ?? assemblyUnitId(previous) : null,
+      rightBlockId: unitByContigId.get(block.id) ?? assemblyUnitId(block),
+      metadata: gap,
+    });
+  });
+
+  return gaps;
 }
 
 export function selectContig(
@@ -119,46 +371,32 @@ export function assemblyContigIdsBetween(
   const orderedBlocks = [...blocks].sort((left, right) => (
     left.visualStart - right.visualStart || left.visualEnd - right.visualEnd
   ));
-  const anchorIndex = orderedBlocks.findIndex((block) => block.id === anchorId);
-  const targetIndex = orderedBlocks.findIndex((block) => block.id === targetId);
+  const units = orderedAssemblyUnits(orderedBlocks);
+  const resolvedAnchorId = resolveAssemblyUnitId(units, anchorId);
+  const resolvedTargetId = resolveAssemblyUnitId(units, targetId);
+  const anchorIndex = units.findIndex((unit) => unit.id === resolvedAnchorId);
+  const targetIndex = units.findIndex((unit) => unit.id === resolvedTargetId);
   if (targetIndex < 0) {
     return [];
   }
   if (anchorIndex < 0) {
-    return [targetId];
+    return [units[targetIndex].id];
   }
 
   const startIndex = Math.min(anchorIndex, targetIndex);
   const endIndex = Math.max(anchorIndex, targetIndex);
-  return orderedBlocks.slice(startIndex, endIndex + 1).map((block) => block.id);
+  return units.slice(startIndex, endIndex + 1).map((unit) => unit.id);
 }
 
 export function assemblyContigSelectionIntent(
-  blocks: ContactMapLayoutBlock[],
-  selection: AssemblySelection | null,
-  anchorId: string | null,
+  _blocks: ContactMapLayoutBlock[],
+  _selection: AssemblySelection | null,
+  _anchorId: string | null,
   targetId: string,
   modifiers: AssemblySelectionModifiers,
 ): AssemblyContigSelectionIntent {
-  const selected = new Set(selectedBlockIds(blocks, selection));
   if (modifiers.metaKey || modifiers.ctrlKey) {
     return { type: "select", id: targetId, additive: true, anchorId: targetId };
-  }
-
-  if (modifiers.shiftKey && selected.has(targetId)) {
-    return { type: "clear", anchorId: null };
-  }
-
-  if (modifiers.shiftKey) {
-    const effectiveAnchor = anchorId
-      ?? (selection?.kind === "contigs" ? selection.ids[selection.ids.length - 1] ?? null : null);
-    if (effectiveAnchor) {
-      return {
-        type: "select-range",
-        ids: assemblyContigIdsBetween(blocks, effectiveAnchor, targetId),
-        anchorId: effectiveAnchor,
-      };
-    }
   }
 
   return { type: "select", id: targetId, additive: false, anchorId: targetId };
@@ -183,7 +421,7 @@ export function groupAssemblyBlocksByChromosome(
   const selected = new Set(selectedBlockIds(blocks, selection));
   const groups = new Map<string, AssemblyChromosomeGroup>();
 
-  for (const block of blocks) {
+  for (const block of buildAssemblyBlockGroups(blocks)) {
     const group = groups.get(block.objectId) ?? {
       id: block.objectId,
       visualStart: block.visualStart,
@@ -201,7 +439,7 @@ export function groupAssemblyBlocksByChromosome(
     group.blockIds.push(block.id);
     group.totalCount += 1;
     group.totalLength += length;
-    if (selected.has(block.id)) {
+    if (block.contigIds.some((id) => selected.has(id))) {
       group.selectedCount += 1;
       group.selectedLength += length;
     }
@@ -215,20 +453,34 @@ export function reverseSelection(
   blocks: ContactMapLayoutBlock[],
   selection: AssemblySelection | null,
 ): ContactMapLayoutBlock[] {
-  const selectedIds = selectedBlockIds(blocks, selection);
-  if (selectedIds.length === 0) {
+  const units = orderedAssemblyUnits(blocks);
+  const selectedUnitIds = selectedAssemblyUnitIds(units, selection);
+  if (selectedUnitIds.size === 0) {
     return blocks;
   }
 
-  const selected = new Set(selectedIds);
-  const reversed = blocks
-    .filter((block) => selected.has(block.id))
+  const reversed = units
+    .filter((unit) => selectedUnitIds.has(unit.id))
     .reverse()
-    .map((block) => ({ ...block, orientation: flipOrientation(block.orientation) }));
+    .map((unit) => reverseAssemblyUnit(unit));
+  const reversedGapBeforeBySlot = reverseSelectedGapOrder(units, selectedUnitIds);
   let nextReversedIndex = 0;
+  const reorderedUnits = units.map((slot, slotIndex) => {
+    if (!selectedUnitIds.has(slot.id)) {
+      return slot;
+    }
+
+    const reversedUnit = reversed[nextReversedIndex++];
+    return retargetAssemblyUnit(reversedUnit, slot.objectId, {
+      value: reversedGapBeforeBySlot.get(slotIndex),
+    });
+  });
+  const structured = hasExplicitAssemblyStructure(blocks);
+  const bounded = ensureAssemblyUnitBoundaries(reorderedUnits, structured)
+    .flatMap((unit) => unit.blocks);
 
   return recomputeVisualCoordinates(
-    blocks.map((block) => (selected.has(block.id) ? reversed[nextReversedIndex++] : block)),
+    structured ? rebuildAssemblyBlockMembership(bounded) : bounded,
   );
 }
 
@@ -237,34 +489,42 @@ export function moveSelectionBefore(
   selection: AssemblySelection | null,
   targetBlockId: string | null,
 ): ContactMapLayoutBlock[] {
-  const selectedIds = selectedBlockIds(blocks, selection);
+  const units = orderedAssemblyUnits(blocks);
+  const selectedUnitIds = selectedAssemblyUnitIds(units, selection);
+  const resolvedTargetId = targetBlockId === null
+    ? null
+    : resolveAssemblyUnitId(units, targetBlockId);
   if (
-    selectedIds.length === 0
-    || (targetBlockId !== null && selectedIds.includes(targetBlockId))
+    selectedUnitIds.size === 0
+    || (resolvedTargetId !== null && selectedUnitIds.has(resolvedTargetId))
     || (targetBlockId === null && selection?.kind !== "chromosome")
   ) {
     return blocks;
   }
 
-  const selected = new Set(selectedIds);
-  const movingBlocks = blocks.filter((block) => selected.has(block.id));
-  const remainingBlocks = blocks.filter((block) => !selected.has(block.id));
+  const movingUnits = units.filter((unit) => selectedUnitIds.has(unit.id));
+  const remainingUnits = units.filter((unit) => !selectedUnitIds.has(unit.id));
   const targetIndex = targetBlockId === null
-    ? remainingBlocks.length
-    : remainingBlocks.findIndex((block) => block.id === targetBlockId);
+    ? remainingUnits.length
+    : remainingUnits.findIndex((unit) => unit.id === resolvedTargetId);
   if (targetIndex < 0) {
     return blocks;
   }
 
-  const targetObjectId = remainingBlocks[targetIndex]?.objectId ?? movingBlocks[0]?.objectId;
-  const retargetedMovingBlocks = selection?.kind === "chromosome"
-    ? movingBlocks
-    : movingBlocks.map((block) => ({ ...block, objectId: targetObjectId }));
-  const reordered = [
-    ...remainingBlocks.slice(0, targetIndex),
-    ...retargetedMovingBlocks,
-    ...remainingBlocks.slice(targetIndex),
-  ];
+  const targetObjectId = remainingUnits[targetIndex]?.objectId ?? movingUnits[0]?.objectId;
+  const retargetedMovingUnits = selection?.kind === "chromosome"
+    ? movingUnits
+    : movingUnits.map((unit) => retargetAssemblyUnit(unit, targetObjectId));
+  const reorderedUnits = ensureAssemblyUnitBoundaries([
+    ...remainingUnits.slice(0, targetIndex),
+    ...retargetedMovingUnits,
+    ...remainingUnits.slice(targetIndex),
+  ], hasExplicitAssemblyStructure(blocks));
+  const reordered = reorderedUnits.flatMap((unit) => unit.blocks);
+
+  if (reordered.length !== blocks.length) {
+    return blocks;
+  }
 
   if (reordered.every((block, index) => (
     block.id === blocks[index]?.id && block.objectId === blocks[index]?.objectId
@@ -272,27 +532,59 @@ export function moveSelectionBefore(
     return blocks;
   }
 
-  return recomputeVisualCoordinates(reordered);
+  return recomputeVisualCoordinates(
+    hasExplicitAssemblyStructure(blocks)
+      ? rebuildAssemblyBlockMembership(reordered)
+      : reordered,
+  );
 }
 
 export function moveSelectionToDebris(
   blocks: ContactMapLayoutBlock[],
   selection: AssemblySelection | null,
 ): ContactMapLayoutBlock[] {
-  const selectedIds = selectedBlockIds(blocks, selection);
-  if (selectedIds.length === 0) {
+  const units = orderedAssemblyUnits(blocks);
+  const selectedUnitIds = selectedAssemblyUnitIds(units, selection);
+  if (selectedUnitIds.size === 0) {
     return blocks;
   }
 
-  const selected = new Set(selectedIds);
-  const movingBlocks = blocks.filter((block) => selected.has(block.id));
-  const remainingBlocks = blocks.filter((block) => !selected.has(block.id));
-  const movedBlocks = movingBlocks.map((block) => ({
-    ...block,
-    objectId: DEBRIS_OBJECT_ID,
-  }));
+  const movingUnits = units
+    .filter((unit) => selectedUnitIds.has(unit.id))
+    .map((unit) => retargetAssemblyUnit(unit, DEBRIS_OBJECT_ID));
+  const remainingUnits = units.filter((unit) => !selectedUnitIds.has(unit.id));
+  const reorderedUnits = ensureAssemblyUnitBoundaries(
+    [...remainingUnits, ...movingUnits],
+    hasExplicitAssemblyStructure(blocks),
+  );
 
-  return recomputeVisualCoordinates([...remainingBlocks, ...movedBlocks]);
+  const reordered = reorderedUnits.flatMap((unit) => unit.blocks);
+  return recomputeVisualCoordinates(
+    hasExplicitAssemblyStructure(blocks)
+      ? rebuildAssemblyBlockMembership(reordered)
+      : reordered,
+  );
+}
+
+export function deleteContigSelection(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+): ContactMapLayoutBlock[] {
+  if (selection?.kind !== "contigs") {
+    return blocks;
+  }
+
+  const selected = new Set(selectedBlockIds(blocks, selection));
+  if (selected.size === 0) {
+    return blocks;
+  }
+
+  const remaining = blocks.filter((block) => !selected.has(block.id));
+  const structured = hasExplicitAssemblyStructure(blocks);
+  const bounded = ensureFlatAssemblyBoundaries(remaining, structured);
+  return recomputeVisualCoordinates(
+    structured ? rebuildAssemblyBlockMembership(bounded) : bounded,
+  );
 }
 
 export function addChromosomeBoundariesToSelection(
@@ -354,11 +646,89 @@ export function addChromosomeBoundariesToSelection(
     return blocks;
   }
 
+  const retargeted = blocks.map((block, blockIndex) => ({
+    ...block,
+    objectId: nextObjectIdByBlockIndex.get(blockIndex) ?? block.objectId,
+  }));
+  const structured = hasExplicitAssemblyStructure(blocks);
+  const bounded = ensureFlatAssemblyBoundaries(retargeted, structured);
   return recomputeVisualCoordinates(
-    blocks.map((block, blockIndex) => ({
-      ...block,
-      objectId: nextObjectIdByBlockIndex.get(blockIndex) ?? block.objectId,
-    })),
+    structured ? rebuildAssemblyBlockMembership(bounded) : bounded,
+  );
+}
+
+function chromosomeBoundaryIndexesWithinSelection(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+) {
+  if (selection?.kind !== "contigs") {
+    return [];
+  }
+
+  const units = orderedAssemblyUnits(blocks);
+  const selectedUnitIds = selectedAssemblyUnitIds(units, selection);
+  const boundaryIndexes: number[] = [];
+  for (let index = 1; index < units.length; index += 1) {
+    const left = units[index - 1];
+    const right = units[index];
+    if (
+      selectedUnitIds.has(left.id)
+      && selectedUnitIds.has(right.id)
+      && left.objectId !== right.objectId
+    ) {
+      boundaryIndexes.push(index);
+    }
+  }
+  return boundaryIndexes;
+}
+
+export function hasRemovableChromosomeBoundary(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+) {
+  return chromosomeBoundaryIndexesWithinSelection(blocks, selection).length > 0;
+}
+
+export function removeChromosomeBoundariesFromSelection(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+): ContactMapLayoutBlock[] {
+  const units = orderedAssemblyUnits(blocks);
+  const boundaryIndexes = chromosomeBoundaryIndexesWithinSelection(blocks, selection);
+  if (boundaryIndexes.length === 0) {
+    return blocks;
+  }
+
+  // Merge every chromosome boundary enclosed by the selection into the
+  // chromosome on its left. Retarget the complete chromosome, not only the
+  // selected edge blocks, so the resulting AGP object remains coherent.
+  const mergedInto = new Map<string, string>();
+  const resolveObjectId = (objectId: string) => {
+    let resolved = objectId;
+    const visited = new Set<string>();
+    while (mergedInto.has(resolved) && !visited.has(resolved)) {
+      visited.add(resolved);
+      resolved = mergedInto.get(resolved) ?? resolved;
+    }
+    return resolved;
+  };
+
+  boundaryIndexes.forEach((index) => {
+    const leftObjectId = resolveObjectId(units[index - 1].objectId);
+    const rightObjectId = resolveObjectId(units[index].objectId);
+    if (leftObjectId !== rightObjectId) {
+      mergedInto.set(rightObjectId, leftObjectId);
+    }
+  });
+
+  const retargeted = blocks.map((block) => ({
+    ...block,
+    objectId: resolveObjectId(block.objectId),
+  }));
+  const structured = hasExplicitAssemblyStructure(blocks);
+  const bounded = ensureFlatAssemblyBoundaries(retargeted, structured);
+  return recomputeVisualCoordinates(
+    structured ? rebuildAssemblyBlockMembership(bounded) : bounded,
   );
 }
 
@@ -375,14 +745,44 @@ export function copySelection(
   const copiedObjectId = selection?.kind === "chromosome"
     ? nextCopyObjectId(blocks, selection.id)
     : null;
-  const copiedBlocks = buildCopiedBlocks(blocks, selected, copiedObjectId);
-  const lastSelectedIndex = Math.max(...blocks.map((block, index) => (selected.has(block.id) ? index : -1)));
-
-  return recomputeVisualCoordinates([
-    ...blocks.slice(0, lastSelectedIndex + 1),
-    ...copiedBlocks,
-    ...blocks.slice(lastSelectedIndex + 1),
-  ]);
+  let reordered: ContactMapLayoutBlock[];
+  if (copiedObjectId) {
+    const copiedBlocks = buildCopiedBlocks(blocks, selected, copiedObjectId);
+    const lastSelectedIndex = Math.max(
+      ...blocks.map((block, index) => (selected.has(block.id) ? index : -1)),
+    );
+    reordered = [
+      ...blocks.slice(0, lastSelectedIndex + 1),
+      ...copiedBlocks,
+      ...blocks.slice(lastSelectedIndex + 1),
+    ];
+  } else {
+    const selectedIdsByObject = new Map<string, Set<string>>();
+    const lastSelectedIndexByObject = new Map<string, number>();
+    blocks.forEach((block, index) => {
+      if (!selected.has(block.id)) {
+        return;
+      }
+      const objectSelection = selectedIdsByObject.get(block.objectId) ?? new Set<string>();
+      objectSelection.add(block.id);
+      selectedIdsByObject.set(block.objectId, objectSelection);
+      lastSelectedIndexByObject.set(block.objectId, index);
+    });
+    const copiedBlocksByObject = new Map(
+      [...selectedIdsByObject].map(([objectId, objectSelection]) => [
+        objectId,
+        buildCopiedBlocks(blocks, objectSelection, null),
+      ] as const),
+    );
+    reordered = blocks.flatMap((block, index) => (
+      lastSelectedIndexByObject.get(block.objectId) === index
+        ? [block, ...(copiedBlocksByObject.get(block.objectId) ?? [])]
+        : [block]
+    ));
+  }
+  const structured = hasExplicitAssemblyStructure(blocks);
+  const bounded = ensureFlatAssemblyBoundaries(reordered, structured);
+  return recomputeVisualCoordinates(structured ? rebuildAssemblyBlockMembership(bounded) : bounded);
 }
 
 export function copySelectionBefore(
@@ -391,22 +791,30 @@ export function copySelectionBefore(
   targetBlockId: string,
 ): ContactMapLayoutBlock[] {
   const selectedIds = selectedBlockIds(blocks, selection);
-  if (selectedIds.length === 0 || selectedIds.includes(targetBlockId)) {
+  const units = orderedAssemblyUnits(blocks);
+  const resolvedTargetId = resolveAssemblyUnitId(units, targetBlockId);
+  const selectedUnitIds = selectedAssemblyUnitIds(units, selection);
+  if (selectedIds.length === 0 || selectedUnitIds.has(resolvedTargetId)) {
     return blocks;
   }
 
-  const targetIndex = blocks.findIndex((block) => block.id === targetBlockId);
+  const targetUnit = units.find((unit) => unit.id === resolvedTargetId);
+  const targetIndex = targetUnit
+    ? blocks.findIndex((block) => block.id === targetUnit.blocks[0]?.id)
+    : -1;
   const targetBlock = blocks[targetIndex];
   if (!targetBlock) {
     return blocks;
   }
 
   const copiedBlocks = buildCopiedBlocks(blocks, new Set(selectedIds), targetBlock.objectId);
-  return recomputeVisualCoordinates([
+  const structured = hasExplicitAssemblyStructure(blocks);
+  const bounded = ensureFlatAssemblyBoundaries([
     ...blocks.slice(0, targetIndex),
     ...copiedBlocks,
     ...blocks.slice(targetIndex),
-  ]);
+  ], structured);
+  return recomputeVisualCoordinates(structured ? rebuildAssemblyBlockMembership(bounded) : bounded);
 }
 
 export function splitContigAtVisualPosition(
@@ -426,23 +834,179 @@ export function splitContigAtVisualPosition(
     return blocks;
   }
 
+  const sourceCut = block.orientation === "-"
+    ? block.sourceEnd - offset
+    : block.sourceStart + offset;
+  const copyInstanceId = assemblyCopyInstanceId(block);
+  const splitParent = {
+    id: block.id,
+    displayName: block.displayName,
+    isSourceSegment: block.isSourceSegment,
+    copyInstanceId: block.copyInstanceId,
+    splitParent: block.splitParent,
+  };
+
   const left: ContactMapLayoutBlock = {
     ...block,
     id: `${block.id}:left`,
-    sourceEnd: block.sourceStart + offset,
+    copyInstanceId,
+    splitParent,
+    sourceStart: block.orientation === "-" ? sourceCut : block.sourceStart,
+    sourceEnd: block.orientation === "-" ? block.sourceEnd : sourceCut,
+    displayName: sourceSegmentDisplayName(
+      block.sourceId,
+      block.orientation === "-" ? sourceCut : block.sourceStart,
+      block.orientation === "-" ? block.sourceEnd : sourceCut,
+    ),
+    isSourceSegment: true,
+    assemblyBlockId: null,
   };
   const right: ContactMapLayoutBlock = {
     ...block,
     id: `${block.id}:right`,
-    sourceStart: block.sourceStart + offset,
+    copyInstanceId,
+    splitParent,
+    sourceStart: block.orientation === "-" ? block.sourceStart : sourceCut,
+    sourceEnd: block.orientation === "-" ? sourceCut : block.sourceEnd,
+    displayName: sourceSegmentDisplayName(
+      block.sourceId,
+      block.orientation === "-" ? block.sourceStart : sourceCut,
+      block.orientation === "-" ? sourceCut : block.sourceEnd,
+    ),
+    isSourceSegment: true,
+    assemblyBlockId: null,
+    gapBefore: { ...DEFAULT_INSERTED_GAP },
   };
 
-  return recomputeVisualCoordinates([
+  return recomputeVisualCoordinates(rebuildAssemblyBlockMembership([
     ...blocks.slice(0, blockIndex),
     left,
     right,
     ...blocks.slice(blockIndex + 1),
-  ]);
+  ]));
+}
+
+function sourceSegmentDisplayName(sourceId: string, sourceStart: number, sourceEnd: number) {
+  // Internal coordinates are 0-based half-open; region labels follow the
+  // conventional 1-based closed form used by AGP and genome browsers.
+  return `${sourceId}:${sourceStart + 1}-${sourceEnd}`;
+}
+
+export function hasDeletableGap(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+) {
+  if (selection?.kind !== "contigs") {
+    return false;
+  }
+  const units = orderedAssemblyUnits(blocks);
+  const selected = selectedAssemblyUnitIds(units, selection);
+  return units.some((unit, index) => (
+    index > 0
+    && selected.has(unit.id)
+    && selected.has(units[index - 1].id)
+    && units[index - 1].objectId === unit.objectId
+    && Boolean(unit.blocks[0]?.gapBefore?.length)
+  ));
+}
+
+export function deleteGapsBetweenSelection(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+): ContactMapLayoutBlock[] {
+  if (selection?.kind !== "contigs") {
+    return blocks;
+  }
+  const selected = new Set(selectedBlockIds(blocks, selection));
+  const deletedGapBeforeIds = new Set<string>();
+  const joinedBlocks = blocks.map((block, index) => {
+    const previous = blocks[index - 1];
+    if (
+      !previous
+      || previous.objectId !== block.objectId
+      || !selected.has(previous.id)
+      || !selected.has(block.id)
+      || !block.gapBefore?.length
+    ) {
+      return block;
+    }
+
+    deletedGapBeforeIds.add(block.id);
+    return { ...block, gapBefore: undefined };
+  });
+
+  if (deletedGapBeforeIds.size === 0) {
+    return blocks;
+  }
+
+  const restoredBlocks = joinedBlocks.reduce<ContactMapLayoutBlock[]>((result, block) => {
+    const previous = result[result.length - 1];
+    if (
+      previous
+      && deletedGapBeforeIds.has(block.id)
+      && canRestoreSplitSiblings(previous, block)
+    ) {
+      result[result.length - 1] = restoreSplitSiblings(previous, block);
+      return result;
+    }
+    result.push(block);
+    return result;
+  }, []);
+
+  return recomputeVisualCoordinates(
+    rebuildAssemblyBlockMembership(restoredBlocks),
+  );
+}
+
+function canRestoreSplitSiblings(
+  left: ContactMapLayoutBlock,
+  right: ContactMapLayoutBlock,
+) {
+  const leftParentId = left.splitParent?.id ?? directSplitParentId(left.id);
+  const rightParentId = right.splitParent?.id ?? directSplitParentId(right.id);
+  const sourceIntervalsTouch = left.sourceEnd === right.sourceStart
+    || right.sourceEnd === left.sourceStart;
+  return Boolean(
+    leftParentId
+    && leftParentId === rightParentId
+    && left.objectId === right.objectId
+    && left.sourceId === right.sourceId
+    && assemblyCopyInstanceId(left) === assemblyCopyInstanceId(right)
+    && left.orientation === right.orientation
+    && sourceIntervalsTouch,
+  );
+}
+
+function directSplitParentId(id: string) {
+  const parentId = id.replace(/:(?:left|right)$/, "");
+  return parentId === id ? null : parentId;
+}
+
+function restoreSplitSiblings(
+  left: ContactMapLayoutBlock,
+  right: ContactMapLayoutBlock,
+): ContactMapLayoutBlock {
+  const splitParent = left.splitParent?.id === right.splitParent?.id
+    ? left.splitParent
+    : undefined;
+  const id = splitParent?.id ?? directSplitParentId(left.id) ?? left.id;
+  const sourceStart = Math.min(left.sourceStart, right.sourceStart);
+  const sourceEnd = Math.max(left.sourceEnd, right.sourceEnd);
+  const fallbackIsSourceSegment = /:(?:left|right)$/.test(id);
+  return {
+    ...left,
+    id,
+    sourceStart,
+    sourceEnd,
+    displayName: splitParent
+      ? splitParent.displayName
+      : fallbackIsSourceSegment
+        ? sourceSegmentDisplayName(left.sourceId, sourceStart, sourceEnd)
+        : undefined,
+    isSourceSegment: splitParent?.isSourceSegment ?? fallbackIsSourceSegment,
+    copyInstanceId: splitParent?.copyInstanceId ?? assemblyCopyInstanceId(left),
+    splitParent: splitParent?.splitParent,
+  };
 }
 
 export function hitTestAssemblyLayout(
@@ -461,17 +1025,42 @@ export function hitTestAssemblyLayout(
   const visualX = viewportXStart + (point.x / widthPx) * viewportXSpan;
   const visualY = viewportYStart + (point.y / heightPx) * viewportYSpan;
 
-  const block = findLastInBox(model.blocks, visualX, visualY);
+  // A split segment is an independently selectable contig even when its left
+  // half remains visually nested inside the original no-gap assembly block.
+  const sourceSegment = findLastInBox(
+    model.blocks.filter((block) => block.isSourceSegment),
+    visualX,
+    visualY,
+  );
+  if (sourceSegment) {
+    return { kind: "contig", id: sourceSegment.id };
+  }
+
+  const block = findLastInBox(model.assemblyBlocks, visualX, visualY);
   if (block) {
     return { kind: "contig", id: block.id };
   }
 
   const chromosome = findLastInBox(model.chromosomes, visualX, visualY);
-  if (chromosome) {
+  if (chromosome && pointSelectsWholeChromosome(chromosome, visualX, visualY)) {
     return { kind: "chromosome-boundary", id: chromosome.id };
   }
 
   return null;
+}
+
+export function pointSelectsWholeChromosome(
+  chromosome: Pick<AssemblyChromosome, "visualStart" | "visualEnd">,
+  visualX: number,
+  visualY: number,
+) {
+  const span = chromosome.visualEnd - chromosome.visualStart;
+  if (span <= 0) {
+    return false;
+  }
+  const midpoint = chromosome.visualStart + span / 2;
+  return (visualX >= midpoint && visualY < midpoint)
+    || (visualX < midpoint && visualY >= midpoint);
 }
 
 export function contigIdsInScreenSelection(
@@ -493,7 +1082,7 @@ export function contigIdsInScreenSelection(
   const selectionTop = Math.min(start.y, end.y);
   const selectionBottom = Math.max(start.y, end.y);
 
-  return model.blocks
+  return model.assemblyBlocks
     .filter((block) => {
       const left = ((block.visualStart - viewportXStart) / viewportXSpan) * widthPx;
       const right = ((block.visualEnd - viewportXStart) / viewportXSpan) * widthPx;
@@ -516,7 +1105,9 @@ export function insertionTargetAtScreenPoint(
   if (selectedIds.size === 0) {
     return null;
   }
-  const selectedBlocks = model.blocks.filter((block) => selectedIds.has(block.id));
+  const selectedBlocks = model.assemblyBlocks.filter((block) => (
+    block.contigIds.some((id) => selectedIds.has(id)) || selectedIds.has(block.id)
+  ));
   if (
     options.selectionKind === "chromosome"
     && selectedBlocks.length > 0
@@ -535,14 +1126,19 @@ export function insertionTargetAtScreenPoint(
   const tolerancePx = Math.max(1, options.tolerancePx);
   const selectionKind = options.selectionKind ?? "contigs";
 
-  for (let index = 0; index < model.blocks.length; index += 1) {
-    const target = model.blocks[index];
-    const previous = index > 0 ? model.blocks[index - 1] : null;
+  for (let index = 0; index < model.assemblyBlocks.length; index += 1) {
+    const target = model.assemblyBlocks[index];
+    const previous = index > 0 ? model.assemblyBlocks[index - 1] : null;
     const isChromosomeBoundary = previous === null || previous.objectId !== target.objectId;
+    const previousSelected = previous
+      ? selectedIds.has(previous.id) || previous.contigIds.some((id) => selectedIds.has(id))
+      : false;
+    const targetSelected = selectedIds.has(target.id)
+      || target.contigIds.some((id) => selectedIds.has(id));
     if (
       (selectionKind === "chromosome" ? !isChromosomeBoundary : isChromosomeBoundary)
-      || (previous !== null && selectedIds.has(previous.id))
-      || selectedIds.has(target.id)
+      || previousSelected
+      || targetSelected
     ) {
       continue;
     }
@@ -557,12 +1153,13 @@ export function insertionTargetAtScreenPoint(
     }
   }
 
-  const lastBlock = model.blocks[model.blocks.length - 1];
+  const lastBlock = model.assemblyBlocks[model.assemblyBlocks.length - 1];
   if (
     selectionKind === "chromosome"
     && lastBlock
     && lastBlock.objectId !== DEBRIS_OBJECT_ID
     && !selectedIds.has(lastBlock.id)
+    && !lastBlock.contigIds.some((id) => selectedIds.has(id))
   ) {
     const boundaryX = ((model.totalSpan - viewportXStart) / viewportXSpan) * widthPx;
     const boundaryY = ((model.totalSpan - viewportYStart) / viewportYSpan) * heightPx;
@@ -605,12 +1202,256 @@ export function selectedBlockIds(
     return [];
   }
 
-  if (selection.kind === "contigs") {
-    const selected = new Set(selection.ids);
-    return blocks.filter((block) => selected.has(block.id)).map((block) => block.id);
+  if (selection.kind === "contigs" && selection.exact) {
+    const exactIds = new Set(selection.ids);
+    return blocks.filter((block) => exactIds.has(block.id)).map((block) => block.id);
   }
 
-  return blocks.filter((block) => block.objectId === selection.id).map((block) => block.id);
+  const explicitlySelectedSegments = selection.kind === "contigs"
+    ? new Set(
+        blocks
+          .filter((block) => block.isSourceSegment && selection.ids.includes(block.id))
+          .map((block) => block.id),
+      )
+    : new Set<string>();
+  const unitSelection = selection.kind === "contigs" && explicitlySelectedSegments.size > 0
+    ? {
+        ...selection,
+        ids: selection.ids.filter((id) => !explicitlySelectedSegments.has(id)),
+      }
+    : selection;
+  const units = orderedAssemblyUnits(blocks);
+  const selectedUnits = selectedAssemblyUnitIds(units, unitSelection);
+  return blocks
+    .filter((block) => (
+      explicitlySelectedSegments.has(block.id) || selectedUnits.has(assemblyUnitId(block))
+    ))
+    .map((block) => block.id);
+}
+
+interface OrderedAssemblyUnit {
+  id: string;
+  objectId: string;
+  blocks: ContactMapLayoutBlock[];
+}
+
+function orderedAssemblyUnits(blocks: ContactMapLayoutBlock[]): OrderedAssemblyUnit[] {
+  const units: OrderedAssemblyUnit[] = [];
+
+  for (const block of blocks) {
+    const id = assemblyUnitId(block);
+    const previous = units[units.length - 1];
+    if (previous && previous.id === id && previous.objectId === block.objectId) {
+      previous.blocks.push(block);
+    } else {
+      units.push({ id, objectId: block.objectId, blocks: [block] });
+    }
+  }
+
+  return units;
+}
+
+function selectedAssemblyUnitIds(
+  units: OrderedAssemblyUnit[],
+  selection: AssemblySelection | null,
+) {
+  if (!selection) {
+    return new Set<string>();
+  }
+  if (selection.kind === "chromosome") {
+    return new Set(
+      units.filter((unit) => unit.objectId === selection.id).map((unit) => unit.id),
+    );
+  }
+
+  const selected = new Set(selection.ids);
+  return new Set(
+    units
+      .filter((unit) => (
+        selected.has(unit.id) || unit.blocks.some((block) => selected.has(block.id))
+      ))
+      .map((unit) => unit.id),
+  );
+}
+
+function resolveAssemblyUnitId(units: OrderedAssemblyUnit[], blockOrContigId: string) {
+  return units.find((unit) => (
+    unit.id === blockOrContigId || unit.blocks.some((block) => block.id === blockOrContigId)
+  ))?.id ?? blockOrContigId;
+}
+
+function reverseAssemblyUnit(unit: OrderedAssemblyUnit): OrderedAssemblyUnit {
+  const gapBefore = unit.blocks[0]?.gapBefore;
+  const reversedBlocks = [...unit.blocks]
+    .reverse()
+    .map((block, index) => ({
+      ...block,
+      gapBefore: index === 0 ? gapBefore : undefined,
+      orientation: flipOrientation(block.orientation),
+    }));
+  return { ...unit, blocks: reversedBlocks };
+}
+
+function reverseSelectedGapOrder(
+  units: OrderedAssemblyUnit[],
+  selectedUnitIds: ReadonlySet<string>,
+) {
+  const gapBeforeBySlot = new Map<number, ContactMapLayoutBlock["gapBefore"]>();
+  let runStart = 0;
+
+  while (runStart < units.length) {
+    const first = units[runStart];
+    if (!selectedUnitIds.has(first.id)) {
+      runStart += 1;
+      continue;
+    }
+
+    let runEnd = runStart;
+    while (
+      runEnd + 1 < units.length
+      && selectedUnitIds.has(units[runEnd + 1].id)
+      && units[runEnd + 1].objectId === first.objectId
+    ) {
+      runEnd += 1;
+    }
+
+    gapBeforeBySlot.set(runStart, first.blocks[0]?.gapBefore);
+    for (let offset = 1; offset <= runEnd - runStart; offset += 1) {
+      gapBeforeBySlot.set(
+        runStart + offset,
+        units[runEnd - offset + 1].blocks[0]?.gapBefore,
+      );
+    }
+    runStart = runEnd + 1;
+  }
+
+  return gapBeforeBySlot;
+}
+
+function retargetAssemblyUnit(
+  unit: OrderedAssemblyUnit,
+  objectId: string,
+  gapBeforeOverride?: { value: ContactMapLayoutBlock["gapBefore"] },
+): OrderedAssemblyUnit {
+  return {
+    ...unit,
+    objectId,
+    blocks: unit.blocks.map((block, index) => ({
+      ...block,
+      objectId,
+      gapBefore: index === 0 && gapBeforeOverride
+        ? gapBeforeOverride.value
+        : block.gapBefore,
+    })),
+  };
+}
+
+function hasExplicitAssemblyStructure(blocks: ContactMapLayoutBlock[]) {
+  return blocks.some((block) => (
+    Object.prototype.hasOwnProperty.call(block, "assemblyBlockId")
+    || Object.prototype.hasOwnProperty.call(block, "gapBefore")
+    || Object.prototype.hasOwnProperty.call(block, "componentType")
+  ));
+}
+
+function ensureAssemblyUnitBoundaries(
+  units: OrderedAssemblyUnit[],
+  enabled: boolean,
+): OrderedAssemblyUnit[] {
+  if (!enabled) {
+    return units;
+  }
+
+  const displacedLeadingGaps = new Map<
+    string,
+    NonNullable<ContactMapLayoutBlock["gapBefore"]>[]
+  >();
+  const withoutLeadingGaps = units.map((unit, index) => {
+    const previous = units[index - 1];
+    const startsObject = !previous || previous.objectId !== unit.objectId;
+    const gapBefore = unit.blocks[0]?.gapBefore;
+    if (!startsObject || gapBefore === undefined) {
+      return unit;
+    }
+    if (gapBefore.length > 0) {
+      const objectGaps = displacedLeadingGaps.get(unit.objectId) ?? [];
+      objectGaps.push(gapBefore);
+      displacedLeadingGaps.set(unit.objectId, objectGaps);
+    }
+    return setAssemblyUnitGapBefore(unit, undefined);
+  });
+
+  const nextDisplacedGapByObject = new Map<string, number>();
+  return withoutLeadingGaps.map((unit, index) => {
+    const previous = withoutLeadingGaps[index - 1];
+    if (
+      !previous
+      || previous.objectId !== unit.objectId
+      || unit.blocks[0]?.gapBefore?.length
+    ) {
+      return unit;
+    }
+
+    const nextDisplacedGap = nextDisplacedGapByObject.get(unit.objectId) ?? 0;
+    const gapBefore = displacedLeadingGaps.get(unit.objectId)?.[nextDisplacedGap]
+      ?? { ...DEFAULT_INSERTED_GAP };
+    nextDisplacedGapByObject.set(unit.objectId, nextDisplacedGap + 1);
+    return setAssemblyUnitGapBefore(unit, gapBefore);
+  });
+}
+
+function setAssemblyUnitGapBefore(
+  unit: OrderedAssemblyUnit,
+  gapBefore: ContactMapLayoutBlock["gapBefore"],
+): OrderedAssemblyUnit {
+  return {
+    ...unit,
+    blocks: unit.blocks.map((block, blockIndex) => (
+      blockIndex === 0 ? { ...block, gapBefore } : block
+    )),
+  };
+}
+
+function ensureFlatAssemblyBoundaries(
+  blocks: ContactMapLayoutBlock[],
+  enabled: boolean,
+) {
+  return ensureAssemblyUnitBoundaries(orderedAssemblyUnits(blocks), enabled)
+    .flatMap((unit) => unit.blocks);
+}
+
+function rebuildAssemblyBlockMembership(
+  blocks: ContactMapLayoutBlock[],
+): ContactMapLayoutBlock[] {
+  const runs: Array<{ objectId: string; indexes: number[] }> = [];
+  blocks.forEach((block, index) => {
+    const previous = blocks[index - 1];
+    const startsRun = !previous
+      || previous.objectId !== block.objectId
+      || Boolean(block.gapBefore?.length);
+    if (startsRun) {
+      runs.push({ objectId: block.objectId, indexes: [] });
+    }
+    runs[runs.length - 1]?.indexes.push(index);
+  });
+
+  const nextBlockOrdinal = new Map<string, number>();
+  const membership = new Map<number, string | null>();
+  for (const run of runs) {
+    if (run.indexes.length <= 1) {
+      membership.set(run.indexes[0], null);
+      continue;
+    }
+    const ordinal = (nextBlockOrdinal.get(run.objectId) ?? 0) + 1;
+    nextBlockOrdinal.set(run.objectId, ordinal);
+    const id = `${run.objectId}_block_${ordinal}`;
+    run.indexes.forEach((index) => membership.set(index, id));
+  }
+
+  return blocks.map((block, index) => ({
+    ...block,
+    assemblyBlockId: membership.get(index) ?? null,
+  }));
 }
 
 function recomputeVisualCoordinates(blocks: ContactMapLayoutBlock[]): ContactMapLayoutBlock[] {
@@ -618,6 +1459,10 @@ function recomputeVisualCoordinates(blocks: ContactMapLayoutBlock[]): ContactMap
 
   return blocks.map((block) => {
     const length = Math.max(0, block.sourceEnd - block.sourceStart);
+    const gapLength = Number.isFinite(block.gapBefore?.length)
+      ? Math.max(0, Number(block.gapBefore?.length))
+      : 0;
+    visualStart += gapLength;
     const nextBlock = {
       ...block,
       visualStart,
@@ -633,19 +1478,47 @@ function buildCopiedBlocks(
   selected: Set<string>,
   copiedObjectId: string | null,
 ) {
+  const copiedUnitIds = new Map<string, string>();
   return blocks
     .filter((block) => selected.has(block.id))
     .reduce<ContactMapLayoutBlock[]>((copies, block) => {
       const copyInstanceId = nextCopySourceId([...blocks, ...copies], block.sourceId);
+      const targetObjectId = copiedObjectId ?? block.objectId;
+      let copiedAssemblyBlockId: string | null = null;
+      if (block.assemblyBlockId) {
+        copiedAssemblyBlockId = copiedUnitIds.get(block.assemblyBlockId) ?? null;
+        if (!copiedAssemblyBlockId) {
+          copiedAssemblyBlockId = nextAssemblyBlockId(
+            [...blocks, ...copies],
+            targetObjectId,
+          );
+          copiedUnitIds.set(block.assemblyBlockId, copiedAssemblyBlockId);
+        }
+      }
+      const id = nextCopyId([...blocks, ...copies], block, copyInstanceId);
       return [
         ...copies,
         {
           ...block,
-          id: nextCopyId([...blocks, ...copies], block, copyInstanceId),
-          objectId: copiedObjectId ?? block.objectId,
+          id,
+          copyInstanceId: id,
+          splitParent: undefined,
+          objectId: targetObjectId,
+          assemblyBlockId: copiedAssemblyBlockId,
         },
       ];
     }, []);
+}
+
+function nextAssemblyBlockId(blocks: ContactMapLayoutBlock[], objectId: string) {
+  const prefix = `${objectId}_block_`;
+  const ordinals = blocks
+    .map((block) => block.assemblyBlockId)
+    .filter((id): id is string => Boolean(id?.startsWith(prefix)))
+    .map((id) => Number(id.slice(prefix.length)))
+    .filter(Number.isFinite);
+  const ordinal = ordinals.length > 0 ? Math.max(...ordinals) + 1 : 1;
+  return `${prefix}${ordinal}`;
 }
 
 function nextCopyId(blocks: ContactMapLayoutBlock[], block: ContactMapLayoutBlock, sourceId: string) {
@@ -709,5 +1582,5 @@ function flipOrientation(orientation: ContactMapLayoutBlock["orientation"]): Con
     return "+";
   }
 
-  return "?";
+  return orientation;
 }

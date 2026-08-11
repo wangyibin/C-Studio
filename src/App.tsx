@@ -131,7 +131,7 @@ const samplePaf = [
 const browserFallbackStatus: AppStatus = {
   engine: "cstudio-core",
   coordinate_convention: "0-based half-open internal; 1-based closed AGP",
-  supported_operations: ["split", "move", "flip", "copy"],
+  supported_operations: ["split", "move", "flip", "copy", "insert_gap", "delete_gap"],
 };
 const emptyLayout: AgpLayout = { blocks: [], totalSpan: 0 };
 const maxBackgroundPrefetchTiles = 16;
@@ -1120,11 +1120,15 @@ function downloadTextFile(filename: string, text: string, type: string) {
 
 function totalVisualSpan(blocks: AgpLayout["blocks"], fallback: number) {
   const finiteFallback = Number.isFinite(fallback) ? fallback : 0;
+  if (blocks.length === 0) {
+    return Math.max(0, finiteFallback);
+  }
+
   const finiteBlockEnds = blocks
     .map((block) => block.visualEnd)
     .filter((visualEnd) => Number.isFinite(visualEnd));
 
-  return Math.max(finiteFallback, 0, ...finiteBlockEnds);
+  return Math.max(0, ...finiteBlockEnds);
 }
 
 function resolutionToBasePairs(resolution: ContactResolution) {

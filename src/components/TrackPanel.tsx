@@ -1,4 +1,5 @@
 import {
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -7,11 +8,15 @@ import {
 } from "react";
 import { Eye, EyeOff, SlidersHorizontal } from "lucide-react";
 import {
-  assemblyContigIdsBetween,
+  assemblyContigDisplayName,
   buildAssemblyEditModel,
   selectedBlockIds,
 } from "../state/assemblyEditing";
-import type { ContactViewport } from "../state/contactViewport";
+import {
+  horizontalViewportDragDeltaMb,
+  horizontalViewportFocusRatio,
+  type ContactViewport,
+} from "../state/contactViewport";
 import type { CoverageView } from "../state/coverageView";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import type { UiAction, UiState } from "../state/uiState";
@@ -22,6 +27,7 @@ interface TrackPanelProps {
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
+  totalSpanMb?: number;
 }
 
 export interface CoverageTrackBar {
@@ -62,10 +68,18 @@ interface CoverageSelectionDrag {
   moved: boolean;
 }
 
-const defaultCoverageMultiplier = 2;
+interface CoveragePanDrag {
+  pointerId: number;
+  startClientX: number;
+  lastClientX: number;
+  moved: boolean;
+}
+
+const defaultCoverageMultiplier = 2.5;
 const minimumCoverageMultiplier = 1;
 const maximumCoverageMultiplier = 100;
 const coverageDragThresholdPx = 4;
+const adaptiveCoverageHighPercentile = 0.98;
 
 export function TrackPanel({
   coverageView: sourceCoverageView,
@@ -73,15 +87,18 @@ export function TrackPanel({
   onUiAction,
   uiState,
   viewport,
+  totalSpanMb = uiState.contact.totalSpanMb,
 }: TrackPanelProps) {
   const [scaleOverride, setScaleOverride] = useState<CoverageScaleDomain | null>(null);
   const [automaticMultiplier, setAutomaticMultiplier] = useState(defaultCoverageMultiplier);
   const [automaticMultiplierInput, setAutomaticMultiplierInput] = useState(
     formatCoverageMultiplier(defaultCoverageMultiplier),
   );
-  const [coverageSelectionAnchorId, setCoverageSelectionAnchorId] = useState<string | null>(null);
   const [coverageSelectionDrag, setCoverageSelectionDrag] = useState<CoverageSelectionDrag | null>(null);
   const coverageSelectionDragRef = useRef<CoverageSelectionDrag | null>(null);
+  const [coveragePanDrag, setCoveragePanDrag] = useState<CoveragePanDrag | null>(null);
+  const coveragePanDragRef = useRef<CoveragePanDrag | null>(null);
+  const coverageScaleControlRef = useRef<HTMLDetailsElement | null>(null);
   const lastDragSelectionSignatureRef = useRef("");
   const suppressCoverageClickRef = useRef(false);
   const coverageView = useMemo(() => (
@@ -119,11 +136,55 @@ export function TrackPanel({
     coverageView?.viewport ?? null,
     uiState.assembly.blocks,
   );
-  const automaticScale = coverageAutoScaleDomain(
-    bars.map((bar) => bar.value),
-    automaticMultiplier,
-  );
+  const coverageValues = bars.map((bar) => bar.value);
+  const automaticScale = coverageAutoScaleDomain(coverageValues, automaticMultiplier);
   const scale = scaleOverride ?? automaticScale;
+  const referenceDepth = coverageReferenceDepth(coverageValues);
+  const referenceLines = coverageReferenceMultiples(coverageValues, referenceDepth)
+    .map((multiple) => ({ multiple, value: (referenceDepth ?? 0) * multiple }));
+
+  useEffect(() => {
+    function abandonCoverageSelection(event: KeyboardEvent) {
+      if (event.key !== "Escape" || (
+        !coverageSelectionDragRef.current && !coveragePanDragRef.current
+      )) {
+        return;
+      }
+      suppressCoverageClickRef.current = true;
+      storeCoverageSelectionDrag(null);
+      storeCoveragePanDrag(null);
+    }
+    function releaseCoverageClickSuppression() {
+      if (suppressCoverageClickRef.current) {
+        setTimeout(() => {
+          suppressCoverageClickRef.current = false;
+        }, 0);
+      }
+    }
+    window.addEventListener("keydown", abandonCoverageSelection);
+    window.addEventListener("pointerup", releaseCoverageClickSuppression, true);
+    window.addEventListener("pointercancel", releaseCoverageClickSuppression, true);
+    return () => {
+      window.removeEventListener("keydown", abandonCoverageSelection);
+      window.removeEventListener("pointerup", releaseCoverageClickSuppression, true);
+      window.removeEventListener("pointercancel", releaseCoverageClickSuppression, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    function closeCoverageScaleOnOutsidePointer(event: PointerEvent) {
+      const control = coverageScaleControlRef.current;
+      if (!control?.open) {
+        return;
+      }
+      if (!(event.target instanceof Node) || !control.contains(event.target)) {
+        control.open = false;
+      }
+    }
+
+    window.addEventListener("pointerdown", closeCoverageScaleOnOutsidePointer);
+    return () => window.removeEventListener("pointerdown", closeCoverageScaleOnOutsidePointer);
+  }, []);
 
   function setScaleBoundary(field: keyof CoverageScaleDomain, value: number) {
     if (!Number.isFinite(value)) {
@@ -169,6 +230,11 @@ export function TrackPanel({
     setCoverageSelectionDrag(drag);
   }
 
+  function storeCoveragePanDrag(drag: CoveragePanDrag | null) {
+    coveragePanDragRef.current = drag;
+    setCoveragePanDrag(drag);
+  }
+
   function suppressNextCoverageClick() {
     suppressCoverageClickRef.current = true;
     setTimeout(() => {
@@ -185,33 +251,10 @@ export function TrackPanel({
     }
 
     if (coverageSelectionIsAdditive(modifiers)) {
-      setCoverageSelectionAnchorId(id);
       onUiAction({ type: "selectAssemblyContig", id, additive: true });
       return;
     }
 
-    if (coverageShiftClickClearsSelection(selectedIds, id, modifiers)) {
-      setCoverageSelectionAnchorId(null);
-      onUiAction({ type: "clearAssemblySelection" });
-      return;
-    }
-
-    if (modifiers.shiftKey) {
-      const anchorId = coverageSelectionAnchorId;
-      if (anchorId && blocksById.has(anchorId)) {
-        onUiAction({
-          type: "selectAssemblyContigs",
-          ids: coverageContigIdsBetween(uiState.assembly.blocks, anchorId, id),
-        });
-        return;
-      }
-
-      setCoverageSelectionAnchorId(id);
-      onUiAction({ type: "selectAssemblyContig", id, additive: false });
-      return;
-    }
-
-    setCoverageSelectionAnchorId(id);
     onUiAction({
       type: "selectAssemblyContig",
       id,
@@ -293,13 +336,6 @@ export function TrackPanel({
         currentRatio,
       );
       onUiAction({ type: "selectAssemblyContigs", ids });
-      setCoverageSelectionAnchorId(
-        coverageBlockIdAtRatio(
-          coverageView?.viewport ?? null,
-          uiState.assembly.blocks,
-          drag.startRatio,
-        ) ?? ids[0] ?? null,
-      );
     } else {
       const id = coverageBlockIdAtRatio(
         coverageView?.viewport ?? null,
@@ -329,6 +365,109 @@ export function TrackPanel({
     storeCoverageSelectionDrag(null);
   }
 
+  function startCoveragePanDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.shiftKey || event.metaKey || event.ctrlKey || event.button !== 0) {
+      return;
+    }
+    event.currentTarget.setPointerCapture(event.pointerId);
+    storeCoveragePanDrag({
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      lastClientX: event.clientX,
+      moved: false,
+    });
+  }
+
+  function moveCoveragePanDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = coveragePanDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const moved = drag.moved
+      || Math.abs(event.clientX - drag.startClientX) >= coverageDragThresholdPx;
+    if (!moved) {
+      return;
+    }
+    event.preventDefault();
+    const deltaXPx = event.clientX - (drag.moved ? drag.lastClientX : drag.startClientX);
+    const deltaXMb = coverageView
+      ? horizontalViewportDragDeltaMb(deltaXPx, bounds.width, coverageView.viewport)
+      : 0;
+    if (deltaXMb !== 0) {
+      onUiAction({ type: "panContactViewport", deltaXMb, deltaYMb: 0 });
+    }
+    storeCoveragePanDrag({ ...drag, lastClientX: event.clientX, moved: true });
+  }
+
+  function stopCoveragePanDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = coveragePanDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    if (drag.moved) {
+      event.preventDefault();
+      suppressNextCoverageClick();
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    storeCoveragePanDrag(null);
+  }
+
+  function cancelCoveragePanDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (coveragePanDragRef.current?.pointerId !== event.pointerId) {
+      return;
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    storeCoveragePanDrag(null);
+  }
+
+  function zoomCoverageAtPointer(event: ReactMouseEvent<HTMLDivElement>) {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    onUiAction({
+      type: "zoomContactViewport",
+      direction: "in",
+      focusRatioX: horizontalViewportFocusRatio(event.clientX, bounds.left, bounds.width),
+      snapToResolution: true,
+      totalSpanMb,
+    });
+  }
+
+  function startCoveragePointer(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.shiftKey) {
+      startCoverageSelectionDrag(event);
+    } else {
+      startCoveragePanDrag(event);
+    }
+  }
+
+  function moveCoveragePointer(event: ReactPointerEvent<HTMLDivElement>) {
+    if (coverageSelectionDragRef.current) {
+      moveCoverageSelectionDrag(event);
+    } else {
+      moveCoveragePanDrag(event);
+    }
+  }
+
+  function stopCoveragePointer(event: ReactPointerEvent<HTMLDivElement>) {
+    if (coverageSelectionDragRef.current) {
+      stopCoverageSelectionDrag(event);
+    } else {
+      stopCoveragePanDrag(event);
+    }
+  }
+
+  function cancelCoveragePointer(event: ReactPointerEvent<HTMLDivElement>) {
+    if (coverageSelectionDragRef.current) {
+      cancelCoverageSelectionDrag(event);
+    } else {
+      cancelCoveragePanDrag(event);
+    }
+  }
+
   return (
     <section
       className={`track-panel coverage-track ${uiState.tracks.coverageVisible ? "" : "track-hidden"}`}
@@ -336,7 +475,7 @@ export function TrackPanel({
     >
       <div className="coverage-controls">
         <button
-          className="coverage-control-button"
+          className="coverage-control-button coverage-visibility-control"
           type="button"
           aria-label={uiState.tracks.coverageVisible ? "Hide coverage track" : "Show coverage track"}
           title={uiState.tracks.coverageVisible ? "Hide coverage track" : "Show coverage track"}
@@ -344,7 +483,7 @@ export function TrackPanel({
         >
           {uiState.tracks.coverageVisible ? <Eye size={13} aria-hidden="true" /> : <EyeOff size={13} aria-hidden="true" />}
         </button>
-        <details className="coverage-scale-control">
+        <details ref={coverageScaleControlRef} className="coverage-scale-control">
           <summary
             className="coverage-control-button"
             aria-label="Set coverage range"
@@ -405,21 +544,40 @@ export function TrackPanel({
             </button>
           </div>
         </details>
+        {referenceLines.length > 0 ? (
+          <div className="coverage-axis-labels" aria-hidden="true">
+            {referenceLines.map((reference) => (
+              <span
+                key={reference.multiple}
+                className={`coverage-axis-label coverage-axis-label-${reference.multiple}x`}
+                style={{
+                  bottom: `clamp(6px, ${coverageValueHeightRatio(reference.value, scale) * 100}%, calc(100% - 6px))`,
+                }}
+              >
+                {reference.multiple}×
+              </span>
+            ))}
+          </div>
+        ) : null}
       </div>
       {uiState.tracks.coverageVisible ? (
         <div
-          className={`coverage-bars ${coverageSelectionDrag ? "coverage-range-dragging" : ""}`}
-          aria-label="Coverage distribution; click selects one contig, Shift-click selects a continuous range, Shift-drag selects a window, and Command or Control-click toggles individual contigs"
+          className={`coverage-bars ${coverageSelectionDrag ? "coverage-range-dragging" : ""} ${
+            coveragePanDrag?.moved ? "coverage-panning" : ""
+          }`}
+          aria-label="Coverage distribution; drag horizontally to pan the heatmap X region, double-click zooms in at the pointer, click replaces the current selection, Shift-drag selects multiple contigs, and Command or Control-click toggles individual contigs"
           data-resolution={coverageView?.resolution ?? undefined}
           data-viewport-x-start={coverageView?.viewport.xStart ?? undefined}
           data-viewport-x-end={coverageView?.viewport.xEnd ?? undefined}
           data-scale-min={scale.min}
           data-scale-max={scale.max}
           data-auto-multiplier={automaticMultiplier}
-          onPointerDown={startCoverageSelectionDrag}
-          onPointerMove={moveCoverageSelectionDrag}
-          onPointerUp={stopCoverageSelectionDrag}
-          onPointerCancel={cancelCoverageSelectionDrag}
+          data-coverage-reference-depth={referenceDepth ?? undefined}
+          onPointerDown={startCoveragePointer}
+          onPointerMove={moveCoveragePointer}
+          onPointerUp={stopCoveragePointer}
+          onPointerCancel={cancelCoveragePointer}
+          onDoubleClick={zoomCoverageAtPointer}
           onContextMenu={onContextMenu}
         >
           {bars.map((bar) => (
@@ -434,6 +592,21 @@ export function TrackPanel({
               }}
             />
           ))}
+          {referenceLines.length > 0 ? (
+            <div className="coverage-reference-lines" aria-hidden="true">
+              {referenceLines.map((reference) => (
+                <span
+                  key={reference.multiple}
+                  className={`coverage-reference-line coverage-reference-${reference.multiple}x`}
+                  data-coverage-multiple={reference.multiple}
+                  data-coverage-value={reference.value}
+                  style={{
+                    bottom: `${coverageValueHeightRatio(reference.value, scale) * 100}%`,
+                  }}
+                />
+              ))}
+            </div>
+          ) : null}
           <div className="coverage-chromosome-grid" aria-hidden="true">
             {chromosomeBoundaries.map((boundary) => (
               <span
@@ -446,14 +619,15 @@ export function TrackPanel({
           <div className="coverage-contig-hit-layer">
             {interactiveRanges.map((range) => {
               const block = blocksById.get(range.id);
+              const blockName = block ? assemblyContigDisplayName(block) : range.id;
               return (
                 <button
                   key={range.id}
                   type="button"
                   data-block-id={range.id}
                   aria-pressed={selectedIds.has(range.id)}
-                  aria-label={`Select ${block?.sourceId ?? range.id} in coverage`}
-                  title={`${block?.sourceId ?? range.id} · Shift-click range · Shift-drag window · Cmd/Ctrl-click toggle`}
+                  aria-label={`Select ${blockName} in coverage`}
+                  title={`${blockName} · Click to replace · Shift-drag multiple · Cmd/Ctrl-click toggle`}
                   style={{
                     left: `${range.leftRatio * 100}%`,
                     width: `${range.widthRatio * 100}%`,
@@ -500,14 +674,61 @@ export function coverageAutoScaleDomain(
 ): CoverageScaleDomain {
   const finiteValues = values.filter(Number.isFinite);
   const minimum = Math.min(0, ...finiteValues);
-  const observedMaximum = Math.max(minimum, ...finiteValues);
-  const observedRange = Math.max(1, observedMaximum - minimum);
   const safeMultiplier = normalizeCoverageMultiplier(multiplier);
+  const referenceDepth = coverageReferenceDepth(finiteValues);
+  if (referenceDepth === null) {
+    return { min: minimum, max: minimum + safeMultiplier };
+  }
+  const referenceMultiples = coverageReferenceMultiples(finiteValues, referenceDepth);
+  const highestReference = referenceMultiples[referenceMultiples.length - 1] ?? 2;
+  const effectiveMultiplier = Math.max(
+    safeMultiplier,
+    highestReference >= 3 ? highestReference + 0.25 : safeMultiplier,
+  );
 
   return {
     min: minimum,
-    max: minimum + observedRange * safeMultiplier,
+    max: minimum + referenceDepth * effectiveMultiplier,
   };
+}
+
+export function coverageReferenceDepth(values: number[]) {
+  const positiveValues = values
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((left, right) => left - right);
+  if (positiveValues.length === 0) {
+    return null;
+  }
+
+  const midpoint = Math.floor(positiveValues.length / 2);
+  return positiveValues.length % 2 === 1
+    ? positiveValues[midpoint]
+    : (positiveValues[midpoint - 1] + positiveValues[midpoint]) / 2;
+}
+
+export function coverageReferenceMultiples(
+  values: number[],
+  referenceDepth = coverageReferenceDepth(values),
+) {
+  if (referenceDepth === null || referenceDepth <= 0) {
+    return [];
+  }
+
+  const positiveValues = values
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((left, right) => left - right);
+  if (positiveValues.length === 0) {
+    return [];
+  }
+
+  const percentileIndex = Math.min(
+    positiveValues.length - 1,
+    Math.floor((positiveValues.length - 1) * adaptiveCoverageHighPercentile),
+  );
+  const robustUpperDepth = positiveValues[percentileIndex];
+  return robustUpperDepth >= referenceDepth * 3
+    ? [1, 2, 3]
+    : [1, 2];
 }
 
 export function normalizeCoverageMultiplier(
@@ -536,22 +757,6 @@ export function coverageSelectionIsAdditive({
   ctrlKey,
 }: CoverageSelectionModifiers) {
   return metaKey || ctrlKey;
-}
-
-export function coverageShiftClickClearsSelection(
-  selectedIds: ReadonlySet<string>,
-  id: string,
-  { shiftKey, metaKey, ctrlKey }: CoverageSelectionModifiers,
-) {
-  return shiftKey && !metaKey && !ctrlKey && selectedIds.has(id);
-}
-
-export function coverageContigIdsBetween(
-  blocks: ContactMapLayoutBlock[],
-  anchorId: string,
-  targetId: string,
-) {
-  return assemblyContigIdsBetween(blocks, anchorId, targetId);
 }
 
 export function coverageContigIdsInRatioRange(

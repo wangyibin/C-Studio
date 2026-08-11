@@ -1,14 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use cstudio_core::contact_cache::{ContactCache, ContactCacheKey};
@@ -151,6 +152,110 @@ struct ContactTileCacheKey {
     tile_y: u64,
 }
 
+#[derive(Debug, Default)]
+struct ContactTileStageTimings {
+    prepare: Cell<Duration>,
+    visual_cache: Cell<Duration>,
+    source_planning: Cell<Duration>,
+    source_cache: Cell<Duration>,
+    cool_read: Cell<Duration>,
+    projection: Cell<Duration>,
+    response_pack: Cell<Duration>,
+    store: Cell<Duration>,
+    total: Cell<Duration>,
+    visual_hits: Cell<usize>,
+    visual_misses: Cell<usize>,
+    source_hits: Cell<usize>,
+    source_misses: Cell<usize>,
+    cool_reads: Cell<usize>,
+    response_cells: Cell<usize>,
+}
+
+static CONTACT_TILE_PERF_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn contact_tile_perf_logging_enabled() -> bool {
+    *CONTACT_TILE_PERF_LOG_ENABLED
+        .get_or_init(|| std::env::var("CSTUDIO_PERF_LOG").ok().as_deref() == Some("1"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContactTilePerfContext<'a> {
+    scenario: &'a str,
+    request_id: u64,
+    generation: u64,
+    base_resolution: u64,
+    target_resolution: u64,
+    tile_size_bins: u64,
+    normalization: ContactNormalizationRequest,
+    layout_blocks: usize,
+    requested_tiles: usize,
+    returned_tiles: usize,
+}
+
+impl ContactTileStageTimings {
+    fn line(&self, context: ContactTilePerfContext<'_>) -> String {
+        format!(
+            "CSTUDIO_PERF event=contact_tiles scenario={} status=ok \
+             request_id={} generation={} base_resolution={} target_resolution={} \
+             tile_size_bins={} normalization={} layout_blocks={} \
+             requested_tiles={} returned_tiles={} \
+             visual_hits={} visual_misses={} source_hits={} source_misses={} \
+             cool_reads={} response_cells={} prepare_us={} visual_cache_us={} \
+             source_planning_us={} source_cache_us={} cool_read_us={} projection_us={} \
+             response_pack_us={} store_us={} total_us={}",
+            context.scenario,
+            context.request_id,
+            context.generation,
+            context.base_resolution,
+            context.target_resolution,
+            context.tile_size_bins,
+            context.normalization.cache_key(),
+            context.layout_blocks,
+            context.requested_tiles,
+            context.returned_tiles,
+            self.visual_hits.get(),
+            self.visual_misses.get(),
+            self.source_hits.get(),
+            self.source_misses.get(),
+            self.cool_reads.get(),
+            self.response_cells.get(),
+            self.prepare.get().as_micros(),
+            self.visual_cache.get().as_micros(),
+            self.source_planning.get().as_micros(),
+            self.source_cache.get().as_micros(),
+            self.cool_read.get().as_micros(),
+            self.projection.get().as_micros(),
+            self.response_pack.get().as_micros(),
+            self.store.get().as_micros(),
+            self.total.get().as_micros(),
+        )
+    }
+}
+
+struct ContactTileStageSpan<'a> {
+    accumulator: &'a Cell<Duration>,
+    started: Instant,
+}
+
+impl<'a> ContactTileStageSpan<'a> {
+    fn new(accumulator: &'a Cell<Duration>) -> Self {
+        Self {
+            accumulator,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ContactTileStageSpan<'_> {
+    fn drop(&mut self) {
+        self.accumulator.set(
+            self.accumulator
+                .get()
+                .saturating_add(self.started.elapsed()),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContactNormalizationRequest {
@@ -227,13 +332,27 @@ pub struct AgpLayoutResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgpGapMetadataResponse {
+    pub component_type: String,
+    pub length: u64,
+    pub gap_type: String,
+    pub linkage: String,
+    pub linkage_evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContactMapLayoutBlockResponse {
     pub id: String,
+    pub object_id: String,
     pub source_id: String,
     pub source_start: u64,
     pub source_end: u64,
     pub visual_start: u64,
     pub orientation: String,
+    pub component_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap_before: Option<AgpGapMetadataResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -645,67 +764,136 @@ fn get_contact_map_tiles_from_cool_with_cache(
 }
 
 fn get_contact_map_tiles_from_cool_with_cache_cancellable(
-    mut request: ContactMapTilesFromCoolRequest,
+    request: ContactMapTilesFromCoolRequest,
     source_cache: &Mutex<SourceContactCache>,
     tile_cache: &Mutex<HashMap<ContactTileCacheKey, ContactMapTileResponse>>,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<ContactMapTileResponse>, String> {
-    ensure_contact_tile_request_active(should_cancel)?;
-    let mut canonical_tiles = BTreeMap::new();
-    for tile in request.tiles.drain(..) {
-        let canonical = if tile.tile_x <= tile.tile_y {
-            tile
-        } else {
-            ContactMapTileKeyRequest {
-                tile_x: tile.tile_y,
-                tile_y: tile.tile_x,
-            }
-        };
-        canonical_tiles.insert((canonical.tile_x, canonical.tile_y), canonical);
-    }
-    request.tiles = canonical_tiles.into_values().collect();
-
-    ensure_contact_tile_request_active(should_cancel)?;
-    if request.tiles.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let tile_span = request
-        .tile_size_bins
-        .saturating_mul(request.target_resolution);
-    let mut axis_fingerprints = BTreeMap::<u64, String>::new();
-    for tile in &request.tiles {
-        for axis in [tile.tile_x, tile.tile_y] {
-            axis_fingerprints.entry(axis).or_insert_with(|| {
-                contact_projection_axis_fingerprint(axis, tile_span, &request.layout_blocks)
-            });
+    let request_id = request.request_id;
+    let generation = request.generation;
+    let base_resolution = request.base_resolution;
+    let target_resolution = request.target_resolution;
+    let tile_size_bins = request.tile_size_bins;
+    let normalization = request.normalization;
+    let layout_blocks = request.layout_blocks.len();
+    let requested_tiles = request.tiles.len();
+    let (result, timings) =
+        profile_contact_tile_request(request, source_cache, tile_cache, should_cancel);
+    if contact_tile_perf_logging_enabled() {
+        if let Ok(tiles) = result.as_ref() {
+            eprintln!(
+                "{}",
+                timings.line(ContactTilePerfContext {
+                    scenario: "request",
+                    request_id,
+                    generation,
+                    base_resolution,
+                    target_resolution,
+                    tile_size_bins,
+                    normalization,
+                    layout_blocks,
+                    requested_tiles,
+                    returned_tiles: tiles.len(),
+                })
+            );
         }
     }
-    let requested_tile_keys = request
-        .tiles
-        .iter()
-        .map(|tile| ContactTileCacheKey {
-            path: request.cool_path.clone(),
-            resolution: request.target_resolution,
-            tile_size_bins: request.tile_size_bins,
-            normalization: request.normalization,
-            projection_fingerprint: format!(
-                "{}:{}",
-                axis_fingerprints
-                    .get(&tile.tile_x)
-                    .expect("tile X axis fingerprint was precomputed"),
-                axis_fingerprints
-                    .get(&tile.tile_y)
-                    .expect("tile Y axis fingerprint was precomputed")
-            ),
-            tile_x: tile.tile_x,
-            tile_y: tile.tile_y,
-        })
-        .collect::<Vec<_>>();
+    result
+}
+
+fn profile_contact_tile_request(
+    request: ContactMapTilesFromCoolRequest,
+    source_cache: &Mutex<SourceContactCache>,
+    tile_cache: &Mutex<HashMap<ContactTileCacheKey, ContactMapTileResponse>>,
+    should_cancel: &dyn Fn() -> bool,
+) -> (
+    Result<Vec<ContactMapTileResponse>, String>,
+    ContactTileStageTimings,
+) {
+    let timings = ContactTileStageTimings::default();
+    let started = Instant::now();
+    let result = get_contact_map_tiles_from_cool_inner(
+        request,
+        source_cache,
+        tile_cache,
+        should_cancel,
+        &timings,
+    );
+    timings.total.set(started.elapsed());
+    (result, timings)
+}
+
+fn get_contact_map_tiles_from_cool_inner(
+    mut request: ContactMapTilesFromCoolRequest,
+    source_cache: &Mutex<SourceContactCache>,
+    tile_cache: &Mutex<HashMap<ContactTileCacheKey, ContactMapTileResponse>>,
+    should_cancel: &dyn Fn() -> bool,
+    timings: &ContactTileStageTimings,
+) -> Result<Vec<ContactMapTileResponse>, String> {
+    let tile_span;
+    let axis_fingerprints;
+    let requested_tile_keys;
+    {
+        let _stage = ContactTileStageSpan::new(&timings.prepare);
+        ensure_contact_tile_request_active(should_cancel)?;
+        let mut canonical_tiles = BTreeMap::new();
+        for tile in request.tiles.drain(..) {
+            let canonical = if tile.tile_x <= tile.tile_y {
+                tile
+            } else {
+                ContactMapTileKeyRequest {
+                    tile_x: tile.tile_y,
+                    tile_y: tile.tile_x,
+                }
+            };
+            canonical_tiles.insert((canonical.tile_x, canonical.tile_y), canonical);
+        }
+        request.tiles = canonical_tiles.into_values().collect();
+
+        ensure_contact_tile_request_active(should_cancel)?;
+        if request.tiles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        tile_span = request
+            .tile_size_bins
+            .saturating_mul(request.target_resolution);
+        let mut fingerprints = BTreeMap::<u64, String>::new();
+        for tile in &request.tiles {
+            for axis in [tile.tile_x, tile.tile_y] {
+                fingerprints.entry(axis).or_insert_with(|| {
+                    contact_projection_axis_fingerprint(axis, tile_span, &request.layout_blocks)
+                });
+            }
+        }
+        requested_tile_keys = request
+            .tiles
+            .iter()
+            .map(|tile| ContactTileCacheKey {
+                path: request.cool_path.clone(),
+                resolution: request.target_resolution,
+                tile_size_bins: request.tile_size_bins,
+                normalization: request.normalization,
+                projection_fingerprint: format!(
+                    "{}:{}",
+                    fingerprints
+                        .get(&tile.tile_x)
+                        .expect("tile X axis fingerprint was precomputed"),
+                    fingerprints
+                        .get(&tile.tile_y)
+                        .expect("tile Y axis fingerprint was precomputed")
+                ),
+                tile_x: tile.tile_x,
+                tile_y: tile.tile_y,
+            })
+            .collect::<Vec<_>>();
+        axis_fingerprints = fingerprints;
+    }
 
     let mut cached_tiles = BTreeMap::new();
     let mut missing_tiles = Vec::new();
     {
+        let _stage = ContactTileStageSpan::new(&timings.visual_cache);
         let tile_cache = tile_cache
             .lock()
             .map_err(|_| "contact tile cache lock poisoned".to_string())?;
@@ -717,9 +905,19 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
             }
         }
     }
+    timings
+        .visual_hits
+        .set(timings.visual_hits.get().saturating_add(cached_tiles.len()));
+    timings.visual_misses.set(
+        timings
+            .visual_misses
+            .get()
+            .saturating_add(missing_tiles.len()),
+    );
     ensure_contact_tile_request_active(should_cancel)?;
 
     if missing_tiles.is_empty() {
+        let _stage = ContactTileStageSpan::new(&timings.response_pack);
         return Ok(request
             .tiles
             .into_iter()
@@ -731,21 +929,26 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
     // Never turn those sparse misses back into one large min/max rectangle:
     // partition them into dense regions whose union is exactly the missing
     // tile set, then load only those regions.
-    let work_regions = contact_tile_work_regions(&missing_tiles);
+    let work_regions = {
+        let _stage = ContactTileStageSpan::new(&timings.source_planning);
+        contact_tile_work_regions(&missing_tiles)
+    };
     if work_regions.len() > 1 {
         for region_tiles in work_regions {
             let mut region_request = request.clone();
             region_request.tiles = region_tiles;
-            let loaded_tiles = get_contact_map_tiles_from_cool_with_cache_cancellable(
+            let loaded_tiles = get_contact_map_tiles_from_cool_inner(
                 region_request,
                 source_cache,
                 tile_cache,
                 should_cancel,
+                timings,
             )?;
             for tile in loaded_tiles {
                 cached_tiles.insert((tile.tile_x, tile.tile_y), tile);
             }
         }
+        let _stage = ContactTileStageSpan::new(&timings.response_pack);
         return Ok(request
             .tiles
             .into_iter()
@@ -753,89 +956,116 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
             .collect());
     }
 
-    let min_tile_x = missing_tiles
-        .iter()
-        .map(|tile| tile.tile_x)
-        .min()
-        .unwrap_or(0);
-    let max_tile_x = missing_tiles
-        .iter()
-        .map(|tile| tile.tile_x)
-        .max()
-        .unwrap_or(min_tile_x);
-    let min_tile_y = missing_tiles
-        .iter()
-        .map(|tile| tile.tile_y)
-        .min()
-        .unwrap_or(0);
-    let max_tile_y = missing_tiles
-        .iter()
-        .map(|tile| tile.tile_y)
-        .max()
-        .unwrap_or(min_tile_y);
-    let viewport = ContactMapViewportRequest {
-        x_start: min_tile_x.saturating_mul(tile_span),
-        x_end: max_tile_x.saturating_add(1).saturating_mul(tile_span),
-        y_start: min_tile_y.saturating_mul(tile_span),
-        y_end: max_tile_y.saturating_add(1).saturating_mul(tile_span),
-    };
+    let (source_ranges, query, source_windows, source_cache_path, source_cache_keys) = {
+        let _stage = ContactTileStageSpan::new(&timings.source_planning);
+        let min_tile_x = missing_tiles
+            .iter()
+            .map(|tile| tile.tile_x)
+            .min()
+            .unwrap_or(0);
+        let max_tile_x = missing_tiles
+            .iter()
+            .map(|tile| tile.tile_x)
+            .max()
+            .unwrap_or(min_tile_x);
+        let min_tile_y = missing_tiles
+            .iter()
+            .map(|tile| tile.tile_y)
+            .min()
+            .unwrap_or(0);
+        let max_tile_y = missing_tiles
+            .iter()
+            .map(|tile| tile.tile_y)
+            .max()
+            .unwrap_or(min_tile_y);
+        let viewport = ContactMapViewportRequest {
+            x_start: min_tile_x.saturating_mul(tile_span),
+            x_end: max_tile_x.saturating_add(1).saturating_mul(tile_span),
+            y_start: min_tile_y.saturating_mul(tile_span),
+            y_end: max_tile_y.saturating_add(1).saturating_mul(tile_span),
+        };
 
-    ensure_contact_tile_request_active(should_cancel)?;
-    let source_ranges = source_ranges_for_contact_viewport(&viewport, &request.layout_blocks);
-    let query = contact_map_query_from_parts(
-        request.base_resolution,
-        request.target_resolution,
-        viewport,
-        request.layout_blocks.clone(),
-    )?;
-    // 180 windows produce 16,290 upper-triangle pairs. The next window would
-    // exceed the 16,384-pair cache budget. Stop collecting at that point so a
-    // deliberately wide or very fragmented viewport cannot first allocate a
-    // huge source-window vector only to bypass the cache afterwards.
-    const MAX_CACHE_WINDOWS_PER_REQUEST: usize = 180;
-    let source_windows = source_windows_for_ranges_with_limit(
-        &source_ranges,
-        tile_span,
-        MAX_CACHE_WINDOWS_PER_REQUEST,
-    );
-    ensure_contact_tile_request_active(should_cancel)?;
-    let source_cache_path = fs::metadata(&request.cool_path)
-        .map(|metadata| {
-            let modified_nanos = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0);
-            format!(
-                "{}|{}|{}|normalization={}",
-                request.cool_path,
-                metadata.len(),
-                modified_nanos,
-                request.normalization.cache_key(),
-            )
-        })
-        .unwrap_or_else(|_| {
-            format!(
-                "{}|normalization={}",
-                request.cool_path,
-                request.normalization.cache_key(),
+        ensure_contact_tile_request_active(should_cancel)?;
+        let source_ranges = source_ranges_for_contact_viewport(&viewport, &request.layout_blocks);
+        let query = contact_map_query_from_parts(
+            request.base_resolution,
+            request.target_resolution,
+            viewport,
+            request.layout_blocks.clone(),
+        )?;
+        // 180 windows produce 16,290 upper-triangle pairs. The next window would
+        // exceed the 16,384-pair cache budget. Stop collecting at that point so a
+        // deliberately wide or very fragmented viewport cannot first allocate a
+        // huge source-window vector only to bypass the cache afterwards.
+        const MAX_CACHE_WINDOWS_PER_REQUEST: usize = 180;
+        let source_windows = source_windows_for_ranges_with_limit(
+            &source_ranges,
+            tile_span,
+            MAX_CACHE_WINDOWS_PER_REQUEST,
+        );
+        ensure_contact_tile_request_active(should_cancel)?;
+        let source_cache_path = fs::metadata(&request.cool_path)
+            .map(|metadata| {
+                let modified_nanos = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0);
+                format!(
+                    "{}|{}|{}|normalization={}",
+                    request.cool_path,
+                    metadata.len(),
+                    modified_nanos,
+                    request.normalization.cache_key(),
+                )
+            })
+            .unwrap_or_else(|_| {
+                format!(
+                    "{}|normalization={}",
+                    request.cool_path,
+                    request.normalization.cache_key(),
+                )
+            });
+        let source_cache_keys = source_windows.as_ref().map(|source_windows| {
+            SourceContactCache::keys_for_windows(
+                &source_cache_path,
+                request.target_resolution,
+                source_windows,
             )
         });
-    let source_cache_keys = source_windows.as_ref().map(|source_windows| {
-        SourceContactCache::keys_for_windows(
-            &source_cache_path,
-            request.target_resolution,
+        (
+            source_ranges,
+            query,
             source_windows,
+            source_cache_path,
+            source_cache_keys,
         )
-    });
+    };
 
     let cached_view = if let Some(keys) = source_cache_keys.as_ref() {
-        source_cache
-            .lock()
-            .map_err(|_| "source contact cache lock poisoned".to_string())?
-            .build_cached_view_cancellable(keys, &query, should_cancel)
-            .map_err(|error| error.to_string())?
+        let (mut source_cache, has_all) = {
+            let _stage = ContactTileStageSpan::new(&timings.source_cache);
+            let source_cache = source_cache
+                .lock()
+                .map_err(|_| "source contact cache lock poisoned".to_string())?;
+            let has_all = source_cache.contains_all(keys);
+            (source_cache, has_all)
+        };
+        if has_all {
+            timings
+                .source_hits
+                .set(timings.source_hits.get().saturating_add(1));
+            let _stage = ContactTileStageSpan::new(&timings.projection);
+            source_cache
+                .build_cached_view_cancellable(keys, &query, should_cancel)
+                .map_err(|error| error.to_string())?
+        } else {
+            timings
+                .source_misses
+                .set(timings.source_misses.get().saturating_add(1));
+            None
+        }
     } else {
         None
     };
@@ -843,6 +1073,7 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
     let view = if let Some(view) = cached_view {
         view
     } else if source_ranges.is_empty() {
+        let _stage = ContactTileStageSpan::new(&timings.projection);
         cstudio_core::contact_map::build_contact_map_view_from_contacts_cancellable(
             &query,
             Vec::<cstudio_core::contact_map::ContactBin>::new(),
@@ -850,48 +1081,65 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
         )
         .map_err(|error| error.to_string())?
     } else {
-        let cache_window_ranges = source_windows.as_ref().map(|source_windows| {
-            source_windows
-                .iter()
-                .map(|window| (window.source_id.clone(), window.start, window.end))
-                .collect::<Vec<_>>()
-        });
+        let cache_window_ranges = {
+            let _stage = ContactTileStageSpan::new(&timings.source_planning);
+            source_windows.as_ref().map(|source_windows| {
+                source_windows
+                    .iter()
+                    .map(|window| (window.source_id.clone(), window.start, window.end))
+                    .collect::<Vec<_>>()
+            })
+        };
         let read_ranges = cache_window_ranges
             .as_deref()
             .unwrap_or(source_ranges.as_slice());
         ensure_contact_tile_request_active(should_cancel)?;
-        let contacts = cstudio_core::cool::read_cool_contacts_for_source_ranges_at_resolution_with_normalization_cancellable(
+        timings
+            .cool_reads
+            .set(timings.cool_reads.get().saturating_add(1));
+        let contacts = {
+            let _stage = ContactTileStageSpan::new(&timings.cool_read);
+            cstudio_core::cool::read_cool_contacts_for_source_ranges_at_resolution_with_normalization_cancellable(
                 &request.cool_path,
                 read_ranges,
                 Some(request.target_resolution),
                 request.normalization.into(),
                 should_cancel,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+        };
         ensure_contact_tile_request_active(should_cancel)?;
 
         if let (Some(keys), Some(source_windows)) =
             (source_cache_keys.as_ref(), source_windows.as_ref())
         {
-            let mut source_cache = source_cache
-                .lock()
-                .map_err(|_| "source contact cache lock poisoned".to_string())?;
-            source_cache
-                .insert_contacts_for_windows_cancellable(
-                    &source_cache_path,
-                    request.target_resolution,
-                    source_windows,
-                    &contacts,
-                    should_cancel,
-                )
-                .map_err(|error| error.to_string())?;
+            let mut source_cache = {
+                let _stage = ContactTileStageSpan::new(&timings.source_cache);
+                let mut source_cache = source_cache
+                    .lock()
+                    .map_err(|_| "source contact cache lock poisoned".to_string())?;
+                source_cache
+                    .insert_contacts_for_windows_cancellable(
+                        &source_cache_path,
+                        request.target_resolution,
+                        source_windows,
+                        &contacts,
+                        should_cancel,
+                    )
+                    .map_err(|error| error.to_string())?;
+                source_cache
+            };
             ensure_contact_tile_request_active(should_cancel)?;
-            if let Some(view) = source_cache
-                .build_cached_view_cancellable(keys, &query, should_cancel)
-                .map_err(|error| error.to_string())?
-            {
+            let cached_projection = {
+                let _stage = ContactTileStageSpan::new(&timings.projection);
+                source_cache
+                    .build_cached_view_cancellable(keys, &query, should_cancel)
+                    .map_err(|error| error.to_string())?
+            };
+            if let Some(view) = cached_projection {
                 view
             } else {
+                let _stage = ContactTileStageSpan::new(&timings.projection);
                 cstudio_core::contact_map::build_contact_map_view_from_contacts_cancellable(
                     &query,
                     contacts,
@@ -900,6 +1148,7 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
                 .map_err(|error| error.to_string())?
             }
         } else {
+            let _stage = ContactTileStageSpan::new(&timings.projection);
             cstudio_core::contact_map::build_contact_map_view_from_contacts_cancellable(
                 &query,
                 contacts,
@@ -909,21 +1158,32 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
         }
     };
     ensure_contact_tile_request_active(should_cancel)?;
-    let response = contact_map_response_from_view_cancellable(view, should_cancel)?;
-    let missing = missing_tiles
-        .into_iter()
-        .map(|tile| (tile.tile_x, tile.tile_y))
-        .collect::<std::collections::BTreeSet<_>>();
-
-    let mut response_tiles = response
-        .tiles
-        .into_iter()
-        .filter(|tile| missing.contains(&(tile.tile_x, tile.tile_y)))
-        .map(|tile| ((tile.tile_x, tile.tile_y), tile.cells))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let (missing, response_tiles) = {
+        let _stage = ContactTileStageSpan::new(&timings.response_pack);
+        let missing = missing_tiles
+            .into_iter()
+            .map(|tile| (tile.tile_x, tile.tile_y))
+            .collect::<BTreeSet<_>>();
+        let response_tiles = contact_map_tiles_from_view_cancellable(
+            view,
+            request.tile_size_bins,
+            &missing,
+            should_cancel,
+        )?;
+        (missing, response_tiles)
+    };
+    timings.response_cells.set(
+        timings.response_cells.get().saturating_add(
+            response_tiles
+                .iter()
+                .map(|tile| tile.cells.len())
+                .sum::<usize>(),
+        ),
+    );
 
     ensure_contact_tile_request_active(should_cancel)?;
     {
+        let _stage = ContactTileStageSpan::new(&timings.store);
         let mut tile_cache = tile_cache
             .lock()
             .map_err(|_| "contact tile cache lock poisoned".to_string())?;
@@ -940,12 +1200,8 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
         for key in stale_keys {
             tile_cache.remove(&key);
         }
-        for (tile_x, tile_y) in missing {
-            let tile = ContactMapTileResponse {
-                tile_x,
-                tile_y,
-                cells: response_tiles.remove(&(tile_x, tile_y)).unwrap_or_default(),
-            };
+        for tile in response_tiles {
+            let (tile_x, tile_y) = (tile.tile_x, tile.tile_y);
             tile_cache.insert(
                 ContactTileCacheKey {
                     path: request.cool_path.clone(),
@@ -971,6 +1227,7 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
     }
 
     ensure_contact_tile_request_active(should_cancel)?;
+    let _stage = ContactTileStageSpan::new(&timings.response_pack);
     Ok(request
         .tiles
         .into_iter()
@@ -1106,11 +1363,12 @@ struct ContactProjectionSegment<'a> {
     source_start: u64,
     source_end: u64,
     reverse: bool,
+    source_shares: Vec<(u64, u64)>,
 }
 
-/// Stable cross-runtime identity for one visual axis tile. Only the clipped
-/// source projection participates: block/chromosome labels cannot affect
-/// contact pixels and therefore must not invalidate the cache.
+/// Stable cross-runtime identity for one visual axis tile. The clipped source
+/// projection and the copy-share intervals that affect it participate;
+/// block/chromosome labels cannot affect contact pixels.
 fn contact_projection_axis_fingerprint(
     axis: u64,
     tile_span: u64,
@@ -1147,6 +1405,22 @@ fn contact_projection_axis_fingerprint(
                     block.source_start.saturating_add(end_offset),
                 )
             };
+            let mut source_shares = layout_blocks
+                .iter()
+                .filter(|candidate| {
+                    candidate.source_id == block.source_id
+                        && candidate.source_start < candidate.source_end
+                        && candidate.source_start < source_end
+                        && candidate.source_end > source_start
+                })
+                .map(|candidate| {
+                    (
+                        candidate.source_start.max(source_start),
+                        candidate.source_end.min(source_end),
+                    )
+                })
+                .collect::<Vec<_>>();
+            source_shares.sort_unstable();
             segments.push(ContactProjectionSegment {
                 relative_visual_start: overlap_start.saturating_sub(tile_start),
                 relative_visual_end: overlap_end.saturating_sub(tile_start),
@@ -1154,6 +1428,7 @@ fn contact_projection_axis_fingerprint(
                 source_start,
                 source_end,
                 reverse,
+                source_shares,
             });
         }
     }
@@ -1180,7 +1455,7 @@ fn contact_projection_axis_fingerprint(
     }
 
     let mut hash = FNV_OFFSET_BASIS;
-    for byte in [b'C', b'S', b'T', b'L', 1] {
+    for byte in [b'C', b'S', b'T', b'L', 2] {
         write_byte(&mut hash, byte);
     }
     write_u64(&mut hash, segments.len() as u64);
@@ -1193,6 +1468,11 @@ fn contact_projection_axis_fingerprint(
         write_u64(&mut hash, segment.source_id.len() as u64);
         for byte in segment.source_id.as_bytes() {
             write_byte(&mut hash, *byte);
+        }
+        write_u64(&mut hash, segment.source_shares.len() as u64);
+        for (source_start, source_end) in segment.source_shares {
+            write_u64(&mut hash, source_start);
+            write_u64(&mut hash, source_end);
         }
     }
     format!("{hash:016x}")
@@ -1491,10 +1771,62 @@ fn contact_map_response_from_view_cancellable(
     })
 }
 
+fn contact_map_tiles_from_view_cancellable(
+    view: cstudio_core::contact_map::ContactMapView,
+    tile_size_bins: u64,
+    requested_tiles: &BTreeSet<(u64, u64)>,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<ContactMapTileResponse>, String> {
+    ensure_contact_tile_request_active(should_cancel)?;
+    if tile_size_bins == 0 {
+        return Err("contact tile size must be greater than zero".to_string());
+    }
+
+    // Seed every requested tile so empty tiles remain explicit cache entries.
+    // BTreeMap also preserves the canonical, deterministic request order.
+    let mut tiles_by_key = requested_tiles
+        .iter()
+        .copied()
+        .map(|key| (key, Vec::new()))
+        .collect::<BTreeMap<_, Vec<ContactMapCellResponse>>>();
+
+    for (cell_index, cell) in view.cells.into_iter().enumerate() {
+        if cell_index % 4_096 == 0 {
+            ensure_contact_tile_request_active(should_cancel)?;
+        }
+        let key = (cell.x_bin / tile_size_bins, cell.y_bin / tile_size_bins);
+        let Some(tile_cells) = tiles_by_key.get_mut(&key) else {
+            continue;
+        };
+        tile_cells.push(ContactMapCellResponse {
+            x_bin: cell.x_bin,
+            y_bin: cell.y_bin,
+            count: cell.count,
+        });
+    }
+
+    ensure_contact_tile_request_active(should_cancel)?;
+    let mut tiles = Vec::with_capacity(tiles_by_key.len());
+    for (tile_index, ((tile_x, tile_y), cells)) in tiles_by_key.into_iter().enumerate() {
+        if tile_index % 128 == 0 {
+            ensure_contact_tile_request_active(should_cancel)?;
+        }
+        tiles.push(ContactMapTileResponse {
+            tile_x,
+            tile_y,
+            cells,
+        });
+    }
+    ensure_contact_tile_request_active(should_cancel)?;
+
+    Ok(tiles)
+}
+
 fn parse_agp_layout_for_response(text: &str) -> Result<AgpLayoutResponse, String> {
     let mut object_offsets = std::collections::HashMap::<String, u64>::new();
     let mut object_order = Vec::<String>::new();
     let mut object_ends = std::collections::HashMap::<String, u64>::new();
+    let mut pending_gaps = std::collections::HashMap::<String, AgpGapMetadataResponse>::new();
     let mut blocks = Vec::new();
 
     for (index, raw_line) in text.lines().enumerate() {
@@ -1535,6 +1867,19 @@ fn parse_agp_layout_for_response(text: &str) -> Result<AgpLayoutResponse, String
             .or_insert(object_end);
 
         if matches!(columns[4], "N" | "U") {
+            let length = columns[5]
+                .parse::<u64>()
+                .map_err(|_| format!("line {} has invalid gap length", index + 1))?;
+            pending_gaps.insert(
+                object_id,
+                AgpGapMetadataResponse {
+                    component_type: columns[4].to_string(),
+                    length,
+                    gap_type: columns[6].to_string(),
+                    linkage: columns[7].to_string(),
+                    linkage_evidence: columns[8].to_string(),
+                },
+            );
             continue;
         }
 
@@ -1548,11 +1893,14 @@ fn parse_agp_layout_for_response(text: &str) -> Result<AgpLayoutResponse, String
 
         blocks.push(ContactMapLayoutBlockResponse {
             id: format!("{}:{}:{}", object_id, columns[3], columns[5]),
+            object_id: object_id.clone(),
             source_id: columns[5].to_string(),
             source_start: component_start,
             source_end: component_end,
             visual_start: object_offsets.get(&object_id).copied().unwrap_or(0) + object_start,
             orientation: normalize_agp_orientation(columns[8]).to_string(),
+            component_type: columns[4].to_string(),
+            gap_before: pending_gaps.remove(&object_id),
         });
     }
 
@@ -1569,6 +1917,8 @@ fn normalize_agp_orientation(value: &str) -> &str {
     match value {
         "-" => "-",
         "?" => "?",
+        "0" => "0",
+        "na" => "na",
         _ => "+",
     }
 }
@@ -2010,7 +2360,7 @@ fn parse_orientation(value: &str) -> Result<cstudio_core::agp::Orientation, Stri
     match value {
         "+" | "forward" | "Forward" => Ok(cstudio_core::agp::Orientation::Forward),
         "-" | "reverse" | "Reverse" => Ok(cstudio_core::agp::Orientation::Reverse),
-        "?" | "unknown" | "Unknown" => Ok(cstudio_core::agp::Orientation::Unknown),
+        "?" | "0" | "na" | "unknown" | "Unknown" => Ok(cstudio_core::agp::Orientation::Unknown),
         _ => Err(format!("invalid orientation: {value}")),
     }
 }
@@ -2024,11 +2374,13 @@ fn project_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Mutex;
 
     use cstudio_core::{
-        contact_cache::ContactCache, coverage_cache::CoverageCache,
+        contact_cache::ContactCache,
+        contact_map::{ContactMapCell, ContactMapView, Viewport},
+        coverage_cache::CoverageCache,
         source_contact_cache::SourceContactCache,
     };
 
@@ -2246,6 +2598,262 @@ mod tests {
     }
 
     #[test]
+    fn contact_tile_converter_keeps_only_requested_tiles() {
+        let view = ContactMapView {
+            resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 20_000,
+                y_start: 0,
+                y_end: 20_000,
+            },
+            cells: vec![
+                ContactMapCell {
+                    x_bin: 1,
+                    y_bin: 2,
+                    count: 3.0,
+                },
+                ContactMapCell {
+                    x_bin: 3,
+                    y_bin: 14,
+                    count: 5.0,
+                },
+                ContactMapCell {
+                    x_bin: 13,
+                    y_bin: 14,
+                    count: 7.0,
+                },
+            ],
+        };
+        let requested = BTreeSet::from([(0, 1)]);
+
+        let tiles = super::contact_map_tiles_from_view_cancellable(view, 10, &requested, &|| false)
+            .expect("requested tile conversion");
+
+        assert_eq!(
+            tiles,
+            vec![super::ContactMapTileResponse {
+                tile_x: 0,
+                tile_y: 1,
+                cells: vec![super::ContactMapCellResponse {
+                    x_bin: 3,
+                    y_bin: 14,
+                    count: 5.0,
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn contact_tile_converter_returns_requested_empty_tiles_in_order() {
+        let view = ContactMapView {
+            resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 40_000,
+                y_start: 0,
+                y_end: 40_000,
+            },
+            cells: vec![ContactMapCell {
+                x_bin: 11,
+                y_bin: 22,
+                count: 9.0,
+            }],
+        };
+        let requested = BTreeSet::from([(2, 3), (0, 1), (1, 2)]);
+
+        let tiles = super::contact_map_tiles_from_view_cancellable(view, 10, &requested, &|| false)
+            .expect("requested empty tiles remain explicit");
+
+        assert_eq!(
+            tiles
+                .iter()
+                .map(|tile| (tile.tile_x, tile.tile_y))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+        assert!(tiles[0].cells.is_empty());
+        assert_eq!(tiles[1].cells.len(), 1);
+        assert!(tiles[2].cells.is_empty());
+    }
+
+    #[test]
+    fn contact_tile_converter_matches_general_converter_for_requested_tiles() {
+        let view = ContactMapView {
+            resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 800_000,
+                y_start: 0,
+                y_end: 800_000,
+            },
+            cells: vec![
+                ContactMapCell {
+                    x_bin: 0,
+                    y_bin: 1,
+                    count: 2.0,
+                },
+                ContactMapCell {
+                    x_bin: 2,
+                    y_bin: 257,
+                    count: 3.0,
+                },
+                ContactMapCell {
+                    x_bin: 258,
+                    y_bin: 300,
+                    count: 5.0,
+                },
+                ContactMapCell {
+                    x_bin: 300,
+                    y_bin: 600,
+                    count: 7.0,
+                },
+            ],
+        };
+        let requested = BTreeSet::from([(0, 1), (1, 1), (2, 2)]);
+
+        let mut general_cells = super::contact_map_response_from_view(view.clone())
+            .expect("general conversion")
+            .tiles
+            .into_iter()
+            .filter(|tile| requested.contains(&(tile.tile_x, tile.tile_y)))
+            .map(|tile| ((tile.tile_x, tile.tile_y), tile.cells))
+            .collect::<BTreeMap<_, _>>();
+        let expected = requested
+            .iter()
+            .map(|&(tile_x, tile_y)| super::ContactMapTileResponse {
+                tile_x,
+                tile_y,
+                cells: general_cells.remove(&(tile_x, tile_y)).unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+
+        let actual =
+            super::contact_map_tiles_from_view_cancellable(view, 256, &requested, &|| false)
+                .expect("tile-only conversion");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn contact_tile_converter_honors_cancellation() {
+        let error = super::contact_map_tiles_from_view_cancellable(
+            ContactMapView {
+                resolution: 1_000,
+                viewport: Viewport {
+                    x_start: 0,
+                    x_end: 1_000,
+                    y_start: 0,
+                    y_end: 1_000,
+                },
+                cells: Vec::new(),
+            },
+            256,
+            &BTreeSet::from([(0, 0)]),
+            &|| true,
+        )
+        .expect_err("cancelled tile conversion must stop");
+
+        assert_eq!(error, "contact tile request cancelled");
+    }
+
+    #[test]
+    fn preserves_agp_component_and_gap_metadata_for_layout_response() {
+        let agp = [
+            "Chr01\t1\t10\t1\tF\tctgA\t11\t20\t+",
+            "Chr01\t11\t110\t2\tU\t100\tscaffold\tyes\tmap",
+            "Chr01\t111\t120\t3\tW\tctgB\t1\t10\t-",
+            "Chr02\t1\t8\t1\tO\tctgC\t3\t10\t?",
+            "Chr02\t9\t13\t2\tN\t5\tcontig\tno\tna",
+            "Chr02\t14\t21\t3\tP\tctgD\t1\t8\t+",
+        ]
+        .join("\n");
+
+        let layout = super::parse_agp_layout_for_response(&agp).expect("valid AGP layout");
+
+        assert_eq!(layout.total_span, 141);
+        assert_eq!(layout.blocks.len(), 4);
+
+        let first = &layout.blocks[0];
+        assert_eq!(first.object_id, "Chr01");
+        assert_eq!(first.component_type, "F");
+        assert_eq!((first.source_start, first.source_end), (10, 20));
+        assert_eq!(first.visual_start, 0);
+        assert_eq!(first.gap_before, None);
+
+        let after_unknown_gap = &layout.blocks[1];
+        assert_eq!(after_unknown_gap.object_id, "Chr01");
+        assert_eq!(after_unknown_gap.component_type, "W");
+        assert_eq!(after_unknown_gap.visual_start, 110);
+        assert_eq!(
+            after_unknown_gap.gap_before,
+            Some(super::AgpGapMetadataResponse {
+                component_type: "U".to_string(),
+                length: 100,
+                gap_type: "scaffold".to_string(),
+                linkage: "yes".to_string(),
+                linkage_evidence: "map".to_string(),
+            })
+        );
+
+        let after_known_gap = &layout.blocks[3];
+        assert_eq!(after_known_gap.object_id, "Chr02");
+        assert_eq!(after_known_gap.component_type, "P");
+        assert_eq!(after_known_gap.visual_start, 133);
+        assert_eq!(
+            after_known_gap.gap_before,
+            Some(super::AgpGapMetadataResponse {
+                component_type: "N".to_string(),
+                length: 5,
+                gap_type: "contig".to_string(),
+                linkage: "no".to_string(),
+                linkage_evidence: "na".to_string(),
+            })
+        );
+
+        let serialized = serde_json::to_value(after_unknown_gap).expect("serialize AGP block");
+        assert_eq!(serialized["objectId"], "Chr01");
+        assert_eq!(serialized["componentType"], "W");
+        assert_eq!(serialized["gapBefore"]["componentType"], "U");
+        assert_eq!(serialized["gapBefore"]["length"], 100);
+        assert_eq!(serialized["gapBefore"]["gapType"], "scaffold");
+        assert_eq!(serialized["gapBefore"]["linkage"], "yes");
+        assert_eq!(serialized["gapBefore"]["linkageEvidence"], "map");
+        let first_serialized = serde_json::to_value(first).expect("serialize first AGP block");
+        assert!(first_serialized.get("gapBefore").is_none());
+    }
+
+    #[test]
+    fn preserves_and_accepts_agp_zero_and_na_orientations() {
+        let agp = [
+            "ChrO\t1\t10\t1\tW\tctgZero\t11\t20\t0",
+            "ChrO\t11\t20\t2\tF\tctgNa\t31\t40\tna",
+        ]
+        .join("\n");
+
+        let layout = super::parse_agp_layout_for_response(&agp).expect("valid AGP layout");
+
+        assert_eq!(layout.blocks[0].orientation, "0");
+        assert_eq!(layout.blocks[1].orientation, "na");
+        assert_eq!(
+            serde_json::to_value(&layout.blocks).expect("serialize AGP blocks")[0]["orientation"],
+            "0"
+        );
+        assert_eq!(
+            serde_json::to_value(&layout.blocks).expect("serialize AGP blocks")[1]["orientation"],
+            "na"
+        );
+        assert_eq!(
+            super::parse_orientation("0").expect("zero means unknown orientation"),
+            cstudio_core::agp::Orientation::Unknown
+        );
+        assert_eq!(
+            super::parse_orientation("na").expect("na means irrelevant orientation"),
+            cstudio_core::agp::Orientation::Unknown
+        );
+    }
+
+    #[test]
     fn loads_example_dataset_summary() {
         let summary = super::load_example_dataset().expect("example dataset should load");
 
@@ -2272,6 +2880,19 @@ mod tests {
         );
         assert_eq!(summary.agp_layout.blocks.len(), 1_298);
         assert!(summary.agp_layout.total_span > summary.max_object_span);
+        assert_eq!(summary.agp_layout.blocks[0].object_id, "Chr01g1");
+        assert_eq!(summary.agp_layout.blocks[0].component_type, "W");
+        assert_eq!(summary.agp_layout.blocks[0].gap_before, None);
+        assert_eq!(
+            summary.agp_layout.blocks[1].gap_before,
+            Some(super::AgpGapMetadataResponse {
+                component_type: "U".to_string(),
+                length: 100,
+                gap_type: "contig".to_string(),
+                linkage: "yes".to_string(),
+                linkage_evidence: "map".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -2376,6 +2997,24 @@ mod tests {
         assert_eq!(flipped_changed, ["0:1", "1:1", "1:2", "1:3", "1:4", "1:5"]);
         assert_eq!(inserted_reused, ["0:0", "0:4", "4:4", "0:5", "4:5", "5:5"]);
 
+        let mut copied = before.clone();
+        copied.push(ContactMapLayoutBlockRequest {
+            id: "block-A-copy".to_string(),
+            source_id: "A".to_string(),
+            source_start: 0,
+            source_end: 100,
+            visual_start: 600,
+            orientation: "+".to_string(),
+        });
+        assert_ne!(
+            super::contact_tile_projection_fingerprint(0, 1, tile_span, &before),
+            super::contact_tile_projection_fingerprint(0, 1, tile_span, &copied),
+        );
+        assert_eq!(
+            super::contact_tile_projection_fingerprint(1, 1, tile_span, &before),
+            super::contact_tile_projection_fingerprint(1, 1, tile_span, &copied),
+        );
+
         let mut renamed = before.clone();
         for (index, block) in renamed.iter_mut().enumerate() {
             block.id = format!("renamed-{index}");
@@ -2399,7 +3038,7 @@ mod tests {
         }];
         assert_eq!(
             super::contact_tile_projection_fingerprint(0, 0, tile_span, &unicode_layout),
-            "dd226eb70d454d8c:dd226eb70d454d8c"
+            "ac570d514b060508:ac570d514b060508"
         );
         assert_eq!(
             super::contact_tile_projection_fingerprint(5, 2, tile_span, &before),
@@ -2696,6 +3335,117 @@ mod tests {
         .expect("cached requested tiles should render");
 
         assert_eq!(cached_response, response);
+    }
+
+    #[test]
+    #[ignore = "run explicitly in a release build for diagnostic timings"]
+    fn contact_tile_backend_release_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "contact tile timings are only meaningful with --release"
+        );
+
+        fn run_scenario(
+            scenario: &str,
+            request: ContactMapTilesFromCoolRequest,
+            source_cache: &Mutex<SourceContactCache>,
+            tile_cache: &Mutex<HashMap<super::ContactTileCacheKey, super::ContactMapTileResponse>>,
+        ) -> (
+            Vec<super::ContactMapTileResponse>,
+            super::ContactTileStageTimings,
+        ) {
+            let request_id = request.request_id;
+            let generation = request.generation;
+            let base_resolution = request.base_resolution;
+            let target_resolution = request.target_resolution;
+            let tile_size_bins = request.tile_size_bins;
+            let normalization = request.normalization;
+            let layout_blocks = request.layout_blocks.len();
+            let requested_tiles = request.tiles.len();
+            let (result, timings) =
+                super::profile_contact_tile_request(request, source_cache, tile_cache, &|| false);
+            let tiles = result.expect("benchmark request should render");
+            println!(
+                "{}",
+                timings.line(super::ContactTilePerfContext {
+                    scenario,
+                    request_id,
+                    generation,
+                    base_resolution,
+                    target_resolution,
+                    tile_size_bins,
+                    normalization,
+                    layout_blocks,
+                    requested_tiles,
+                    returned_tiles: tiles.len(),
+                })
+            );
+            (tiles, timings)
+        }
+
+        let summary = super::load_example_dataset().expect("example dataset should load");
+        let source_block = summary
+            .agp_layout
+            .blocks
+            .into_iter()
+            .max_by_key(|block| block.source_end - block.source_start)
+            .expect("example layout block");
+        let source_cache = Mutex::new(SourceContactCache::new(16 * 1024 * 1024));
+        let cold_visual_cache = Mutex::new(HashMap::new());
+        let moved_visual_cache = Mutex::new(HashMap::new());
+        let tile_size_bins = 256;
+        let target_resolution = 10_000;
+        let tile_span = tile_size_bins * target_resolution;
+        let request = |request_id, tile_x, tile_y, visual_start| ContactMapTilesFromCoolRequest {
+            request_id,
+            generation: 1,
+            cool_path: summary.cool_path.clone(),
+            base_resolution: 1_000,
+            target_resolution,
+            tile_size_bins,
+            normalization: ContactNormalizationRequest::Raw,
+            tiles: vec![ContactMapTileKeyRequest { tile_x, tile_y }],
+            layout_blocks: vec![ContactMapLayoutBlockRequest {
+                id: source_block.id.clone(),
+                source_id: source_block.source_id.clone(),
+                source_start: source_block.source_start,
+                source_end: source_block.source_end,
+                visual_start,
+                orientation: source_block.orientation.clone(),
+            }],
+        };
+
+        let (cold_tiles, cold) = run_scenario(
+            "cold",
+            request(10_001, 0, 0, 0),
+            &source_cache,
+            &cold_visual_cache,
+        );
+        assert_eq!(cold_tiles.len(), 1);
+        assert_eq!(cold.cool_reads.get(), 1);
+        assert_eq!(cold.source_misses.get(), 1);
+
+        let (reprojected_tiles, reprojected) = run_scenario(
+            "source_reprojection",
+            request(10_002, 1, 1, tile_span),
+            &source_cache,
+            &moved_visual_cache,
+        );
+        assert_eq!(reprojected_tiles.len(), 1);
+        assert_eq!(reprojected.cool_reads.get(), 0);
+        assert_eq!(reprojected.source_hits.get(), 1);
+
+        let (visual_hit_tiles, visual_hit) = run_scenario(
+            "visual_hit",
+            request(10_003, 0, 0, 0),
+            &source_cache,
+            &cold_visual_cache,
+        );
+        assert_eq!(visual_hit_tiles, cold_tiles);
+        assert_eq!(visual_hit.visual_hits.get(), 1);
+        assert_eq!(visual_hit.cool_reads.get(), 0);
+        assert_eq!(visual_hit.projection.get(), std::time::Duration::ZERO);
+        assert_eq!(visual_hit.store.get(), std::time::Duration::ZERO);
     }
 
     #[test]
