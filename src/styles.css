@@ -1143,7 +1143,9 @@ button {
 }
 
 .contact-tile-surface {
-  overflow: hidden;
+  /* The outer viewport owns clipping. Keep the prefetched padding canvases
+     paintable while this surface is translated during a pan. */
+  overflow: visible;
   background: #ffffff;
   pointer-events: none;
 }

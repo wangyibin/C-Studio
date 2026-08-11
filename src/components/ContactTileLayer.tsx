@@ -29,6 +29,8 @@ export interface ContactTileLayerProps {
   contactMap: ContactMapView | null;
   viewport?: ContactViewport;
   renderStyle: ContactTileRenderStyle;
+  /** One cached tile beyond the viewport, only on the active pan axes. */
+  overscanDirection?: ContactTileOverscanMode;
   /** Keep the currently presented style while a target resolution is loading. */
   freezePresentedStyle?: boolean;
   layerRef: React.RefObject<HTMLDivElement>;
@@ -50,6 +52,22 @@ export interface ContactTileLayerProps {
 export interface ContactTileRenderStyle {
   colormap: ContactColormap;
   colorScale: Pick<ContactColorScale, "log" | "min" | "max">;
+}
+
+export type ContactTileOverscanAxisDirection = -1 | 0 | 1;
+
+export interface ContactTileOverscanDirection {
+  x: ContactTileOverscanAxisDirection;
+  y: ContactTileOverscanAxisDirection;
+}
+
+/** Prewarm every edge while idle, then retain only the leading edge while panning. */
+export type ContactTileOverscanMode = ContactTileOverscanDirection | "all";
+
+export interface ContactTileCanvasDescriptor {
+  key: string;
+  tile: ContactMapTile;
+  transpose: boolean;
 }
 
 type ContactTileBufferSlot = 0 | 1;
@@ -461,6 +479,7 @@ export function ContactTileLayer({
   onPointerDown,
   onPointerMove,
   onPointerUp,
+  overscanDirection = "all",
   renderStyle,
   viewport,
 }: ContactTileLayerProps) {
@@ -655,6 +674,7 @@ export function ContactTileLayer({
               paintRevision={frame.contactMap.renderGeneration ?? paintRevision}
               phase={phase}
               renderStyle={frame.renderStyle}
+              overscanDirection={overscanDirection}
               viewport={viewport ?? frame.contactMap.viewport}
             />
           );
@@ -673,6 +693,7 @@ function ContactTileSurface({
   onTileLayerPaintUnavailable,
   phase,
   renderStyle,
+  overscanDirection,
   viewport,
 }: {
   contactMap: ContactMapView;
@@ -683,6 +704,7 @@ function ContactTileSurface({
   onTileLayerPaintUnavailable: (event: ContactTileLayerPaintEvent) => void;
   phase: "presented" | "staging";
   renderStyle: ContactTileRenderStyle;
+  overscanDirection: ContactTileOverscanMode;
   viewport: ContactViewport;
 }) {
   const rawTiles = contactMap.cachedTiles ?? contactMap.tiles;
@@ -695,11 +717,47 @@ function ContactTileSurface({
     [previewTiles, rawTiles],
   );
   const tileSizeBins = contactMap.tileSizeBins ?? 256;
+  const renderCanvases = useMemo(
+    () => contactTileCanvasDescriptorsForViewport(
+      tiles,
+      contactMap.resolution,
+      tileSizeBins,
+      viewport,
+      overscanDirection,
+    ),
+    [
+      contactMap.resolution,
+      typeof overscanDirection === "string" ? overscanDirection : overscanDirection.x,
+      typeof overscanDirection === "string" ? overscanDirection : overscanDirection.y,
+      tileSizeBins,
+      tiles,
+      viewport.xEnd,
+      viewport.xStart,
+      viewport.yEnd,
+      viewport.yStart,
+    ],
+  );
   const paintEpochCounterRef = useRef(0);
   const activePaintCoordinatorRef = useRef<ContactTilePaintCoordinator | null>(null);
-  const paintCanvasKeySignature = canvasKeysForTiles(
-    canonicalTilesForRendering(contactMap.tiles ?? tiles),
-  ).join("|");
+  const paintCanvasKeySignature = useMemo(
+    () => contactTileCanvasDescriptorsForViewport(
+      canonicalTilesForRendering(contactMap.tiles ?? tiles),
+      contactMap.resolution,
+      tileSizeBins,
+      viewport,
+      { x: 0, y: 0 },
+    ).map(({ key }) => key).join("|"),
+    [
+      contactMap.resolution,
+      contactMap.tiles,
+      tileSizeBins,
+      tiles,
+      viewport.xEnd,
+      viewport.xStart,
+      viewport.yEnd,
+      viewport.yStart,
+    ],
+  );
   const visibleTileIdentitySignature = contactVisibleTileIdentitySignature(
     contactMap.tiles,
     tiles,
@@ -763,37 +821,19 @@ function ContactTileSurface({
   return (
     <div className="contact-tile-surface" data-phase={phase} aria-hidden={phase === "staging"}>
       <div ref={layerRef} className="contact-tile-layer">
-        {tiles.flatMap((tile) => {
-          const canvases = [
-            <ContactTileCanvas
-              key={`${tile.tileX}:${tile.tileY}:source`}
-              contactMap={contactMap}
-              tile={tile}
-              tileSizeBins={tileSizeBins}
-              transpose={false}
-              paintCanvasKey={`${tile.tileX}:${tile.tileY}:source`}
-              paintCoordinator={paintCoordinator}
-              renderStyle={renderStyle}
-              viewport={viewport}
-            />,
-          ];
-          if (tile.tileX !== tile.tileY) {
-            canvases.push(
-              <ContactTileCanvas
-                key={`${tile.tileX}:${tile.tileY}:mirror`}
-                contactMap={contactMap}
-                tile={tile}
-                tileSizeBins={tileSizeBins}
-                transpose
-                paintCanvasKey={`${tile.tileX}:${tile.tileY}:mirror`}
-                paintCoordinator={paintCoordinator}
-                renderStyle={renderStyle}
-                viewport={viewport}
-              />,
-            );
-          }
-          return canvases;
-        })}
+        {renderCanvases.map(({ key, tile, transpose }) => (
+          <ContactTileCanvas
+            key={key}
+            contactMap={contactMap}
+            tile={tile}
+            tileSizeBins={tileSizeBins}
+            transpose={transpose}
+            paintCanvasKey={key}
+            paintCoordinator={paintCoordinator}
+            renderStyle={renderStyle}
+            viewport={viewport}
+          />
+        ))}
       </div>
     </div>
   );
@@ -830,13 +870,61 @@ export function canonicalTilesForRendering(tiles: ContactMapTile[]): ContactMapT
   return [...unique.values()];
 }
 
-function canvasKeysForTiles(tiles: ContactMapTile[]): string[] {
-  return tiles.flatMap((tile) => {
-    const prefix = `${tile.tileX}:${tile.tileY}`;
-    return tile.tileX === tile.tileY
-      ? [`${prefix}:source`]
-      : [`${prefix}:source`, `${prefix}:mirror`];
-  });
+export function contactTileCanvasDescriptorsForViewport(
+  tiles: readonly ContactMapTile[],
+  resolution: number,
+  tileSizeBins: number,
+  viewport: ContactViewport,
+  overscanDirection: ContactTileOverscanMode,
+): ContactTileCanvasDescriptor[] {
+  if (viewport.xEnd <= viewport.xStart || viewport.yEnd <= viewport.yStart) {
+    return [];
+  }
+  const tileSpanBp = Math.max(1, resolution * tileSizeBins);
+  const minVisibleTileX = Math.floor(viewport.xStart / tileSpanBp);
+  const maxVisibleTileX = Math.ceil(viewport.xEnd / tileSpanBp) - 1;
+  const minVisibleTileY = Math.floor(viewport.yStart / tileSpanBp);
+  const maxVisibleTileY = Math.ceil(viewport.yEnd / tileSpanBp) - 1;
+  if (maxVisibleTileX < minVisibleTileX || maxVisibleTileY < minVisibleTileY) {
+    return [];
+  }
+
+  const warmAllDirections = overscanDirection === "all";
+  const directionX = warmAllDirections ? 0 : overscanDirection.x;
+  const directionY = warmAllDirections ? 0 : overscanDirection.y;
+  const minTileX = minVisibleTileX - (warmAllDirections || directionX < 0 ? 1 : 0);
+  const maxTileX = maxVisibleTileX + (warmAllDirections || directionX > 0 ? 1 : 0);
+  const minTileY = minVisibleTileY - (warmAllDirections || directionY < 0 ? 1 : 0);
+  const maxTileY = maxVisibleTileY + (warmAllDirections || directionY > 0 ? 1 : 0);
+  const descriptors: ContactTileCanvasDescriptor[] = [];
+  const addIfVisible = (
+    tile: ContactMapTile,
+    transpose: boolean,
+    renderedTileX: number,
+    renderedTileY: number,
+  ) => {
+    if (
+      renderedTileX < minTileX
+      || renderedTileX > maxTileX
+      || renderedTileY < minTileY
+      || renderedTileY > maxTileY
+    ) {
+      return;
+    }
+    descriptors.push({
+      key: `${tile.tileX}:${tile.tileY}:${transpose ? "mirror" : "source"}`,
+      tile,
+      transpose,
+    });
+  };
+
+  for (const tile of tiles) {
+    addIfVisible(tile, false, tile.tileX, tile.tileY);
+    if (tile.tileX !== tile.tileY) {
+      addIfVisible(tile, true, tile.tileY, tile.tileX);
+    }
+  }
+  return descriptors;
 }
 
 function frontendPerformanceTimestamp(): number {

@@ -10,6 +10,7 @@ import {
   contactCanvasBackingSizeFromBounds,
   contactViewportForAxisNavigator,
   contactViewportSizePxFromBounds,
+  contactTileOverscanDirectionForViewports,
   contactWheelPanIntent,
   historyPreviewBoxes,
 } from "./ContactMapViewport";
@@ -106,6 +107,19 @@ describe("contactWheelPanIntent", () => {
       bounds: { width: 0, height: 200 },
       viewport,
     })).toBeNull();
+  });
+});
+
+describe("contactTileOverscanDirectionForViewports", () => {
+  it("tracks the genomic direction independently on both pan axes", () => {
+    expect(contactTileOverscanDirectionForViewports(viewport, {
+      xStart: 60_000_000,
+      xEnd: 260_000_000,
+      yStart: 65_000_000,
+      yEnd: 165_000_000,
+    })).toEqual({ x: 1, y: -1 });
+
+    expect(contactTileOverscanDirectionForViewports(viewport, viewport)).toEqual({ x: 0, y: 0 });
   });
 });
 

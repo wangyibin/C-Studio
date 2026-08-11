@@ -6,6 +6,7 @@ import {
   canonicalTilesForRendering,
   ContactTileLayer,
   contactTileCanvasBox,
+  contactTileCanvasDescriptorsForViewport,
   contactTileCanvasPaintDependencyValues,
   contactVisibleTileIdentitySignature,
   createContactTileLayerBufferState,
@@ -461,6 +462,69 @@ describe("contactTileCanvasBox", () => {
       width: 256,
       height: 256,
     });
+  });
+
+  it("renders only visible canvases plus one tile on the active overscan axes", () => {
+    const cachedTiles = [
+      { tileX: 0, tileY: 1, cells: [] },
+      { tileX: 0, tileY: 2, cells: [] },
+      { tileX: 1, tileY: 1, cells: [] },
+    ];
+    const viewport = {
+      xStart: 0,
+      xEnd: 256_000,
+      yStart: 256_000,
+      yEnd: 512_000,
+    };
+    const keysFor = (x: -1 | 0 | 1, y: -1 | 0 | 1) => (
+      contactTileCanvasDescriptorsForViewport(
+        cachedTiles,
+        1_000,
+        256,
+        viewport,
+        { x, y },
+      ).map(({ key }) => key)
+    );
+
+    expect(keysFor(0, 0)).toEqual(["0:1:source"]);
+    expect(keysFor(1, 0)).toEqual(["0:1:source", "1:1:source"]);
+    expect(keysFor(0, 1)).toEqual(["0:1:source", "0:2:source"]);
+    expect(keysFor(1, -1)).toEqual([
+      "0:1:source",
+      "0:1:mirror",
+      "1:1:source",
+    ]);
+    expect(contactTileCanvasDescriptorsForViewport(
+      cachedTiles,
+      1_000,
+      256,
+      viewport,
+      "all",
+    ).map(({ key }) => key)).toEqual([
+      "0:1:source",
+      "0:1:mirror",
+      "0:2:source",
+      "1:1:source",
+    ]);
+  });
+
+  it("drops a symmetric mirror when only the canonical source intersects the viewport", () => {
+    const descriptors = contactTileCanvasDescriptorsForViewport(
+      [{ tileX: 2, tileY: 5, cells: [] }],
+      1_000,
+      256,
+      {
+        xStart: 2 * 256_000,
+        xEnd: 3 * 256_000,
+        yStart: 5 * 256_000,
+        yEnd: 6 * 256_000,
+      },
+      { x: 0, y: 0 },
+    );
+
+    expect(descriptors).toHaveLength(1);
+    const [source] = descriptors;
+    expect(source).toMatchObject({ key: "2:5:source", transpose: false });
   });
 
   it("renders one cached source tile plus its symmetric mirror without rebuilding a global canvas", () => {

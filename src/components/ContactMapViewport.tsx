@@ -46,7 +46,13 @@ import {
   type AssemblyContextMenuPosition,
 } from "./AssemblyContextMenu";
 import { ContactLayoutRasterPreview } from "./ContactLayoutRasterPreview";
-import { ContactTileLayer, type ContactTileLayerPaintEvent } from "./ContactTileLayer";
+import {
+  ContactTileLayer,
+  type ContactTileLayerPaintEvent,
+  type ContactTileOverscanAxisDirection,
+  type ContactTileOverscanDirection,
+  type ContactTileOverscanMode,
+} from "./ContactTileLayer";
 import { GenomeAxisNavigator } from "./GenomeAxisNavigator";
 import { TrackPanel } from "./TrackPanel";
 
@@ -267,6 +273,23 @@ export function contactWheelPanIntent({
   };
 }
 
+export function contactTileOverscanDirectionForViewports(
+  source: ContactViewport,
+  target: ContactViewport,
+): ContactTileOverscanDirection {
+  const axisDirection = (delta: number): ContactTileOverscanAxisDirection => (
+    delta < 0 ? -1 : delta > 0 ? 1 : 0
+  );
+  return {
+    x: axisDirection(
+      (target.xStart + target.xEnd) - (source.xStart + source.xEnd),
+    ),
+    y: axisDirection(
+      (target.yStart + target.yEnd) - (source.yStart + source.yEnd),
+    ),
+  };
+}
+
 /** Resolve a selected contig diagonal under the pointer, including compact boxes at whole-genome scale. */
 export function assemblyCutTargetAtScreenPoint({
   model,
@@ -372,6 +395,9 @@ export function ContactMapViewport({
   deleteConfirmationOpenRef.current = deleteConfirmationOpen;
   const [dragState, setDragState] = useState<DragState | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
+  const [panOverscanDirection, setPanOverscanDirection] = useState<ContactTileOverscanMode>("all");
+  const panOverscanDirectionRef = useRef(panOverscanDirection);
+  panOverscanDirectionRef.current = panOverscanDirection;
   const panAnimationFrameRef = useRef<number | null>(null);
   const redrawAnimationFrameRef = useRef<number | null>(null);
   const pendingPanFrameRef = useRef<PendingPanFrame | null>(null);
@@ -706,6 +732,25 @@ export function ContactMapViewport({
   }, []);
 
   useEffect(() => {
+    if (!contactMap || contactMap.visibleLayerComplete !== true || dragStateRef.current) {
+      return;
+    }
+    let secondFrame: number | null = null;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        panOverscanDirectionRef.current = "all";
+        setPanOverscanDirection("all");
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) {
+        window.cancelAnimationFrame(secondFrame);
+      }
+    };
+  }, [contactMap]);
+
+  useEffect(() => {
     const stage = mapContentRef.current;
     if (!stage) {
       return;
@@ -758,6 +803,7 @@ export function ContactMapViewport({
         return;
       }
 
+      updatePanOverscanDirection(currentViewport, previewContactMap.viewport);
       schedulePanTransform(
         currentContactMap,
         previewContactMap,
@@ -886,6 +932,7 @@ export function ContactMapViewport({
       currentY: latestPointer.clientY,
       previewViewport: previewContactMap.viewport,
     };
+    updatePanOverscanDirection(liveContactMap.viewport, previewContactMap.viewport);
     schedulePanTransform(
       liveContactMap,
       previewContactMap,
@@ -1000,6 +1047,19 @@ export function ContactMapViewport({
     }
   }
 
+  function updatePanOverscanDirection(
+    sourceViewport: ContactViewport,
+    targetViewport: ContactViewport,
+  ) {
+    const next = contactTileOverscanDirectionForViewports(sourceViewport, targetViewport);
+    const current = panOverscanDirectionRef.current;
+    if (current !== "all" && current.x === next.x && current.y === next.y) {
+      return;
+    }
+    panOverscanDirectionRef.current = next;
+    setPanOverscanDirection(next);
+  }
+
   function previewAxisNavigator(axis: "x" | "y", centerRatio: number) {
     if (!liveContactMap) {
       return;
@@ -1020,6 +1080,7 @@ export function ContactMapViewport({
       centerXMb: uiState.contact.viewportCenterXMb,
       centerYMb: uiState.contact.viewportCenterYMb,
     });
+    updatePanOverscanDirection(liveContactMap.viewport, previewViewport);
     schedulePanTransform(
       liveContactMap,
       { ...liveContactMap, viewport: previewViewport },
@@ -1366,6 +1427,7 @@ export function ContactMapViewport({
                 onPointerMove={movePan}
                 onPointerUp={stopPan}
                 onPointerCancel={stopPan}
+                overscanDirection={panOverscanDirection}
                 paintRevision={renderGeneration}
                 onTileLayerCommit={renderGeneration === undefined || !onContactTileLayerCommit
                   ? undefined
