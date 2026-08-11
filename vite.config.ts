@@ -9,5 +9,6 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
   },
-  envPrefix: ["VITE_", "TAURI_"],
+  // Expose only the diagnostic flag so the same command enables Rust and WebView timings.
+  envPrefix: ["VITE_", "TAURI_", "CSTUDIO_PERF_LOG"],
 });

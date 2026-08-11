@@ -6,6 +6,19 @@ import {
   normalizeContactValue,
 } from "./contactColorScale";
 
+function sortedPercentileOracle(counts: number[]): number {
+  const values = counts
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((left, right) => left - right);
+
+  if (values.length === 0) {
+    return 1;
+  }
+
+  const thresholdIndex = Math.min(values.length - 1, Math.floor((95 / 100) * values.length));
+  return values[thresholdIndex];
+}
+
 describe("contactAutoColorScaleKey", () => {
   it("keeps a shared comparison scale for one dataset and resolution", () => {
     expect(contactAutoColorScaleKey("/tmp/input.cool", 10_000, 256, false)).toBe(
@@ -18,6 +31,24 @@ describe("contactAutoColorScaleKey", () => {
 });
 
 describe("estimateContactColorScale", () => {
+  it("matches a full-sort oracle across deterministic mixed distributions", () => {
+    let state = 0x12345678;
+    const pseudoRandomValues = Array.from({ length: 4_097 }, () => {
+      state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+      return (state % 257) - 16;
+    });
+    const samples = [
+      [7],
+      [8, 1, 5, 3, 13, 2, 21, 1],
+      [0, -3, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY],
+      [...pseudoRandomValues, 0.25, 0.5, 10_000, Number.NaN],
+    ];
+
+    for (const counts of samples) {
+      expect(estimateContactColorScale(counts, false).max).toBe(sortedPercentileOracle(counts));
+    }
+  });
+
   it("uses Juicebox's nearest-index P95 as the automatic threshold", () => {
     const scale = estimateContactColorScale(
       Array.from({ length: 100 }, (_, index) => index + 1),
@@ -42,6 +73,34 @@ describe("estimateContactColorScale", () => {
 
     expect(estimateContactColorScale(values999, false).max).toBe(950);
     expect(estimateContactColorScale(values1000, false).max).toBe(951);
+  });
+
+  it("handles repeated values on and around the percentile boundary", () => {
+    const values = [
+      ...Array.from({ length: 9_500 }, (_, index) => (index % 2 === 0 ? 7 : 5)),
+      ...Array.from({ length: 500 }, () => 23),
+    ];
+
+    expect(estimateContactColorScale(values, false).max).toBe(23);
+    expect(estimateContactColorScale(Array.from({ length: 10_000 }, () => 7), false).max).toBe(7);
+  });
+
+  it("returns the same result for ascending and descending samples", () => {
+    const ascending = Array.from({ length: 10_001 }, (_, index) => index + 1);
+    const descending = [...ascending].reverse();
+    const expected = sortedPercentileOracle(ascending);
+
+    expect(estimateContactColorScale(ascending, false).max).toBe(expected);
+    expect(estimateContactColorScale(descending, false).max).toBe(expected);
+  });
+
+  it("does not modify the caller's sample", () => {
+    const counts = [7, 3, Number.NaN, -1, 4, Number.POSITIVE_INFINITY, 2, 7];
+    const original = [...counts];
+
+    estimateContactColorScale(counts, true);
+
+    expect(counts).toEqual(original);
   });
 
   it("adapts each resolution independently while retaining a zero baseline", () => {
@@ -108,5 +167,37 @@ describe("contactCountSampleForColorScale", () => {
     expect(counts[0]).toBe(1);
     expect(counts[counts.length - 1]).toBe(20_005);
     expect(counts).not.toContain(999_999);
+  });
+
+  it("samples packed visible counts without materializing contact cells", () => {
+    const packedTile = {
+      tileX: 2,
+      tileY: 3,
+      cells: [],
+      packedCells: {
+        xLocal: new Uint16Array([1, 2, 3]),
+        yLocal: new Uint16Array([4, 5, 6]),
+        counts: new Float64Array([0.25, 7, 42]),
+      },
+    };
+    const counts = contactCountSampleForColorScale({
+      resolution: 1_000,
+      viewport: { xStart: 0, xEnd: 1_000_000, yStart: 0, yEnd: 1_000_000 },
+      cells: [],
+      tileSizeBins: 256,
+      tiles: [packedTile],
+      cachedTiles: [{
+        tileX: 0,
+        tileY: 0,
+        cells: [],
+        packedCells: {
+          xLocal: new Uint16Array([0]),
+          yLocal: new Uint16Array([0]),
+          counts: new Float64Array([999_999]),
+        },
+      }],
+    });
+
+    expect(counts).toEqual([0.25, 7, 42]);
   });
 });

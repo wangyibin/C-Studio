@@ -5,6 +5,7 @@ import {
   assemblyRenameTarget,
   assemblyRenameValidationError,
   buildAssemblyEditModel,
+  chromosomeEndInsertionTargets,
   contigIdsInScreenSelection,
   DEFAULT_INSERTED_GAP,
   deleteContigSelection,
@@ -571,6 +572,21 @@ describe("assemblyEditing", () => {
     ]);
   });
 
+  it("inserts every contig from a selected chromosome into an internal target gap", () => {
+    const moved = moveSelectionBefore(
+      blocks,
+      { kind: "chromosome", id: "Chr02" },
+      "Chr01:2:ctg2",
+      "Chr01",
+    );
+
+    expect(moved.map((block) => [block.id, block.objectId])).toEqual([
+      ["Chr01:1:ctg1", "Chr01"],
+      ["Chr02:1:ctg3", "Chr01"],
+      ["Chr01:2:ctg2", "Chr01"],
+    ]);
+  });
+
   it("keeps the original blocks for a chromosome move that would not change its position", () => {
     expect(moveSelectionBefore(
       blocks,
@@ -1060,10 +1076,11 @@ describe("assemblyEditing", () => {
     ]);
     expect(split[1]?.orientation).toBe("-");
     expect(split[2]?.orientation).toBe("-");
-    expect(split.slice(1, 3).map((block) => block.displayName)).toEqual([
-      "ctg2:91-150",
-      "ctg2:1-90",
+    expect(split.slice(1, 3).map((block) => assemblyContigDisplayName(block))).toEqual([
+      "ctg2",
+      "ctg2",
     ]);
+    expect(split.slice(1, 3).every((block) => block.displayName === undefined)).toBe(true);
     expect(split.slice(1, 3).every((block) => block.isSourceSegment)).toBe(true);
     expect(split.slice(1, 3).map((block) => block.copyInstanceId)).toEqual([
       "Chr01:2:ctg2",
@@ -1118,11 +1135,30 @@ describe("assemblyEditing", () => {
       linkage: "no",
       linkageEvidence: "na",
     });
-    expect(split.map((block) => block.displayName)).toEqual([
-      "ctgForward:11-50",
-      "ctgForward:51-110",
+    expect(split.map((block) => assemblyContigDisplayName(block))).toEqual([
+      "ctgForward",
+      "ctgForward",
     ]);
+    expect(split.every((block) => block.displayName === undefined)).toBe(true);
     expect(split.every((block) => block.isSourceSegment)).toBe(true);
+  });
+
+  it("preserves a user-assigned contig name across split source intervals", () => {
+    const renamed = renameAssemblySelection(
+      blocks,
+      { kind: "contigs", ids: ["Chr01:1:ctg1"] },
+      "renamed_ctg1",
+    );
+    const split = splitContigAtVisualPosition(renamed, "Chr01:1:ctg1", 50);
+
+    expect(split.slice(0, 2).map((block) => block.displayName)).toEqual([
+      "renamed_ctg1",
+      "renamed_ctg1",
+    ]);
+    expect(split.slice(0, 2).map((block) => [block.sourceStart, block.sourceEnd])).toEqual([
+      [0, 50],
+      [50, 100],
+    ]);
   });
 
   it("copies only the selected half of a split contig inside a composite block", () => {
@@ -1143,7 +1179,11 @@ describe("assemblyEditing", () => {
     expect(copied.filter((block) => (
       block.sourceId === "ctgB" && block.sourceStart === 10 && block.sourceEnd === 35
     ))).toHaveLength(1);
-    expect(copied.filter((block) => block.displayName === "ctgB:36-60")).toHaveLength(2);
+    expect(copied.filter((block) => (
+      block.sourceStart === 35
+      && block.sourceEnd === 60
+      && assemblyContigDisplayName(block) === "ctgB"
+    ))).toHaveLength(2);
   });
 
   it("deletes only a selected adjacent gap and rebuilds composite and singleton semantics", () => {
@@ -1381,7 +1421,81 @@ describe("assemblyEditing", () => {
     )).toBeNull();
   });
 
-  it("offers chromosome selections insertion points only at other chromosome boundaries", () => {
+  it("separates the two chromosome-end insertion choices with opposing hit targets", () => {
+    const blocksWithThirdChromosome: ContactMapLayoutBlock[] = [
+      ...blocks,
+      {
+        id: "Chr03:1:ctg4",
+        objectId: "Chr03",
+        sourceId: "ctg4",
+        sourceStart: 0,
+        sourceEnd: 70,
+        visualStart: 330,
+        visualEnd: 400,
+        orientation: "+",
+      },
+    ];
+    const model = buildAssemblyEditModel(blocksWithThirdChromosome);
+    const selected = new Set(["Chr03:1:ctg4"]);
+
+    expect(chromosomeEndInsertionTargets(model, selected)).toEqual(expect.arrayContaining([
+      {
+        targetBlockId: "Chr02:1:ctg3",
+        targetObjectId: "Chr01",
+        visualPosition: 250,
+        chromosomeEnd: "end",
+      },
+      {
+        targetBlockId: "Chr02:1:ctg3",
+        targetObjectId: "Chr02",
+        visualPosition: 250,
+        chromosomeEnd: "start",
+      },
+    ]));
+    expect(insertionTargetAtScreenPoint(
+      model,
+      selected,
+      { x: 241, y: 241 },
+      { sizePx: 400, tolerancePx: 7 },
+    )).toMatchObject({ targetObjectId: "Chr01", chromosomeEnd: "end" });
+    expect(insertionTargetAtScreenPoint(
+      model,
+      selected,
+      { x: 259, y: 259 },
+      { sizePx: 400, tolerancePx: 7 },
+    )).toMatchObject({ targetObjectId: "Chr02", chromosomeEnd: "start" });
+  });
+
+  it("retargets a contig to the chosen chromosome end instead of the adjacent chromosome", () => {
+    const blocksWithThirdChromosome: ContactMapLayoutBlock[] = [
+      ...blocks,
+      {
+        id: "Chr03:1:ctg4",
+        objectId: "Chr03",
+        sourceId: "ctg4",
+        sourceStart: 0,
+        sourceEnd: 70,
+        visualStart: 330,
+        visualEnd: 400,
+        orientation: "+",
+      },
+    ];
+    const moved = moveSelectionBefore(
+      blocksWithThirdChromosome,
+      { kind: "contigs", ids: ["Chr03:1:ctg4"] },
+      "Chr02:1:ctg3",
+      "Chr01",
+    );
+
+    expect(moved.map((block) => [block.sourceId, block.objectId])).toEqual([
+      ["ctg1", "Chr01"],
+      ["ctg2", "Chr01"],
+      ["ctg4", "Chr01"],
+      ["ctg3", "Chr02"],
+    ]);
+  });
+
+  it("offers chromosome selections insertion at chromosome boundaries and internal contig gaps", () => {
     const model = buildAssemblyEditModel(blocks);
     const selectedChromosome = new Set(["Chr02:1:ctg3"]);
 
@@ -1396,7 +1510,11 @@ describe("assemblyEditing", () => {
       selectedChromosome,
       { x: 100, y: 100 },
       { sizePx: 330, tolerancePx: 7, selectionKind: "chromosome" },
-    )).toBeNull();
+    )).toEqual({
+      targetBlockId: "Chr01:2:ctg2",
+      targetObjectId: "Chr01",
+      visualPosition: 100,
+    });
 
     expect(insertionTargetAtScreenPoint(
       model,

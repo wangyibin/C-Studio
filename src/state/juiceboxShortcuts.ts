@@ -1,4 +1,5 @@
 export type JuiceboxShortcutIntent =
+  | "save"
   | "undo"
   | "redo"
   | "toggle-annotations"
@@ -25,12 +26,16 @@ export function juiceboxShortcutIntent({
   repeat,
   editable,
 }: JuiceboxShortcutInput): JuiceboxShortcutIntent | null {
+  const menuModifier = ctrlKey || metaKey;
+  const normalizedKey = key.toLowerCase();
+  if (!altKey && menuModifier && !shiftKey && !repeat && normalizedKey === "s") {
+    return "save";
+  }
+
   if (editable || altKey) {
     return null;
   }
 
-  const menuModifier = ctrlKey || metaKey;
-  const normalizedKey = key.toLowerCase();
   if (menuModifier) {
     if (normalizedKey === "z") {
       return shiftKey ? "redo" : "undo";

@@ -1,4 +1,5 @@
 import type { ContactMapView } from "../App";
+import { appendContactTileCounts } from "./contactTileData";
 
 export interface ContactColorScale {
   log: boolean;
@@ -40,9 +41,7 @@ export function contactCountSampleForColorScale(contactMap: ContactMapView): num
     const counts: number[] = [];
 
     for (const tile of contactMap.tiles) {
-      for (const cell of tile.cells) {
-        counts.push(cell.count);
-      }
+      appendContactTileCounts(tile, counts);
     }
 
     return counts;
@@ -52,7 +51,7 @@ export function contactCountSampleForColorScale(contactMap: ContactMapView): num
 }
 
 export function estimateContactColorScale(counts: number[], log: boolean): ContactColorScale {
-  const values = counts.filter((value) => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
+  const values = counts.filter((value) => Number.isFinite(value) && value > 0);
 
   if (values.length === 0) {
     return {
@@ -68,7 +67,7 @@ export function estimateContactColorScale(counts: number[], log: boolean): Conta
     values.length - 1,
     Math.floor((juiceboxAutoThresholdPercentile / 100) * values.length),
   );
-  const max = values[thresholdIndex] ?? defaultColorScale.max;
+  const max = selectKthInPlace(values, thresholdIndex);
 
   return {
     log,
@@ -76,6 +75,72 @@ export function estimateContactColorScale(counts: number[], log: boolean): Conta
     max,
     auto: true,
   };
+}
+
+/**
+ * Select the zero-based kth value without sorting the whole sample. The
+ * median-of-three pivot keeps monotonic inputs balanced, while the three-way
+ * partition collapses repeated values in one pass.
+ */
+function selectKthInPlace(values: number[], kth: number): number {
+  let left = 0;
+  let right = values.length - 1;
+
+  while (left < right) {
+    const middle = left + Math.floor((right - left) / 2);
+    const pivot = medianOfThree(values[left], values[middle], values[right]);
+    let lower = left;
+    let cursor = left;
+    let upper = right;
+
+    while (cursor <= upper) {
+      if (values[cursor] < pivot) {
+        swap(values, lower, cursor);
+        lower += 1;
+        cursor += 1;
+      } else if (values[cursor] > pivot) {
+        swap(values, cursor, upper);
+        upper -= 1;
+      } else {
+        cursor += 1;
+      }
+    }
+
+    if (kth < lower) {
+      right = lower - 1;
+    } else if (kth > upper) {
+      left = upper + 1;
+    } else {
+      return values[kth];
+    }
+  }
+
+  return values[left];
+}
+
+function medianOfThree(first: number, middle: number, last: number): number {
+  if (first < middle) {
+    if (middle < last) {
+      return middle;
+    }
+    return first < last ? last : first;
+  }
+
+  if (first < last) {
+    return first;
+  }
+
+  return middle < last ? last : middle;
+}
+
+function swap(values: number[], firstIndex: number, secondIndex: number) {
+  if (firstIndex === secondIndex) {
+    return;
+  }
+
+  const first = values[firstIndex];
+  values[firstIndex] = values[secondIndex];
+  values[secondIndex] = first;
 }
 
 export function normalizeContactValue(value: number, scale: Pick<ContactColorScale, "log" | "min" | "max">) {

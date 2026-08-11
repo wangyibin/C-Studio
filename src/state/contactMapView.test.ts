@@ -77,6 +77,89 @@ describe("contactCellsForViewport", () => {
     expect(new Set(first.map((cell) => cell.yBin % 2)).size).toBe(2);
   });
 
+  it("keeps packed viewport filtering and coordinate-hash thinning equivalent to objects", () => {
+    const tileSizeBins = 256;
+    const cellCount = 5_000;
+    const xLocal = new Uint16Array(cellCount);
+    const yLocal = new Uint16Array(cellCount);
+    const counts = new Float64Array(cellCount);
+    const objectCells = Array.from({ length: cellCount }, (_, index) => {
+      xLocal[index] = index % tileSizeBins;
+      yLocal[index] = Math.floor(index / tileSizeBins);
+      counts[index] = index + 0.5;
+      return {
+        xBin: 2 * tileSizeBins + xLocal[index],
+        yBin: 3 * tileSizeBins + yLocal[index],
+        count: counts[index],
+      };
+    });
+    const baseView = {
+      resolution: 1,
+      viewport: {
+        xStart: 2 * tileSizeBins,
+        xEnd: 3 * tileSizeBins,
+        yStart: 3 * tileSizeBins,
+        yEnd: 4 * tileSizeBins,
+      },
+      cells: [],
+      tileSizeBins,
+    };
+    const objectView: ContactMapView = {
+      ...baseView,
+      tiles: [{ tileX: 2, tileY: 3, cells: objectCells }],
+    };
+    const packedView: ContactMapView = {
+      ...baseView,
+      tiles: [{
+        tileX: 2,
+        tileY: 3,
+        cells: [],
+        packedCells: { xLocal, yLocal, counts },
+      }],
+    };
+
+    const objectSample = contactCellsForViewport(objectView, 100);
+    const packedSample = contactCellsForViewport(packedView, 100);
+    expect(packedSample).toEqual(objectSample);
+    expect(packedSample.length).toBeGreaterThan(0);
+    expect(packedSample.length).toBeLessThanOrEqual(100);
+  });
+
+  it("materializes only packed tiles intersecting the viewport", () => {
+    const view: ContactMapView = {
+      resolution: 1_000,
+      viewport: { xStart: 512_000, xEnd: 768_000, yStart: 0, yEnd: 256_000 },
+      cells: [],
+      tileSizeBins: 256,
+      cachedTiles: [
+        {
+          tileX: 0,
+          tileY: 0,
+          cells: [],
+          packedCells: {
+            xLocal: new Uint16Array([4]),
+            yLocal: new Uint16Array([4]),
+            counts: new Float64Array([2]),
+          },
+        },
+        {
+          tileX: 2,
+          tileY: 0,
+          cells: [],
+          packedCells: {
+            xLocal: new Uint16Array([8]),
+            yLocal: new Uint16Array([4]),
+            counts: new Float64Array([9]),
+          },
+        },
+      ],
+    };
+
+    expect(contactCellsForViewport(view)).toEqual([
+      { xBin: 520, yBin: 4, count: 9 },
+    ]);
+  });
+
   it("does not reuse the previous layer across resolutions", () => {
     const previousView: ContactMapView = {
       resolution: 1_000_000,
@@ -404,5 +487,31 @@ describe("reprojectContactMapLayout", () => {
     expect(first?.cells.length).toBeGreaterThan(0);
     expect(first?.cells.length).toBeLessThanOrEqual(maxInteractivePreviewContactCells);
     expect(second?.cells).toEqual(first?.cells);
+  });
+
+  it("reprojects a packed tile through the same bounded preview path", () => {
+    const view: ContactMapView = {
+      resolution: 10,
+      viewport: { xStart: 0, xEnd: 200, yStart: 0, yEnd: 200 },
+      cells: [],
+      tileSizeBins: 20,
+      tiles: [{
+        tileX: 0,
+        tileY: 0,
+        cells: [],
+        packedCells: {
+          xLocal: new Uint16Array([1]),
+          yLocal: new Uint16Array([12]),
+          counts: new Float64Array([7]),
+        },
+      }],
+    };
+    const reversed = [
+      { ...blocks[1], visualStart: 0, visualEnd: 100, orientation: "-" as const },
+      { ...blocks[0], visualStart: 100, visualEnd: 200, orientation: "-" as const },
+    ];
+
+    const preview = reprojectContactMapLayout(view, blocks, reversed);
+    expect(preview?.cells).toEqual([{ xBin: 7, yBin: 18, count: 7 }]);
   });
 });

@@ -1,11 +1,11 @@
 import {
   Check,
   ChevronDown,
-  Download,
   Ellipsis,
   PanelRight,
   Plus,
   Redo2,
+  Save,
   Undo2,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -21,6 +21,7 @@ import {
   selectedBlockIds,
 } from "../state/assemblyEditing";
 import type { CoverageView } from "../state/coverageView";
+import type { ContactTileRenderMilestone } from "../state/contactTilePerformance";
 import type { SyntenyView } from "../state/syntenyView";
 import {
   contactNormalizationForBackend,
@@ -60,11 +61,17 @@ interface AppShellProps {
   onCoverageFileRequested: () => void;
   onCoverageFileSelected: (file: File) => void;
   onExportAgp: () => void;
+  autoSaveEnabled: boolean;
+  autoSaveAvailable: boolean;
+  isAgpDirty: boolean;
+  onAutoSaveEnabledChange: (enabled: boolean) => void;
   onLoadExample: () => void;
   status: AppStatus;
   statusMessage: string;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
+  onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
+  onContactTileLayerPaintComplete?: (event: ContactTileRenderMilestone) => void;
 }
 
 export const inspectorPanelMinWidth = 260;
@@ -114,7 +121,13 @@ export function AppShell({
   onCoverageFileRequested,
   onCoverageFileSelected,
   onExportAgp,
+  autoSaveEnabled,
+  autoSaveAvailable,
+  isAgpDirty,
+  onAutoSaveEnabledChange,
   onLoadExample,
+  onContactTileLayerCommit,
+  onContactTileLayerPaintComplete,
   onUiAction,
   status,
   statusMessage,
@@ -128,6 +141,7 @@ export function AppShell({
     startWidth: number;
   } | null>(null);
   const [inspectorWidth, setInspectorWidth] = useState<number | null>(null);
+  const projectMenuRef = useRef<HTMLDetailsElement>(null);
   const addDataMenuRef = useRef<HTMLDetailsElement>(null);
   const appMenuRef = useRef<HTMLDetailsElement>(null);
   const hiddenAssemblyOverlaysRef = useRef<{
@@ -165,6 +179,8 @@ export function AppShell({
     && displayedContactNormalization !== selectedContactNormalization
       ? ` (showing ${contactNormalizationLabel(displayedContactNormalization)})`
       : "";
+  const assemblyFileName = fileName(dataset?.agp_path, "Untitled assembly");
+  const displayedAssemblyFileName = `${assemblyFileName}${isAgpDirty ? "*" : ""}`;
 
   function workspaceWidth() {
     return workspaceRef.current?.clientWidth
@@ -266,6 +282,12 @@ export function AppShell({
       event.preventDefault();
       event.stopPropagation();
 
+      if (intent === "save") {
+        if (uiState.assembly.blocks.length > 0) {
+          onExportAgp();
+        }
+        return;
+      }
       if (intent === "undo") {
         if (uiState.operationHistory.length > 0) {
           onUiAction({ type: "undo" });
@@ -320,10 +342,45 @@ export function AppShell({
 
     window.addEventListener("keydown", handleJuiceboxShortcut, true);
     return () => window.removeEventListener("keydown", handleJuiceboxShortcut, true);
-  }, [onUiAction, uiState.assembly, uiState.operationHistory.length, uiState.redoStack.length]);
+  }, [
+    onExportAgp,
+    onUiAction,
+    uiState.assembly,
+    uiState.operationHistory.length,
+    uiState.redoStack.length,
+  ]);
 
   useEffect(() => () => {
     document.documentElement.classList.remove("inspector-resizing");
+  }, []);
+
+  useEffect(() => {
+    function closeToolbarMenusOutside(event: PointerEvent) {
+      for (const menu of [projectMenuRef.current, addDataMenuRef.current]) {
+        if (menu?.open && !menu.contains(event.target as Node)) {
+          menu.open = false;
+        }
+      }
+    }
+
+    function closeToolbarMenusWithEscape(event: KeyboardEvent) {
+      if (event.key !== "Escape") {
+        return;
+      }
+      for (const menu of [projectMenuRef.current, addDataMenuRef.current]) {
+        if (menu?.open) {
+          menu.open = false;
+          menu.querySelector<HTMLElement>("summary")?.focus();
+        }
+      }
+    }
+
+    document.addEventListener("pointerdown", closeToolbarMenusOutside);
+    window.addEventListener("keydown", closeToolbarMenusWithEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeToolbarMenusOutside);
+      window.removeEventListener("keydown", closeToolbarMenusWithEscape);
+    };
   }, []);
 
   function runAddDataAction(action: () => void) {
@@ -341,10 +398,29 @@ export function AppShell({
               <strong>C-Studio</strong>
             </div>
 
-            <button className="project-picker" type="button" aria-label="Current assembly project">
-              <span>{fileName(dataset?.agp_path, "Untitled assembly")}</span>
-              <ChevronDown size={14} aria-hidden="true" />
-            </button>
+            <details ref={projectMenuRef} className="toolbar-disclosure project-menu-disclosure">
+              <summary className="project-picker" aria-label="Current assembly project menu">
+                <span>{displayedAssemblyFileName}</span>
+                <ChevronDown size={14} aria-hidden="true" />
+              </summary>
+              <div className="toolbar-popover project-menu-popover">
+                <label
+                  className={`project-menu-toggle${autoSaveAvailable ? "" : " disabled"}`}
+                  title={autoSaveAvailable
+                    ? "Save automatically 5 seconds after changes"
+                    : "Save As once to enable auto-save"}
+                >
+                  <span>Auto-save</span>
+                  <input
+                    type="checkbox"
+                    aria-label="Auto-save"
+                    checked={autoSaveAvailable && autoSaveEnabled}
+                    disabled={!autoSaveAvailable}
+                    onChange={(event) => onAutoSaveEnabledChange(event.currentTarget.checked)}
+                  />
+                </label>
+              </div>
+            </details>
 
             <span className={`project-health ${agpImported ? "ready" : "idle"}`} aria-label={agpImported ? "Assembly loaded" : "Assembly not loaded"} />
 
@@ -450,11 +526,13 @@ export function AppShell({
             <button
               className="global-icon-button export-project-button"
               type="button"
-              aria-label="Export edited AGP"
+              aria-label="Save edited AGP"
+              aria-keyshortcuts="Control+S Meta+S"
+              title={`Save edited AGP (${shortcuts.save})`}
               disabled={!uiState.assembly.blocks.length}
               onClick={onExportAgp}
             >
-              <Download size={16} aria-hidden="true" />
+              <Save size={16} aria-hidden="true" />
             </button>
             <button
               className={`global-icon-button${uiState.layout.rightCollapsed ? "" : " active"}`}
@@ -479,6 +557,7 @@ export function AppShell({
                 <section className="app-shortcuts" aria-label="Keyboard shortcuts">
                   <h3>Keyboard shortcuts</h3>
                   <dl>
+                    <div><dt>Save AGP</dt><dd>{shortcuts.save}</dd></div>
                     <div><dt>Undo</dt><dd>{shortcuts.undo}</dd></div>
                     <div><dt>Redo</dt><dd>{shortcuts.redo}</dd></div>
                     <div><dt>Rename</dt><dd>{shortcuts.rename}</dd></div>
@@ -517,6 +596,8 @@ export function AppShell({
                 coverageView={coverageView}
                 uiState={uiState}
                 onUiAction={onUiAction}
+                onContactTileLayerCommit={onContactTileLayerCommit}
+                onContactTileLayerPaintComplete={onContactTileLayerPaintComplete}
               />
               {uiState.layout.syntenySplitOpen ? (
                 <aside className="synteny-split-pane" aria-label="Synteny split view">
@@ -572,6 +653,7 @@ export function AppShell({
               overviewContactMap={overviewContactMap}
               status={status}
               statusMessage={statusMessage}
+              isAgpDirty={isAgpDirty}
               uiState={uiState}
               onUiAction={onUiAction}
               syntenyView={syntenyView}
@@ -590,7 +672,7 @@ export function AppShell({
           Normalization: {uiState.normalization}{displayedNormalizationLabel}
         </span>
         <span>Matrix: {fileName(dataset?.mcool_path ?? dataset?.cool_path, "None")}</span>
-        <span>Assembly: {fileName(dataset?.agp_path, "None")}</span>
+        <span>Assembly: {dataset?.agp_path ? displayedAssemblyFileName : "None"}</span>
         <span>Tool: {uiState.selectedTool}</span>
         <span>X: {uiState.contact.viewportCenterXMb.toFixed(2)} Mb</span>
         <span>Y: {uiState.contact.viewportCenterYMb.toFixed(2)} Mb</span>

@@ -1131,10 +1131,31 @@ button {
   background: #ffffff;
 }
 
+.contact-tile-transform-stack,
+.contact-tile-surface,
 .contact-tile-layer {
   position: absolute;
   inset: 0;
+}
+
+.contact-tile-transform-stack {
   will-change: transform;
+}
+
+.contact-tile-surface {
+  overflow: hidden;
+  background: #ffffff;
+  pointer-events: none;
+}
+
+.contact-tile-surface[data-phase="presented"] {
+  visibility: visible;
+  z-index: 1;
+}
+
+.contact-tile-surface[data-phase="staging"] {
+  visibility: hidden;
+  z-index: 0;
 }
 
 .contact-map canvas.contact-tile-canvas {
@@ -1230,6 +1251,7 @@ button {
 .shift-selection-active .assembly-resize-handle,
 .shift-selection-active .contig-handle,
 .shift-selection-active .assembly-cut-marker,
+.shift-selection-active .assembly-chromosome-end-target,
 .shift-selection-active .assembly-insert-marker {
   visibility: hidden;
   opacity: 0 !important;
@@ -1501,6 +1523,27 @@ button {
   color: #000;
   transform: translate(-20%, -80%);
   pointer-events: none;
+}
+
+.assembly-chromosome-end-target {
+  position: absolute;
+  z-index: 13;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  background: transparent;
+  color: #000;
+  pointer-events: none;
+}
+
+.assembly-chromosome-end-target.end {
+  transform: translate(-100%, -100%);
+}
+
+.assembly-chromosome-end-target.start {
+  transform: translate(0, 0);
 }
 
 .block-box.selected, .block-box.selected:hover {
@@ -3200,6 +3243,36 @@ summary:focus-visible,
 
 .add-data-popover {
   left: 0;
+}
+
+.project-menu-popover {
+  left: 0;
+  min-width: 210px;
+}
+
+.project-menu-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 36px;
+  padding: 0 9px;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.project-menu-toggle:hover {
+  background: color-mix(in srgb, var(--accent) 12%, white);
+}
+
+.project-menu-toggle.disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.project-menu-toggle input {
+  accent-color: var(--accent);
 }
 
 .app-menu-popover {

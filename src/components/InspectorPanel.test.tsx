@@ -45,13 +45,42 @@ describe("InspectorPanel", () => {
 
     expect(
       contactOverviewMapForDisplayedNormalization(rawMap, iceOverview),
-    ).toBe(rawMap);
+    ).toBeNull();
     expect(
       contactOverviewMapForDisplayedNormalization(
         { ...rawMap, normalization: "ice" },
         iceOverview,
       ),
     ).toBe(iceOverview);
+  });
+
+  it("never stretches the local viewport map into the whole-genome overview", () => {
+    const rawMap = { ...contactMap, normalization: "raw" as const };
+
+    expect(
+      contactOverviewMapForDisplayedNormalization(rawMap, null),
+    ).toBeNull();
+  });
+
+  it("retains the last complete overview while a new layout is loading", () => {
+    const currentLayoutMap = {
+      ...contactMap,
+      normalization: "raw" as const,
+      layoutScope: "layout-b-visible",
+    };
+    const lastCompleteOverview = {
+      ...contactMap,
+      normalization: "raw" as const,
+      layoutScope: "layout-a-overview",
+      viewport: { xStart: 0, xEnd: 5_000_000, yStart: 0, yEnd: 5_000_000 },
+    };
+
+    expect(
+      contactOverviewMapForDisplayedNormalization(
+        currentLayoutMap,
+        lastCompleteOverview,
+      ),
+    ).toBe(lastCompleteOverview);
   });
 
   it("binds the overview to the active contact map", () => {
@@ -77,6 +106,44 @@ describe("InspectorPanel", () => {
     expect(markup).toContain('aria-label="Contact map overview"');
     expect(markup).toContain('class="overview-heatmap-canvas"');
     expect(markup).toContain("Overview");
+  });
+
+  it("keeps stale overview pixels and their span in one atomic snapshot", () => {
+    const uiState = createInitialUiState("ready");
+    const rawMap = { ...contactMap, normalization: "raw" as const };
+    const lastCompleteOverview = {
+      ...rawMap,
+      viewport: { xStart: 0, xEnd: 5_000_000, yStart: 0, yEnd: 5_000_000 },
+    };
+    const editedBlocks = [{
+      id: "edited",
+      objectId: "Chr01",
+      sourceId: "ctg1",
+      sourceStart: 0,
+      sourceEnd: 3_000_000,
+      visualStart: 0,
+      visualEnd: 3_000_000,
+      orientation: "+" as const,
+    }];
+
+    const markup = renderToStaticMarkup(
+      <InspectorPanel
+        dataset={dataset}
+        contactMap={rawMap}
+        overviewContactMap={lastCompleteOverview}
+        status={status}
+        statusMessage="ready"
+        uiState={uiState}
+        onUiAction={() => undefined}
+        syntenyView={null}
+        assemblyBlocks={editedBlocks}
+        selectedAssemblyBlockIds={[]}
+        pafText=""
+        onPafTextChange={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('<span class="overview-end">5 Mb</span>');
   });
 
   it("marks the synteny preview to fill the inspector overview area", () => {

@@ -1,5 +1,12 @@
-import { ArrowDownLeft, MoveDiagonal2, RotateCcw, Scissors } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowDownLeft,
+  ArrowDownRight,
+  ArrowUpLeft,
+  MoveDiagonal2,
+  RotateCcw,
+  Scissors,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ContactMapCell, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   assemblyContigDisplayName,
@@ -16,23 +23,30 @@ import {
 import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
 import { contactColorCss } from "../state/contactColor";
 import { normalizeContactValue } from "../state/contactColorScale";
+import type { ContactTileRenderMilestone } from "../state/contactTilePerformance";
 import {
   buildContactLayoutRasterPlan,
   contactLayoutRasterPlanCoversViewport,
 } from "../state/contactLayoutPreview";
 import { contactCellsForViewport } from "../state/contactMapView";
 import { contactRenderGeometry } from "../state/contactRenderGeometry";
+import { contactResolutionToBasePairs } from "../state/contactResolution";
 import { buildCenteredContactViewport, type ContactViewport } from "../state/contactViewport";
 import type { CoverageView } from "../state/coverageView";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import { isEditableShortcutTarget } from "../state/juiceboxShortcuts";
-import type { OperationRecord, UiAction, UiState } from "../state/uiState";
+import {
+  contactNormalizationForBackend,
+  type OperationRecord,
+  type UiAction,
+  type UiState,
+} from "../state/uiState";
 import {
   AssemblyContextMenu,
   type AssemblyContextMenuPosition,
 } from "./AssemblyContextMenu";
 import { ContactLayoutRasterPreview } from "./ContactLayoutRasterPreview";
-import { ContactTileLayer } from "./ContactTileLayer";
+import { ContactTileLayer, type ContactTileLayerPaintEvent } from "./ContactTileLayer";
 import { GenomeAxisNavigator } from "./GenomeAxisNavigator";
 import { TrackPanel } from "./TrackPanel";
 
@@ -42,6 +56,8 @@ interface ContactMapViewportProps {
   coverageView: CoverageView | null;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
+  onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
+  onContactTileLayerPaintComplete?: (event: ContactTileRenderMilestone) => void;
 }
 
 interface DragState {
@@ -79,6 +95,8 @@ interface AssemblyPointerState {
   kind: "cut" | "insert" | "select";
   blockId: string | null;
   visualPosition: number | null;
+  targetObjectId?: string;
+  chromosomeEnd?: "start" | "end";
 }
 
 interface AssemblyContextMenuState extends AssemblyContextMenuPosition {
@@ -326,11 +344,20 @@ function setShiftSelectionCursor(active: boolean) {
   document.documentElement.classList.toggle(shiftSelectionClassName, active);
 }
 
-export function ContactMapViewport({ contactMap, coverageView, dataset, onUiAction, uiState }: ContactMapViewportProps) {
+export function ContactMapViewport({
+  contactMap,
+  coverageView,
+  dataset,
+  onContactTileLayerCommit,
+  onContactTileLayerPaintComplete,
+  onUiAction,
+  uiState,
+}: ContactMapViewportProps) {
   const mapLayoutRef = useRef<HTMLDivElement>(null);
   const mapContentRef = useRef<HTMLDivElement>(null);
   const canvasFrameRef = useRef<HTMLDivElement>(null);
   const contactTileLayerRef = useRef<HTMLDivElement>(null);
+  const contactTileTransformRef = useRef<HTMLDivElement>(null);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const latestContactMapRef = useRef<ContactMapView | null>(null);
@@ -354,7 +381,46 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     blockId: null,
     visualPosition: null,
   });
+  const [tilePresentedSurfaceRevision, setTilePresentedSurfaceRevision] = useState(0);
   const hasContactMap = Boolean(dataset?.mcool_path);
+  const renderGeneration = contactMap?.renderGeneration;
+  const tileRenderStyle = useMemo(() => ({
+    colormap: uiState.contact.colormap,
+    colorScale: uiState.contact.colorScale,
+  }), [uiState.contact.colormap, uiState.contact.colorScale]);
+  const freezePresentedTileStyle = Boolean(
+    contactMap
+    && (
+      contactMap.resolution !== contactResolutionToBasePairs(uiState.contact.resolution)
+      || (
+        contactMap.normalization !== undefined
+        && contactMap.normalization !== contactNormalizationForBackend(uiState.normalization)
+      )
+    ),
+  );
+  const reportPresentedSurfaceChange = useCallback(() => {
+    setTilePresentedSurfaceRevision((revision) => revision + 1);
+  }, []);
+  const reportTileLayerCommit = useCallback((event: ContactTileLayerPaintEvent) => {
+    if (event.paintRevision !== undefined) {
+      onContactTileLayerCommit?.({
+        renderEpoch: event.renderEpoch,
+        canvasCount: event.canvasCount,
+        generation: event.paintRevision,
+        commitTimestamp: event.commitTimestamp,
+      });
+    }
+  }, [onContactTileLayerCommit]);
+  const reportTileLayerPaintComplete = useCallback((event: ContactTileLayerPaintEvent) => {
+    if (event.paintRevision !== undefined) {
+      onContactTileLayerPaintComplete?.({
+        renderEpoch: event.renderEpoch,
+        canvasCount: event.canvasCount,
+        generation: event.paintRevision,
+        commitTimestamp: event.commitTimestamp,
+      });
+    }
+  }, [onContactTileLayerPaintComplete]);
   const usesTiledRenderer = Boolean(
     contactMap?.tiles || contactMap?.cachedTiles || contactMap?.previewTiles,
   );
@@ -881,8 +947,8 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     if (canvasRef.current) {
       canvasRef.current.style.transform = transform;
     }
-    if (contactTileLayerRef.current) {
-      contactTileLayerRef.current.style.transform = transform;
+    if (contactTileTransformRef.current) {
+      contactTileTransformRef.current.style.transform = transform;
     }
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = transform;
@@ -926,8 +992,8 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
     if (canvasRef.current) {
       canvasRef.current.style.transform = "";
     }
-    if (contactTileLayerRef.current) {
-      contactTileLayerRef.current.style.transform = "";
+    if (contactTileTransformRef.current) {
+      contactTileTransformRef.current.style.transform = "";
     }
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = "";
@@ -997,6 +1063,8 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
       current.kind === nextState.kind
       && current.blockId === nextState.blockId
       && current.visualPosition === nextState.visualPosition
+      && current.targetObjectId === nextState.targetObjectId
+      && current.chromosomeEnd === nextState.chromosomeEnd
         ? current
         : nextState,
     );
@@ -1052,11 +1120,14 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
       && confirmedInsertTarget !== null
       && assemblyPointerState.blockId === confirmedInsertTarget.targetBlockId
       && assemblyPointerState.visualPosition === confirmedInsertTarget.visualPosition
+      && assemblyPointerState.targetObjectId === confirmedInsertTarget.targetObjectId
+      && assemblyPointerState.chromosomeEnd === confirmedInsertTarget.chromosomeEnd
     ) {
       event.stopPropagation();
       onUiAction({
         type: "moveAssemblySelectionBefore",
         targetBlockId: confirmedInsertTarget.targetBlockId,
+        targetObjectId: confirmedInsertTarget.targetObjectId,
       });
       setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
       return;
@@ -1137,6 +1208,8 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
         kind: "insert",
         blockId: insertTargetId.targetBlockId,
         visualPosition: insertTargetId.visualPosition,
+        targetObjectId: insertTargetId.targetObjectId,
+        chromosomeEnd: insertTargetId.chromosomeEnd,
       });
       return;
     }
@@ -1286,12 +1359,22 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
             {usesTiledRenderer ? (
               <ContactTileLayer
                 contactMap={contactMap}
+                freezePresentedStyle={freezePresentedTileStyle}
                 layerRef={contactTileLayerRef}
+                transformRef={contactTileTransformRef}
                 onPointerDown={startPan}
                 onPointerMove={movePan}
                 onPointerUp={stopPan}
                 onPointerCancel={stopPan}
-                uiState={uiState}
+                paintRevision={renderGeneration}
+                onTileLayerCommit={renderGeneration === undefined || !onContactTileLayerCommit
+                  ? undefined
+                  : reportTileLayerCommit}
+                onTileLayerPaintComplete={renderGeneration === undefined || !onContactTileLayerPaintComplete
+                  ? undefined
+                  : reportTileLayerPaintComplete}
+                onPresentedSurfaceChange={reportPresentedSurfaceChange}
+                renderStyle={tileRenderStyle}
                 viewport={displayViewport}
               />
             ) : (
@@ -1315,6 +1398,7 @@ export function ContactMapViewport({ contactMap, coverageView, dataset, onUiActi
                   uiState.contact.colorScale.min,
                   uiState.contact.colorScale.max,
                   uiState.contact.colorScale.log,
+                  tilePresentedSurfaceRevision,
                 ].join("|")}
               />
             ) : null}
@@ -1767,6 +1851,26 @@ function AssemblyOverlay({
           );
         }) : null}
         {(showBlockBoxes || showContigBoxes)
+          && selectedContigIds.size > 0
+          && pointerState.kind === "insert"
+          && pointerState.chromosomeEnd
+          && pointerState.visualPosition !== null ? (() => {
+            const left = ((pointerState.visualPosition - viewportXStart) / viewportXSpan) * 100;
+            const top = ((pointerState.visualPosition - viewportYStart) / viewportYSpan) * 100;
+            const isStart = pointerState.chromosomeEnd === "start";
+            return (
+              <span
+                className={`assembly-chromosome-end-target ${pointerState.chromosomeEnd}`}
+                style={{ left: `${left}%`, top: `${top}%` }}
+                title={`Insert at ${pointerState.chromosomeEnd} of ${pointerState.targetObjectId}`}
+              >
+                {isStart
+                  ? <ArrowUpLeft size={17} strokeWidth={2.25} absoluteStrokeWidth />
+                  : <ArrowDownRight size={17} strokeWidth={2.25} absoluteStrokeWidth />}
+              </span>
+            );
+          })() : null}
+        {(showBlockBoxes || showContigBoxes)
           && pointerState.kind === "cut"
           && pointerState.visualPosition !== null ? (() => {
           const left = ((pointerState.visualPosition - viewportXStart) / viewportXSpan) * 100;
@@ -1786,7 +1890,11 @@ function AssemblyOverlay({
             </span>
           );
         })() : null}
-        {(showBlockBoxes || showContigBoxes) && selectedContigIds.size > 0 && pointerState.kind === "insert" && pointerState.visualPosition !== null ? (() => {
+        {(showBlockBoxes || showContigBoxes)
+          && selectedContigIds.size > 0
+          && pointerState.kind === "insert"
+          && !pointerState.chromosomeEnd
+          && pointerState.visualPosition !== null ? (() => {
           const left = ((pointerState.visualPosition - viewportXStart) / viewportXSpan) * 100;
           const top = ((pointerState.visualPosition - viewportYStart) / viewportYSpan) * 100;
           return (

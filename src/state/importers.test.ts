@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { assemblyCopyIntervalGroups } from "./assemblyEditing";
 import { normalizeImportedAgpLayout, parseAgpLayout, summarizeAgpText } from "./importers";
 
 describe("summarizeAgpText", () => {
@@ -22,6 +23,51 @@ describe("summarizeAgpText", () => {
 });
 
 describe("parseAgpLayout", () => {
+  it("recognizes touching component intervals as one split copy beside a duplicate copy", () => {
+    const layout = parseAgpLayout([
+      "Chr01\t1\t50\t1\tW\tctgA\t1\t50\t+",
+      "Chr01\t51\t150\t2\tU\t100\tcontig\tno\tna",
+      "Chr01\t151\t200\t3\tW\tctgA\t51\t100\t+",
+      "Chr02\t1\t100\t1\tW\tctgA\t1\t100\t+",
+    ].join("\n"));
+    const [left, right, duplicate] = layout.blocks;
+
+    expect(left?.copyInstanceId).toBe("Chr01:1:ctgA");
+    expect(right?.copyInstanceId).toBe("Chr01:1:ctgA");
+    expect(left?.isSourceSegment).toBe(true);
+    expect(right?.isSourceSegment).toBe(true);
+    expect(duplicate?.copyInstanceId).toBeUndefined();
+
+    const groups = assemblyCopyIntervalGroups(layout.blocks, left!);
+    expect(groups).toHaveLength(2);
+    expect(groups.map((group) => ({
+      blocks: group.blocks.length,
+      coversInterval: group.coversInterval,
+      isSplit: group.isSplit,
+    }))).toEqual([
+      { blocks: 2, coversInterval: true, isSplit: true },
+      { blocks: 1, coversInterval: true, isSplit: false },
+    ]);
+  });
+
+  it("recognizes touching reverse intervals but keeps overlapping rows as separate copies", () => {
+    const reverse = parseAgpLayout([
+      "ChrR\t1\t50\t1\tW\tctgR\t51\t100\t-",
+      "ChrR\t51\t100\t2\tW\tctgR\t1\t50\t-",
+    ].join("\n"));
+    expect(reverse.blocks.map((block) => block.copyInstanceId)).toEqual([
+      "ChrR:1:ctgR",
+      "ChrR:1:ctgR",
+    ]);
+
+    const duplicates = parseAgpLayout([
+      "ChrD\t1\t100\t1\tW\tctgD\t1\t100\t+",
+      "ChrD\t101\t200\t2\tW\tctgD\t1\t100\t+",
+    ].join("\n"));
+    expect(duplicates.blocks.every((block) => block.copyInstanceId === undefined)).toBe(true);
+    expect(assemblyCopyIntervalGroups(duplicates.blocks, duplicates.blocks[0]!)).toHaveLength(2);
+  });
+
   it("builds visual layout blocks from contig-level AGP components", () => {
     const layout = parseAgpLayout(
       [

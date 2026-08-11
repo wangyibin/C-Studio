@@ -75,6 +75,8 @@ export interface MapPoint {
 export interface AssemblyInsertionTarget {
   targetBlockId: string | null;
   visualPosition: number;
+  targetObjectId?: string;
+  chromosomeEnd?: "start" | "end";
 }
 
 export interface HitTestOptions {
@@ -488,6 +490,7 @@ export function moveSelectionBefore(
   blocks: ContactMapLayoutBlock[],
   selection: AssemblySelection | null,
   targetBlockId: string | null,
+  targetObjectId?: string,
 ): ContactMapLayoutBlock[] {
   const units = orderedAssemblyUnits(blocks);
   const selectedUnitIds = selectedAssemblyUnitIds(units, selection);
@@ -497,7 +500,7 @@ export function moveSelectionBefore(
   if (
     selectedUnitIds.size === 0
     || (resolvedTargetId !== null && selectedUnitIds.has(resolvedTargetId))
-    || (targetBlockId === null && selection?.kind !== "chromosome")
+    || (targetBlockId === null && selection?.kind !== "chromosome" && !targetObjectId)
   ) {
     return blocks;
   }
@@ -511,10 +514,12 @@ export function moveSelectionBefore(
     return blocks;
   }
 
-  const targetObjectId = remainingUnits[targetIndex]?.objectId ?? movingUnits[0]?.objectId;
-  const retargetedMovingUnits = selection?.kind === "chromosome"
+  const resolvedTargetObjectId = targetObjectId
+    ?? remainingUnits[targetIndex]?.objectId
+    ?? movingUnits[0]?.objectId;
+  const retargetedMovingUnits = selection?.kind === "chromosome" && !targetObjectId
     ? movingUnits
-    : movingUnits.map((unit) => retargetAssemblyUnit(unit, targetObjectId));
+    : movingUnits.map((unit) => retargetAssemblyUnit(unit, resolvedTargetObjectId));
   const reorderedUnits = ensureAssemblyUnitBoundaries([
     ...remainingUnits.slice(0, targetIndex),
     ...retargetedMovingUnits,
@@ -853,11 +858,6 @@ export function splitContigAtVisualPosition(
     splitParent,
     sourceStart: block.orientation === "-" ? sourceCut : block.sourceStart,
     sourceEnd: block.orientation === "-" ? block.sourceEnd : sourceCut,
-    displayName: sourceSegmentDisplayName(
-      block.sourceId,
-      block.orientation === "-" ? sourceCut : block.sourceStart,
-      block.orientation === "-" ? block.sourceEnd : sourceCut,
-    ),
     isSourceSegment: true,
     assemblyBlockId: null,
   };
@@ -868,11 +868,6 @@ export function splitContigAtVisualPosition(
     splitParent,
     sourceStart: block.orientation === "-" ? block.sourceStart : sourceCut,
     sourceEnd: block.orientation === "-" ? sourceCut : block.sourceEnd,
-    displayName: sourceSegmentDisplayName(
-      block.sourceId,
-      block.orientation === "-" ? block.sourceStart : sourceCut,
-      block.orientation === "-" ? sourceCut : block.sourceEnd,
-    ),
     isSourceSegment: true,
     assemblyBlockId: null,
     gapBefore: { ...DEFAULT_INSERTED_GAP },
@@ -884,12 +879,6 @@ export function splitContigAtVisualPosition(
     right,
     ...blocks.slice(blockIndex + 1),
   ]));
-}
-
-function sourceSegmentDisplayName(sourceId: string, sourceStart: number, sourceEnd: number) {
-  // Internal coordinates are 0-based half-open; region labels follow the
-  // conventional 1-based closed form used by AGP and genome browsers.
-  return `${sourceId}:${sourceStart + 1}-${sourceEnd}`;
 }
 
 export function hasDeletableGap(
@@ -1000,8 +989,8 @@ function restoreSplitSiblings(
     sourceEnd,
     displayName: splitParent
       ? splitParent.displayName
-      : fallbackIsSourceSegment
-        ? sourceSegmentDisplayName(left.sourceId, sourceStart, sourceEnd)
+      : left.displayName === right.displayName
+        ? left.displayName
         : undefined,
     isSourceSegment: splitParent?.isSourceSegment ?? fallbackIsSourceSegment,
     copyInstanceId: splitParent?.copyInstanceId ?? assemblyCopyInstanceId(left),
@@ -1126,6 +1115,22 @@ export function insertionTargetAtScreenPoint(
   const tolerancePx = Math.max(1, options.tolerancePx);
   const selectionKind = options.selectionKind ?? "contigs";
 
+  if (selectionKind !== "chromosome") {
+    for (const target of chromosomeEndInsertionTargets(model, selectedIds)) {
+      const boundaryX = ((target.visualPosition - viewportXStart) / viewportXSpan) * widthPx;
+      const boundaryY = ((target.visualPosition - viewportYStart) / viewportYSpan) * heightPx;
+      const offset = target.chromosomeEnd === "start" ? 9 : -9;
+      const targetX = boundaryX + offset;
+      const targetY = boundaryY + offset;
+      if (
+        Math.abs(point.x - targetX) <= tolerancePx
+        && Math.abs(point.y - targetY) <= tolerancePx
+      ) {
+        return target;
+      }
+    }
+  }
+
   for (let index = 0; index < model.assemblyBlocks.length; index += 1) {
     const target = model.assemblyBlocks[index];
     const previous = index > 0 ? model.assemblyBlocks[index - 1] : null;
@@ -1136,7 +1141,10 @@ export function insertionTargetAtScreenPoint(
     const targetSelected = selectedIds.has(target.id)
       || target.contigIds.some((id) => selectedIds.has(id));
     if (
-      (selectionKind === "chromosome" ? !isChromosomeBoundary : isChromosomeBoundary)
+      (selectionKind !== "chromosome" && isChromosomeBoundary)
+      || (selectionKind === "chromosome"
+        && !isChromosomeBoundary
+        && target.objectId === DEBRIS_OBJECT_ID)
       || previousSelected
       || targetSelected
     ) {
@@ -1149,7 +1157,13 @@ export function insertionTargetAtScreenPoint(
       Math.abs(point.x - boundaryX) <= tolerancePx
       && Math.abs(point.y - boundaryY) <= tolerancePx
     ) {
-      return { targetBlockId: target.id, visualPosition: target.visualStart };
+      return {
+        targetBlockId: target.id,
+        visualPosition: target.visualStart,
+        ...(selectionKind === "chromosome" && !isChromosomeBoundary
+          ? { targetObjectId: target.objectId }
+          : {}),
+      };
     }
   }
 
@@ -1172,6 +1186,52 @@ export function insertionTargetAtScreenPoint(
   }
 
   return null;
+}
+
+export function chromosomeEndInsertionTargets(
+  model: AssemblyEditModel,
+  selectedIds: ReadonlySet<string>,
+): AssemblyInsertionTarget[] {
+  const blockIsSelected = (block: AssemblyEditModel["assemblyBlocks"][number] | undefined) => (
+    Boolean(block)
+    && (selectedIds.has(block!.id) || block!.contigIds.some((id) => selectedIds.has(id)))
+  );
+  const targets: AssemblyInsertionTarget[] = [];
+
+  for (const chromosome of model.chromosomes) {
+    if (chromosome.id === DEBRIS_OBJECT_ID) {
+      continue;
+    }
+    const firstIndex = model.assemblyBlocks.findIndex((block) => block.objectId === chromosome.id);
+    if (firstIndex < 0) {
+      continue;
+    }
+    let lastIndex = firstIndex;
+    while (model.assemblyBlocks[lastIndex + 1]?.objectId === chromosome.id) {
+      lastIndex += 1;
+    }
+
+    const firstBlock = model.assemblyBlocks[firstIndex];
+    const nextBlock = model.assemblyBlocks[lastIndex + 1];
+    if (!blockIsSelected(firstBlock)) {
+      targets.push({
+        targetBlockId: firstBlock.id,
+        targetObjectId: chromosome.id,
+        visualPosition: chromosome.visualStart,
+        chromosomeEnd: "start",
+      });
+    }
+    if (!blockIsSelected(nextBlock)) {
+      targets.push({
+        targetBlockId: nextBlock?.id ?? null,
+        targetObjectId: chromosome.id,
+        visualPosition: chromosome.visualEnd,
+        chromosomeEnd: "end",
+      });
+    }
+  }
+
+  return targets;
 }
 
 function findLastInBox<T extends { visualStart: number; visualEnd: number }>(

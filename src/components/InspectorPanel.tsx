@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import { contactColorCss } from "../state/contactColor";
-import { estimateContactColorScale, normalizeContactValue, type ContactColorScale } from "../state/contactColorScale";
+import {
+  contactCountSampleForColorScale,
+  estimateContactColorScale,
+  normalizeContactValue,
+  type ContactColorScale,
+} from "../state/contactColorScale";
+import { forEachContactTileCell } from "../state/contactTileData";
 import {
   assemblyCopyInstanceId,
   assemblyCopyIntervalGroups,
@@ -27,6 +33,7 @@ interface InspectorPanelProps {
   overviewContactMap: ContactMapView | null;
   status: AppStatus;
   statusMessage: string;
+  isAgpDirty?: boolean;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   syntenyView: SyntenyView | null;
@@ -42,6 +49,7 @@ export function InspectorPanel({
   overviewContactMap,
   status,
   statusMessage,
+  isAgpDirty = false,
   uiState,
   onUiAction,
   syntenyView,
@@ -130,7 +138,15 @@ export function InspectorPanel({
           <ContactOverview
             contactMap={contactMap}
             overviewContactMap={overviewContactMap}
-            dataset={dataset}
+            totalSpanBp={Math.max(
+              1,
+              assemblyBlocks.length > 0
+                ? assemblyBlocks.reduce(
+                  (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
+                  0,
+                )
+                : dataset?.agp_layout.totalSpan ?? 0,
+            )}
             uiState={uiState}
             onUiAction={onUiAction}
           />
@@ -232,7 +248,7 @@ export function InspectorPanel({
           <dl>
             <div>
               <dt>Assembly (AGP)</dt>
-              <dd>{dataset.agp_path || "Not loaded"}</dd>
+              <dd>{dataset.agp_path ? `${dataset.agp_path}${isAgpDirty ? "*" : ""}` : "Not loaded"}</dd>
             </div>
             <div>
               <dt>Contact Map (.mcool)</dt>
@@ -763,7 +779,7 @@ function formatCount(count: number, singular: string, plural = `${singular}s`) {
 interface ContactOverviewProps {
   contactMap: ContactMapView | null;
   overviewContactMap: ContactMapView | null;
-  dataset: ExampleDatasetSummary | null;
+  totalSpanBp: number;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
 }
@@ -775,14 +791,30 @@ export function contactOverviewMapForDisplayedNormalization(
   if (overviewContactMap?.normalization === contactMap?.normalization) {
     return overviewContactMap;
   }
-  return contactMap;
+  return null;
 }
 
-function ContactOverview({ contactMap, overviewContactMap, dataset, uiState, onUiAction }: ContactOverviewProps) {
+function ContactOverview({
+  contactMap,
+  overviewContactMap,
+  totalSpanBp,
+  uiState,
+  onUiAction,
+}: ContactOverviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const totalSpanBp = Math.max(1, dataset?.agp_layout.totalSpan ?? contactMap?.viewport.xEnd ?? 200_000_000);
-  const totalSpanMb = Math.max(1, Math.round(totalSpanBp / 1_000_000));
+  const displayedOverview = contactOverviewMapForDisplayedNormalization(
+    contactMap,
+    overviewContactMap,
+  );
+  // Keep the transitional pixels and their coordinate span from the same
+  // last-complete snapshot. A copy/delete edit swaps both atomically.
+  const displayedTotalSpanBp = Math.max(
+    1,
+    displayedOverview?.viewport.xEnd ?? totalSpanBp,
+  );
+  const totalSpanMb = Math.max(1, Math.round(displayedTotalSpanBp / 1_000_000));
   const [dragRatio, setDragRatio] = useState<{ x: number; y: number } | null>(null);
+  const dragRatioRef = useRef<{ x: number; y: number } | null>(null);
   const windowSpanRatio = Math.min(1, Math.max(0.001, uiState.contact.viewportSpanMb / totalSpanMb));
   const maxWindowStartRatio = Math.max(0, 1 - windowSpanRatio);
   const viewportXCenterRatio = Math.min(1, Math.max(0, uiState.contact.viewportCenterXMb / totalSpanMb));
@@ -804,14 +836,13 @@ function ContactOverview({ contactMap, overviewContactMap, dataset, uiState, onU
   useEffect(() => {
     drawOverviewHeatmap(
       canvasRef.current,
-      contactOverviewMapForDisplayedNormalization(contactMap, overviewContactMap),
+      displayedOverview,
       uiState,
-      totalSpanBp,
+      displayedTotalSpanBp,
     );
   }, [
-    contactMap,
-    overviewContactMap,
-    totalSpanBp,
+    displayedOverview,
+    displayedTotalSpanBp,
     uiState.contact.colorScale.log,
   ]);
 
@@ -825,23 +856,40 @@ function ContactOverview({ contactMap, overviewContactMap, dataset, uiState, onU
 
   function startDrag(event: React.PointerEvent<HTMLDivElement>) {
     event.currentTarget.setPointerCapture(event.pointerId);
-    setDragRatio(ratioFromEvent(event));
+    const ratio = ratioFromEvent(event);
+    dragRatioRef.current = ratio;
+    setDragRatio(ratio);
+    moveMainViewport(ratio, true);
   }
 
   function moveDrag(event: React.PointerEvent<HTMLDivElement>) {
-    if (event.buttons === 1) {
-      setDragRatio(ratioFromEvent(event));
+    if (dragRatioRef.current !== null) {
+      const ratio = ratioFromEvent(event);
+      dragRatioRef.current = ratio;
+      setDragRatio(ratio);
+      moveMainViewport(ratio, true);
     }
   }
 
   function stopDrag(event: React.PointerEvent<HTMLDivElement>) {
-    const ratio = dragRatio ?? ratioFromEvent(event);
+    const ratio = ratioFromEvent(event);
+    dragRatioRef.current = null;
     setDragRatio(null);
+    moveMainViewport(ratio, false);
+  }
+
+  function cancelDrag() {
+    dragRatioRef.current = null;
+    setDragRatio(null);
+  }
+
+  function moveMainViewport(ratio: { x: number; y: number }, transient: boolean) {
     onUiAction({
       type: "setContactViewportCenterFromOverview",
       xRatio: ratio.x,
       yRatio: ratio.y,
       totalSpanMb,
+      transient,
     });
   }
 
@@ -852,7 +900,7 @@ function ContactOverview({ contactMap, overviewContactMap, dataset, uiState, onU
       onPointerDown={startDrag}
       onPointerMove={moveDrag}
       onPointerUp={stopDrag}
-      onPointerCancel={() => setDragRatio(null)}
+      onPointerCancel={cancelDrag}
     >
       <canvas
         ref={canvasRef}
@@ -901,16 +949,25 @@ function drawOverviewHeatmap(
   }
 
   const scale = estimateContactColorScale(
-    contactMap.cells.map((cell) => cell.count),
+    contactCountSampleForColorScale(contactMap),
     uiState.contact.colorScale.log,
   );
   const binSize = Math.max(1, (contactMap.resolution / Math.max(1, totalSpanBp)) * width);
-  const cells = contactMap.tiles?.flatMap((tile) => tile.cells) ?? contactMap.cells;
 
-  for (const cell of cells) {
-    drawOverviewCell(context, cell.xBin, cell.yBin, cell.count, contactMap.resolution, totalSpanBp, width, height, binSize, scale);
-    if (cell.xBin !== cell.yBin) {
-      drawOverviewCell(context, cell.yBin, cell.xBin, cell.count, contactMap.resolution, totalSpanBp, width, height, binSize, scale);
+  const drawCell = (xBin: number, yBin: number, count: number) => {
+    drawOverviewCell(context, xBin, yBin, count, contactMap.resolution, totalSpanBp, width, height, binSize, scale);
+    if (xBin !== yBin) {
+      drawOverviewCell(context, yBin, xBin, count, contactMap.resolution, totalSpanBp, width, height, binSize, scale);
+    }
+  };
+  if (contactMap.tiles && contactMap.tiles.length > 0) {
+    const tileSizeBins = contactMap.tileSizeBins ?? 256;
+    for (const tile of contactMap.tiles) {
+      forEachContactTileCell(tile, tileSizeBins, drawCell);
+    }
+  } else {
+    for (const cell of contactMap.cells) {
+      drawCell(cell.xBin, cell.yBin, cell.count);
     }
   }
 }

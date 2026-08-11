@@ -1,7 +1,7 @@
 import { createRef } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import type { ContactMapView } from "../App";
+import type { ContactMapView, ExampleDatasetSummary } from "../App";
 import { keyboardShortcutLabels } from "../state/keyboardShortcutLabels";
 import { createInitialUiState, type UiState } from "../state/uiState";
 import { AppShell, clampInspectorPanelWidth } from "./AppShell";
@@ -10,6 +10,12 @@ function renderShell(
   rightCollapsed = false,
   contactMap: ContactMapView | null = null,
   normalization: UiState["normalization"] = "None (Raw)",
+  project: {
+    dataset?: ExampleDatasetSummary | null;
+    isAgpDirty?: boolean;
+    autoSaveEnabled?: boolean;
+    autoSaveAvailable?: boolean;
+  } = {},
 ) {
   const uiState = createInitialUiState("Ready");
   uiState.layout.rightCollapsed = rightCollapsed;
@@ -17,7 +23,7 @@ function renderShell(
 
   return renderToStaticMarkup(
     <AppShell
-      dataset={null}
+      dataset={project.dataset ?? null}
       contactMap={contactMap}
       overviewContactMap={null}
       syntenyView={null}
@@ -35,6 +41,10 @@ function renderShell(
       onCoverageFileRequested={() => undefined}
       onCoverageFileSelected={() => undefined}
       onExportAgp={() => undefined}
+      autoSaveEnabled={project.autoSaveEnabled ?? false}
+      autoSaveAvailable={project.autoSaveAvailable ?? false}
+      isAgpDirty={project.isAgpDirty ?? false}
+      onAutoSaveEnabledChange={() => undefined}
       onLoadExample={() => undefined}
       status={{
         engine: "c-studio-core",
@@ -67,7 +77,12 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('aria-label="Resize inspector"');
     expect(markup).toContain('aria-keyshortcuts="Control+Z Meta+Z Control+U Meta+U"');
     expect(markup).toContain('aria-keyshortcuts="Meta+Shift+Z Control+Y Control+R Meta+R"');
+    expect(markup).toContain('aria-label="Save edited AGP"');
+    expect(markup).toContain('aria-keyshortcuts="Control+S Meta+S"');
+    expect(markup).toContain('aria-label="Auto-save"');
+    expect(markup).toContain("Save As once to enable auto-save");
     expect(markup).toContain('aria-label="Keyboard shortcuts"');
+    expect(markup).toContain(`<dt>Save AGP</dt><dd>${shortcuts.save}</dd>`);
     expect(markup).toContain(`<dt>Rename</dt><dd>${shortcuts.rename}</dd>`);
     expect(markup).toContain(`<dt>Move to debris</dt><dd>${shortcuts.moveToDebris}</dd>`);
     expect(markup).not.toContain(`<dt>Rename</dt><dd>${otherRenameLabel}</dd>`);
@@ -90,6 +105,34 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('aria-label="Contig boxes"');
     expect(markup).toContain('aria-keyshortcuts="F2"');
     expect(markup).toContain('aria-keyshortcuts="F9"');
+  });
+
+  it("marks unsaved names consistently and enables auto-save only after Save As", () => {
+    const dataset: ExampleDatasetSummary = {
+      agp_path: "/tmp/renamed.agp",
+      mcool_path: "",
+      cool_path: "",
+      paf_path: null,
+      coverage_path: null,
+      agp_lines: 1,
+      agp_objects: 1,
+      agp_components: 1,
+      agp_gaps: 0,
+      max_object_span: 100,
+      mcool_size_bytes: 0,
+      agp_layout: { blocks: [], totalSpan: 0 },
+    };
+    const markup = renderShell(false, null, "None (Raw)", {
+      dataset,
+      isAgpDirty: true,
+      autoSaveEnabled: true,
+      autoSaveAvailable: true,
+    });
+
+    expect(markup).toContain("renamed.agp*");
+    expect(markup).toContain("/tmp/renamed.agp*");
+    expect(markup).toContain('aria-label="Auto-save" checked=""');
+    expect(markup).not.toContain("Save As once to enable auto-save");
   });
 
   it("allows the inspector to collapse without changing the heatmap workspace", () => {

@@ -17,6 +17,9 @@ function shortcut(input: Partial<JuiceboxShortcutInput>) {
 
 describe("juiceboxShortcutIntent", () => {
   it("maps the Juicebox shortcuts that have direct C-Studio equivalents", () => {
+    expect(shortcut({ key: "s", metaKey: true })).toBe("save");
+    expect(shortcut({ key: "S", ctrlKey: true })).toBe("save");
+    expect(shortcut({ key: "s", metaKey: true, editable: true })).toBe("save");
     expect(shortcut({ key: "F2" })).toBe("toggle-annotations");
     expect(shortcut({ key: "F9" })).toBe("toggle-inspector");
     expect(shortcut({ key: "F10" })).toBe("open-file-menu");
@@ -40,5 +43,7 @@ describe("juiceboxShortcutIntent", () => {
     expect(shortcut({ key: "y", metaKey: true })).toBeNull();
     expect(shortcut({ key: "F2", repeat: true })).toBeNull();
     expect(shortcut({ key: "F9", editable: true })).toBeNull();
+    expect(shortcut({ key: "s", metaKey: true, shiftKey: true })).toBeNull();
+    expect(shortcut({ key: "s", ctrlKey: true, repeat: true })).toBeNull();
   });
 });

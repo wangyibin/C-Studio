@@ -14,11 +14,13 @@ describe("keyboard shortcut labels", () => {
 
   it("shows only the labels for the active platform", () => {
     expect(keyboardShortcutLabels("mac")).toMatchObject({
+      save: "⌘S",
       rename: "⌘E",
       reverse: "⇧⌘R",
       deleteContig: "⇧⌫",
     });
     expect(keyboardShortcutLabels("windows")).toMatchObject({
+      save: "Ctrl+S",
       rename: "Ctrl+E",
       reverse: "Ctrl+Shift+R",
       deleteContig: "Shift+Del",

@@ -1,6 +1,7 @@
 export type DesktopShortcutPlatform = "mac" | "windows";
 
 export interface KeyboardShortcutLabels {
+  save: string;
   undo: string;
   redo: string;
   legacyUndo: string;
@@ -26,6 +27,7 @@ export function keyboardShortcutLabels(
 ): KeyboardShortcutLabels {
   if (platform === "mac") {
     return {
+      save: "⌘S",
       undo: "⌘Z",
       redo: "⇧⌘Z",
       legacyUndo: "⌘U",
@@ -40,6 +42,7 @@ export function keyboardShortcutLabels(
   }
 
   return {
+    save: "Ctrl+S",
     undo: "Ctrl+Z",
     redo: "Ctrl+Y",
     legacyUndo: "Ctrl+U",

@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     io::{BufRead, BufReader},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -33,6 +34,108 @@ pub struct ContactTileCacheState {
 pub struct ContactTileRequestState {
     latest_generation: Arc<AtomicU64>,
     active_requests: Arc<Mutex<HashMap<u64, u64>>>,
+}
+
+const MAX_CONTACT_LAYOUT_HANDLES: usize = 64;
+const UNKNOWN_CONTACT_LAYOUT_HANDLE_PREFIX: &str = "unknown contact map layout handle";
+
+#[derive(Debug)]
+struct ContactLayoutRegistry {
+    capacity: usize,
+    next_handle: u64,
+    layouts: HashMap<String, Arc<Vec<ContactMapLayoutBlockRequest>>>,
+    recency: VecDeque<String>,
+}
+
+impl ContactLayoutRegistry {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            next_handle: 1,
+            layouts: HashMap::new(),
+            recency: VecDeque::new(),
+        }
+    }
+
+    fn register(
+        &mut self,
+        layout_blocks: Vec<ContactMapLayoutBlockRequest>,
+    ) -> Result<String, String> {
+        let next_handle = self.next_handle;
+        self.next_handle = self
+            .next_handle
+            .checked_add(1)
+            .ok_or_else(|| "contact map layout handle space exhausted".to_string())?;
+        let handle = format!("layout-{next_handle:016x}");
+        self.layouts.insert(handle.clone(), Arc::new(layout_blocks));
+        self.touch(&handle);
+        self.evict_over_capacity();
+        Ok(handle)
+    }
+
+    fn resolve(&mut self, handle: &str) -> Result<Arc<Vec<ContactMapLayoutBlockRequest>>, String> {
+        let layout = self
+            .layouts
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| format!("{UNKNOWN_CONTACT_LAYOUT_HANDLE_PREFIX}: {handle}"))?;
+        self.touch(handle);
+        Ok(layout)
+    }
+
+    fn touch(&mut self, handle: &str) {
+        if let Some(index) = self.recency.iter().position(|current| current == handle) {
+            self.recency.remove(index);
+        }
+        self.recency.push_back(handle.to_string());
+    }
+
+    fn evict_over_capacity(&mut self) {
+        while self.layouts.len() > self.capacity {
+            let Some(handle) = self.recency.pop_front() else {
+                break;
+            };
+            self.layouts.remove(&handle);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ContactLayoutRegistryState {
+    registry: Arc<Mutex<ContactLayoutRegistry>>,
+}
+
+impl Default for ContactLayoutRegistryState {
+    fn default() -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(ContactLayoutRegistry::with_capacity(
+                MAX_CONTACT_LAYOUT_HANDLES,
+            ))),
+        }
+    }
+}
+
+impl ContactLayoutRegistryState {
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(ContactLayoutRegistry::with_capacity(capacity))),
+        }
+    }
+
+    fn register(&self, layout_blocks: Vec<ContactMapLayoutBlockRequest>) -> Result<String, String> {
+        self.registry
+            .lock()
+            .map_err(|_| "contact map layout registry lock poisoned".to_string())?
+            .register(layout_blocks)
+    }
+
+    fn resolve(&self, handle: &str) -> Result<Arc<Vec<ContactMapLayoutBlockRequest>>, String> {
+        self.registry
+            .lock()
+            .map_err(|_| "contact map layout registry lock poisoned".to_string())?
+            .resolve(handle)
+    }
 }
 
 impl ContactTileRequestState {
@@ -78,6 +181,26 @@ impl ContactTileRequestState {
         active_requests.insert(request_id, generation);
         self.latest_generation
             .fetch_max(generation, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Register low-priority work only after the visible layer has explicitly
+    /// begun this generation. Unlike `register`, this cannot advance the
+    /// generation clock and therefore cannot cancel foreground requests.
+    fn register_current_generation(&self, request_id: u64, generation: u64) -> Result<(), String> {
+        let mut active_requests = self
+            .active_requests
+            .lock()
+            .map_err(|_| "contact tile request state lock poisoned".to_string())?;
+        if generation != self.latest_generation.load(Ordering::SeqCst) {
+            return Err("contact tile request cancelled".to_string());
+        }
+        if active_requests.contains_key(&request_id) {
+            return Err(format!(
+                "contact tile request {request_id} is already active"
+            ));
+        }
+        active_requests.insert(request_id, generation);
         Ok(())
     }
 
@@ -192,6 +315,89 @@ struct ContactTilePerfContext<'a> {
     returned_tiles: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ContactTileCommandPerfContext<'a> {
+    scenario: &'a str,
+    request_id: u64,
+    generation: u64,
+    target_resolution: u64,
+    requested_tiles: usize,
+    returned_tiles: usize,
+    response_cells: usize,
+    command_us: u128,
+}
+
+fn contact_tile_command_perf_line(context: ContactTileCommandPerfContext<'_>) -> String {
+    format!(
+        "CSTUDIO_PERF event=contact_tiles_command scenario={} status=ok \
+         request_id={} generation={} target_resolution={} requested_tiles={} \
+         returned_tiles={} response_cells={} command_us={}",
+        context.scenario,
+        context.request_id,
+        context.generation,
+        context.target_resolution,
+        context.requested_tiles,
+        context.returned_tiles,
+        context.response_cells,
+        context.command_us,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContactTileBinaryCommandPerfContext<'a> {
+    scenario: &'a str,
+    request_id: u64,
+    generation: u64,
+    target_resolution: u64,
+    requested_tiles: usize,
+    returned_tiles: usize,
+    response_cells: usize,
+    response_bytes: usize,
+    command_us: u128,
+}
+
+fn contact_tile_binary_command_perf_line(
+    context: ContactTileBinaryCommandPerfContext<'_>,
+) -> String {
+    format!(
+        "CSTUDIO_PERF event=contact_tiles_binary_command scenario={} status=ok \
+         request_id={} generation={} target_resolution={} requested_tiles={} \
+         returned_tiles={} response_cells={} response_bytes={} command_us={}",
+        context.scenario,
+        context.request_id,
+        context.generation,
+        context.target_resolution,
+        context.requested_tiles,
+        context.returned_tiles,
+        context.response_cells,
+        context.response_bytes,
+        context.command_us,
+    )
+}
+
+fn contact_tile_frontend_ipc_perf_line(
+    request: &ContactTileFrontendIpcPerformanceRequest,
+) -> String {
+    format!(
+        "CSTUDIO_PERF event=contact_tiles_invoke scenario={} status={} \
+         request_id={} generation={} attempt={} target_resolution={} requested_tiles={} \
+         returned_tiles={} response_cells={} response_bytes={} decode_us={} transport={} invoke_us={}",
+        request.purpose.scenario_key(),
+        request.status.key(),
+        request.request_id,
+        request.generation,
+        request.attempt,
+        request.target_resolution,
+        request.requested_tiles,
+        request.returned_tiles,
+        request.response_cells,
+        request.response_bytes,
+        request.decode_us,
+        request.transport.key(),
+        request.invoke_us,
+    )
+}
+
 impl ContactTileStageTimings {
     fn line(&self, context: ContactTilePerfContext<'_>) -> String {
         format!(
@@ -275,6 +481,62 @@ impl ContactNormalizationRequest {
             Self::Kr => "kr",
             Self::Vc => "vc",
             Self::VcSqrt => "vc_sqrt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactTileRequestPurpose {
+    #[default]
+    Visible,
+    SpatialPrefetch,
+    AdjacentPrefetch,
+    Overview,
+}
+
+impl ContactTileRequestPurpose {
+    fn scenario_key(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::SpatialPrefetch => "spatial_prefetch",
+            Self::AdjacentPrefetch => "adjacent_prefetch",
+            Self::Overview => "overview",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactTileFrontendIpcStatus {
+    Ok,
+    Error,
+}
+
+impl ContactTileFrontendIpcStatus {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactTileFrontendIpcTransport {
+    ArrayBuffer,
+    Json,
+    #[default]
+    Unknown,
+}
+
+impl ContactTileFrontendIpcTransport {
+    fn key(self) -> &'static str {
+        match self {
+            Self::ArrayBuffer => "array_buffer",
+            Self::Json => "json",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -377,11 +639,40 @@ pub struct ContactMapViewFromCoolRequest {
     pub layout_blocks: Vec<ContactMapLayoutBlockRequest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterContactMapLayoutRequest {
+    pub layout_blocks: Vec<ContactMapLayoutBlockRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactTileFrontendIpcPerformanceRequest {
+    pub request_id: u64,
+    pub generation: u64,
+    pub purpose: ContactTileRequestPurpose,
+    pub attempt: u32,
+    pub target_resolution: u64,
+    pub requested_tiles: usize,
+    pub returned_tiles: usize,
+    pub response_cells: usize,
+    #[serde(default)]
+    pub response_bytes: usize,
+    #[serde(default)]
+    pub decode_us: u64,
+    #[serde(default)]
+    pub transport: ContactTileFrontendIpcTransport,
+    pub invoke_us: u64,
+    pub status: ContactTileFrontendIpcStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactMapTilesFromCoolRequest {
     pub request_id: u64,
     pub generation: u64,
+    #[serde(default)]
+    pub purpose: ContactTileRequestPurpose,
     pub cool_path: String,
     pub base_resolution: u64,
     pub target_resolution: u64,
@@ -389,7 +680,52 @@ pub struct ContactMapTilesFromCoolRequest {
     #[serde(default)]
     pub normalization: ContactNormalizationRequest,
     pub tiles: Vec<ContactMapTileKeyRequest>,
+    #[serde(default)]
+    pub layout_handle: Option<String>,
+    #[serde(default)]
     pub layout_blocks: Vec<ContactMapLayoutBlockRequest>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedContactMapTilesFromCoolRequest {
+    request: ContactMapTilesFromCoolRequest,
+    layout_blocks: Arc<Vec<ContactMapLayoutBlockRequest>>,
+}
+
+impl Deref for ResolvedContactMapTilesFromCoolRequest {
+    type Target = ContactMapTilesFromCoolRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl DerefMut for ResolvedContactMapTilesFromCoolRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
+    }
+}
+
+fn resolve_contact_tile_request(
+    mut request: ContactMapTilesFromCoolRequest,
+    registry_state: Option<&ContactLayoutRegistryState>,
+) -> Result<ResolvedContactMapTilesFromCoolRequest, String> {
+    let layout_blocks = if let Some(handle) = request.layout_handle.as_deref() {
+        let registry_state = registry_state
+            .ok_or_else(|| format!("{UNKNOWN_CONTACT_LAYOUT_HANDLE_PREFIX}: {handle}"))?;
+        registry_state.resolve(handle)?
+    } else {
+        Arc::new(std::mem::take(&mut request.layout_blocks))
+    };
+    // Once a handle has been resolved, the immutable Arc is the sole layout
+    // authority for this request. Clearing the legacy payload keeps recursive
+    // work-region clones cheap and prevents a conflicting fallback from being
+    // consulted later.
+    request.layout_blocks.clear();
+    Ok(ResolvedContactMapTilesFromCoolRequest {
+        request,
+        layout_blocks,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -469,6 +805,158 @@ pub struct ContactMapTileResponse {
     pub tile_x: u64,
     pub tile_y: u64,
     pub cells: Vec<ContactMapCellResponse>,
+}
+
+const CONTACT_TILE_BINARY_MAGIC: [u8; 4] = *b"CST1";
+const CONTACT_TILE_BINARY_VERSION: u16 = 1;
+const CONTACT_TILE_BINARY_FLAGS: u16 = 0;
+const CONTACT_TILE_BINARY_HEADER_BYTES: usize = 16;
+const CONTACT_TILE_BINARY_DIRECTORY_BYTES: usize = 24;
+const CONTACT_TILE_BINARY_MAX_TILE_SIZE_BINS: u64 = u16::MAX as u64 + 1;
+
+fn encode_contact_map_tiles_binary_v1(
+    tiles: &[ContactMapTileResponse],
+    tile_size_bins: u64,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, String> {
+    ensure_contact_tile_request_active(should_cancel)?;
+    if tile_size_bins == 0 || tile_size_bins > CONTACT_TILE_BINARY_MAX_TILE_SIZE_BINS {
+        return Err(format!(
+            "binary contact tile size must be between 1 and {CONTACT_TILE_BINARY_MAX_TILE_SIZE_BINS} bins"
+        ));
+    }
+
+    let tile_count = u32::try_from(tiles.len())
+        .map_err(|_| "binary contact tile count exceeds u32".to_string())?;
+    let directory_len = tiles
+        .len()
+        .checked_mul(CONTACT_TILE_BINARY_DIRECTORY_BYTES)
+        .ok_or_else(|| "binary contact tile directory size overflow".to_string())?;
+    let metadata_len = CONTACT_TILE_BINARY_HEADER_BYTES
+        .checked_add(directory_len)
+        .ok_or_else(|| "binary contact tile metadata size overflow".to_string())?;
+    let mut response_len = metadata_len;
+    for tile in tiles {
+        let cell_count = tile.cells.len();
+        u32::try_from(cell_count)
+            .map_err(|_| "binary contact tile cell count exceeds u32".to_string())?;
+        let coordinate_bytes = cell_count
+            .checked_mul(4)
+            .ok_or_else(|| "binary contact tile coordinate size overflow".to_string())?;
+        let aligned_coordinate_bytes = coordinate_bytes
+            .checked_add(7)
+            .map(|bytes| bytes & !7)
+            .ok_or_else(|| "binary contact tile coordinate alignment overflow".to_string())?;
+        let count_bytes = cell_count
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| "binary contact tile count payload size overflow".to_string())?;
+        response_len = response_len
+            .checked_add(aligned_coordinate_bytes)
+            .and_then(|bytes| bytes.checked_add(count_bytes))
+            .ok_or_else(|| "binary contact tile response size overflow".to_string())?;
+    }
+    if response_len > u32::MAX as usize {
+        return Err("binary contact tile response exceeds u32 offsets".to_string());
+    }
+
+    let mut bytes = vec![0; metadata_len];
+    bytes.reserve(response_len.saturating_sub(metadata_len));
+    bytes[0..4].copy_from_slice(&CONTACT_TILE_BINARY_MAGIC);
+    bytes[4..6].copy_from_slice(&CONTACT_TILE_BINARY_VERSION.to_le_bytes());
+    bytes[6..8].copy_from_slice(&CONTACT_TILE_BINARY_FLAGS.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(tile_size_bins as u32).to_le_bytes());
+    bytes[12..16].copy_from_slice(&tile_count.to_le_bytes());
+
+    for (tile_index, tile) in tiles.iter().enumerate() {
+        ensure_contact_tile_request_active(should_cancel)?;
+        let (tile_start_x, tile_start_y) = if tile.cells.is_empty() {
+            // Empty tiles carry only their directory identity. Avoid rejecting a
+            // valid u64 tile key merely because no coordinate needs an origin.
+            (0, 0)
+        } else {
+            (
+                tile.tile_x
+                    .checked_mul(tile_size_bins)
+                    .ok_or_else(|| "binary contact tile X origin overflow".to_string())?,
+                tile.tile_y
+                    .checked_mul(tile_size_bins)
+                    .ok_or_else(|| "binary contact tile Y origin overflow".to_string())?,
+            )
+        };
+        let data_offset = u32::try_from(bytes.len())
+            .map_err(|_| "binary contact tile data offset exceeds u32".to_string())?;
+        let cell_count = u32::try_from(tile.cells.len())
+            .map_err(|_| "binary contact tile cell count exceeds u32".to_string())?;
+        let directory_offset =
+            CONTACT_TILE_BINARY_HEADER_BYTES + tile_index * CONTACT_TILE_BINARY_DIRECTORY_BYTES;
+        bytes[directory_offset..directory_offset + 8].copy_from_slice(&tile.tile_x.to_le_bytes());
+        bytes[directory_offset + 8..directory_offset + 16]
+            .copy_from_slice(&tile.tile_y.to_le_bytes());
+        bytes[directory_offset + 16..directory_offset + 20]
+            .copy_from_slice(&cell_count.to_le_bytes());
+        bytes[directory_offset + 20..directory_offset + 24]
+            .copy_from_slice(&data_offset.to_le_bytes());
+
+        for (cell_index, cell) in tile.cells.iter().enumerate() {
+            if cell_index % 4_096 == 0 {
+                ensure_contact_tile_request_active(should_cancel)?;
+            }
+            let local_x = contact_tile_local_bin(
+                cell.x_bin,
+                tile_start_x,
+                tile_size_bins,
+                tile.tile_x,
+                tile.tile_y,
+                "X",
+            )?;
+            bytes.extend_from_slice(&local_x.to_le_bytes());
+        }
+        for (cell_index, cell) in tile.cells.iter().enumerate() {
+            if cell_index % 4_096 == 0 {
+                ensure_contact_tile_request_active(should_cancel)?;
+            }
+            let local_y = contact_tile_local_bin(
+                cell.y_bin,
+                tile_start_y,
+                tile_size_bins,
+                tile.tile_x,
+                tile.tile_y,
+                "Y",
+            )?;
+            bytes.extend_from_slice(&local_y.to_le_bytes());
+        }
+        while bytes.len() % std::mem::align_of::<f64>() != 0 {
+            bytes.push(0);
+        }
+        for (cell_index, cell) in tile.cells.iter().enumerate() {
+            if cell_index % 4_096 == 0 {
+                ensure_contact_tile_request_active(should_cancel)?;
+            }
+            bytes.extend_from_slice(&cell.count.to_le_bytes());
+        }
+    }
+    ensure_contact_tile_request_active(should_cancel)?;
+    debug_assert_eq!(bytes.len(), response_len);
+    Ok(bytes)
+}
+
+fn contact_tile_local_bin(
+    global_bin: u64,
+    tile_start: u64,
+    tile_size_bins: u64,
+    tile_x: u64,
+    tile_y: u64,
+    axis: &str,
+) -> Result<u16, String> {
+    let local_bin = global_bin.checked_sub(tile_start).ok_or_else(|| {
+        format!("contact cell {axis} bin {global_bin} is outside tile ({tile_x}, {tile_y})")
+    })?;
+    if local_bin >= tile_size_bins || local_bin > u64::from(u16::MAX) {
+        return Err(format!(
+            "contact cell {axis} bin {global_bin} is outside tile ({tile_x}, {tile_y})"
+        ));
+    }
+    Ok(local_bin as u16)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -671,6 +1159,25 @@ pub fn save_agp_file(default_filename: String, contents: String) -> Result<Optio
 }
 
 #[tauri::command]
+pub fn overwrite_agp_file(path: String, contents: String) -> Result<bool, String> {
+    write_existing_agp_path(Path::new(&path), &contents)
+}
+
+#[tauri::command]
+pub fn set_window_title(window: tauri::WebviewWindow, title: String) -> Result<(), String> {
+    window.set_title(&title).map_err(|error| error.to_string())
+}
+
+fn write_existing_agp_path(path: &Path, contents: &str) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    fs::write(path, contents).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
 pub fn build_contact_map_view(
     request: ContactMapViewRequest,
 ) -> Result<ContactMapViewResponse, String> {
@@ -713,6 +1220,21 @@ pub async fn build_contact_map_view_from_cool(
 }
 
 #[tauri::command]
+pub fn register_contact_map_layout(
+    request: RegisterContactMapLayoutRequest,
+    registry_state: tauri::State<'_, ContactLayoutRegistryState>,
+) -> Result<String, String> {
+    registry_state.register(request.layout_blocks)
+}
+
+#[tauri::command]
+pub fn log_contact_tile_frontend_ipc(request: ContactTileFrontendIpcPerformanceRequest) {
+    if contact_tile_perf_logging_enabled() {
+        eprintln!("{}", contact_tile_frontend_ipc_perf_line(&request));
+    }
+}
+
+#[tauri::command]
 pub fn begin_contact_tile_generation(
     request: BeginContactTileGenerationRequest,
     request_state: tauri::State<'_, ContactTileRequestState>,
@@ -723,13 +1245,26 @@ pub fn begin_contact_tile_generation(
 #[tauri::command]
 pub async fn get_contact_map_tiles_from_cool(
     request: ContactMapTilesFromCoolRequest,
+    layout_registry_state: tauri::State<'_, ContactLayoutRegistryState>,
     source_cache_state: tauri::State<'_, SourceContactCacheState>,
     tile_cache_state: tauri::State<'_, ContactTileCacheState>,
     request_state: tauri::State<'_, ContactTileRequestState>,
 ) -> Result<Vec<ContactMapTileResponse>, String> {
+    let command_started = Instant::now();
+    // Resolve and clone the immutable layout before generation registration.
+    // An unknown handle must not advance the generation clock, and later LRU
+    // eviction cannot invalidate the Arc held by this in-flight request.
+    let request = resolve_contact_tile_request(request, Some(layout_registry_state.inner()))?;
     let request_id = request.request_id;
     let generation = request.generation;
-    request_state.register(request_id, generation)?;
+    let purpose = request.purpose;
+    let target_resolution = request.target_resolution;
+    let requested_tiles = request.tiles.len();
+    if request.purpose == ContactTileRequestPurpose::Overview {
+        request_state.register_current_generation(request_id, generation)?;
+    } else {
+        request_state.register(request_id, generation)?;
+    }
     let _request_guard = ContactTileRequestGuard {
         state: request_state.inner().clone(),
         request_id,
@@ -737,7 +1272,7 @@ pub async fn get_contact_map_tiles_from_cool(
     let source_cache = Arc::clone(&source_cache_state.inner().cache);
     let tile_cache = Arc::clone(&tile_cache_state.inner().cache);
     let task_request_state = request_state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let tiles = tauri::async_runtime::spawn_blocking(move || {
         get_contact_map_tiles_from_cool_with_cache_cancellable(
             request,
             source_cache.as_ref(),
@@ -746,7 +1281,90 @@ pub async fn get_contact_map_tiles_from_cool(
         )
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())??;
+    let command_us = command_started.elapsed().as_micros();
+    if contact_tile_perf_logging_enabled() {
+        eprintln!(
+            "{}",
+            contact_tile_command_perf_line(ContactTileCommandPerfContext {
+                scenario: purpose.scenario_key(),
+                request_id,
+                generation,
+                target_resolution,
+                requested_tiles,
+                returned_tiles: tiles.len(),
+                response_cells: tiles.iter().map(|tile| tile.cells.len()).sum(),
+                command_us,
+            })
+        );
+    }
+    Ok(tiles)
+}
+
+#[tauri::command]
+pub async fn get_contact_map_tiles_from_cool_binary_v1(
+    request: ContactMapTilesFromCoolRequest,
+    layout_registry_state: tauri::State<'_, ContactLayoutRegistryState>,
+    source_cache_state: tauri::State<'_, SourceContactCacheState>,
+    tile_cache_state: tauri::State<'_, ContactTileCacheState>,
+    request_state: tauri::State<'_, ContactTileRequestState>,
+) -> Result<tauri::ipc::Response, String> {
+    let command_started = Instant::now();
+    // Match the JSON command's handle, generation, cancellation, and cache
+    // semantics exactly. Only the final response representation differs.
+    let request = resolve_contact_tile_request(request, Some(layout_registry_state.inner()))?;
+    let request_id = request.request_id;
+    let generation = request.generation;
+    let purpose = request.purpose;
+    let target_resolution = request.target_resolution;
+    let tile_size_bins = request.tile_size_bins;
+    let requested_tiles = request.tiles.len();
+    if purpose == ContactTileRequestPurpose::Overview {
+        request_state.register_current_generation(request_id, generation)?;
+    } else {
+        request_state.register(request_id, generation)?;
+    }
+    let _request_guard = ContactTileRequestGuard {
+        state: request_state.inner().clone(),
+        request_id,
+    };
+    let source_cache = Arc::clone(&source_cache_state.inner().cache);
+    let tile_cache = Arc::clone(&tile_cache_state.inner().cache);
+    let task_request_state = request_state.inner().clone();
+    let (bytes, returned_tiles, response_cells) = tauri::async_runtime::spawn_blocking(move || {
+        let should_cancel = || task_request_state.is_cancelled(request_id);
+        let tiles = get_contact_map_tiles_from_cool_with_cache_cancellable(
+            request,
+            source_cache.as_ref(),
+            tile_cache.as_ref(),
+            &should_cancel,
+        )?;
+        let returned_tiles = tiles.len();
+        let response_cells = tiles.iter().map(|tile| tile.cells.len()).sum();
+        let bytes = encode_contact_map_tiles_binary_v1(&tiles, tile_size_bins, &should_cancel)?;
+        Ok::<_, String>((bytes, returned_tiles, response_cells))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let response_bytes = bytes.len();
+    let command_us = command_started.elapsed().as_micros();
+    if contact_tile_perf_logging_enabled() {
+        eprintln!(
+            "{}",
+            contact_tile_binary_command_perf_line(ContactTileBinaryCommandPerfContext {
+                scenario: purpose.scenario_key(),
+                request_id,
+                generation,
+                target_resolution,
+                requested_tiles,
+                returned_tiles,
+                response_cells,
+                response_bytes,
+                command_us,
+            })
+        );
+    }
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[cfg(test)]
@@ -755,6 +1373,7 @@ fn get_contact_map_tiles_from_cool_with_cache(
     source_cache: &Mutex<SourceContactCache>,
     tile_cache: &Mutex<HashMap<ContactTileCacheKey, ContactMapTileResponse>>,
 ) -> Result<Vec<ContactMapTileResponse>, String> {
+    let request = resolve_contact_tile_request(request, None)?;
     get_contact_map_tiles_from_cool_with_cache_cancellable(
         request,
         source_cache,
@@ -764,13 +1383,14 @@ fn get_contact_map_tiles_from_cool_with_cache(
 }
 
 fn get_contact_map_tiles_from_cool_with_cache_cancellable(
-    request: ContactMapTilesFromCoolRequest,
+    request: ResolvedContactMapTilesFromCoolRequest,
     source_cache: &Mutex<SourceContactCache>,
     tile_cache: &Mutex<HashMap<ContactTileCacheKey, ContactMapTileResponse>>,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<ContactMapTileResponse>, String> {
     let request_id = request.request_id;
     let generation = request.generation;
+    let purpose = request.purpose;
     let base_resolution = request.base_resolution;
     let target_resolution = request.target_resolution;
     let tile_size_bins = request.tile_size_bins;
@@ -784,7 +1404,7 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
             eprintln!(
                 "{}",
                 timings.line(ContactTilePerfContext {
-                    scenario: "request",
+                    scenario: purpose.scenario_key(),
                     request_id,
                     generation,
                     base_resolution,
@@ -802,7 +1422,7 @@ fn get_contact_map_tiles_from_cool_with_cache_cancellable(
 }
 
 fn profile_contact_tile_request(
-    request: ContactMapTilesFromCoolRequest,
+    request: ResolvedContactMapTilesFromCoolRequest,
     source_cache: &Mutex<SourceContactCache>,
     tile_cache: &Mutex<HashMap<ContactTileCacheKey, ContactMapTileResponse>>,
     should_cancel: &dyn Fn() -> bool,
@@ -824,7 +1444,7 @@ fn profile_contact_tile_request(
 }
 
 fn get_contact_map_tiles_from_cool_inner(
-    mut request: ContactMapTilesFromCoolRequest,
+    mut request: ResolvedContactMapTilesFromCoolRequest,
     source_cache: &Mutex<SourceContactCache>,
     tile_cache: &Mutex<HashMap<ContactTileCacheKey, ContactMapTileResponse>>,
     should_cancel: &dyn Fn() -> bool,
@@ -918,8 +1538,7 @@ fn get_contact_map_tiles_from_cool_inner(
 
     if missing_tiles.is_empty() {
         let _stage = ContactTileStageSpan::new(&timings.response_pack);
-        return Ok(request
-            .tiles
+        return Ok(std::mem::take(&mut request.tiles)
             .into_iter()
             .filter_map(|tile| cached_tiles.remove(&(tile.tile_x, tile.tile_y)))
             .collect());
@@ -949,8 +1568,7 @@ fn get_contact_map_tiles_from_cool_inner(
             }
         }
         let _stage = ContactTileStageSpan::new(&timings.response_pack);
-        return Ok(request
-            .tiles
+        return Ok(std::mem::take(&mut request.tiles)
             .into_iter()
             .filter_map(|tile| cached_tiles.remove(&(tile.tile_x, tile.tile_y)))
             .collect());
@@ -991,7 +1609,7 @@ fn get_contact_map_tiles_from_cool_inner(
             request.base_resolution,
             request.target_resolution,
             viewport,
-            request.layout_blocks.clone(),
+            request.layout_blocks.as_ref().clone(),
         )?;
         // 180 windows produce 16,290 upper-triangle pairs. The next window would
         // exceed the 16,384-pair cache budget. Stop collecting at that point so a
@@ -1228,8 +1846,7 @@ fn get_contact_map_tiles_from_cool_inner(
 
     ensure_contact_tile_request_active(should_cancel)?;
     let _stage = ContactTileStageSpan::new(&timings.response_pack);
-    Ok(request
-        .tiles
+    Ok(std::mem::take(&mut request.tiles)
         .into_iter()
         .filter_map(|tile| cached_tiles.remove(&(tile.tile_x, tile.tile_y)))
         .collect())
@@ -2114,9 +2731,37 @@ POSIX path of saveFile"#
     Ok(Some(PathBuf::from(path)))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn choose_agp_save_path(default_filename: &str) -> Result<Option<PathBuf>, String> {
+    use std::process::Command;
+
+    let safe_filename = default_filename.replace('\'', "''");
+    let script = format!(
+        r#"Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.SaveFileDialog
+$dialog.Title = 'Save edited AGP'
+$dialog.FileName = '{safe_filename}'
+$dialog.Filter = 'AGP files (*.agp)|*.agp|Text files (*.txt)|*.txt|All files (*.*)|*.*'
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
+  [Console]::Out.Write($dialog.FileName)
+}}"#
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn choose_agp_save_path(_default_filename: &str) -> Result<Option<PathBuf>, String> {
-    Err("native AGP save dialog is only implemented for macOS".to_string())
+    Err("native AGP save dialog is only implemented for macOS and Windows".to_string())
 }
 
 #[tauri::command]
@@ -2375,7 +3020,9 @@ fn project_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::fs;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use cstudio_core::{
         contact_cache::ContactCache,
@@ -2386,12 +3033,282 @@ mod tests {
 
     use super::{
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
-        build_synteny_view, get_app_status, BedGraphRecordRequest, ContactMapBinRequest,
-        ContactMapLayoutBlockRequest, ContactMapTileKeyRequest, ContactMapTilesFromCoolRequest,
-        ContactMapViewFromCoolRequest, ContactMapViewRequest, ContactMapViewportRequest,
-        ContactNormalizationRequest, CoverageViewFromBedGraphRequest, CoverageViewRequest,
-        PafRecordRequest, SyntenyViewRequest,
+        build_synteny_view, get_app_status, write_existing_agp_path, BedGraphRecordRequest,
+        ContactMapBinRequest, ContactMapLayoutBlockRequest, ContactMapTileKeyRequest,
+        ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
+        ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
+        CoverageViewFromBedGraphRequest, CoverageViewRequest, PafRecordRequest, SyntenyViewRequest,
     };
+
+    fn test_layout_block(id: &str, visual_start: u64) -> ContactMapLayoutBlockRequest {
+        ContactMapLayoutBlockRequest {
+            id: id.to_string(),
+            source_id: format!("source-{id}"),
+            source_start: 0,
+            source_end: 1_000,
+            visual_start,
+            orientation: "+".to_string(),
+        }
+    }
+
+    fn test_contact_tile_request(
+        layout_handle: Option<String>,
+        layout_blocks: Vec<ContactMapLayoutBlockRequest>,
+    ) -> ContactMapTilesFromCoolRequest {
+        ContactMapTilesFromCoolRequest {
+            request_id: 1,
+            generation: 1,
+            purpose: ContactTileRequestPurpose::Visible,
+            cool_path: "/tmp/input.cool".to_string(),
+            base_resolution: 1_000,
+            target_resolution: 1_000,
+            tile_size_bins: 256,
+            normalization: ContactNormalizationRequest::Raw,
+            tiles: vec![ContactMapTileKeyRequest {
+                tile_x: 0,
+                tile_y: 0,
+            }],
+            layout_handle,
+            layout_blocks,
+        }
+    }
+
+    fn read_binary_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn read_binary_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_binary_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn read_binary_f64(bytes: &[u8], offset: usize) -> f64 {
+        f64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn formats_contact_tile_command_performance_with_request_identity() {
+        let line = super::contact_tile_command_perf_line(super::ContactTileCommandPerfContext {
+            scenario: "visible",
+            request_id: 41,
+            generation: 7,
+            target_resolution: 10_000,
+            requested_tiles: 2,
+            returned_tiles: 2,
+            response_cells: 321,
+            command_us: 4_500,
+        });
+
+        assert_eq!(
+            line,
+            "CSTUDIO_PERF event=contact_tiles_command scenario=visible status=ok \
+             request_id=41 generation=7 target_resolution=10000 requested_tiles=2 \
+             returned_tiles=2 response_cells=321 command_us=4500"
+        );
+    }
+
+    #[test]
+    fn formats_binary_contact_tile_command_performance_with_response_bytes() {
+        let line = super::contact_tile_binary_command_perf_line(
+            super::ContactTileBinaryCommandPerfContext {
+                scenario: "visible",
+                request_id: 41,
+                generation: 7,
+                target_resolution: 10_000,
+                requested_tiles: 2,
+                returned_tiles: 2,
+                response_cells: 321,
+                response_bytes: 3_916,
+                command_us: 4_700,
+            },
+        );
+
+        assert_eq!(
+            line,
+            "CSTUDIO_PERF event=contact_tiles_binary_command scenario=visible status=ok \
+             request_id=41 generation=7 target_resolution=10000 requested_tiles=2 \
+             returned_tiles=2 response_cells=321 response_bytes=3916 command_us=4700"
+        );
+    }
+
+    #[test]
+    fn encodes_binary_contact_tiles_with_empty_tile_local_columns_and_f64_bits() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_1234);
+        let tiles = vec![
+            super::ContactMapTileResponse {
+                tile_x: 0,
+                tile_y: 0,
+                cells: Vec::new(),
+            },
+            super::ContactMapTileResponse {
+                tile_x: 1,
+                tile_y: 2,
+                cells: vec![
+                    super::ContactMapCellResponse {
+                        x_bin: 256,
+                        y_bin: 512,
+                        count: 1.5,
+                    },
+                    super::ContactMapCellResponse {
+                        x_bin: 511,
+                        y_bin: 767,
+                        count: nan,
+                    },
+                    super::ContactMapCellResponse {
+                        x_bin: 263,
+                        y_bin: 530,
+                        count: f64::INFINITY,
+                    },
+                    super::ContactMapCellResponse {
+                        x_bin: 300,
+                        y_bin: 600,
+                        count: f64::NEG_INFINITY,
+                    },
+                ],
+            },
+        ];
+
+        let bytes = super::encode_contact_map_tiles_binary_v1(&tiles, 256, &|| false).unwrap();
+
+        assert_eq!(&bytes[0..4], b"CST1");
+        assert_eq!(read_binary_u16(&bytes, 4), 1);
+        assert_eq!(read_binary_u16(&bytes, 6), 0);
+        assert_eq!(read_binary_u32(&bytes, 8), 256);
+        assert_eq!(read_binary_u32(&bytes, 12), 2);
+
+        assert_eq!(read_binary_u64(&bytes, 16), 0);
+        assert_eq!(read_binary_u64(&bytes, 24), 0);
+        assert_eq!(read_binary_u32(&bytes, 32), 0);
+        assert_eq!(read_binary_u32(&bytes, 36), 64);
+        assert_eq!(read_binary_u64(&bytes, 40), 1);
+        assert_eq!(read_binary_u64(&bytes, 48), 2);
+        assert_eq!(read_binary_u32(&bytes, 56), 4);
+        assert_eq!(read_binary_u32(&bytes, 60), 64);
+
+        assert_eq!(
+            (0..4)
+                .map(|index| read_binary_u16(&bytes, 64 + index * 2))
+                .collect::<Vec<_>>(),
+            vec![0, 255, 7, 44]
+        );
+        assert_eq!(
+            (0..4)
+                .map(|index| read_binary_u16(&bytes, 72 + index * 2))
+                .collect::<Vec<_>>(),
+            vec![0, 255, 18, 88]
+        );
+        assert_eq!(read_binary_f64(&bytes, 80), 1.5);
+        assert_eq!(read_binary_f64(&bytes, 88).to_bits(), nan.to_bits());
+        assert_eq!(read_binary_f64(&bytes, 96), f64::INFINITY);
+        assert_eq!(read_binary_f64(&bytes, 104), f64::NEG_INFINITY);
+        assert_eq!(bytes.len(), 112);
+    }
+
+    #[test]
+    fn encodes_binary_contact_tile_u16_boundary_and_deterministically() {
+        let tiles = vec![super::ContactMapTileResponse {
+            tile_x: 1,
+            tile_y: 1,
+            cells: vec![super::ContactMapCellResponse {
+                x_bin: 131_071,
+                y_bin: 131_071,
+                count: 42.25,
+            }],
+        }];
+
+        let first = super::encode_contact_map_tiles_binary_v1(&tiles, 65_536, &|| false).unwrap();
+        let second = super::encode_contact_map_tiles_binary_v1(&tiles, 65_536, &|| false).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(read_binary_u32(&first, 8), 65_536);
+        assert_eq!(read_binary_u32(&first, 36), 40);
+        assert_eq!(read_binary_u16(&first, 40), u16::MAX);
+        assert_eq!(read_binary_u16(&first, 42), u16::MAX);
+        assert_eq!(&first[44..48], &[0, 0, 0, 0]);
+        assert_eq!(read_binary_f64(&first, 48), 42.25);
+        assert_eq!(first.len(), 56);
+    }
+
+    #[test]
+    fn rejects_binary_contact_cells_outside_their_tile_and_invalid_tile_sizes() {
+        let outside_x = vec![super::ContactMapTileResponse {
+            tile_x: 1,
+            tile_y: 2,
+            cells: vec![super::ContactMapCellResponse {
+                x_bin: 255,
+                y_bin: 512,
+                count: 1.0,
+            }],
+        }];
+        let outside_y = vec![super::ContactMapTileResponse {
+            tile_x: 1,
+            tile_y: 2,
+            cells: vec![super::ContactMapCellResponse {
+                x_bin: 256,
+                y_bin: 768,
+                count: 1.0,
+            }],
+        }];
+
+        assert!(
+            super::encode_contact_map_tiles_binary_v1(&outside_x, 256, &|| false)
+                .unwrap_err()
+                .contains("X bin 255 is outside tile (1, 2)")
+        );
+        assert!(
+            super::encode_contact_map_tiles_binary_v1(&outside_y, 256, &|| false)
+                .unwrap_err()
+                .contains("Y bin 768 is outside tile (1, 2)")
+        );
+        assert!(super::encode_contact_map_tiles_binary_v1(&[], 0, &|| false)
+            .unwrap_err()
+            .contains("between 1 and 65536"));
+        assert!(
+            super::encode_contact_map_tiles_binary_v1(&[], 65_537, &|| false)
+                .unwrap_err()
+                .contains("between 1 and 65536")
+        );
+    }
+
+    #[test]
+    fn binary_contact_tile_encoding_observes_cancellation() {
+        assert_eq!(
+            super::encode_contact_map_tiles_binary_v1(&[], 256, &|| true).unwrap_err(),
+            "contact tile request cancelled"
+        );
+    }
+
+    #[test]
+    fn formats_frontend_invoke_performance_with_attempt() {
+        let line = super::contact_tile_frontend_ipc_perf_line(
+            &super::ContactTileFrontendIpcPerformanceRequest {
+                request_id: 41,
+                generation: 7,
+                purpose: ContactTileRequestPurpose::Overview,
+                attempt: 2,
+                target_resolution: 10_000,
+                requested_tiles: 2,
+                returned_tiles: 0,
+                response_cells: 0,
+                response_bytes: 3_916,
+                decode_us: 275,
+                transport: super::ContactTileFrontendIpcTransport::ArrayBuffer,
+                invoke_us: 8_250,
+                status: super::ContactTileFrontendIpcStatus::Error,
+            },
+        );
+
+        assert_eq!(
+            line,
+            "CSTUDIO_PERF event=contact_tiles_invoke scenario=overview status=error \
+             request_id=41 generation=7 attempt=2 target_resolution=10000 requested_tiles=2 \
+             returned_tiles=0 response_cells=0 response_bytes=3916 decode_us=275 \
+             transport=array_buffer invoke_us=8250"
+        );
+    }
 
     #[test]
     fn returns_core_engine_status() {
@@ -2406,6 +3323,27 @@ mod tests {
             status.supported_operations,
             vec!["split", "move", "flip", "copy"]
         );
+    }
+
+    #[test]
+    fn overwrites_only_an_existing_agp_save_target() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after the Unix epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("c-studio-save-{}-{unique}.agp", std::process::id()));
+
+        assert!(!write_existing_agp_path(&path, "new")
+            .expect("a missing target should request Save As"));
+        fs::write(&path, "old").expect("test target should be created");
+        assert!(write_existing_agp_path(&path, "new").expect("target should be overwritten"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("saved AGP should be readable"),
+            "new"
+        );
+
+        fs::remove_file(path).expect("test target should be removed");
     }
 
     #[test]
@@ -2440,6 +3378,148 @@ mod tests {
         .expect("legacy request without normalization");
 
         assert_eq!(request.normalization, ContactNormalizationRequest::Raw);
+        assert_eq!(request.purpose, ContactTileRequestPurpose::Visible);
+        assert_eq!(request.layout_handle, None);
+    }
+
+    #[test]
+    fn contact_tile_request_accepts_a_handle_without_legacy_layout_blocks() {
+        let request: ContactMapTilesFromCoolRequest = serde_json::from_value(serde_json::json!({
+            "requestId": 1,
+            "generation": 1,
+            "coolPath": "/tmp/input.cool",
+            "baseResolution": 1_000,
+            "targetResolution": 10_000,
+            "tileSizeBins": 256,
+            "tiles": [],
+            "layoutHandle": "layout-0000000000000001",
+        }))
+        .expect("handle-backed request without legacy blocks");
+
+        assert_eq!(
+            request.layout_handle.as_deref(),
+            Some("layout-0000000000000001")
+        );
+        assert!(request.layout_blocks.is_empty());
+    }
+
+    #[test]
+    fn contact_layout_registry_is_immutable_lru_and_resolved_arcs_survive_eviction() {
+        let registry = super::ContactLayoutRegistryState::with_capacity(2);
+        let first = registry
+            .register(vec![test_layout_block("first", 0)])
+            .expect("first layout registers");
+        let second = registry
+            .register(vec![test_layout_block("second", 1_000)])
+            .expect("second layout registers");
+        assert_ne!(first, second);
+
+        let retained_first = registry.resolve(&first).expect("first layout resolves");
+        let third = registry
+            .register(vec![test_layout_block("third", 2_000)])
+            .expect("third layout registers");
+
+        assert_eq!(retained_first[0].id, "first");
+        assert_eq!(registry.resolve(&first).unwrap()[0].id, "first");
+        assert_eq!(registry.resolve(&third).unwrap()[0].id, "third");
+        assert_eq!(
+            registry.resolve(&second).unwrap_err(),
+            format!("{}: {second}", super::UNKNOWN_CONTACT_LAYOUT_HANDLE_PREFIX)
+        );
+    }
+
+    #[test]
+    fn handle_resolution_is_authoritative_and_unknown_handles_fail_closed() {
+        let registry = super::ContactLayoutRegistryState::with_capacity(2);
+        let registered_blocks = vec![test_layout_block("registered", 0)];
+        let handle = registry
+            .register(registered_blocks.clone())
+            .expect("layout registers");
+        let registered_arc = registry.resolve(&handle).expect("layout resolves");
+        let resolved = super::resolve_contact_tile_request(
+            test_contact_tile_request(
+                Some(handle),
+                vec![test_layout_block("conflicting-legacy", 10_000)],
+            ),
+            Some(&registry),
+        )
+        .expect("known handle resolves");
+
+        assert!(std::sync::Arc::ptr_eq(
+            &registered_arc,
+            &resolved.layout_blocks
+        ));
+        assert_eq!(resolved.layout_blocks.as_ref(), &registered_blocks);
+        assert!(resolved.request.layout_blocks.is_empty());
+
+        let missing = "layout-000000000000ffff";
+        let error = super::resolve_contact_tile_request(
+            test_contact_tile_request(
+                Some(missing.to_string()),
+                vec![test_layout_block("must-not-fallback", 0)],
+            ),
+            Some(&registry),
+        )
+        .expect_err("unknown handle must not use a conflicting legacy payload");
+        assert_eq!(
+            error,
+            format!("{}: {missing}", super::UNKNOWN_CONTACT_LAYOUT_HANDLE_PREFIX)
+        );
+    }
+
+    #[test]
+    fn legacy_layout_blocks_still_resolve_without_a_handle() {
+        let blocks = vec![test_layout_block("legacy", 0)];
+        let resolved = super::resolve_contact_tile_request(
+            test_contact_tile_request(None, blocks.clone()),
+            None,
+        )
+        .expect("legacy request resolves");
+
+        assert_eq!(resolved.layout_blocks.as_ref(), &blocks);
+        assert!(resolved.request.layout_blocks.is_empty());
+    }
+
+    #[test]
+    fn unknown_layout_handle_cannot_advance_the_contact_generation() {
+        let registry = super::ContactLayoutRegistryState::with_capacity(1);
+        let request_state = super::ContactTileRequestState::default();
+        request_state
+            .retain_and_begin_generation(7, &[])
+            .expect("generation begins");
+        let mut request = test_contact_tile_request(Some("layout-missing".to_string()), Vec::new());
+        request.generation = 8;
+
+        assert!(super::resolve_contact_tile_request(request, Some(&registry)).is_err());
+        assert_eq!(
+            request_state
+                .latest_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            7
+        );
+    }
+
+    #[test]
+    fn contact_tile_request_purpose_uses_stable_wire_values() {
+        for (wire_value, expected) in [
+            ("visible", ContactTileRequestPurpose::Visible),
+            (
+                "spatial_prefetch",
+                ContactTileRequestPurpose::SpatialPrefetch,
+            ),
+            (
+                "adjacent_prefetch",
+                ContactTileRequestPurpose::AdjacentPrefetch,
+            ),
+            ("overview", ContactTileRequestPurpose::Overview),
+        ] {
+            let parsed: ContactTileRequestPurpose =
+                serde_json::from_str(format!("\"{wire_value}\"").as_str())
+                    .expect("known contact tile purpose");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.scenario_key(), wire_value);
+        }
+        assert!(serde_json::from_str::<ContactTileRequestPurpose>("\"unknown\"").is_err());
     }
 
     #[test]
@@ -2507,13 +3587,43 @@ mod tests {
     }
 
     #[test]
+    fn overview_joins_only_the_started_generation_and_is_cancelled_by_the_next_one() {
+        let state = super::ContactTileRequestState::default();
+        state
+            .retain_and_begin_generation(7, &[])
+            .expect("visible generation begins");
+        state.register(70, 7).expect("foreground request registers");
+        state
+            .register_current_generation(71, 7)
+            .expect("overview joins the current generation");
+
+        assert!(!state.is_cancelled(70));
+        assert!(!state.is_cancelled(71));
+        assert_eq!(
+            state
+                .register_current_generation(72, 8)
+                .expect_err("overview cannot advance the generation clock"),
+            "contact tile request cancelled"
+        );
+        assert!(!state.is_cancelled(70));
+
+        let retained = state
+            .retain_and_begin_generation(8, &[70])
+            .expect("next visible generation begins");
+        assert_eq!(retained, vec![70]);
+        assert!(!state.is_cancelled(70));
+        assert!(state.is_cancelled(71));
+    }
+
+    #[test]
     fn cancelled_contact_tile_request_stops_before_io_or_cache_mutation() {
         let source_cache = Mutex::new(SourceContactCache::new(1024));
         let tile_cache = Mutex::new(HashMap::new());
-        let result = super::get_contact_map_tiles_from_cool_with_cache_cancellable(
+        let request = super::resolve_contact_tile_request(
             ContactMapTilesFromCoolRequest {
                 request_id: 1,
                 generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
                 cool_path: "/path/that/does/not/exist.cool".to_string(),
                 base_resolution: 1_000,
                 target_resolution: 1_000,
@@ -2523,8 +3633,14 @@ mod tests {
                     tile_x: 0,
                     tile_y: 0,
                 }],
+                layout_handle: None,
                 layout_blocks: Vec::new(),
             },
+            None,
+        )
+        .expect("legacy layout blocks should resolve");
+        let result = super::get_contact_map_tiles_from_cool_with_cache_cancellable(
+            request,
             &source_cache,
             &tile_cache,
             &|| true,
@@ -3090,12 +4206,14 @@ mod tests {
             ContactMapTilesFromCoolRequest {
                 request_id: 10,
                 generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
                 cool_path: cool_path.clone(),
                 base_resolution: target_resolution,
                 target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![unaffected_tile],
+                layout_handle: None,
                 layout_blocks: inserted.clone(),
             },
             &source_cache,
@@ -3141,12 +4259,14 @@ mod tests {
             ContactMapTilesFromCoolRequest {
                 request_id: 11,
                 generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
                 cool_path,
                 base_resolution: target_resolution,
                 target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
                 tiles: vec![affected_tile],
+                layout_handle: None,
                 layout_blocks: inserted,
             },
             &source_cache,
@@ -3201,6 +4321,7 @@ mod tests {
             ContactMapTilesFromCoolRequest {
                 request_id: 1,
                 generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
                 cool_path,
                 base_resolution: 1_000,
                 target_resolution,
@@ -3220,6 +4341,7 @@ mod tests {
                         tile_y: 2,
                     },
                 ],
+                layout_handle: None,
                 layout_blocks,
             },
             &source_cache,
@@ -3266,6 +4388,7 @@ mod tests {
             ContactMapTilesFromCoolRequest {
                 request_id: 1,
                 generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path.clone(),
                 base_resolution: 1_000,
                 target_resolution: 10_000,
@@ -3285,6 +4408,7 @@ mod tests {
                         tile_y: 10_001,
                     },
                 ],
+                layout_handle: None,
                 layout_blocks: layout_blocks.clone(),
             },
             &source_cache,
@@ -3308,6 +4432,7 @@ mod tests {
             ContactMapTilesFromCoolRequest {
                 request_id: 2,
                 generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path,
                 base_resolution: 1_000,
                 target_resolution: 10_000,
@@ -3327,6 +4452,7 @@ mod tests {
                         tile_y: 10_001,
                     },
                 ],
+                layout_handle: None,
                 layout_blocks,
             },
             &empty_source_cache,
@@ -3362,6 +4488,8 @@ mod tests {
             let normalization = request.normalization;
             let layout_blocks = request.layout_blocks.len();
             let requested_tiles = request.tiles.len();
+            let request = super::resolve_contact_tile_request(request, None)
+                .expect("benchmark legacy layout blocks should resolve");
             let (result, timings) =
                 super::profile_contact_tile_request(request, source_cache, tile_cache, &|| false);
             let tiles = result.expect("benchmark request should render");
@@ -3399,12 +4527,14 @@ mod tests {
         let request = |request_id, tile_x, tile_y, visual_start| ContactMapTilesFromCoolRequest {
             request_id,
             generation: 1,
+            purpose: ContactTileRequestPurpose::Visible,
             cool_path: summary.cool_path.clone(),
             base_resolution: 1_000,
             target_resolution,
             tile_size_bins,
             normalization: ContactNormalizationRequest::Raw,
             tiles: vec![ContactMapTileKeyRequest { tile_x, tile_y }],
+            layout_handle: None,
             layout_blocks: vec![ContactMapLayoutBlockRequest {
                 id: source_block.id.clone(),
                 source_id: source_block.source_id.clone(),
@@ -3475,6 +4605,7 @@ mod tests {
             ContactMapTilesFromCoolRequest {
                 request_id: 3,
                 generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path.clone(),
                 base_resolution: 1_000,
                 target_resolution,
@@ -3484,6 +4615,7 @@ mod tests {
                     tile_x: 0,
                     tile_y: 0,
                 }],
+                layout_handle: None,
                 layout_blocks: vec![layout_block(0)],
             },
             &source_cache,
@@ -3498,6 +4630,7 @@ mod tests {
             ContactMapTilesFromCoolRequest {
                 request_id: 4,
                 generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path,
                 base_resolution: 1_000,
                 target_resolution,
@@ -3507,6 +4640,7 @@ mod tests {
                     tile_x: 1,
                     tile_y: 1,
                 }],
+                layout_handle: None,
                 layout_blocks: vec![layout_block(tile_span)],
             },
             &source_cache,

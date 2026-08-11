@@ -1,4 +1,10 @@
 import type { ContactMapCell, ContactMapTile, ContactMapView } from "../App";
+import {
+  contactTileCellCount,
+  forEachContactTileCell,
+  validatedPackedContactTileCells,
+  type ContactTileData,
+} from "./contactTileData";
 import { contactTileKey } from "./contactTiles";
 import type { ContactMapLayoutBlock } from "./importers";
 
@@ -21,7 +27,7 @@ export function contactCellsForViewport(
     contactMap.previewTiles ?? [],
   );
 
-  return thinContactCellsForDrawing(tiles.flatMap((tile) => {
+  const visibleTiles = tiles.filter((tile) => {
     const tileStartX = tile.tileX * tileSizeBins * contactMap.resolution;
     const tileEndX = tileStartX + tileSizeBins * contactMap.resolution;
     const tileStartY = tile.tileY * tileSizeBins * contactMap.resolution;
@@ -32,11 +38,13 @@ export function contactCellsForViewport(
       tileEndY < contactMap.viewport.yStart ||
       tileStartY > contactMap.viewport.yEnd
     ) {
-      return [];
+      return false;
     }
 
-    return tile.cells;
-  }), maxCells);
+    return true;
+  });
+
+  return thinContactTileCellsForDrawing(visibleTiles, tileSizeBins, maxCells);
 }
 
 export function displayContactMapForPendingLayer(
@@ -265,8 +273,78 @@ function thinContactCellsForDrawing(cells: ContactMapCell[], maxCells: number) {
 }
 
 function contactCellHash(cell: ContactMapCell) {
-  let hash = Math.imul(cell.xBin ^ 0x9e3779b9, 0x85ebca6b);
-  hash ^= Math.imul(cell.yBin ^ (hash >>> 16), 0xc2b2ae35);
+  return contactCellCoordinateHash(cell.xBin, cell.yBin);
+}
+
+/**
+ * Count first, then materialize only accepted cells. This preserves the old
+ * coordinate-hash thinning rule without expanding every packed tile into a
+ * large temporary object array.
+ */
+function thinContactTileCellsForDrawing(
+  tiles: ContactTileData[],
+  tileSizeBins: number,
+  maxCells: number,
+): ContactMapCell[] {
+  const candidateCount = tiles.reduce(
+    (total, tile) => total + contactTileCellCount(tile),
+    0,
+  );
+  if (candidateCount === 0 || maxCells <= 0) {
+    return [];
+  }
+
+  if (candidateCount <= maxCells) {
+    const cells: ContactMapCell[] = [];
+    for (const tile of tiles) {
+      const packed = validatedPackedContactTileCells(tile);
+      if (!packed) {
+        for (const cell of tile.cells) {
+          cells.push(cell);
+        }
+        continue;
+      }
+      forEachContactTileCell(tile, tileSizeBins, (xBin, yBin, count) => {
+        cells.push({ xBin, yBin, count });
+      });
+    }
+    return cells;
+  }
+
+  const keepRatio = Math.max(1, maxCells) / candidateCount;
+  const threshold = Math.floor(keepRatio * 0x1_0000_0000);
+  const sampled: ContactMapCell[] = [];
+  for (const tile of tiles) {
+    const packed = validatedPackedContactTileCells(tile);
+    if (packed) {
+      forEachContactTileCell(tile, tileSizeBins, (xBin, yBin, count) => {
+        if (
+          sampled.length < maxCells
+          && contactCellCoordinateHash(xBin, yBin) < threshold
+        ) {
+          sampled.push({ xBin, yBin, count });
+        }
+      });
+    } else {
+      for (const cell of tile.cells) {
+        if (
+          sampled.length < maxCells
+          && contactCellHash(cell) < threshold
+        ) {
+          sampled.push(cell);
+        }
+      }
+    }
+    if (sampled.length >= maxCells) {
+      break;
+    }
+  }
+  return sampled;
+}
+
+function contactCellCoordinateHash(xBin: number, yBin: number) {
+  let hash = Math.imul(xBin ^ 0x9e3779b9, 0x85ebca6b);
+  hash ^= Math.imul(yBin ^ (hash >>> 16), 0xc2b2ae35);
   hash ^= hash >>> 16;
   return hash >>> 0;
 }

@@ -210,7 +210,13 @@ export type UiAction =
     }
   | { type: "fitContactViewport"; totalSpanMb: number }
   | { type: "setContactViewportFromOverview"; ratio: number; totalSpanMb: number }
-  | { type: "setContactViewportCenterFromOverview"; xRatio: number; yRatio: number; totalSpanMb: number }
+  | {
+      type: "setContactViewportCenterFromOverview";
+      xRatio: number;
+      yRatio: number;
+      totalSpanMb: number;
+      transient?: boolean;
+    }
   | {
       type: "setContactViewportAxisFromNavigator";
       axis: "x" | "y";
@@ -230,7 +236,11 @@ export type UiAction =
   | { type: "selectAssemblyChromosome"; id: string }
   | { type: "clearAssemblySelection" }
   | { type: "reverseAssemblySelection" }
-  | { type: "moveAssemblySelectionBefore"; targetBlockId: string | null }
+  | {
+      type: "moveAssemblySelectionBefore";
+      targetBlockId: string | null;
+      targetObjectId?: string;
+    }
   | { type: "moveAssemblySelectionToDebris" }
   | { type: "deleteAssemblySelection" }
   | { type: "addAssemblyChromosomeBoundaries" }
@@ -1044,19 +1054,22 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
       const viewportCenterYMb = overviewRatioToViewportCenterMb(action.yRatio, action.totalSpanMb);
       const viewportCenterMb = Number(((viewportCenterXMb + viewportCenterYMb) / 2).toFixed(2));
 
-      return withLog(
-        {
-          ...state,
-          contact: {
-            ...state.contact,
-            viewportCenterMb,
-            viewportCenterXMb,
-            viewportCenterYMb,
-            jumpTargetMb: viewportCenterXMb,
-          },
+      const nextState = {
+        ...state,
+        contact: {
+          ...state.contact,
+          viewportCenterMb,
+          viewportCenterXMb,
+          viewportCenterYMb,
+          jumpTargetMb: viewportCenterXMb,
         },
+      };
+      return action.transient
+        ? nextState
+        : withLog(
+          nextState,
         `Contact viewport moved to ${viewportCenterXMb}, ${viewportCenterYMb} Mb`,
-      );
+        );
     }
     case "setContactViewportAxisFromNavigator": {
       const totalSpanMb = sanitizeContactTotalSpanMb(action.totalSpanMb);
@@ -1288,6 +1301,7 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
             state.assembly.blocks,
             state.assembly.selection,
             action.targetBlockId,
+            action.targetObjectId,
           ),
           selection: null,
         },

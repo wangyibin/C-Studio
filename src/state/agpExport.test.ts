@@ -138,9 +138,9 @@ describe("exportAgpText", () => {
 
     expect(exportAgpText(split)).toBe([
       "Chr01\t1\t100\t1\tW\tctgA\t1\t100\t+",
-      "Chr01\t101\t150\t2\tW\tctgB:1-50\t1\t50\t+",
+      "Chr01\t101\t150\t2\tW\tctgB\t1\t50\t+",
       "Chr01\t151\t250\t3\tU\t100\tcontig\tno\tna",
-      "Chr01\t251\t300\t4\tW\tctgB:51-100\t51\t100\t+",
+      "Chr01\t251\t300\t4\tW\tctgB\t51\t100\t+",
       "",
     ].join("\n"));
 

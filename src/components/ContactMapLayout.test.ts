@@ -217,6 +217,23 @@ describe("confirmed contact map layout styles", () => {
     );
   });
 
+  it("shows chromosome-end insertion as hover-only frameless diagonal arrows", () => {
+    expect(styles).toMatch(
+      /\.assembly-chromosome-end-target\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent;[^}]*color:\s*#000;/,
+    );
+    expect(styles).toMatch(
+      /\.assembly-chromosome-end-target\.end\s*\{[^}]*translate\(-100%, -100%\)/,
+    );
+    expect(styles).toMatch(
+      /\.assembly-chromosome-end-target\.start\s*\{[^}]*translate\(0, 0\)/,
+    );
+    expect(viewportSource).toContain("<ArrowDownRight");
+    expect(viewportSource).toContain("<ArrowUpLeft");
+    expect(viewportSource).toMatch(
+      /pointerState\.kind === "insert"[\s\S]*?pointerState\.chromosomeEnd[\s\S]*?assembly-chromosome-end-target/,
+    );
+  });
+
   it("renders a frameless cut marker with upper-left scissors and an exact cut point", () => {
     expect(styles).toMatch(
       /\.assembly-cut-marker\s*\{[^}]*background:\s*transparent;[^}]*border:\s*0;[^}]*box-shadow:\s*none;/,

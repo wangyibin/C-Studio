@@ -722,6 +722,21 @@ describe("reduceUiState", () => {
     expect(state.contact.viewportCenterMb).toBe(100);
   });
 
+  it("updates the main viewport during overview dragging without appending transient logs", () => {
+    const initial = createInitialUiState("Browser preview mode");
+    const state = reduceUiState(initial, {
+      type: "setContactViewportCenterFromOverview",
+      xRatio: 0.3,
+      yRatio: 0.6,
+      totalSpanMb: 200,
+      transient: true,
+    });
+
+    expect(state.contact.viewportCenterXMb).toBe(60);
+    expect(state.contact.viewportCenterYMb).toBe(120);
+    expect(state.logEntries).toHaveLength(initial.logEntries.length);
+  });
+
   it("moves only the x viewport axis from the navigator and clamps to the visible window", () => {
     const initialState = createInitialUiState("Browser preview mode");
     const state = reduceUiState(
@@ -1316,6 +1331,24 @@ describe("reduceUiState", () => {
     expect(state.assembly.selection).toBeNull();
   });
 
+  it("merges a selected chromosome into an internal contig gap when explicitly targeted", () => {
+    let state = createInitialUiState("Browser preview mode");
+
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, { type: "selectAssemblyChromosome", id: "Chr02" });
+    state = reduceUiState(state, {
+      type: "moveAssemblySelectionBefore",
+      targetBlockId: "Chr01:2:ctg2",
+      targetObjectId: "Chr01",
+    });
+
+    expect(state.assembly.blocks.map((block) => [block.id, block.objectId])).toEqual([
+      ["Chr01:1:ctg1", "Chr01"],
+      ["Chr02:1:ctg3", "Chr01"],
+      ["Chr01:2:ctg2", "Chr01"],
+    ]);
+  });
+
   it("moves a selected chromosome to the end of the assembly", () => {
     let state = createInitialUiState("Browser preview mode");
 
@@ -1427,7 +1460,10 @@ describe("reduceUiState", () => {
       block.sourceId === "ctgB" && block.sourceStart === 0 && block.sourceEnd === 25
     ))).toHaveLength(1);
     expect(state.assembly.blocks.filter((block) => (
-      block.displayName === "ctgB:26-50"
+      block.sourceStart === 25
+      && block.sourceEnd === 50
+      && block.displayName === undefined
+      && block.sourceId === "ctgB"
     ))).toHaveLength(2);
   });
 

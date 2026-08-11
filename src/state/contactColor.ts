@@ -7,12 +7,16 @@ export interface ContactRgba {
   alpha: number;
 }
 
+export const contactColorLutSize = 256;
+
 const colormapStops: Record<Exclude<ContactColormap, "Reds">, number[]> = {
   Viridis: [0x440154, 0x31688e, 0x35b779, 0xfde725],
   Magma: [0x000004, 0x721f81, 0xf1605d, 0xfcfdbf],
   Inferno: [0x000004, 0x781c6d, 0xed6925, 0xfcffa4],
   Turbo: [0x30123b, 0x28a5f6, 0x7ef658, 0xfaba39, 0x7a0403],
 };
+
+const colorLutCache = new Map<ContactColormap, Map<number, Uint8ClampedArray>>();
 
 /**
  * Match Juicebox's default contact-map color scale: solid red whose alpha is
@@ -52,6 +56,80 @@ export function contactColorCss(
 ) {
   const color = contactColorAt(colormap, intensity, paletteAlpha);
   return `rgba(${color.red}, ${color.green}, ${color.blue}, ${color.alpha})`;
+}
+
+/**
+ * Return a shared 256-entry packed RGBA lookup table for one palette and opacity.
+ *
+ * Entry `i` occupies bytes `i * 4..i * 4 + 4`. RGB values reuse the existing
+ * `contactColorAt` definition at intensity `i / 255`; alpha is rounded to its
+ * nearest 8-bit byte, as required by ImageData. Consumers map an arbitrary
+ * intensity with `contactColorLutIndex`. Reds uses its exact 8-bit alpha index;
+ * the discrete palettes select a representative entry from the same color stop,
+ * so their existing hard boundaries remain exact. The returned cached table is
+ * shared and must be treated as read-only.
+ */
+export function contactColorLut(
+  colormap: ContactColormap,
+  paletteAlpha = 0.9,
+): Uint8ClampedArray {
+  const opacityByte = Math.round(clamp01(paletteAlpha) * 255);
+  const opacity = opacityByte / 255;
+  let byOpacity = colorLutCache.get(colormap);
+  if (!byOpacity) {
+    byOpacity = new Map();
+    colorLutCache.set(colormap, byOpacity);
+  }
+
+  const cached = byOpacity.get(opacityByte);
+  if (cached) {
+    return cached;
+  }
+
+  const lut = new Uint8ClampedArray(contactColorLutSize * 4);
+  for (let index = 0; index < contactColorLutSize; index += 1) {
+    const color = contactColorAt(
+      colormap,
+      index / (contactColorLutSize - 1),
+      opacity,
+    );
+    const offset = index * 4;
+    lut[offset] = color.red;
+    lut[offset + 1] = color.green;
+    lut[offset + 2] = color.blue;
+    lut[offset + 3] = Math.round(color.alpha * 255);
+  }
+  byOpacity.set(opacityByte, lut);
+  return lut;
+}
+
+export function contactColorLutIndex(
+  colormap: ContactColormap,
+  intensity: number,
+): number {
+  const value = clamp01(intensity);
+  if (colormap === "Reds") {
+    return Math.floor(value * (contactColorLutSize - 1));
+  }
+
+  const stopCount = colormapStops[colormap].length;
+  const stopIndex = Math.min(stopCount - 1, Math.floor(value * stopCount));
+  const representativeIntensity = (stopIndex + 0.5) / stopCount;
+  return Math.floor(representativeIntensity * (contactColorLutSize - 1));
+}
+
+export function contactColorFromLut(
+  lut: Uint8ClampedArray,
+  colormap: ContactColormap,
+  intensity: number,
+): ContactRgba {
+  const offset = contactColorLutIndex(colormap, intensity) * 4;
+  return {
+    red: lut[offset] ?? 0,
+    green: lut[offset + 1] ?? 0,
+    blue: lut[offset + 2] ?? 0,
+    alpha: (lut[offset + 3] ?? 0) / 255,
+  };
 }
 
 export function contactColorHex(color: Pick<ContactRgba, "red" | "green" | "blue">) {

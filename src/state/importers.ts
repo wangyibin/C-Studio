@@ -28,7 +28,7 @@ export interface ContactMapLayoutBlock {
   sourceId: string;
   /** User-facing/exported contig name; sourceId remains the immutable data lookup key. */
   displayName?: string;
-  /** True when this placement is a source interval created by an in-app contig split. */
+  /** True when this placement is one source interval of a recognized split copy. */
   isSourceSegment?: boolean;
   /** Stable placement lineage; split segments share one copy instance. */
   copyInstanceId?: string;
@@ -214,7 +214,7 @@ export function parseAgpLayout(text: string): AgpLayout {
   }
 
   return {
-    blocks: assignAssemblyBlockIds(blocks, false),
+    blocks: assignImportedSplitCopyIds(assignAssemblyBlockIds(blocks, false)),
     totalSpan: objectOffset,
   };
 }
@@ -249,12 +249,71 @@ export function normalizeImportedAgpLayout(layout: ImportedAgpLayout): AgpLayout
     }
     return normalized;
   });
-  const annotatedBlocks = assignAssemblyBlockIds(blocks, true);
+  const annotatedBlocks = assignImportedSplitCopyIds(assignAssemblyBlockIds(blocks, true));
   const totalSpan = Number.isFinite(layout.totalSpan)
     ? Math.max(layout.totalSpan, 0, ...annotatedBlocks.map((block) => block.visualEnd))
     : Math.max(0, ...annotatedBlocks.map((block) => block.visualEnd));
 
   return { blocks: annotatedBlocks, totalSpan };
+}
+
+/**
+ * Recover split-copy identity available in standard AGP coordinates.
+ * Consecutive rows for the same component belong to one copy when their
+ * source intervals touch in visual orientation. Equal or overlapping source
+ * intervals deliberately remain separate copy placements.
+ */
+export function assignImportedSplitCopyIds(
+  blocks: ContactMapLayoutBlock[],
+): ContactMapLayoutBlock[] {
+  const annotated = blocks.map((block) => ({ ...block }));
+  let run: number[] = [];
+
+  const finishRun = () => {
+    if (run.length > 1) {
+      const copyInstanceId = annotated[run[0]].id;
+      for (const index of run) {
+        annotated[index].copyInstanceId = copyInstanceId;
+        annotated[index].isSourceSegment = true;
+      }
+    }
+    run = [];
+  };
+
+  for (let index = 0; index < annotated.length; index += 1) {
+    const current = annotated[index];
+    const previousIndex = run[run.length - 1];
+    const previous = previousIndex === undefined ? undefined : annotated[previousIndex];
+    if (previous && importedSourceIntervalsTouchInVisualOrder(previous, current)) {
+      run.push(index);
+    } else {
+      finishRun();
+      run.push(index);
+    }
+  }
+  finishRun();
+  return annotated;
+}
+
+function importedSourceIntervalsTouchInVisualOrder(
+  previous: ContactMapLayoutBlock,
+  current: ContactMapLayoutBlock,
+) {
+  if (
+    previous.objectId !== current.objectId
+    || previous.sourceId !== current.sourceId
+    || previous.orientation !== current.orientation
+  ) {
+    return false;
+  }
+  if (previous.orientation === "-") {
+    return previous.sourceStart === current.sourceEnd;
+  }
+  if (previous.orientation === "+") {
+    return previous.sourceEnd === current.sourceStart;
+  }
+  return previous.sourceEnd === current.sourceStart
+    || previous.sourceStart === current.sourceEnd;
 }
 
 function assignAssemblyBlockIds(
