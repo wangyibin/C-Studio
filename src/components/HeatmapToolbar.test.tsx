@@ -67,6 +67,24 @@ describe("HeatmapToolbar", () => {
     expect(openingButton(markup, "Contig boxes")).toContain('aria-pressed="true"');
   });
 
+  it("shows only pyramid levels that actually exist in an mcool", () => {
+    const uiState = createInitialUiState("ready");
+    const markup = renderToStaticMarkup(
+      <HeatmapToolbar
+        uiState={uiState}
+        onUiAction={() => undefined}
+        totalSpanMb={200}
+        preserveResolutionViewport
+        availableResolutionBasePairs={[2_500_000, 500_000, 100_000, 10_000, 1_000]}
+      />,
+    );
+
+    expect(markup).toContain('aria-valuetext="500 kb"');
+    expect(markup).toContain('type="range" min="0" max="1"');
+    expect(markup).not.toContain("2 Mb");
+    expect(markup).not.toContain("250 kb");
+  });
+
   it("reflects imported display settings", () => {
     const uiState = createInitialUiState("ready");
     uiState.assembly.selection = { kind: "contigs", ids: ["Chr01:1:ctg1"] };

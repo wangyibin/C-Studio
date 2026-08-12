@@ -68,7 +68,12 @@ mod tests {
 
     fn query(blocks: Vec<LayoutBlock>, end: u64) -> SyntenyQuery {
         SyntenyQuery {
-            viewport: Viewport { x_start: 0, x_end: end, y_start: 0, y_end: 1 },
+            viewport: Viewport {
+                x_start: 0,
+                x_end: end,
+                y_start: 0,
+                y_end: 1,
+            },
             layout_blocks: blocks,
             min_mapq: 0,
             min_alignment_len: 1,
@@ -92,18 +97,31 @@ mod tests {
     fn cached_paf_reprojects_to_copied_blocks_without_reparsing() {
         let mut cache = SyntenyCache::new();
         let cache_key = key();
-        cache.insert_records(cache_key.clone(), vec![PafRecord {
-            query_name: "ctg-a".to_string(), query_len: 1_000,
-            query_start: 0, query_end: 1_000, strand: '+',
-            target_name: "ref-a".to_string(), target_len: 2_000,
-            target_start: 0, target_end: 1_000, residue_matches: 900,
-            alignment_block_len: 1_000, mapq: 60,
-        }]);
+        cache.insert_records(
+            cache_key.clone(),
+            vec![PafRecord {
+                query_name: "ctg-a".to_string(),
+                query_len: 1_000,
+                query_start: 0,
+                query_end: 1_000,
+                strand: '+',
+                target_name: "ref-a".to_string(),
+                target_len: 2_000,
+                target_start: 0,
+                target_end: 1_000,
+                residue_matches: 900,
+                alignment_block_len: 1_000,
+                mapq: 60,
+            }],
+        );
 
-        let view = cache.build_cached_view(
-            &cache_key,
-            &query(vec![block("original", 0), block("copy", 1_000)], 2_000),
-        ).unwrap().unwrap();
+        let view = cache
+            .build_cached_view(
+                &cache_key,
+                &query(vec![block("original", 0), block("copy", 1_000)], 2_000),
+            )
+            .unwrap()
+            .unwrap();
 
         assert_eq!(cache.entry_count(), 1);
         assert_eq!(view.blocks.len(), 2);

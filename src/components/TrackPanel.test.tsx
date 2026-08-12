@@ -1,3 +1,5 @@
+// @ts-expect-error Vitest executes this CSS contract test in Node; the app tsconfig omits Node globals.
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { CoverageView } from "../state/coverageView";
@@ -18,6 +20,8 @@ import {
   TrackPanel,
 } from "./TrackPanel";
 
+const styles = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+
 const coverageView: CoverageView = {
   resolution: 50,
   viewport: { xStart: 0, xEnd: 100, yStart: 0, yEnd: 1 },
@@ -25,6 +29,40 @@ const coverageView: CoverageView = {
 };
 
 describe("TrackPanel", () => {
+  it("keeps coverage visibility and settings controls side by side when collapsed", () => {
+    expect(styles).toMatch(
+      /\.coverage-controls\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 18px;/,
+    );
+    expect(styles).toMatch(
+      /\.coverage-control-buttons\s*\{[^}]*display:\s*flex;[^}]*gap:\s*2px;/,
+    );
+    expect(styles).toMatch(
+      /\.coverage-visibility-control\s*\{[^}]*position:\s*static;[^}]*width:\s*15px;/,
+    );
+    expect(styles).toMatch(
+      /\.coverage-scale-control\s*\{[^}]*position:\s*relative;/,
+    );
+    expect(styles).toMatch(
+      /@media \(max-width:\s*760px\)[\s\S]*\.coverage-axis-labels\s*\{[^}]*display:\s*none;/,
+    );
+  });
+
+  it("removes coverage y-axis labels when the track is hidden", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.tracks.coverageVisible = false;
+    const markup = renderToStaticMarkup(
+      <TrackPanel
+        coverageView={coverageView}
+        uiState={uiState}
+        onUiAction={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('aria-label="Show coverage track"');
+    expect(markup).toContain('class="coverage-control-buttons"');
+    expect(markup).not.toContain('class="coverage-axis-labels"');
+  });
+
   it("maps real coverage bins to assembly contig instances", () => {
     const uiState = createInitialUiState("ready");
     uiState.assembly.blocks = [
@@ -264,6 +302,38 @@ describe("TrackPanel", () => {
     expect(markup).toContain('class="coverage-chromosome-grid"');
     expect(markup).toContain('data-boundary-bp="100"');
     expect(markup).toContain('left:60%');
+  });
+
+  it("collapses dense unplaced-object boundaries and restores them after zoom", () => {
+    const blocks = [
+      ["Chr01", 0, 400],
+      ["Chr02", 400, 800],
+      ["unplaced-1", 800, 805],
+      ["unplaced-2", 805, 810],
+      ["unplaced-3", 810, 815],
+      ["unplaced-4", 815, 820],
+    ].map(([id, visualStart, visualEnd]) => ({
+      id: String(id),
+      objectId: String(id),
+      sourceId: String(id),
+      sourceStart: 0,
+      sourceEnd: Number(visualEnd) - Number(visualStart),
+      visualStart: Number(visualStart),
+      visualEnd: Number(visualEnd),
+      orientation: "+" as const,
+    }));
+
+    expect(buildCoverageChromosomeBoundaries(
+      { xStart: 0, xEnd: 1_000, yStart: 0, yEnd: 1 },
+      blocks,
+      100,
+    ).map((boundary) => boundary.positionBp)).toEqual([400, 800, 820]);
+
+    expect(buildCoverageChromosomeBoundaries(
+      { xStart: 800, xEnd: 820, yStart: 0, yEnd: 1 },
+      blocks,
+      100,
+    ).map((boundary) => boundary.positionBp)).toEqual([805, 810, 815]);
   });
 
   it("projects coverage against the live heatmap viewport when resize exposes empty field", () => {

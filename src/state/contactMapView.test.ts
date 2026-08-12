@@ -233,20 +233,36 @@ describe("contactCellsForViewport", () => {
     expect(displayContactMapForPendingLayer(pendingView, previousView, false)).toBe(pendingView);
   });
 
-  it("switches to the pending layer as soon as its first visible tile arrives", () => {
+  it("retains compatible cached tiles while the first new visible tile arrives", () => {
+    const previousTile: ContactMapTile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 2, yBin: 2, count: 8 }],
+    };
     const previousView: ContactMapView = {
       resolution: 100_000,
       viewport: { xStart: 0, xEnd: 50_000_000, yStart: 0, yEnd: 50_000_000 },
-      cells: [{ xBin: 10, yBin: 10, count: 8 }],
+      cells: [],
+      layoutScope: "shared-layout",
+      tiles: [previousTile],
+    };
+    const arrivedTile: ContactMapTile = {
+      tileX: 0,
+      tileY: 1,
+      cells: [{ xBin: 2, yBin: 258, count: 3 }],
     };
     const partialView: ContactMapView = {
       resolution: 100_000,
       viewport: previousView.viewport,
       cells: [],
-      tiles: [{ tileX: 0, tileY: 0, cells: [{ xBin: 2, yBin: 2, count: 3 }] }],
+      layoutScope: "shared-layout",
+      tiles: [arrivedTile],
     };
 
-    expect(displayContactMapForPendingLayer(partialView, previousView, false)).toEqual(partialView);
+    expect(displayContactMapForPendingLayer(partialView, previousView, false)).toEqual({
+      ...partialView,
+      cachedTiles: [previousTile, arrivedTile],
+    });
     expect(displayContactMapForPendingLayer(partialView, previousView, true)).toEqual(partialView);
   });
 

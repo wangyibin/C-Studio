@@ -1,4 +1,5 @@
 mod commands;
+mod contact_lod_cache;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -13,6 +14,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_app_status,
             commands::load_example_dataset,
+            commands::load_example_gfa_text,
             commands::select_contact_file,
             commands::select_coverage_file,
             commands::select_paf_file,
@@ -21,11 +23,15 @@ pub fn run() {
             commands::set_window_title,
             commands::build_contact_map_view,
             commands::build_contact_map_view_from_cool,
+            commands::build_contact_map_overview_from_cool,
             commands::register_contact_map_layout,
             commands::log_contact_tile_frontend_ipc,
+            commands::log_contact_pan_frontend_performance,
             commands::begin_contact_tile_generation,
             commands::get_contact_map_tiles_from_cool,
             commands::get_contact_map_tiles_from_cool_binary_v1,
+            commands::stream_contact_map_tiles_from_cool_binary_v1,
+            commands::stream_contact_map_tile_deltas_from_cool_binary_v1,
             commands::build_coverage_view,
             commands::build_coverage_view_from_bedgraph,
             commands::build_synteny_view,

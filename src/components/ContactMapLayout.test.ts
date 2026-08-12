@@ -11,6 +11,21 @@ const confirmedStylesStart = styles.lastIndexOf(":root {");
 const confirmedRedesignStyles = confirmedStylesStart >= 0 ? styles.slice(confirmedStylesStart) : styles;
 
 describe("confirmed contact map layout styles", () => {
+  it("keeps the GFA expand button visible while truncating long preview metadata", () => {
+    expect(styles).toMatch(
+      /\.gfa-preview-header\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 18px;[^}]*overflow:\s*hidden;/,
+    );
+    expect(styles).toMatch(
+      /\.gfa-preview-header \.gfa-preview-expand-button\s*\{[^}]*min-width:\s*18px;[^}]*max-width:\s*18px;/,
+    );
+    expect(styles).toMatch(
+      /\.gfa-preview-title\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden;/,
+    );
+    expect(styles).toMatch(
+      /\.gfa-preview-stats dt,[\s\S]*?\.gfa-preview-stats dd\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/,
+    );
+  });
+
   it("provides a responsive draggable inspector column", () => {
     expect(confirmedRedesignStyles).toContain("var(--inspector-width, 326px)");
     expect(confirmedRedesignStyles).toContain(".inspector-resize-handle");
@@ -54,10 +69,13 @@ describe("confirmed contact map layout styles", () => {
       /\.coverage-reference-line\s*\{[\s\S]*?rgba\(58, 58, 60, 0\.82\)/,
     );
     expect(styles).toMatch(
-      /\.coverage-visibility-control\s*\{[^}]*left:\s*12px;/,
+      /\.coverage-controls\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 18px;/,
     );
     expect(styles).toMatch(
-      /\.coverage-scale-control\s*\{[^}]*left:\s*12px;/,
+      /\.coverage-visibility-control\s*\{[^}]*position:\s*static;/,
+    );
+    expect(styles).toMatch(
+      /\.coverage-scale-control\s*\{[^}]*position:\s*relative;/,
     );
     expect(styles).not.toContain(
       "repeating-linear-gradient(90deg, transparent 0 9.9%",

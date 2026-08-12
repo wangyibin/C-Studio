@@ -10,20 +10,24 @@ const exampleFiles = new Map([
     readFileSync(new URL("../../examples/groups.agp", import.meta.url), "utf8"),
   ],
   [
-    "/examples/input.1000.coverage.bedgraph",
+    "/examples/hifi.asm.bp.p_utg.noseq.depth",
     readFileSync(
-      new URL("../../examples/input.1000.coverage.bedgraph", import.meta.url),
+      new URL("../../examples/hifi.asm.bp.p_utg.noseq.depth", import.meta.url),
       "utf8",
     ),
   ],
   [
-    "/examples/ref_vs_contig.paf",
-    readFileSync(new URL("../../examples/ref_vs_contig.paf", import.meta.url), "utf8"),
+    "/examples/mono.hifi.asm.bp.p_utg.paf",
+    readFileSync(new URL("../../examples/mono.hifi.asm.bp.p_utg.paf", import.meta.url), "utf8"),
+  ],
+  [
+    "/examples/hifi.asm.bp.p_utg.noseq.gfa",
+    readFileSync(new URL("../../examples/hifi.asm.bp.p_utg.noseq.gfa", import.meta.url), "utf8"),
   ],
 ]);
 
 describe("loadBrowserExampleBundle", () => {
-  it("loads assembly, coverage depth and PAF as one browser example", async () => {
+  it("loads assembly, contact metadata, coverage depth, PAF and GFA as one browser example", async () => {
     const requestedPaths: string[] = [];
     const bundle = await loadBrowserExampleBundle(async (path) => {
       requestedPaths.push(path);
@@ -33,29 +37,34 @@ describe("loadBrowserExampleBundle", () => {
 
     expect(requestedPaths).toEqual([
       "/examples/groups.agp",
-      "/examples/input.1000.coverage.bedgraph",
-      "/examples/ref_vs_contig.paf",
+      "/examples/hifi.asm.bp.p_utg.noseq.depth",
+      "/examples/mono.hifi.asm.bp.p_utg.paf",
+      "/examples/hifi.asm.bp.p_utg.noseq.gfa",
     ]);
     expect(bundle.dataset).toMatchObject({
       agp_path: "examples/groups.agp",
-      mcool_path: "examples/input.q1.1k.cool",
-      coverage_path: "examples/input.1000.coverage.bedgraph",
-      paf_path: "examples/ref_vs_contig.paf",
-      agp_lines: 2_576,
-      agp_components: 1_298,
+      mcool_path: "examples/input.1k.cool",
+      coverage_path: "examples/hifi.asm.bp.p_utg.noseq.depth",
+      paf_path: "examples/mono.hifi.asm.bp.p_utg.paf",
+      agp_lines: 1_177,
+      agp_components: 798,
     });
-    expect(bundle.coverageRecords).toHaveLength(48_298);
+    expect(bundle.coverageRecords).toHaveLength(40_633);
     expect(summarizePafText(bundle.pafText)).toMatchObject({
-      alignmentCount: 1_304,
-      queryCount: 1_298,
+      alignmentCount: 825,
+      queryCount: 819,
       targetCount: 5,
+    });
+    expect(bundle.gfaDocument.summary).toMatchObject({
+      segmentCount: 887,
+      aRecordCount: 28_840,
     });
   });
 
   it("fails the combined load when the example PAF is unavailable", async () => {
     await expect(
       loadBrowserExampleBundle(async (path) => {
-        if (path === "/examples/ref_vs_contig.paf") {
+        if (path === "/examples/mono.hifi.asm.bp.p_utg.paf") {
           return new Response("", { status: 404 });
         }
         return new Response(exampleFiles.get(path) ?? "", { status: 200 });

@@ -97,7 +97,10 @@ impl CoverageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{agp::Orientation, contact_map::{LayoutBlock, Viewport}};
+    use crate::{
+        agp::Orientation,
+        contact_map::{LayoutBlock, Viewport},
+    };
 
     fn key(modified_nanos: u128) -> CoverageCacheKey {
         CoverageCacheKey {
@@ -110,7 +113,12 @@ mod tests {
     fn query(blocks: Vec<LayoutBlock>, end: u64) -> CoverageQuery {
         CoverageQuery {
             display_resolution: 100,
-            viewport: Viewport { x_start: 0, x_end: end, y_start: 0, y_end: 1 },
+            viewport: Viewport {
+                x_start: 0,
+                x_end: end,
+                y_start: 0,
+                y_end: 1,
+            },
             layout_blocks: blocks,
         }
     }
@@ -130,35 +138,63 @@ mod tests {
     fn reprojects_cached_records_for_a_new_layout_without_reinsertion() {
         let mut cache = CoverageCache::new();
         let cache_key = key(1);
-        cache.insert_records(cache_key.clone(), vec![BedGraphRecord {
-            chrom: "ctg-a".to_string(), start: 0, end: 200, value: 12.0,
-        }]);
+        cache.insert_records(
+            cache_key.clone(),
+            vec![BedGraphRecord {
+                chrom: "ctg-a".to_string(),
+                start: 0,
+                end: 200,
+                value: 12.0,
+            }],
+        );
 
-        let initial = cache.build_cached_view(&cache_key, &query(vec![block("a", 0)], 200))
-            .unwrap().unwrap();
-        let moved = cache.build_cached_view(&cache_key, &query(vec![block("a", 300)], 500))
-            .unwrap().unwrap();
+        let initial = cache
+            .build_cached_view(&cache_key, &query(vec![block("a", 0)], 200))
+            .unwrap()
+            .unwrap();
+        let moved = cache
+            .build_cached_view(&cache_key, &query(vec![block("a", 300)], 500))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(cache.entry_count(), 1);
         assert_eq!(cache.cached_record_count(&cache_key), 1);
-        assert_eq!(initial.bins.iter().map(|bin| bin.x_bin).collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(moved.bins.iter().map(|bin| bin.x_bin).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            initial.bins.iter().map(|bin| bin.x_bin).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            moved.bins.iter().map(|bin| bin.x_bin).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
     }
 
     #[test]
     fn copied_layout_blocks_share_the_same_cached_source_coverage() {
         let mut cache = CoverageCache::new();
         let cache_key = key(1);
-        cache.insert_records(cache_key.clone(), vec![BedGraphRecord {
-            chrom: "ctg-a".to_string(), start: 0, end: 200, value: 7.0,
-        }]);
+        cache.insert_records(
+            cache_key.clone(),
+            vec![BedGraphRecord {
+                chrom: "ctg-a".to_string(),
+                start: 0,
+                end: 200,
+                value: 7.0,
+            }],
+        );
 
-        let view = cache.build_cached_view(
-            &cache_key,
-            &query(vec![block("original", 0), block("copy", 200)], 400),
-        ).unwrap().unwrap();
+        let view = cache
+            .build_cached_view(
+                &cache_key,
+                &query(vec![block("original", 0), block("copy", 200)], 400),
+            )
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(view.bins.iter().map(|bin| bin.x_bin).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            view.bins.iter().map(|bin| bin.x_bin).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
         assert!(view.bins.iter().all(|bin| bin.value == 3.5));
     }
 

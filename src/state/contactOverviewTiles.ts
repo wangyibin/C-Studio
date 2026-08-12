@@ -1,25 +1,13 @@
-import { contactTilesForViewport, type ContactMapTileKey } from "./contactTiles";
 import type { ContactViewport } from "./contactViewport";
 
-const overviewTargetBins = 320;
-const overviewResolutionCandidates = [
-  5_000,
-  10_000,
-  25_000,
-  50_000,
-  100_000,
-  200_000,
-  500_000,
-  1_000_000,
-  2_000_000,
-  5_000_000,
-  10_000_000,
-] as const;
+export const overviewTargetBins = 320;
+const fallbackCoolResolution = 1_000;
 
 export interface ContactOverviewTilePlan {
+  sourceResolution: number;
   targetResolution: number;
+  targetBins: number;
   viewport: ContactViewport;
-  tiles: ContactMapTileKey[];
 }
 
 export interface ContactOverviewRequestReadiness {
@@ -35,19 +23,32 @@ type ContactOverviewGenerationReadiness = Omit<
   "documentHidden"
 >;
 
-export function overviewResolutionForSpan(totalSpanBp: number) {
+export function overviewResolutionForSpan(
+  totalSpanBp: number,
+  availableResolutions: readonly number[] = [fallbackCoolResolution],
+) {
   const safeTotalSpanBp = Math.max(1, Math.round(totalSpanBp));
   const rawResolution = Math.max(1, Math.ceil(safeTotalSpanBp / overviewTargetBins));
-  return overviewResolutionCandidates.find((resolution) => resolution >= rawResolution)
-    ?? overviewResolutionCandidates[overviewResolutionCandidates.length - 1];
+  const sourceResolution = closestContactResolution(rawResolution, availableResolutions);
+  return Math.max(
+    sourceResolution,
+    Math.ceil(rawResolution / sourceResolution) * sourceResolution,
+  );
 }
 
 export function buildContactOverviewTilePlan(
   totalSpanBp: number,
-  tileSizeBins: number,
+  availableResolutions: readonly number[] = [fallbackCoolResolution],
 ): ContactOverviewTilePlan {
   const safeTotalSpanBp = Math.max(1, Math.round(totalSpanBp));
-  const targetResolution = overviewResolutionForSpan(safeTotalSpanBp);
+  const sourceResolution = closestContactResolution(
+    Math.max(1, Math.ceil(safeTotalSpanBp / overviewTargetBins)),
+    availableResolutions,
+  );
+  const targetResolution = overviewResolutionForSpan(
+    safeTotalSpanBp,
+    availableResolutions,
+  );
   const viewport = {
     xStart: 0,
     xEnd: safeTotalSpanBp,
@@ -56,15 +57,42 @@ export function buildContactOverviewTilePlan(
   };
 
   return {
+    sourceResolution,
     targetResolution,
+    targetBins: overviewTargetBins,
     viewport,
-    tiles: contactTilesForViewport(
-      viewport,
-      targetResolution,
-      tileSizeBins,
-      safeTotalSpanBp,
-    ),
   };
+}
+
+/**
+ * Use the stored matrix level nearest to one overview pixel. The overview
+ * command may aggregate that level further, but never falls back to the
+ * finest `.mcool` level merely because the exact display resolution is absent.
+ */
+export function closestContactResolution(
+  targetResolution: number,
+  availableResolutions: readonly number[],
+) {
+  const target = Number.isFinite(targetResolution)
+    ? Math.max(1, Math.round(targetResolution))
+    : 1;
+  const available = [...new Set(
+    availableResolutions
+      .filter((resolution) => Number.isFinite(resolution) && resolution > 0)
+      .map((resolution) => Math.round(resolution)),
+  )];
+  if (available.length === 0) {
+    return fallbackCoolResolution;
+  }
+
+  return available.reduce((closest, resolution) => {
+    const distance = Math.abs(resolution - target);
+    const closestDistance = Math.abs(closest - target);
+    return distance < closestDistance
+      || (distance === closestDistance && resolution > closest)
+      ? resolution
+      : closest;
+  });
 }
 
 /**

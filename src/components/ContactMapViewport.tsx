@@ -2,9 +2,11 @@ import {
   ArrowDownLeft,
   ArrowDownRight,
   ArrowUpLeft,
+  Maximize2,
   MoveDiagonal2,
   RotateCcw,
   Scissors,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ContactMapCell, ContactMapView, ExampleDatasetSummary } from "../App";
@@ -23,6 +25,8 @@ import {
 import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
 import { contactColorCss } from "../state/contactColor";
 import { normalizeContactValue } from "../state/contactColorScale";
+import type { ContactPanPreview } from "../state/contactPanPerformance";
+import type { ContactTileDeltaRenderStream } from "../state/contactTileDelta";
 import type { ContactTileRenderMilestone } from "../state/contactTilePerformance";
 import {
   buildContactLayoutRasterPlan,
@@ -31,12 +35,20 @@ import {
 import { contactCellsForViewport } from "../state/contactMapView";
 import { contactRenderGeometry } from "../state/contactRenderGeometry";
 import { contactResolutionToBasePairs } from "../state/contactResolution";
-import { buildCenteredContactViewport, type ContactViewport } from "../state/contactViewport";
+import {
+  buildCenteredContactViewport,
+  contactViewportWithDirectionalLead,
+  type ContactViewport,
+} from "../state/contactViewport";
+import { contactTileViewportSignature } from "../state/contactTiles";
 import type { CoverageView } from "../state/coverageView";
 import type { ContactMapLayoutBlock } from "../state/importers";
+import { defaultGfaHomologPattern } from "../state/gfaHomologLayout";
 import { isEditableShortcutTarget } from "../state/juiceboxShortcuts";
 import {
+  availableContactResolutions,
   contactNormalizationForBackend,
+  type ContactResolution,
   type OperationRecord,
   type UiAction,
   type UiState,
@@ -53,15 +65,23 @@ import {
   type ContactTileOverscanDirection,
   type ContactTileOverscanMode,
 } from "./ContactTileLayer";
+import type { ContactTileGpuRenderer } from "./contactTileGpu";
 import { GenomeAxisNavigator } from "./GenomeAxisNavigator";
 import { TrackPanel } from "./TrackPanel";
 
 interface ContactMapViewportProps {
   dataset: ExampleDatasetSummary | null;
   contactMap: ContactMapView | null;
+  contactTileDeltaStream?: ContactTileDeltaRenderStream | null;
   coverageView: CoverageView | null;
   uiState: UiState;
+  homologPattern?: string;
   onUiAction: (action: UiAction) => void;
+  preserveResolutionViewport?: boolean;
+  availableResolutionBasePairs?: number[];
+  onClosePanel?: () => void;
+  onExpandPanel?: () => void;
+  onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
   onContactTileLayerPaintComplete?: (event: ContactTileRenderMilestone) => void;
 }
@@ -126,6 +146,44 @@ const shiftSelectionClassName = "shift-selection-active";
 const wheelLinePixels = 16;
 const wheelDeltaLineMode = 1;
 const wheelDeltaPageMode = 2;
+const resolutionWheelCooldownMs = 140;
+
+interface ContactResolutionWheelInput {
+  deltaX: number;
+  deltaY: number;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  currentResolution: ContactResolution;
+  resolutionOptions: readonly ContactResolution[];
+}
+
+/** Resolve one modified wheel gesture into the adjacent displayed pyramid level. */
+export function contactResolutionWheelIntent({
+  deltaX,
+  deltaY,
+  ctrlKey,
+  metaKey,
+  currentResolution,
+  resolutionOptions,
+}: ContactResolutionWheelInput): ContactResolution | null {
+  if ((!ctrlKey && !metaKey) || resolutionOptions.length === 0) {
+    return null;
+  }
+  const wheelDelta = Math.abs(deltaY) >= Math.abs(deltaX) ? deltaY : deltaX;
+  if (!Number.isFinite(wheelDelta) || wheelDelta === 0) {
+    return null;
+  }
+  const currentIndex = resolutionOptions.indexOf(currentResolution);
+  if (currentIndex < 0) {
+    return null;
+  }
+  const nextIndex = wheelDelta < 0
+    ? Math.min(resolutionOptions.length - 1, currentIndex + 1)
+    : Math.max(0, currentIndex - 1);
+  return resolutionOptions[nextIndex] === currentResolution
+    ? null
+    : resolutionOptions[nextIndex] ?? null;
+}
 
 interface ContactWheelPanInput {
   deltaX: number;
@@ -369,24 +427,33 @@ function setShiftSelectionCursor(active: boolean) {
 
 export function ContactMapViewport({
   contactMap,
+  contactTileDeltaStream,
   coverageView,
   dataset,
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
   onUiAction,
+  onContactViewportPreview,
+  preserveResolutionViewport = false,
+  availableResolutionBasePairs = [],
+  onClosePanel,
+  onExpandPanel,
   uiState,
+  homologPattern = defaultGfaHomologPattern,
 }: ContactMapViewportProps) {
   const mapLayoutRef = useRef<HTMLDivElement>(null);
   const mapContentRef = useRef<HTMLDivElement>(null);
   const canvasFrameRef = useRef<HTMLDivElement>(null);
   const contactTileLayerRef = useRef<HTMLDivElement>(null);
   const contactTileTransformRef = useRef<HTMLDivElement>(null);
+  const contactTilePanRendererRef = useRef<ContactTileGpuRenderer | null>(null);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const latestContactMapRef = useRef<ContactMapView | null>(null);
   const latestDisplayContactMapRef = useRef<ContactMapView | null>(null);
   const latestUiStateRef = useRef(uiState);
   latestUiStateRef.current = uiState;
+  const resolutionWheelReadyAtRef = useRef(0);
   const [contextMenu, setContextMenu] = useState<AssemblyContextMenuState | null>(null);
   const contextMenuRef = useRef(contextMenu);
   contextMenuRef.current = contextMenu;
@@ -398,6 +465,8 @@ export function ContactMapViewport({
   const [panOverscanDirection, setPanOverscanDirection] = useState<ContactTileOverscanMode>("all");
   const panOverscanDirectionRef = useRef(panOverscanDirection);
   panOverscanDirectionRef.current = panOverscanDirection;
+  const panPreviewTileSignatureRef = useRef<string | null>(null);
+  const panPreviewSequenceRef = useRef(0);
   const panAnimationFrameRef = useRef<number | null>(null);
   const redrawAnimationFrameRef = useRef<number | null>(null);
   const pendingPanFrameRef = useRef<PendingPanFrame | null>(null);
@@ -728,8 +797,9 @@ export function ContactMapViewport({
   useEffect(() => {
     return () => {
       cancelScheduledPanFrame();
+      onContactViewportPreview?.(null);
     };
-  }, []);
+  }, [onContactViewportPreview]);
 
   useEffect(() => {
     if (!contactMap || contactMap.visibleLayerComplete !== true || dragStateRef.current) {
@@ -758,6 +828,44 @@ export function ContactMapViewport({
 
     function handleWheelPan(event: WheelEvent) {
       const sourceContactMap = latestContactMapRef.current;
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!sourceContactMap) {
+          return;
+        }
+        const latestUiState = latestUiStateRef.current;
+        const viewportResolutionOptions = availableContactResolutions(
+          latestUiState.contact,
+          totalSpanMb,
+          preserveResolutionViewport,
+        );
+        const resolutionOptions = preserveResolutionViewport
+          && availableResolutionBasePairs.length > 0
+          ? viewportResolutionOptions.filter((resolution) => (
+              availableResolutionBasePairs.includes(contactResolutionToBasePairs(resolution))
+            ))
+          : viewportResolutionOptions;
+        const nextResolution = contactResolutionWheelIntent({
+          deltaX: event.deltaX,
+          deltaY: event.deltaY,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey,
+          currentResolution: latestUiState.contact.resolution,
+          resolutionOptions,
+        });
+        const now = performance.now();
+        if (!nextResolution || now < resolutionWheelReadyAtRef.current) {
+          return;
+        }
+        resolutionWheelReadyAtRef.current = now + resolutionWheelCooldownMs;
+        onUiAction({
+          type: "setContactResolution",
+          resolution: nextResolution,
+          preserveViewport: preserveResolutionViewport,
+        });
+        return;
+      }
       if (!sourceContactMap) {
         return;
       }
@@ -815,7 +923,12 @@ export function ContactMapViewport({
 
     stage.addEventListener("wheel", handleWheelPan, { passive: false });
     return () => stage.removeEventListener("wheel", handleWheelPan);
-  }, [onUiAction, totalSpanMb]);
+  }, [
+    availableResolutionBasePairs,
+    onUiAction,
+    preserveResolutionViewport,
+    totalSpanMb,
+  ]);
 
   useEffect(() => {
     const frame = canvasFrameRef.current;
@@ -902,6 +1015,12 @@ export function ContactMapViewport({
       previewViewport: null,
     };
     dragStateRef.current = nextDragState;
+    panPreviewTileSignatureRef.current = contactTileViewportSignature(
+      liveViewport,
+      liveContactMap.resolution,
+      liveContactMap.tileSizeBins ?? 256,
+      totalSpanMb * 1_000_000,
+    );
     setDragState(nextDragState);
   }
 
@@ -933,6 +1052,7 @@ export function ContactMapViewport({
       previewViewport: previewContactMap.viewport,
     };
     updatePanOverscanDirection(liveContactMap.viewport, previewContactMap.viewport);
+    requestPanPreviewTiles(previewContactMap.viewport);
     schedulePanTransform(
       liveContactMap,
       previewContactMap,
@@ -974,6 +1094,41 @@ export function ContactMapViewport({
       resetPanTransform();
       drawContactMapBuffer(canvasRef.current, liveContactMap, uiState);
     }
+    panPreviewTileSignatureRef.current = null;
+    onContactViewportPreview?.(null);
+  }
+
+  function requestPanPreviewTiles(previewViewport: ContactViewport) {
+    if (!onContactViewportPreview || !liveContactMap) {
+      return;
+    }
+    const tileSpanBp = liveContactMap.resolution * (liveContactMap.tileSizeBins ?? 256);
+    const prefetchViewport = contactViewportWithDirectionalLead(
+      liveContactMap.viewport,
+      previewViewport,
+      tileSpanBp / 2,
+      totalSpanMb * 1_000_000,
+    );
+    // Key preview generations from the look-ahead window. This wakes the data
+    // pipeline roughly half a tile before the displayed viewport crosses the
+    // next tile boundary while preserving the exact pointer-following view.
+    const signature = contactTileViewportSignature(
+      prefetchViewport,
+      liveContactMap.resolution,
+      liveContactMap.tileSizeBins ?? 256,
+      totalSpanMb * 1_000_000,
+    );
+    if (signature === panPreviewTileSignatureRef.current) {
+      return;
+    }
+    panPreviewTileSignatureRef.current = signature;
+    panPreviewSequenceRef.current += 1;
+    onContactViewportPreview({
+      viewport: previewViewport,
+      prefetchViewport,
+      sequence: panPreviewSequenceRef.current,
+      pointerTimestamp: contactPanPerformanceTimestamp(),
+    });
   }
 
   function applyPanTransform(
@@ -995,7 +1150,12 @@ export function ContactMapViewport({
       canvasRef.current.style.transform = transform;
     }
     if (contactTileTransformRef.current) {
-      contactTileTransformRef.current.style.transform = transform;
+      if (contactTilePanRendererRef.current) {
+        contactTileTransformRef.current.style.transform = "";
+        contactTilePanRendererRef.current.setPanOffset(offsetX, offsetY);
+      } else {
+        contactTileTransformRef.current.style.transform = transform;
+      }
     }
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = transform;
@@ -1042,6 +1202,7 @@ export function ContactMapViewport({
     if (contactTileTransformRef.current) {
       contactTileTransformRef.current.style.transform = "";
     }
+    contactTilePanRendererRef.current?.resetPanOffset();
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = "";
     }
@@ -1081,6 +1242,7 @@ export function ContactMapViewport({
       centerYMb: uiState.contact.viewportCenterYMb,
     });
     updatePanOverscanDirection(liveContactMap.viewport, previewViewport);
+    requestPanPreviewTiles(previewViewport);
     schedulePanTransform(
       liveContactMap,
       { ...liveContactMap, viewport: previewViewport },
@@ -1092,6 +1254,8 @@ export function ContactMapViewport({
   function cancelAxisNavigatorPreview() {
     cancelScheduledPanFrame();
     resetPanTransform();
+    panPreviewTileSignatureRef.current = null;
+    onContactViewportPreview?.(null);
   }
 
   function commitAxisNavigator(axis: "x" | "y", centerRatio: number) {
@@ -1102,6 +1266,8 @@ export function ContactMapViewport({
       ratio: centerRatio,
       totalSpanMb,
     });
+    panPreviewTileSignatureRef.current = null;
+    onContactViewportPreview?.(null);
   }
 
   function handleAssemblyDoubleClick(event: React.MouseEvent<HTMLDivElement>) {
@@ -1368,6 +1534,30 @@ export function ContactMapViewport({
 
   return (
     <section className="contact-map" aria-label="Contact map viewport">
+      {onClosePanel || onExpandPanel ? (
+        <div className="heatmap-panel-controls" aria-label="Heatmap window controls">
+          {onExpandPanel ? (
+            <button
+              type="button"
+              aria-label="Expand heatmap window"
+              title="Expand heatmap window"
+              onClick={onExpandPanel}
+            >
+              <Maximize2 size={11} aria-hidden="true" />
+            </button>
+          ) : null}
+          {onClosePanel ? (
+            <button
+              type="button"
+              aria-label="Close heatmap window"
+              title="Close heatmap window"
+              onClick={onClosePanel}
+            >
+              <X size={12} aria-hidden="true" />
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <div
         ref={mapLayoutRef}
         className={`map-content${hasCoverageTrack
@@ -1417,11 +1607,22 @@ export function ContactMapViewport({
           }}
         >
           <div ref={canvasFrameRef} className="contact-map-canvas-frame">
-            {usesTiledRenderer ? (
+            {!usesTiledRenderer ? (
+              <canvas
+                ref={canvasRef}
+                className={`contact-map-buffer-canvas ${hasContactMap ? "loaded-contact-canvas" : "empty-contact-canvas"}`}
+                width="2880"
+                height="2880"
+                aria-label={hasContactMap ? "Imported contact map" : "Contact map canvas placeholder"}
+              />
+            ) : null}
+            {usesTiledRenderer || contactTileDeltaStream ? (
               <ContactTileLayer
-                contactMap={contactMap}
+                contactMap={usesTiledRenderer ? contactMap : null}
+                deltaStream={contactTileDeltaStream}
                 freezePresentedStyle={freezePresentedTileStyle}
                 layerRef={contactTileLayerRef}
+                panRendererRef={contactTilePanRendererRef}
                 transformRef={contactTileTransformRef}
                 onPointerDown={startPan}
                 onPointerMove={movePan}
@@ -1439,15 +1640,7 @@ export function ContactMapViewport({
                 renderStyle={tileRenderStyle}
                 viewport={displayViewport}
               />
-            ) : (
-              <canvas
-                ref={canvasRef}
-                className={`contact-map-buffer-canvas ${hasContactMap ? "loaded-contact-canvas" : "empty-contact-canvas"}`}
-                width="2880"
-                height="2880"
-                aria-label={hasContactMap ? "Imported contact map" : "Contact map canvas placeholder"}
-              />
-            )}
+            ) : null}
             {showsLayoutRasterPreview && contactMap && layoutRasterPlan ? (
               <ContactLayoutRasterPreview
                 sourceLayerRef={contactTileLayerRef}
@@ -1536,6 +1729,7 @@ export function ContactMapViewport({
             viewportSpanMb={viewportYSpanMb}
             centerMb={viewportYCenterMb}
             assemblyBlocks={assemblyBlocks}
+            homologPattern={homologPattern}
             ariaLabel="Y axis whole-genome navigator"
             onPreview={(ratio) => previewAxisNavigator("y", ratio)}
             onPreviewCancel={cancelAxisNavigatorPreview}
@@ -1550,6 +1744,7 @@ export function ContactMapViewport({
             viewportSpanMb={viewportXSpanMb}
             centerMb={viewportXCenterMb}
             assemblyBlocks={assemblyBlocks}
+            homologPattern={homologPattern}
             ariaLabel="X axis whole-genome navigator"
             onPreview={(ratio) => previewAxisNavigator("x", ratio)}
             onPreviewCancel={cancelAxisNavigatorPreview}
@@ -2167,6 +2362,10 @@ function latestPointerCoordinates(event: PointerEvent) {
   const coalescedEvents = event.getCoalescedEvents?.() ?? [];
   const latest = coalescedEvents[coalescedEvents.length - 1] ?? event;
   return { clientX: latest.clientX, clientY: latest.clientY };
+}
+
+function contactPanPerformanceTimestamp() {
+  return typeof performance === "undefined" ? Date.now() : performance.now();
 }
 
 function drawContactMapBuffer(

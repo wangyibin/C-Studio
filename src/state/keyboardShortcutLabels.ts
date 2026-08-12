@@ -12,6 +12,7 @@ export interface KeyboardShortcutLabels {
   moveToDebris: string;
   deleteGap: string;
   deleteContig: string;
+  resolutionWheel: string;
 }
 
 export function detectDesktopShortcutPlatform(
@@ -38,6 +39,7 @@ export function keyboardShortcutLabels(
       moveToDebris: "⇧⌘D",
       deleteGap: "⌘J",
       deleteContig: "⇧⌫",
+      resolutionWheel: "⌘+Scroll",
     };
   }
 
@@ -53,5 +55,6 @@ export function keyboardShortcutLabels(
     moveToDebris: "Ctrl+Shift+D",
     deleteGap: "Ctrl+J",
     deleteContig: "Shift+Del",
+    resolutionWheel: "Ctrl+Scroll",
   };
 }

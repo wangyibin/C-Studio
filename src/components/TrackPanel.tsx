@@ -13,6 +13,10 @@ import {
   selectedBlockIds,
 } from "../state/assemblyEditing";
 import {
+  buildAssemblyBoundaryBands,
+  fallbackAssemblyBoundaryViewportWidthPx,
+} from "../state/assemblyBoundaryLod";
+import {
   horizontalViewportDragDeltaMb,
   horizontalViewportFocusRatio,
   type ContactViewport,
@@ -99,6 +103,10 @@ export function TrackPanel({
   const [coveragePanDrag, setCoveragePanDrag] = useState<CoveragePanDrag | null>(null);
   const coveragePanDragRef = useRef<CoveragePanDrag | null>(null);
   const coverageScaleControlRef = useRef<HTMLDetailsElement | null>(null);
+  const coverageBarsRef = useRef<HTMLDivElement | null>(null);
+  const [coverageViewportWidthPx, setCoverageViewportWidthPx] = useState(
+    fallbackAssemblyBoundaryViewportWidthPx,
+  );
   const lastDragSelectionSignatureRef = useRef("");
   const suppressCoverageClickRef = useRef(false);
   const coverageView = useMemo(() => (
@@ -135,6 +143,7 @@ export function TrackPanel({
   const chromosomeBoundaries = buildCoverageChromosomeBoundaries(
     coverageView?.viewport ?? null,
     uiState.assembly.blocks,
+    coverageViewportWidthPx,
   );
   const coverageValues = bars.map((bar) => bar.value);
   const automaticScale = coverageAutoScaleDomain(coverageValues, automaticMultiplier);
@@ -185,6 +194,34 @@ export function TrackPanel({
     window.addEventListener("pointerdown", closeCoverageScaleOnOutsidePointer);
     return () => window.removeEventListener("pointerdown", closeCoverageScaleOnOutsidePointer);
   }, []);
+
+  useEffect(() => {
+    const bars = coverageBarsRef.current;
+    if (!bars) {
+      return;
+    }
+
+    const updateWidth = (width: number) => {
+      if (!Number.isFinite(width) || width <= 0) {
+        return;
+      }
+      setCoverageViewportWidthPx((current) => (
+        Math.abs(current - width) < 0.5 ? current : width
+      ));
+    };
+
+    updateWidth(bars.clientWidth);
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) {
+        updateWidth(entry.contentRect.width);
+      }
+    });
+    observer.observe(bars);
+    return () => observer.disconnect();
+  }, [uiState.tracks.coverageVisible]);
 
   function setScaleBoundary(field: keyof CoverageScaleDomain, value: number) {
     if (!Number.isFinite(value)) {
@@ -474,24 +511,25 @@ export function TrackPanel({
       aria-label="Coverage track"
     >
       <div className="coverage-controls">
-        <button
-          className="coverage-control-button coverage-visibility-control"
-          type="button"
-          aria-label={uiState.tracks.coverageVisible ? "Hide coverage track" : "Show coverage track"}
-          title={uiState.tracks.coverageVisible ? "Hide coverage track" : "Show coverage track"}
-          onClick={() => onUiAction({ type: "toggleTrackVisibility", track: "coverage" })}
-        >
-          {uiState.tracks.coverageVisible ? <Eye size={13} aria-hidden="true" /> : <EyeOff size={13} aria-hidden="true" />}
-        </button>
-        <details ref={coverageScaleControlRef} className="coverage-scale-control">
-          <summary
-            className="coverage-control-button"
-            aria-label="Set coverage range"
-            title={`Coverage range ${formatCoverageScale(scale.min)}–${formatCoverageScale(scale.max)}`}
+        <div className="coverage-control-buttons">
+          <button
+            className="coverage-control-button coverage-visibility-control"
+            type="button"
+            aria-label={uiState.tracks.coverageVisible ? "Hide coverage track" : "Show coverage track"}
+            title={uiState.tracks.coverageVisible ? "Hide coverage track" : "Show coverage track"}
+            onClick={() => onUiAction({ type: "toggleTrackVisibility", track: "coverage" })}
           >
-            <SlidersHorizontal size={13} aria-hidden="true" />
-          </summary>
-          <div className="coverage-scale-popover" aria-label="Coverage range settings">
+            {uiState.tracks.coverageVisible ? <Eye size={13} aria-hidden="true" /> : <EyeOff size={13} aria-hidden="true" />}
+          </button>
+          <details ref={coverageScaleControlRef} className="coverage-scale-control">
+            <summary
+              className="coverage-control-button"
+              aria-label="Set coverage range"
+              title={`Coverage range ${formatCoverageScale(scale.min)}–${formatCoverageScale(scale.max)}`}
+            >
+              <SlidersHorizontal size={13} aria-hidden="true" />
+            </summary>
+            <div className="coverage-scale-popover" aria-label="Coverage range settings">
             <label>
               <span>Min</span>
               <input
@@ -542,9 +580,10 @@ export function TrackPanel({
             >
               Auto {formatCoverageMultiplier(automaticMultiplier)}×
             </button>
-          </div>
-        </details>
-        {referenceLines.length > 0 ? (
+            </div>
+          </details>
+        </div>
+        {uiState.tracks.coverageVisible && referenceLines.length > 0 ? (
           <div className="coverage-axis-labels" aria-hidden="true">
             {referenceLines.map((reference) => (
               <span
@@ -562,6 +601,7 @@ export function TrackPanel({
       </div>
       {uiState.tracks.coverageVisible ? (
         <div
+          ref={coverageBarsRef}
           className={`coverage-bars ${coverageSelectionDrag ? "coverage-range-dragging" : ""} ${
             coveragePanDrag?.moved ? "coverage-panning" : ""
           }`}
@@ -826,6 +866,7 @@ export function buildCoverageSelectionRanges(
 export function buildCoverageChromosomeBoundaries(
   viewport: ContactViewport | null,
   blocks: ContactMapLayoutBlock[],
+  viewportWidthPx = fallbackAssemblyBoundaryViewportWidthPx,
 ): CoverageChromosomeBoundary[] {
   if (!viewport || viewport.xEnd <= viewport.xStart || blocks.length === 0) {
     return [];
@@ -833,12 +874,17 @@ export function buildCoverageChromosomeBoundaries(
 
   const span = viewport.xEnd - viewport.xStart;
   const positions = new Set<number>();
-  for (const chromosome of buildAssemblyEditModel(blocks).chromosomes) {
-    if (chromosome.visualStart > viewport.xStart && chromosome.visualStart < viewport.xEnd) {
-      positions.add(chromosome.visualStart);
+  const boundaryBands = buildAssemblyBoundaryBands(
+    buildAssemblyEditModel(blocks).chromosomes,
+    viewport,
+    viewportWidthPx,
+  );
+  for (const band of boundaryBands) {
+    if (band.visualStart > viewport.xStart && band.visualStart < viewport.xEnd) {
+      positions.add(band.visualStart);
     }
-    if (chromosome.visualEnd > viewport.xStart && chromosome.visualEnd < viewport.xEnd) {
-      positions.add(chromosome.visualEnd);
+    if (band.visualEnd > viewport.xStart && band.visualEnd < viewport.xEnd) {
+      positions.add(band.visualEnd);
     }
   }
 

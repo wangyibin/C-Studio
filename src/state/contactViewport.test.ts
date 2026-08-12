@@ -3,6 +3,7 @@ import {
   buildCenteredContactViewport,
   buildWholeGenomeContactViewport,
   contactViewportAxisSpans,
+  contactViewportWithDirectionalLead,
   horizontalViewportDragDeltaMb,
   horizontalViewportFocusRatio,
 } from "./contactViewport";
@@ -78,6 +79,32 @@ describe("buildCenteredContactViewport", () => {
       yStart: 0,
       yEnd: 123_456_789,
     });
+  });
+});
+
+describe("contactViewportWithDirectionalLead", () => {
+  it("looks ahead independently on each moving axis without changing the displayed span", () => {
+    expect(contactViewportWithDirectionalLead(
+      { xStart: 100, xEnd: 300, yStart: 100, yEnd: 300 },
+      { xStart: 120, xEnd: 320, yStart: 80, yEnd: 280 },
+      40,
+      1_000,
+    )).toEqual({ xStart: 160, xEnd: 360, yStart: 40, yEnd: 240 });
+  });
+
+  it("clamps the hint at genome edges and ignores invalid lead distances", () => {
+    expect(contactViewportWithDirectionalLead(
+      { xStart: 700, xEnd: 900, yStart: 0, yEnd: 200 },
+      { xStart: 800, xEnd: 1_000, yStart: 0, yEnd: 200 },
+      80,
+      1_000,
+    )).toEqual({ xStart: 800, xEnd: 1_000, yStart: 0, yEnd: 200 });
+    expect(contactViewportWithDirectionalLead(
+      { xStart: 100, xEnd: 300, yStart: 100, yEnd: 300 },
+      { xStart: 120, xEnd: 320, yStart: 100, yEnd: 300 },
+      Number.NaN,
+      1_000,
+    )).toEqual({ xStart: 120, xEnd: 320, yStart: 100, yEnd: 300 });
   });
 });
 

@@ -3,7 +3,6 @@ pub mod assembly;
 pub mod contact_cache;
 pub mod contact_map;
 pub mod contact_normalization;
-pub mod source_contact_cache;
 pub mod cool;
 pub mod coords;
 pub mod copy_model;
@@ -11,6 +10,7 @@ pub mod coverage;
 pub mod coverage_cache;
 pub mod error;
 pub mod ops;
+pub mod source_contact_cache;
 pub mod synteny;
 pub mod synteny_cache;
 

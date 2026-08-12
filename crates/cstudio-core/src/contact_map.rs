@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{agp::Orientation, CStudioError, CStudioResult};
 
@@ -146,67 +146,163 @@ where
     I: IntoIterator<Item = C>,
     C: ContactMapContact,
 {
-    validate_query(query)?;
+    let mut projector = ContactMapChunkProjector::new(query)?;
     ensure_not_cancelled(should_cancel)?;
-
-    let block_index = LayoutBlockIndex::new(&query.layout_blocks);
-    let mut aggregate: HashMap<(u64, u64), f64> = HashMap::new();
 
     for (contact_index, contact) in contacts.into_iter().enumerate() {
         if contact_index % 4_096 == 0 {
             ensure_not_cancelled(should_cancel)?;
         }
-        let x_positions = block_index.visual_positions(contact.source1(), contact.start1());
-        if x_positions.is_empty() {
-            continue;
+        projector.push_contact(
+            contact.source1(),
+            contact.start1(),
+            contact.source2(),
+            contact.start2(),
+            contact.count(),
+        );
+    }
+
+    ensure_not_cancelled(should_cancel)?;
+    let view = projector.take_view();
+    ensure_not_cancelled(should_cancel)?;
+    Ok(view)
+}
+
+/// Stateful projector for one HDF5 scan. `take_view` drains only the current
+/// chunk's sparse aggregate, allowing callers to emit additive deltas without
+/// retaining the complete contact matrix in backend memory.
+pub struct ContactMapChunkProjector<'a> {
+    query: &'a ContactMapQuery,
+    block_index: LayoutBlockIndex<'a>,
+    requested_tiles: Option<RequestedTileFilter>,
+    aggregate: HashMap<(u64, u64), f64>,
+}
+
+struct RequestedTileFilter {
+    tile_size_bins: u64,
+    tiles: HashSet<(u64, u64)>,
+}
+
+impl<'a> ContactMapChunkProjector<'a> {
+    pub fn new(query: &'a ContactMapQuery) -> CStudioResult<Self> {
+        validate_query(query)?;
+        Ok(Self {
+            query,
+            block_index: LayoutBlockIndex::new(&query.layout_blocks),
+            requested_tiles: None,
+            aggregate: HashMap::new(),
+        })
+    }
+
+    pub fn new_for_tiles<I>(
+        query: &'a ContactMapQuery,
+        tile_size_bins: u64,
+        requested_tiles: I,
+    ) -> CStudioResult<Self>
+    where
+        I: IntoIterator<Item = (u64, u64)>,
+    {
+        if tile_size_bins == 0 {
+            return Err(CStudioError::InvalidContactMapQuery(
+                "tile_size_bins must be positive".to_string(),
+            ));
         }
-        let y_positions = block_index.visual_positions(contact.source2(), contact.start2());
-        if y_positions.is_empty() {
-            continue;
+        let mut projector = Self::new(query)?;
+        projector.requested_tiles = Some(RequestedTileFilter {
+            tile_size_bins,
+            tiles: requested_tiles
+                .into_iter()
+                .map(|(tile_x, tile_y)| {
+                    if tile_x <= tile_y {
+                        (tile_x, tile_y)
+                    } else {
+                        (tile_y, tile_x)
+                    }
+                })
+                .collect(),
+        });
+        Ok(projector)
+    }
+
+    pub fn push_contact(
+        &mut self,
+        source1: &str,
+        start1: u64,
+        source2: &str,
+        start2: u64,
+        count: f64,
+    ) {
+        let Some(x_blocks) = self.block_index.blocks(source1) else {
+            return;
+        };
+        let Some(y_blocks) = self.block_index.blocks(source2) else {
+            return;
+        };
+        let x_position_count = x_blocks
+            .iter()
+            .filter(|block| block.visual_position(start1).is_some())
+            .count();
+        if x_position_count == 0 {
+            return;
+        }
+        let y_position_count = y_blocks
+            .iter()
+            .filter(|block| block.visual_position(start2).is_some())
+            .count();
+        if y_position_count == 0 {
+            return;
         }
         // A copied layout placement does not create new source observations.
         // Treat every matching placement pair as one equally likely assignment
         // of the original contact so projection conserves the observed signal.
-        let assignment_count = x_positions.len() as f64 * y_positions.len() as f64;
-        let projected_count = contact.count() / assignment_count;
+        let assignment_count = x_position_count as f64 * y_position_count as f64;
+        let projected_count = count / assignment_count;
 
-        for x in &x_positions {
-            for y in &y_positions {
-                // Cooler contacts are canonical in source coordinates, but a
-                // layout reorder can invert their visual coordinates. The
-                // contact map stores only the visual upper triangle, so
-                // canonicalize before viewport filtering as well as binning.
-                let (visual_x, visual_y) = if x <= y { (*x, *y) } else { (*y, *x) };
-                if !query.viewport.contains(visual_x, visual_y) {
+        for x_block in x_blocks {
+            let Some(x) = x_block.visual_position(start1) else {
+                continue;
+            };
+            for y_block in y_blocks {
+                let Some(y) = y_block.visual_position(start2) else {
+                    continue;
+                };
+                let (visual_x, visual_y) = if x <= y { (x, y) } else { (y, x) };
+                if !self.query.viewport.contains(visual_x, visual_y) {
                     continue;
                 }
-
-                let x_bin = visual_x / query.target_resolution;
-                let y_bin = visual_y / query.target_resolution;
-
-                *aggregate.entry((x_bin, y_bin)).or_insert(0.0) += projected_count;
+                let x_bin = visual_x / self.query.target_resolution;
+                let y_bin = visual_y / self.query.target_resolution;
+                if let Some(filter) = &self.requested_tiles {
+                    let tile = (x_bin / filter.tile_size_bins, y_bin / filter.tile_size_bins);
+                    if !filter.tiles.contains(&tile) {
+                        continue;
+                    }
+                }
+                *self.aggregate.entry((x_bin, y_bin)).or_insert(0.0) += projected_count;
             }
         }
     }
 
-    ensure_not_cancelled(should_cancel)?;
-    let mut cells: Vec<ContactMapCell> = aggregate
-        .into_iter()
-        .map(|((x_bin, y_bin), count)| ContactMapCell {
-            x_bin,
-            y_bin,
-            count,
-        })
-        .collect();
-    ensure_not_cancelled(should_cancel)?;
-    cells.sort_by_key(|cell| (cell.x_bin, cell.y_bin));
-    ensure_not_cancelled(should_cancel)?;
+    pub fn take_view(&mut self) -> ContactMapView {
+        let mut cells: Vec<ContactMapCell> = std::mem::take(&mut self.aggregate)
+            .into_iter()
+            .map(|((x_bin, y_bin), count)| ContactMapCell {
+                x_bin,
+                y_bin,
+                count,
+            })
+            .collect();
+        cells.sort_by_key(|cell| (cell.x_bin, cell.y_bin));
+        ContactMapView {
+            resolution: self.query.target_resolution,
+            viewport: self.query.viewport,
+            cells,
+        }
+    }
 
-    Ok(ContactMapView {
-        resolution: query.target_resolution,
-        viewport: query.viewport,
-        cells,
-    })
+    pub fn pending_cell_count(&self) -> usize {
+        self.aggregate.len()
+    }
 }
 
 fn ensure_not_cancelled(should_cancel: &dyn Fn() -> bool) -> CStudioResult<()> {
@@ -269,13 +365,8 @@ impl<'a> LayoutBlockIndex<'a> {
         Self { by_source }
     }
 
-    fn visual_positions(&self, source_id: &str, source_start: u64) -> Vec<u64> {
-        self.by_source
-            .get(source_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|block| block.visual_position(source_start))
-            .collect()
+    fn blocks(&self, source_id: &str) -> Option<&[&'a LayoutBlock]> {
+        self.by_source.get(source_id).map(Vec::as_slice)
     }
 }
 
@@ -315,7 +406,8 @@ mod tests {
         agp::Orientation,
         contact_map::{
             build_contact_map_view, build_contact_map_view_from_contacts_cancellable,
-            build_contact_map_view_from_refs, ContactBin, ContactMapQuery, LayoutBlock, Viewport,
+            build_contact_map_view_from_refs, ContactBin, ContactMapCell, ContactMapChunkProjector,
+            ContactMapQuery, LayoutBlock, Viewport,
         },
         CStudioError,
     };
@@ -357,6 +449,100 @@ mod tests {
 
         assert_eq!(error, CStudioError::RequestCancelled);
         assert_eq!(consumed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn chunk_projector_deltas_sum_to_the_one_shot_projection() {
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 2_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 4_000,
+                y_start: 0,
+                y_end: 4_000,
+            },
+            layout_blocks: vec![LayoutBlock {
+                id: "block-a".to_string(),
+                source_id: "contig-a".to_string(),
+                source_start: 0,
+                source_end: 4_000,
+                visual_start: 0,
+                orientation: Orientation::Forward,
+            }],
+        };
+        let contacts = vec![
+            ContactBin {
+                source1: "contig-a".to_string(),
+                start1: 0,
+                source2: "contig-a".to_string(),
+                start2: 1_000,
+                count: 3.0,
+            },
+            ContactBin {
+                source1: "contig-a".to_string(),
+                start1: 500,
+                source2: "contig-a".to_string(),
+                start2: 1_500,
+                count: 7.0,
+            },
+        ];
+        let expected = build_contact_map_view(&query, contacts.clone()).expect("one-shot view");
+        let mut projector = ContactMapChunkProjector::new(&query).expect("valid projector");
+        let mut delta_counts = std::collections::HashMap::new();
+        for contact in contacts {
+            projector.push_contact(
+                &contact.source1,
+                contact.start1,
+                &contact.source2,
+                contact.start2,
+                contact.count,
+            );
+            for cell in projector.take_view().cells {
+                *delta_counts.entry((cell.x_bin, cell.y_bin)).or_insert(0.0) += cell.count;
+            }
+        }
+
+        assert!(projector.take_view().cells.is_empty());
+        assert_eq!(delta_counts.len(), expected.cells.len());
+        for cell in expected.cells {
+            assert_eq!(delta_counts[&(cell.x_bin, cell.y_bin)], cell.count);
+        }
+    }
+
+    #[test]
+    fn chunk_projector_filters_unrequested_tiles_before_aggregation() {
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 4_000,
+                y_start: 0,
+                y_end: 4_000,
+            },
+            layout_blocks: vec![LayoutBlock {
+                id: "block-a".to_string(),
+                source_id: "contig-a".to_string(),
+                source_start: 0,
+                source_end: 4_000,
+                visual_start: 0,
+                orientation: Orientation::Forward,
+            }],
+        };
+        let mut projector = ContactMapChunkProjector::new_for_tiles(&query, 2, [(0, 0)])
+            .expect("valid tile-filtered projector");
+        projector.push_contact("contig-a", 0, "contig-a", 1_000, 3.0);
+        projector.push_contact("contig-a", 2_000, "contig-a", 3_000, 7.0);
+
+        assert_eq!(
+            projector.take_view().cells,
+            vec![ContactMapCell {
+                x_bin: 0,
+                y_bin: 1,
+                count: 3.0,
+            }]
+        );
     }
 
     #[test]

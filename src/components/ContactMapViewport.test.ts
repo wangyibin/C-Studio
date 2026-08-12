@@ -8,6 +8,7 @@ import {
   assemblyShiftClickIntent,
   ContactMapViewport,
   contactCanvasBackingSizeFromBounds,
+  contactResolutionWheelIntent,
   contactViewportForAxisNavigator,
   contactViewportSizePxFromBounds,
   contactTileOverscanDirectionForViewports,
@@ -26,6 +27,64 @@ const viewport = {
   yStart: 75_000_000,
   yEnd: 175_000_000,
 };
+
+describe("contactResolutionWheelIntent", () => {
+  const resolutionOptions = ["1 Mb", "500 kb", "100 kb", "10 kb"] as const;
+
+  it("uses modified wheel-up for a finer level and wheel-down for a coarser level", () => {
+    expect(contactResolutionWheelIntent({
+      deltaX: 0,
+      deltaY: -24,
+      ctrlKey: false,
+      metaKey: true,
+      currentResolution: "500 kb",
+      resolutionOptions,
+    })).toBe("100 kb");
+    expect(contactResolutionWheelIntent({
+      deltaX: 0,
+      deltaY: 24,
+      ctrlKey: true,
+      metaKey: false,
+      currentResolution: "500 kb",
+      resolutionOptions,
+    })).toBe("1 Mb");
+  });
+
+  it("ignores unmodified, empty, unavailable, and boundary wheel input", () => {
+    expect(contactResolutionWheelIntent({
+      deltaX: 0,
+      deltaY: -24,
+      ctrlKey: false,
+      metaKey: false,
+      currentResolution: "500 kb",
+      resolutionOptions,
+    })).toBeNull();
+    expect(contactResolutionWheelIntent({
+      deltaX: 0,
+      deltaY: 0,
+      ctrlKey: true,
+      metaKey: false,
+      currentResolution: "500 kb",
+      resolutionOptions,
+    })).toBeNull();
+    expect(contactResolutionWheelIntent({
+      deltaX: 0,
+      deltaY: -24,
+      ctrlKey: true,
+      metaKey: false,
+      currentResolution: "250 kb",
+      resolutionOptions,
+    })).toBeNull();
+    expect(contactResolutionWheelIntent({
+      deltaX: 0,
+      deltaY: -24,
+      ctrlKey: true,
+      metaKey: false,
+      currentResolution: "10 kb",
+      resolutionOptions,
+    })).toBeNull();
+  });
+});
 
 describe("contactWheelPanIntent", () => {
   it("maps trackpad movement independently across both genomic axes", () => {

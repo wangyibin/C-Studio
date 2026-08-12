@@ -99,6 +99,22 @@ describe("SyntenyDotplot", () => {
     expect(reverse?.top).toBeLessThan(positive?.top ?? 0);
   });
 
+  it("keeps segment endpoints aligned on a non-square canvas", () => {
+    const canvasAspectRatio = 2;
+    const block = buildDotplotLayout(syntenyView, canvasAspectRatio).blocks[0];
+    expect(block).toBeDefined();
+
+    const angleRadians = ((block?.angle ?? 0) * Math.PI) / 180;
+    const renderedDeltaXPercent = (block?.width ?? 0) * Math.cos(angleRadians);
+    const renderedDeltaYPercent = canvasAspectRatio
+      * (block?.width ?? 0)
+      * Math.sin(angleRadians);
+
+    expect(block?.left).toBe(53);
+    expect(renderedDeltaXPercent).toBeCloseTo(22, 8);
+    expect(renderedDeltaYPercent).toBeCloseTo(-21.5, 8);
+  });
+
   it("separates reference chromosomes into stable target lanes", () => {
     const layout = buildDotplotLayout({
       ...syntenyView,
@@ -225,6 +241,48 @@ describe("SyntenyDotplot", () => {
 
     expect(track.chromosomes.map((chromosome) => chromosome.id)).toEqual(["Chr01", "Chr02"]);
     expect(track.chromosomes[0]?.left).toBeLessThan(track.chromosomes[1]?.left ?? 0);
+  });
+
+  it("uses compact visual bands without removing chromosome hit segments", () => {
+    const assemblyBlocks = [
+      ["Chr01", 0, 400],
+      ["Chr02", 400, 800],
+      ["unplaced-1", 800, 805],
+      ["unplaced-2", 805, 810],
+      ["unplaced-3", 810, 815],
+      ["unplaced-4", 815, 820],
+    ].map(([id, visualStart, visualEnd]) => ({
+      id: String(id),
+      objectId: String(id),
+      sourceId: String(id),
+      sourceStart: 0,
+      sourceEnd: Number(visualEnd) - Number(visualStart),
+      visualStart: Number(visualStart),
+      visualEnd: Number(visualEnd),
+      orientation: "+" as const,
+    }));
+    const overviewTrack = buildAssemblyTrack({
+      viewport: { xStart: 0, xEnd: 1_000, yStart: 0, yEnd: 1 },
+      blocks: [],
+    }, assemblyBlocks, 100);
+
+    expect(overviewTrack.chromosomes).toHaveLength(6);
+    expect(overviewTrack.chromosomeBands.map((band) => band.objectIds)).toEqual([
+      ["Chr01"],
+      ["Chr02"],
+      ["unplaced-1", "unplaced-2", "unplaced-3", "unplaced-4"],
+    ]);
+
+    const zoomedTrack = buildAssemblyTrack({
+      viewport: { xStart: 800, xEnd: 820, yStart: 0, yEnd: 1 },
+      blocks: [],
+    }, assemblyBlocks, 100);
+    expect(zoomedTrack.chromosomeBands.map((band) => band.objectIds)).toEqual([
+      ["unplaced-1"],
+      ["unplaced-2"],
+      ["unplaced-3"],
+      ["unplaced-4"],
+    ]);
   });
 
 });

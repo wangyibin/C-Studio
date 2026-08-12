@@ -55,16 +55,31 @@ export function displayContactMapForPendingLayer(
   const hasPendingVisibleTiles = pendingContactMap.cells.length > 0
     || (pendingContactMap.tiles?.length ?? 0) > 0
     || (pendingContactMap.previewTiles?.length ?? 0) > 0;
-  if (hasPendingVisibleTiles || !previousContactMap) {
+  if (!previousContactMap) {
     return pendingContactMap;
   }
-
   const layersAreCompatible = !visibleLayerComplete
     && pendingContactMap.resolution === previousContactMap.resolution
     && (pendingContactMap.tileSizeBins ?? 256) === (previousContactMap.tileSizeBins ?? 256)
     && pendingContactMap.layoutScope !== undefined
     && pendingContactMap.layoutScope === previousContactMap.layoutScope;
   if (layersAreCompatible) {
+    if (hasPendingVisibleTiles) {
+      const retainedTiles = contactTilesWithPreviewFallback(
+        [
+          ...(pendingContactMap.cachedTiles ?? []),
+          ...(pendingContactMap.tiles ?? []),
+        ],
+        [
+          ...(previousContactMap.cachedTiles ?? []),
+          ...(previousContactMap.tiles ?? []),
+        ],
+      );
+      return {
+        ...pendingContactMap,
+        cachedTiles: retainedTiles,
+      };
+    }
     return {
       ...previousContactMap,
       viewport: pendingContactMap.viewport,

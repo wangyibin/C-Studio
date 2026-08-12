@@ -1,6 +1,8 @@
 import { useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, PointerEvent } from "react";
 import { createPortal } from "react-dom";
+import { assemblyScaffoldColorMap, unplacedAssemblyColor } from "../state/assemblyPalette";
+import { defaultGfaHomologPattern } from "../state/gfaHomologLayout";
 
 export type GenomeAxis = "x" | "y";
 
@@ -21,6 +23,7 @@ export interface GenomeAxisNavigatorProps {
   onPreviewCancel?: () => void;
   onCommit: (centerRatio: number) => void;
   ariaLabel?: string;
+  homologPattern?: string;
 }
 
 export interface GenomeViewportWindow {
@@ -277,6 +280,7 @@ function formatMb(value: number): string {
 
 export function GenomeAxisNavigator({
   ariaLabel,
+  homologPattern = defaultGfaHomologPattern,
   assemblyBlocks,
   axis,
   centerMb,
@@ -291,6 +295,10 @@ export function GenomeAxisNavigator({
   const segments = useMemo(
     () => buildGenomeSegments(assemblyBlocks, safeTotalSpanMb),
     [assemblyBlocks, safeTotalSpanMb],
+  );
+  const chromosomeColors = useMemo(
+    () => assemblyScaffoldColorMap(segments.map((segment) => segment.objectId), homologPattern),
+    [homologPattern, segments],
   );
   const dragSession = useRef<DragSession | null>(null);
   const [previewCenterRatio, setPreviewCenterRatio] = useState<number | null>(null);
@@ -465,6 +473,7 @@ export function GenomeAxisNavigator({
             return axis === "x" ? (
               <rect
                 className={`genome-axis-segment segment-tone-${index % 5}`}
+                style={{ fill: chromosomeColors.get(segment.objectId) ?? unplacedAssemblyColor }}
                 data-object-id={segment.objectId}
                 key={segment.id}
                 x={start}
@@ -488,6 +497,7 @@ export function GenomeAxisNavigator({
             ) : (
               <rect
                 className={`genome-axis-segment segment-tone-${index % 5}`}
+                style={{ fill: chromosomeColors.get(segment.objectId) ?? unplacedAssemblyColor }}
                 data-object-id={segment.objectId}
                 key={segment.id}
                 x="2"

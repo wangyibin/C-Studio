@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { LocateFixed, Maximize2 } from "lucide-react";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import { contactColorCss } from "../state/contactColor";
 import {
@@ -20,12 +21,14 @@ import {
   type AssemblyBlockGroup,
 } from "../state/assemblyEditing";
 import type { ContactMapLayoutBlock } from "../state/importers";
+import type { GfaEvidenceDocument } from "../state/gfa";
 import {
   SyntenyDotplot,
 } from "./SyntenyDotplot";
 import type { SyntenyView } from "../state/syntenyView";
 import type { OperationRecord, UiAction, UiState } from "../state/uiState";
 import { fitContextMenuToViewport } from "./AssemblyContextMenu";
+import { GfaPreviewCard } from "./GfaGraphPanel";
 
 interface InspectorPanelProps {
   dataset: ExampleDatasetSummary | null;
@@ -41,6 +44,11 @@ interface InspectorPanelProps {
   selectedAssemblyBlockIds: string[];
   pafText: string;
   onPafTextChange: (value: string) => void;
+  gfaDocument?: GfaEvidenceDocument | null;
+  gfaHomologPattern?: string;
+  onExpandHeatmap?: () => void;
+  onOpenGfaPanel?: () => void;
+  gfaPreviewScaffoldIds?: ReadonlySet<string>;
 }
 
 export function InspectorPanel({
@@ -57,6 +65,11 @@ export function InspectorPanel({
   selectedAssemblyBlockIds,
   pafText,
   onPafTextChange,
+  gfaDocument = null,
+  gfaHomologPattern = "(Chr\\d+)g(\\d+)",
+  onExpandHeatmap = () => undefined,
+  onOpenGfaPanel = () => undefined,
+  gfaPreviewScaffoldIds = new Set<string>(),
 }: InspectorPanelProps) {
   const [historyMenu, setHistoryMenu] = useState<{
     id: number;
@@ -117,21 +130,39 @@ export function InspectorPanel({
     <aside className="inspector" aria-label="Inspector">
       <section className={`overview-panel inspector-overview${
         uiState.activeOverviewMode === "synteny" ? " synteny-overview-active" : ""
+      }${
+        uiState.activeOverviewMode === "gfa" ? " gfa-overview-active" : ""
       }`}>
         <div className="panel-tabs compact-tabs" role="tablist" aria-label="Overview mode">
           <button
             type="button"
             className={`panel-tab ${uiState.activeOverviewMode === "overview" ? "active" : ""}`}
+            title="Click to preview; double-click to expand the heatmap"
             onClick={() => onUiAction({ type: "setOverviewMode", mode: "overview" })}
+            onDoubleClick={onExpandHeatmap}
           >
             Overview
           </button>
           <button
             type="button"
             className={`panel-tab ${uiState.activeOverviewMode === "synteny" ? "active" : ""}`}
+            title="Click to preview; double-click to open the interactive synteny view"
             onClick={() => onUiAction({ type: "setOverviewMode", mode: "synteny" })}
+            onDoubleClick={() => onUiAction({ type: "setSyntenySplitOpen", open: true })}
           >
             Synteny
+          </button>
+          <button
+            type="button"
+            className={`panel-tab ${uiState.activeOverviewMode === "gfa" ? "active" : ""}`}
+            disabled={!gfaDocument}
+            title={gfaDocument
+              ? "Click to preview; double-click to open the GFA graph panel"
+              : "Import a GFA file to enable this preview"}
+            onClick={() => onUiAction({ type: "setOverviewMode", mode: "gfa" })}
+            onDoubleClick={onOpenGfaPanel}
+          >
+            GFA Preview
           </button>
         </div>
         {uiState.activeOverviewMode === "overview" ? (
@@ -149,8 +180,9 @@ export function InspectorPanel({
             )}
             uiState={uiState}
             onUiAction={onUiAction}
+            onExpand={onExpandHeatmap}
           />
-        ) : (
+        ) : uiState.activeOverviewMode === "synteny" ? (
           <SyntenyPreview
             syntenyView={syntenyView}
             onExpand={() => onUiAction({ type: "setSyntenySplitOpen", open: true })}
@@ -159,6 +191,17 @@ export function InspectorPanel({
             uiState={uiState}
             onUiAction={onUiAction}
           />
+        ) : gfaDocument ? (
+          <GfaPreviewCard
+            document={gfaDocument}
+            assemblyBlocks={assemblyBlocks}
+            homologPattern={gfaHomologPattern}
+            onExpand={onOpenGfaPanel}
+            embedded
+            visibleScaffoldIds={gfaPreviewScaffoldIds}
+          />
+        ) : (
+          <p className="empty-state">Import a GFA file to preview the assembly graph.</p>
         )}
       </section>
 
@@ -463,7 +506,15 @@ function ContigOccurrenceSummary({
   return (
     <section className="contig-occurrences" aria-label="Contig occurrences">
       <div className="contig-occurrence-heading">
-        <span>{assemblyContigDisplayName(contig)}</span>
+        <button
+          type="button"
+          aria-label={`Center and select ${assemblyContigDisplayName(contig)}`}
+          title="Center this contig in the heatmap"
+          onClick={() => onUiAction({ type: "focusAssemblyContig", id: contig.id })}
+        >
+          <span>{assemblyContigDisplayName(contig)}</span>
+          <LocateFixed size={12} aria-hidden="true" />
+        </button>
         <strong>{formatCount(coveringCopyCount, "copy", "copies")}</strong>
       </div>
       <dl>
@@ -551,11 +602,10 @@ function ContigPlacementItems({
         <li key={placement.id}>
           <button
             type="button"
-            aria-label={`Select ${assemblyContigDisplayName(placement)} at ${formatContigLocation(placement)}`}
+            aria-label={`Center and select ${assemblyContigDisplayName(placement)} at ${formatContigLocation(placement)}`}
             onClick={() => onUiAction({
-              type: "selectAssemblyContig",
+              type: "focusAssemblyContig",
               id: placement.id,
-              additive: false,
             })}
           >
             <span>{assemblyContigDisplayName(placement)} · {placement.objectId}</span>
@@ -678,18 +728,29 @@ function ChromosomeGroupList({
               ) : null}
             </form>
           ) : (
-            <button
-              type="button"
-              className="selection-group-header"
-              title={`Double-click to rename ${group.id}`}
-              onClick={() => onUiAction({ type: "selectAssemblyChromosome", id: group.id })}
-              onDoubleClick={() => beginChromosomeRename(group.id)}
-            >
-              <span>{group.id}</span>
-              <strong>
-                {group.selectedCount}/{group.totalCount}
-              </strong>
-            </button>
+            <div className="selection-group-heading">
+              <button
+                type="button"
+                className="selection-group-header"
+                title={`Double-click to rename ${group.id}`}
+                onClick={() => onUiAction({ type: "selectAssemblyChromosome", id: group.id })}
+                onDoubleClick={() => beginChromosomeRename(group.id)}
+              >
+                <span>{group.id}</span>
+                <strong>
+                  {group.selectedCount}/{group.totalCount}
+                </strong>
+              </button>
+              <button
+                type="button"
+                className="selection-group-locate-button"
+                aria-label={`Center and select chromosome ${group.id}`}
+                title={`Center chromosome ${group.id} in the heatmap`}
+                onClick={() => onUiAction({ type: "focusAssemblyChromosome", id: group.id })}
+              >
+                <LocateFixed size={12} aria-hidden="true" />
+              </button>
+            </div>
           )}
           <div className="selection-group-list">
             {group.blockIds.filter((blockId) => {
@@ -716,15 +777,20 @@ function ChromosomeGroupList({
                     className={`selection-chip ${isBlockSelected(selection, group.id, block) ? "selected" : ""}`}
                     aria-label={`Select block ${label}`}
                     title={label}
-                    onClick={() => onUiAction({
-                      type: "selectAssemblyContig",
-                      id: blockId,
-                      additive: Boolean(
-                        selection?.kind === "contigs"
-                        && (selection.ids.includes(blockId)
-                          || block.contigIds.some((id) => selection.ids.includes(id))),
-                      ),
-                    })}
+                    onClick={() => onUiAction(block.isComposite
+                      ? {
+                          type: "selectAssemblyContig",
+                          id: blockId,
+                          additive: Boolean(
+                            selection?.kind === "contigs"
+                            && (selection.ids.includes(blockId)
+                              || block.contigIds.some((id) => selection.ids.includes(id))),
+                          ),
+                        }
+                      : {
+                          type: "focusAssemblyContig",
+                          id: childContigs[0]?.id ?? blockId,
+                        })}
                   >
                     <span className={block.isComposite ? undefined : "selection-contig-label"}>
                       {label}
@@ -734,9 +800,23 @@ function ChromosomeGroupList({
                   {block.isComposite ? (
                     <div className="selection-contig-children" aria-label={`Contigs in ${block.id}`}>
                       {childContigs.map((contig) => (
-                        <span key={contig.id} title={`${assemblyContigDisplayName(contig)} ${contig.orientation}`}>
-                          {assemblyContigDisplayName(contig)}
-                        </span>
+                        <button
+                          type="button"
+                          key={contig.id}
+                          title={`Center ${assemblyContigDisplayName(contig)} (${contig.orientation})`}
+                          aria-label={`Center and select ${assemblyContigDisplayName(contig)}, orientation ${contig.orientation}`}
+                          onClick={() => onUiAction({ type: "focusAssemblyContig", id: contig.id })}
+                        >
+                          <span>{assemblyContigDisplayName(contig)}</span>
+                          <strong
+                            className={`selection-contig-orientation orientation-${
+                              contig.orientation === "+" ? "forward" : contig.orientation === "-" ? "reverse" : "unknown"
+                            }`}
+                            aria-hidden="true"
+                          >
+                            {contig.orientation}
+                          </strong>
+                        </button>
                       ))}
                     </div>
                   ) : null}
@@ -782,6 +862,7 @@ interface ContactOverviewProps {
   totalSpanBp: number;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
+  onExpand: () => void;
 }
 
 export function contactOverviewMapForDisplayedNormalization(
@@ -800,6 +881,7 @@ function ContactOverview({
   totalSpanBp,
   uiState,
   onUiAction,
+  onExpand,
 }: ContactOverviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const displayedOverview = contactOverviewMapForDisplayedNormalization(
@@ -909,6 +991,21 @@ function ContactOverview({
         height="320"
         aria-hidden="true"
       />
+      <button
+        className="overview-expand-button"
+        type="button"
+        aria-label="Expand heatmap window"
+        title="Expand heatmap window"
+        onPointerDown={(event) => event.stopPropagation()}
+        onPointerUp={(event) => event.stopPropagation()}
+        onPointerCancel={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          event.stopPropagation();
+          onExpand();
+        }}
+      >
+        <Maximize2 size={11} aria-hidden="true" />
+      </button>
       <div
         className="overview-window"
         style={{
@@ -1019,6 +1116,15 @@ function SyntenyPreview({
         uiState={uiState}
         onUiAction={onUiAction}
       />
+      <button
+        className="synteny-preview-expand-button"
+        type="button"
+        aria-label="Open interactive synteny view"
+        title="Open interactive synteny view"
+        onClick={onExpand}
+      >
+        <Maximize2 size={11} aria-hidden="true" />
+      </button>
     </div>
   );
 }

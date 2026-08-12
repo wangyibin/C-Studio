@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc && vite build",
+    "benchmark:contact-delta": "vite-node scripts/benchmark-contact-tile-delta.ts",
     "test": "vitest run",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "tauri": "tauri"

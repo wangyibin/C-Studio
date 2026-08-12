@@ -22,6 +22,7 @@ import type { ContactColorScale } from "./contactColorScale";
 import {
   chooseContactResolutionForBpPerPixel,
   clampContactResolutionToViewport,
+  contactResolutionToBasePairs,
   contactResolutionLevelsForViewport,
   contactResolutionLevels,
   contactWholeGenomeViewportSpanMb,
@@ -46,6 +47,11 @@ export type ContactResolution =
   | "25 kb"
   | "10 kb"
   | "5 kb";
+
+// Manual pyramid changes keep the genomic viewport fixed. Bound the number of
+// matrix bins across the longer viewport axis so choosing a very fine level on
+// a whole-genome view cannot fan out into thousands of visible tile requests.
+const maxManualContactBinsPerAxis = 6_144;
 export type ContactColormap = "Reds" | "Viridis" | "Magma" | "Inferno" | "Turbo";
 export type Normalization =
   | "None (Raw)"
@@ -100,7 +106,7 @@ export interface OperationRecord {
 export type TrackId = "coverage" | "agp";
 export type LayoutPanel = "left" | "right" | "bottom";
 export type ColorScaleField = "min" | "max";
-export type OverviewMode = "overview" | "synteny";
+export type OverviewMode = "overview" | "synteny" | "gfa";
 
 export interface UiState {
   selectedTool: Tool;
@@ -175,7 +181,11 @@ export type UiAction =
   | { type: "toggleLayoutPanel"; panel: LayoutPanel }
   | { type: "setSyntenySplitOpen"; open: boolean }
   | { type: "adjustContactResolution"; direction: "decrease" | "increase" }
-  | { type: "setContactResolution"; resolution: ContactResolution }
+  | {
+      type: "setContactResolution";
+      resolution: ContactResolution;
+      preserveViewport?: boolean;
+    }
   | { type: "toggleContactResolutionLock" }
   | {
       type: "setContactViewportMetrics";
@@ -232,8 +242,10 @@ export type UiAction =
   | { type: "toggleAssemblyOverlay"; overlay: "chromosome" | "block" | "contig" }
   | { type: "setAssemblyOverlayVisibility"; chromosome: boolean; block?: boolean; contig: boolean }
   | { type: "selectAssemblyContig"; id: string; additive: boolean }
+  | { type: "focusAssemblyContig"; id: string }
   | { type: "selectAssemblyContigs"; ids: string[] }
   | { type: "selectAssemblyChromosome"; id: string }
+  | { type: "focusAssemblyChromosome"; id: string }
   | { type: "clearAssemblySelection" }
   | { type: "reverseAssemblySelection" }
   | {
@@ -251,6 +263,7 @@ export type UiAction =
   | { type: "splitAssemblyContig"; blockId: string; visualPosition: number }
   | { type: "deleteAssemblyGaps" }
   | { type: "renameAssemblySelection"; name: string }
+  | { type: "clearLoadedData" }
   | { type: "appendLog"; message: string };
 
 export const resolutions: Resolution[] = ["10 kb", "25 kb", "50 kb", "100 kb"];
@@ -298,6 +311,7 @@ export function contactNormalizationLabel(
 export function availableContactResolutions(
   contact: UiState["contact"],
   totalSpanMb = contact.totalSpanMb,
+  preserveViewport = false,
 ): ContactResolution[] {
   const wholeGenomeViewportSpanMb = maximumContactViewportSpanMb(
     totalSpanMb,
@@ -318,7 +332,34 @@ export function availableContactResolutions(
   const firstIndex = currentIndex >= 0 && currentIndex < fittedIndex
     ? currentIndex
     : fittedIndex;
-  return [...contactResolutionLevels.slice(Math.max(0, firstIndex))];
+  const firstAvailableIndex = Math.max(0, firstIndex);
+  if (!preserveViewport) {
+    return [...contactResolutionLevels.slice(firstAvailableIndex)];
+  }
+  const { xSpanMb, ySpanMb } = contactViewportAxisSpansMb(
+    contact.viewportSpanMb,
+    totalSpanMb,
+    contact.viewportWidthPx,
+    contact.viewportHeightPx,
+  );
+  const longestViewportSpanBp = Math.max(xSpanMb, ySpanMb) * 1_000_000;
+  const lastSafeIndex = contactResolutionLevels.reduce(
+    (lastIndex, resolution, index) => (
+      longestViewportSpanBp / contactResolutionToBasePairs(resolution)
+        <= maxManualContactBinsPerAxis
+        ? index
+        : lastIndex
+    ),
+    firstAvailableIndex,
+  );
+  // Preserve the active level after a resize or a restored session even if it
+  // temporarily exceeds the manual-load budget. The next explicit choice is
+  // still clamped to the safe portion of the pyramid.
+  const lastAvailableIndex = currentIndex >= firstAvailableIndex
+    ? Math.max(lastSafeIndex, currentIndex)
+    : lastSafeIndex;
+
+  return [...contactResolutionLevels.slice(firstAvailableIndex, lastAvailableIndex + 1)];
 }
 
 export function createInitialUiState(initialMessage: string): UiState {
@@ -383,6 +424,36 @@ export function createInitialUiState(initialMessage: string): UiState {
 
 export function reduceUiState(state: UiState, action: UiAction): UiState {
   switch (action.type) {
+    case "clearLoadedData": {
+      const initial = createInitialUiState("All loaded data cleared");
+      return withLog(
+        {
+          ...state,
+          activeOverviewMode: "overview",
+          operationHistory: [],
+          redoStack: [],
+          nextOperationId: 1,
+          historyPreviewOperationId: null,
+          layout: {
+            ...state.layout,
+            syntenySplitOpen: false,
+          },
+          contact: {
+            ...initial.contact,
+            viewportSizePx: state.contact.viewportSizePx,
+            viewportWidthPx: state.contact.viewportWidthPx,
+            viewportHeightPx: state.contact.viewportHeightPx,
+            colormap: state.contact.colormap,
+          },
+          assembly: {
+            ...state.assembly,
+            blocks: [],
+            selection: null,
+          },
+        },
+        "All loaded data cleared",
+      );
+    }
     case "selectTool":
       return withLog({ ...state, selectedTool: action.tool }, `Tool selected: ${capitalize(action.tool)}`);
     case "setEditMode":
@@ -582,7 +653,11 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
       return withLog(setContactResolution(state, resolution), `Contact resolution set to ${resolution}`);
     }
     case "setContactResolution": {
-      const nextState = setContactResolution(state, action.resolution);
+      const nextState = setContactResolution(
+        state,
+        action.resolution,
+        action.preserveViewport ?? false,
+      );
       return withLog(
         nextState,
         `Contact resolution set to ${nextState.contact.resolution}`,
@@ -1257,6 +1332,70 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         },
       };
     }
+    case "focusAssemblyContig": {
+      const contig = state.assembly.blocks.find((block) => block.id === action.id);
+      if (!contig) {
+        return state;
+      }
+      const centerMb = roundContactViewportMb(
+        (contig.visualStart + contig.visualEnd) / 2_000_000,
+      );
+      const totalSpanMb = Math.max(
+        0.000001,
+        ...state.assembly.blocks.map((block) => block.visualEnd / 1_000_000),
+      );
+      const contigSpanMb = Math.max(
+        0.000001,
+        (contig.visualEnd - contig.visualStart) / 1_000_000,
+      );
+      const viewportWidthPx = sanitizeContactViewportSizePx(state.contact.viewportWidthPx);
+      const viewportHeightPx = sanitizeContactViewportSizePx(state.contact.viewportHeightPx);
+      const longestAxisScale = Math.max(viewportWidthPx, viewportHeightPx)
+        / Math.min(viewportWidthPx, viewportHeightPx);
+      const centeredSpanLimitMb = Math.max(
+        0.000001,
+        (2 * Math.min(centerMb, totalSpanMb - centerMb)) / longestAxisScale,
+      );
+      const contextSpanMb = Math.max(contigSpanMb * 4, totalSpanMb * 0.02);
+      const viewportSpanMb = roundContactViewportMb(Math.max(
+        0.000001,
+        Math.min(state.contact.viewportSpanMb, contextSpanMb, centeredSpanLimitMb),
+      ));
+      const resolution = state.contact.resolutionLocked
+        ? state.contact.resolution
+        : chooseContactResolutionForBpPerPixel(
+            (viewportSpanMb * 1_000_000)
+            / sanitizeContactViewportSizePx(state.contact.viewportSizePx),
+          );
+      const colorScale = resolution === state.contact.resolution
+        ? state.contact.colorScale
+        : state.contact.colorScaleByResolution[resolution] ?? {
+            ...state.contact.colorScale,
+            auto: true,
+          };
+
+      return withLog(
+        {
+          ...state,
+          contact: {
+            ...state.contact,
+            totalSpanMb,
+            viewportSpanMb,
+            viewportCenterMb: centerMb,
+            viewportCenterXMb: centerMb,
+            viewportCenterYMb: centerMb,
+            jumpTargetMb: centerMb,
+            resolution,
+            colorScale,
+          },
+          assembly: {
+            ...state.assembly,
+            selection: { kind: "contigs", ids: [contig.id], exact: true },
+          },
+        },
+        `Focused contig ${contig.sourceId} at ${contig.objectId}`,
+      );
+    }
     case "selectAssemblyContigs":
       return {
         ...state,
@@ -1275,6 +1414,59 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           selection: selectChromosome(state.assembly.selection, action.id, false),
         },
       };
+    case "focusAssemblyChromosome": {
+      const chromosomeBlocks = state.assembly.blocks.filter(
+        (block) => block.objectId === action.id,
+      );
+      if (chromosomeBlocks.length === 0) {
+        return state;
+      }
+      const visualStart = Math.min(...chromosomeBlocks.map((block) => block.visualStart));
+      const visualEnd = Math.max(...chromosomeBlocks.map((block) => block.visualEnd));
+      const totalSpanMb = Math.max(
+        0.000001,
+        ...state.assembly.blocks.map((block) => block.visualEnd / 1_000_000),
+      );
+      const centerMb = roundContactViewportMb((visualStart + visualEnd) / 2_000_000);
+      const viewportSpanMb = roundContactViewportMb(Math.max(
+        0.000001,
+        Math.min(totalSpanMb, (visualEnd - visualStart) / 1_000_000),
+      ));
+      const resolution = state.contact.resolutionLocked
+        ? state.contact.resolution
+        : chooseContactResolutionForBpPerPixel(
+            (viewportSpanMb * 1_000_000)
+            / sanitizeContactViewportSizePx(state.contact.viewportSizePx),
+          );
+      const colorScale = resolution === state.contact.resolution
+        ? state.contact.colorScale
+        : state.contact.colorScaleByResolution[resolution] ?? {
+            ...state.contact.colorScale,
+            auto: true,
+          };
+
+      return withLog(
+        {
+          ...state,
+          contact: {
+            ...state.contact,
+            totalSpanMb,
+            viewportSpanMb,
+            viewportCenterMb: centerMb,
+            viewportCenterXMb: centerMb,
+            viewportCenterYMb: centerMb,
+            jumpTargetMb: centerMb,
+            resolution,
+            colorScale,
+          },
+          assembly: {
+            ...state.assembly,
+            selection: { kind: "chromosome", id: action.id },
+          },
+        },
+        `Focused chromosome ${action.id}`,
+      );
+    }
     case "clearAssemblySelection":
       return {
         ...state,
@@ -1634,24 +1826,89 @@ function sameContactViewportSpan(left: number, right: number) {
   return Math.abs(left - right) <= 0.000001;
 }
 
-function setContactResolution(state: UiState, requestedResolution: ContactResolution): UiState {
+function setContactResolution(
+  state: UiState,
+  requestedResolution: ContactResolution,
+  preserveViewport = false,
+): UiState {
   const totalSpanMb = sanitizeContactTotalSpanMb(state.contact.totalSpanMb);
   const wholeGenomeViewportSpanMb = maximumContactViewportSpanMb(
     totalSpanMb,
     state.contact.viewportWidthPx,
     state.contact.viewportHeightPx,
   );
-  const resolution = clampContactResolutionToViewport(
-    requestedResolution,
-    wholeGenomeViewportSpanMb,
-    state.contact.viewportSizePx,
-  );
-  const viewportSpanMb = roundContactViewportMb(
-    contactViewportSpanForResolution(
-      resolution,
-      state.contact.viewportSizePx,
+  if (!preserveViewport) {
+    const resolution = clampContactResolutionToViewport(
+      requestedResolution,
       wholeGenomeViewportSpanMb,
-    ),
+      state.contact.viewportSizePx,
+    );
+    const viewportSpanMb = roundContactViewportMb(
+      contactViewportSpanForResolution(
+        resolution,
+        state.contact.viewportSizePx,
+        wholeGenomeViewportSpanMb,
+      ),
+    );
+    const { xSpanMb, ySpanMb } = contactViewportAxisSpansMb(
+      viewportSpanMb,
+      totalSpanMb,
+      state.contact.viewportWidthPx,
+      state.contact.viewportHeightPx,
+    );
+    const viewportCenterXMb = clampContactViewportCenter(
+      state.contact.viewportCenterXMb,
+      xSpanMb,
+      totalSpanMb,
+    );
+    const viewportCenterYMb = clampContactViewportCenter(
+      state.contact.viewportCenterYMb,
+      ySpanMb,
+      totalSpanMb,
+    );
+    const colorScale = resolution === state.contact.resolution
+      ? state.contact.colorScale
+      : state.contact.colorScaleByResolution[resolution] ?? {
+          ...state.contact.colorScale,
+          auto: true,
+        };
+
+    return {
+      ...state,
+      contact: {
+        ...state.contact,
+        resolution,
+        viewportSpanMb,
+        viewportCenterMb: roundContactViewportMb(
+          (viewportCenterXMb + viewportCenterYMb) / 2,
+        ),
+        viewportCenterXMb,
+        viewportCenterYMb,
+        jumpTargetMb: viewportCenterXMb,
+        colorScale,
+      },
+    };
+  }
+
+  const availableResolutions = availableContactResolutions(
+    state.contact,
+    totalSpanMb,
+    true,
+  );
+  const requestedIndex = contactResolutionLevels.indexOf(requestedResolution);
+  const firstAvailable = availableResolutions[0] ?? state.contact.resolution;
+  const lastAvailable = availableResolutions[availableResolutions.length - 1] ?? firstAvailable;
+  const firstAvailableIndex = contactResolutionLevels.indexOf(firstAvailable);
+  const lastAvailableIndex = contactResolutionLevels.indexOf(lastAvailable);
+  const resolution = requestedIndex < firstAvailableIndex
+    ? firstAvailable
+    : requestedIndex > lastAvailableIndex
+      ? lastAvailable
+      : requestedResolution;
+  // Resolution selection changes the .mcool pyramid level, not the camera.
+  // Zoom actions remain responsible for changing viewportSpanMb.
+  const viewportSpanMb = roundContactViewportMb(
+    clamp(state.contact.viewportSpanMb, 0.000001, totalSpanMb),
   );
   const { xSpanMb, ySpanMb } = contactViewportAxisSpansMb(
     viewportSpanMb,

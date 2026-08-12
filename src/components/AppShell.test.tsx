@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { ContactMapView, ExampleDatasetSummary } from "../App";
 import { keyboardShortcutLabels } from "../state/keyboardShortcutLabels";
 import { createInitialUiState, type UiState } from "../state/uiState";
-import { AppShell, clampInspectorPanelWidth } from "./AppShell";
+import { AppShell, clampGfaPanelHeight, clampInspectorPanelWidth } from "./AppShell";
 
 function renderShell(
   rightCollapsed = false,
@@ -15,6 +15,7 @@ function renderShell(
     isAgpDirty?: boolean;
     autoSaveEnabled?: boolean;
     autoSaveAvailable?: boolean;
+    gfaHomologPattern?: string;
   } = {},
 ) {
   const uiState = createInitialUiState("Ready");
@@ -30,11 +31,16 @@ function renderShell(
       coverageView={null}
       pafText=""
       pafImported={false}
+      gfaDocument={null}
+      gfaHomologPattern={project.gfaHomologPattern ?? "(Chr\\d+)g(\\d+)"}
+      onGfaHomologPatternChange={() => undefined}
       onPafTextChange={() => undefined}
       agpInputRef={createRef<HTMLInputElement>()}
+      gfaInputRef={createRef<HTMLInputElement>()}
       pafInputRef={createRef<HTMLInputElement>()}
       coverageInputRef={createRef<HTMLInputElement>()}
       onAgpFileSelected={() => undefined}
+      onGfaFileSelected={() => undefined}
       onContactFileSelected={() => undefined}
       onPafFileRequested={() => undefined}
       onPafFileSelected={() => undefined}
@@ -46,6 +52,7 @@ function renderShell(
       isAgpDirty={project.isAgpDirty ?? false}
       onAutoSaveEnabledChange={() => undefined}
       onLoadExample={() => undefined}
+      onClearAllData={() => undefined}
       status={{
         engine: "c-studio-core",
         coordinate_convention: "0-based half-open",
@@ -66,12 +73,18 @@ describe("AppShell confirmed workspace", () => {
 
     expect(markup).toContain('class="app-toolbar-stack"');
     expect(markup).toContain('class="global-toolbar"');
+    expect(markup).toContain('class="global-homolog-pattern"');
+    expect(markup).toContain('aria-label="Homologous chromosome regular expression"');
+    expect(markup).toContain('value="(Chr\\d+)g(\\d+)"');
     expect(markup).toContain('class="heatmap-toolbar"');
     expect(markup).toContain("Assembly (.agp)");
+    expect(markup).toContain("Assembly graph (.gfa)");
     expect(markup).toContain("Contact map (.cool/.mcool)");
     expect(markup).toContain("Synteny alignments (.paf)");
     expect(markup).toContain("Coverage track");
     expect(markup).toContain("Load example project");
+    expect(markup).toContain("Clear all loaded data…");
+    expect(markup).toContain('title="No loaded data"');
     expect(markup).toContain('aria-keyshortcuts="F10"');
     expect(markup).toContain('role="separator"');
     expect(markup).toContain('aria-label="Resize inspector"');
@@ -90,6 +103,21 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain(`<dt>Delete contig</dt><dd>${shortcuts.deleteContig}</dd>`);
   });
 
+  it("marks an invalid global homolog regex in the top toolbar", () => {
+    const markup = renderShell(false, null, "None (Raw)", {
+      gfaHomologPattern: "(Chr\\d+",
+    });
+
+    expect(markup).toContain('class="global-homolog-pattern invalid"');
+    expect(markup).toContain("Invalid regular expression:");
+  });
+
+  it("clamps the bottom GFA panel between a usable minimum and workspace share", () => {
+    expect(clampGfaPanelHeight(80, 900)).toBe(180);
+    expect(clampGfaPanelHeight(360, 900)).toBe(360);
+    expect(clampGfaPanelHeight(900, 900)).toBe(585);
+  });
+
   it("removes the former side and bottom tool surfaces while wiring both genome axes", () => {
     const markup = renderShell();
 
@@ -105,6 +133,9 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('aria-label="Contig boxes"');
     expect(markup).toContain('aria-keyshortcuts="F2"');
     expect(markup).toContain('aria-keyshortcuts="F9"');
+    expect(markup).toContain('aria-label="Heatmap window controls"');
+    expect(markup).toContain('aria-label="Expand heatmap window"');
+    expect(markup).toContain('aria-label="Close heatmap window"');
   });
 
   it("marks unsaved names consistently and enables auto-save only after Save As", () => {
@@ -133,6 +164,8 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain("/tmp/renamed.agp*");
     expect(markup).toContain('aria-label="Auto-save" checked=""');
     expect(markup).not.toContain("Save As once to enable auto-save");
+    expect(markup).toContain('title="Remove every loaded data source"');
+    expect(markup).not.toContain('title="No loaded data"');
   });
 
   it("allows the inspector to collapse without changing the heatmap workspace", () => {

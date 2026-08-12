@@ -10,22 +10,37 @@ import {
 } from "lucide-react";
 import type { UiAction, UiState } from "../state/uiState";
 import { availableContactResolutions, normalizations } from "../state/uiState";
+import { contactResolutionToBasePairs } from "../state/contactResolution";
 import { resolveContactJumpInputs } from "../state/contactJump";
 
 export interface HeatmapToolbarProps {
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   totalSpanMb: number;
+  preserveResolutionViewport?: boolean;
+  availableResolutionBasePairs?: number[];
 }
 
-export function HeatmapToolbar({ onUiAction, totalSpanMb, uiState }: HeatmapToolbarProps) {
+export function HeatmapToolbar({
+  onUiAction,
+  preserveResolutionViewport = false,
+  availableResolutionBasePairs = [],
+  totalSpanMb,
+  uiState,
+}: HeatmapToolbarProps) {
   const safeTotalSpanMb = Number.isFinite(totalSpanMb) && totalSpanMb > 0
     ? totalSpanMb
     : uiState.contact.totalSpanMb;
-  const resolutionOptions = availableContactResolutions(
+  const viewportResolutionOptions = availableContactResolutions(
     uiState.contact,
     safeTotalSpanMb,
+    preserveResolutionViewport,
   );
+  const resolutionOptions = preserveResolutionViewport && availableResolutionBasePairs.length > 0
+    ? viewportResolutionOptions.filter((resolution) => (
+        availableResolutionBasePairs.includes(contactResolutionToBasePairs(resolution))
+      ))
+    : viewportResolutionOptions;
   const resolutionIndex = resolutionOptions.indexOf(uiState.contact.resolution);
   const safeResolutionIndex = Math.max(0, resolutionIndex);
   const colorScaleMin = uiState.contact.colorScale.min;
@@ -57,7 +72,11 @@ export function HeatmapToolbar({ onUiAction, totalSpanMb, uiState }: HeatmapTool
     const nextIndex = Math.min(resolutionOptions.length - 1, Math.max(0, rawIndex));
     const resolution = resolutionOptions[nextIndex];
     if (resolution && resolution !== uiState.contact.resolution) {
-      onUiAction({ type: "setContactResolution", resolution });
+      onUiAction({
+        type: "setContactResolution",
+        resolution,
+        preserveViewport: preserveResolutionViewport,
+      });
     }
   }
 

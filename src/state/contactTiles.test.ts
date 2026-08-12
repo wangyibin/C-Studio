@@ -9,6 +9,7 @@ import {
   contactTileKey,
   contactTileProjectionFingerprint,
   contactTileScope,
+  contactTileViewportSignature,
   contactTilesForViewport,
   createContactTileCacheKeyResolver,
   missingContactTiles,
@@ -102,6 +103,30 @@ describe("contact tile requests", () => {
       { tileX: 0, tileY: 1 },
       { tileX: 1, tileY: 1 },
     ]);
+  });
+
+  it("changes the viewport signature only after panning crosses a tile boundary", () => {
+    const initial = contactTileViewportSignature(
+      { xStart: 10_000, xEnd: 200_000, yStart: 20_000, yEnd: 210_000 },
+      1_000,
+      256,
+      1_000_000,
+    );
+    const insideSameTiles = contactTileViewportSignature(
+      { xStart: 20_000, xEnd: 210_000, yStart: 30_000, yEnd: 220_000 },
+      1_000,
+      256,
+      1_000_000,
+    );
+    const crossesRightEdge = contactTileViewportSignature(
+      { xStart: 80_000, xEnd: 270_000, yStart: 30_000, yEnd: 220_000 },
+      1_000,
+      256,
+      1_000_000,
+    );
+
+    expect(insideSameTiles).toBe(initial);
+    expect(crossesRightEdge).not.toBe(initial);
   });
 
   it("bounds visible tiles by the measured viewport after selecting 5 kb", () => {

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { AppShell } from "./components/AppShell";
 import { exportAgpText } from "./state/agpExport";
@@ -15,10 +15,18 @@ import {
 } from "./state/contactTileBinary";
 import { contactTileCellCount } from "./state/contactTileData";
 import {
+  ContactTileDeltaAccumulator,
+  type ContactTileDeltaRenderStream,
+} from "./state/contactTileDelta";
+import {
   displayContactMapForPendingLayer,
   shouldHoldPreviousContactMapFrame,
   shouldPublishContactMapLayer,
 } from "./state/contactMapView";
+import {
+  createContactPanPerformanceTracker,
+  type ContactPanPreview,
+} from "./state/contactPanPerformance";
 import { contactResolutionToBasePairs } from "./state/contactResolution";
 import { buildCenteredContactViewport } from "./state/contactViewport";
 import {
@@ -61,6 +69,10 @@ import {
   shouldResumeContactBackgroundSchedulingAfterFailure,
 } from "./state/contactOverviewTiles";
 import {
+  buildContactMainLodPlan,
+  maxExactMainContactTiles,
+} from "./state/contactMainLod";
+import {
   buildContactTileLoadPlan,
   buildContactTileWorld,
   projectContactTileWorldView,
@@ -72,6 +84,8 @@ import {
   type ContactMapLayoutBlock,
   summarizeAgpText,
 } from "./state/importers";
+import { parseGfaText, type GfaEvidenceDocument } from "./state/gfa";
+import { defaultGfaHomologPattern } from "./state/gfaHomologLayout";
 import { summarizePafText } from "./state/pafPreview";
 import {
   buildBrowserSyntenyView,
@@ -108,6 +122,7 @@ export interface ExampleDatasetSummary {
   coverage_path: string | null;
   agp_layout: AgpLayout;
   cool_path: string;
+  available_resolutions?: number[];
 }
 
 export interface ContactMapCell {
@@ -158,6 +173,7 @@ interface ImportedContactFile {
   path: string;
   name: string;
   size_bytes: number;
+  available_resolutions?: number[];
 }
 
 interface PendingResolutionPerformance {
@@ -205,6 +221,13 @@ interface ContactTileFrontendIpcPerformanceRequest {
   status: "ok" | "error";
 }
 
+interface ContactMapOverviewResponse {
+  sourceResolution: number;
+  resolution: number;
+  viewport: ContactMapView["viewport"];
+  cells: ContactMapCell[];
+}
+
 const samplePaf = [
   "ctg00003\t1400000\t120000\t760000\t+\tchrA\t2200000\t240000\t900000\t600000\t640000\t60",
   "ctg00008\t960000\t180000\t620000\t-\tchrA\t2200000\t1040000\t1500000\t390000\t440000\t48",
@@ -218,7 +241,8 @@ const browserFallbackStatus: AppStatus = {
 };
 const emptyLayout: AgpLayout = { blocks: [], totalSpan: 0 };
 const maxBackgroundPrefetchTiles = 16;
-const visibleContactTileRequestBatchSize = 2;
+const visibleContactTileRequestBatchSize = 8;
+const panVisibleContactTileRequestBatchSize = 2;
 const prefetchContactTileRequestBatchSize = 16;
 const contactViewportRequestDelayMs = 24;
 const secondaryTrackRequestDelayMs = 180;
@@ -227,6 +251,10 @@ const contactTileRequestCancelledMessage = "contact tile request cancelled";
 const autoSavePreferenceKey = "c-studio:auto-save-agp";
 const contactTileIpcPerformanceEnabled = isContactTilePerformanceEnabled();
 const contactTileBinaryEnabled = import.meta.env.VITE_CSTUDIO_TILE_BINARY !== "0";
+const contactTileStreamEnabled = import.meta.env.VITE_CSTUDIO_TILE_STREAM !== "0";
+const contactTileSingleScanEnabled = import.meta.env.VITE_CSTUDIO_TILE_SINGLE_SCAN !== "0";
+const contactTileDirectDeltaEnabled = import.meta.env.VITE_CSTUDIO_TILE_DIRECT_DELTA !== "0";
+const contactMainLodEnabled = import.meta.env.VITE_CSTUDIO_MAIN_LOD !== "0";
 
 function isContactTileRequestCancelled(error: unknown): boolean {
   return String(error).toLowerCase().includes(contactTileRequestCancelledMessage);
@@ -249,6 +277,29 @@ function registerContactMapLayout(layoutBlocks: ContactMapLayoutBlock[]) {
       layoutBlocks: contactLayoutRegistrationBlocks(layoutBlocks),
     },
   });
+}
+
+function loadContactOverviewWithLayoutHandle(
+  registry: ContactLayoutHandleRegistry,
+  layoutBlocks: ContactMapLayoutBlock[],
+  request: {
+    requestId: number;
+    generation: number;
+    coolPath: string;
+    sourceResolution: number;
+    targetResolution: number;
+    normalization: ContactNormalization;
+    viewport: ContactMapView["viewport"];
+  },
+) {
+  return registry.run(
+    layoutBlocks,
+    registerContactMapLayout,
+    (layoutHandle) => invoke<ContactMapOverviewResponse>(
+      "build_contact_map_overview_from_cool",
+      { request: { ...request, layoutHandle } },
+    ),
+  );
 }
 
 function logContactTileFrontendIpcPerformance(
@@ -400,10 +451,226 @@ function loadContactTilesWithLayoutHandle(
   );
 }
 
+function streamContactTilesWithLayoutHandle(
+  registry: ContactLayoutHandleRegistry,
+  layoutBlocks: ContactMapLayoutBlock[],
+  request: ContactTileHandleRequest,
+  chunks: ContactMapTileKey[][],
+  onChunk: (tiles: ContactMapTile[]) => void,
+) {
+  let attempt = 0;
+  return registry.run(
+    layoutBlocks,
+    registerContactMapLayout,
+    async (layoutHandle) => {
+      attempt += 1;
+      const invokeRequest = { ...request, layoutHandle };
+      const expectedChunks = chunks.filter((chunk) => chunk.length > 0).length;
+      if (expectedChunks === 0) {
+        return [];
+      }
+
+      const streamedTiles: ContactMapTile[] = [];
+      let responseBytes = 0;
+      let decodeUs = 0;
+      let receivedChunks = 0;
+      let resolveAllChunks!: () => void;
+      let rejectAllChunks!: (error: unknown) => void;
+      const allChunks = new Promise<void>((resolve, reject) => {
+        resolveAllChunks = resolve;
+        rejectAllChunks = reject;
+      });
+      const channel = new Channel<unknown>();
+      channel.onmessage = (rawResponse) => {
+        try {
+          const responseAt = performance.now();
+          const decoded = decodeContactTileBinaryV1(rawResponse);
+          decodeUs += Math.round(Math.max(0, performance.now() - responseAt) * 1_000);
+          if (decoded.tileSizeBins !== request.tileSizeBins) {
+            throw new Error(
+              `contact tile binary size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
+            );
+          }
+          responseBytes += decoded.byteLength;
+          streamedTiles.push(...decoded.tiles);
+          receivedChunks += 1;
+          onChunk(decoded.tiles);
+          if (receivedChunks === expectedChunks) {
+            resolveAllChunks();
+          }
+        } catch (error) {
+          rejectAllChunks(error);
+        }
+      };
+
+      const startedAt = performance.now();
+      let invokeUs = 0;
+      try {
+        await Promise.all([
+          invoke<void>("stream_contact_map_tiles_from_cool_binary_v1", {
+            request: invokeRequest,
+            chunks,
+            onChunk: channel,
+          }),
+          allChunks,
+        ]);
+        invokeUs = Math.round(Math.max(0, performance.now() - startedAt) * 1_000);
+        if (contactTileIpcPerformanceEnabled) {
+          logContactTileFrontendIpcPerformance({
+            requestId: request.requestId,
+            generation: request.generation,
+            purpose: request.purpose,
+            attempt,
+            targetResolution: request.targetResolution,
+            requestedTiles: request.tiles.length,
+            returnedTiles: streamedTiles.length,
+            responseCells: streamedTiles.reduce(
+              (total, tile) => total + contactTileCellCount(tile),
+              0,
+            ),
+            responseBytes,
+            invokeUs,
+            decodeUs,
+            transport: "array_buffer",
+            status: "ok",
+          });
+        }
+        return streamedTiles;
+      } catch (error) {
+        invokeUs = Math.round(Math.max(0, performance.now() - startedAt) * 1_000);
+        if (contactTileIpcPerformanceEnabled) {
+          logContactTileFrontendIpcPerformance({
+            requestId: request.requestId,
+            generation: request.generation,
+            purpose: request.purpose,
+            attempt,
+            targetResolution: request.targetResolution,
+            requestedTiles: request.tiles.length,
+            returnedTiles: streamedTiles.length,
+            responseCells: streamedTiles.reduce(
+              (total, tile) => total + contactTileCellCount(tile),
+              0,
+            ),
+            responseBytes,
+            invokeUs,
+            decodeUs,
+            transport: "array_buffer",
+            status: "error",
+          });
+        }
+        throw error;
+      }
+    },
+  );
+}
+
+function streamContactTileDeltasWithLayoutHandle(
+  registry: ContactLayoutHandleRegistry,
+  layoutBlocks: ContactMapLayoutBlock[],
+  request: ContactTileHandleRequest,
+  callbacks: {
+    onStart?: (accumulator: ContactTileDeltaAccumulator) => void;
+    onDelta?: () => void;
+    /** Compatibility path selected by VITE_CSTUDIO_TILE_DIRECT_DELTA=0. */
+    onChunk?: (tiles: ContactMapTile[]) => void;
+  },
+) {
+  return registry.run(
+    layoutBlocks,
+    registerContactMapLayout,
+    async (layoutHandle) => {
+      const accumulator = new ContactTileDeltaAccumulator(
+        request.tiles,
+        request.tileSizeBins,
+      );
+      callbacks.onStart?.(accumulator);
+      let responseBytes = 0;
+      let decodeUs = 0;
+      let resolveFinished!: () => void;
+      let rejectFinished!: (error: unknown) => void;
+      const finished = new Promise<void>((resolve, reject) => {
+        resolveFinished = resolve;
+        rejectFinished = reject;
+      });
+      const channel = new Channel<unknown>();
+      channel.onmessage = (rawResponse) => {
+        try {
+          const responseAt = performance.now();
+          const decoded = decodeContactTileBinaryV1(rawResponse);
+          decodeUs += Math.round(Math.max(0, performance.now() - responseAt) * 1_000);
+          responseBytes += decoded.byteLength;
+          if (decoded.tileSizeBins !== request.tileSizeBins) {
+            throw new Error(
+              `contact tile delta size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
+            );
+          }
+          if (decoded.tiles.length === 0) {
+            resolveFinished();
+            return;
+          }
+          const changedTileKeys = accumulator.merge(decoded.tiles);
+          if (changedTileKeys.length > 0) {
+            callbacks.onDelta?.();
+            if (callbacks.onChunk) {
+              callbacks.onChunk(accumulator.snapshotTiles(changedTileKeys));
+            }
+          }
+        } catch (error) {
+          rejectFinished(error);
+        }
+      };
+
+      const startedAt = performance.now();
+      try {
+        await Promise.all([
+          invoke<void>("stream_contact_map_tile_deltas_from_cool_binary_v1", {
+            request: { ...request, layoutHandle },
+            onChunk: channel,
+          }),
+          finished,
+        ]);
+        const tiles = accumulator.finish();
+        if (contactTileIpcPerformanceEnabled) {
+          logContactTileFrontendIpcPerformance({
+            requestId: request.requestId,
+            generation: request.generation,
+            purpose: request.purpose,
+            attempt: 1,
+            targetResolution: request.targetResolution,
+            requestedTiles: request.tiles.length,
+            returnedTiles: tiles.length,
+            responseCells: tiles.reduce(
+              (total, tile) => total + contactTileCellCount(tile),
+              0,
+            ),
+            responseBytes,
+            invokeUs: Math.round(Math.max(0, performance.now() - startedAt) * 1_000),
+            decodeUs,
+            transport: "array_buffer",
+            status: "ok",
+          });
+        }
+        return tiles;
+      } catch (error) {
+        rejectFinished(error);
+        throw error;
+      }
+    },
+  );
+}
+
 export function App() {
   const [status, setStatus] = useState<AppStatus>(browserFallbackStatus);
   const [dataset, setDataset] = useState<ExampleDatasetSummary | null>(null);
+  const [contactAvailableResolutions, setContactAvailableResolutions] = useState<number[]>([]);
   const [contactMap, setContactMap] = useState<ContactMapView | null>(null);
+  const [contactTileDeltaStream, setContactTileDeltaStream] = useState<
+    ContactTileDeltaRenderStream | null
+  >(null);
+  const [contactTilePreviewViewport, setContactTilePreviewViewport] = useState<
+    ContactPanPreview | null
+  >(null);
+  const pendingPanPerformancePreviewRef = useRef<ContactPanPreview | null>(null);
   const [overviewContactMap, setOverviewContactMap] = useState<ContactMapView | null>(null);
   const overviewContactMapRef = useRef<ContactMapView | null>(overviewContactMap);
   overviewContactMapRef.current = overviewContactMap;
@@ -437,13 +704,21 @@ export function App() {
   const [pafText, setPafText] = useState(samplePaf);
   const [pafPath, setPafPath] = useState<string | null>(null);
   const [pafImported, setPafImported] = useState(false);
+  const [gfaDocument, setGfaDocument] = useState<GfaEvidenceDocument | null>(null);
+  const [gfaHomologPattern, setGfaHomologPattern] = useState(defaultGfaHomologPattern);
   const [statusMessage, setStatusMessage] = useState("Workbench ready");
+  const [contactPanPerformanceLog, setContactPanPerformanceLog] = useState<string | null>(() => (
+    contactTileIpcPerformanceEnabled
+      ? "CSTUDIO_PERF event=contact_pan_pipeline status=armed"
+      : null
+  ));
   const savedAgpPathRef = useRef<string | null>(null);
   const [savedAgpPath, setSavedAgpPath] = useState<string | null>(null);
   const savingAgpRef = useRef(false);
   const [savedAgpText, setSavedAgpText] = useState("");
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(readAutoSavePreference);
   const agpInputRef = useRef<HTMLInputElement>(null);
+  const gfaInputRef = useRef<HTMLInputElement>(null);
   const pafInputRef = useRef<HTMLInputElement>(null);
   const coverageInputRef = useRef<HTMLInputElement>(null);
   const [uiState, dispatchUi] = useReducer(
@@ -457,6 +732,28 @@ export function App() {
     contactTilePerformanceRef.current = createContactTilePerformanceTracker();
   }
   const contactTilePerformance = contactTilePerformanceRef.current;
+  const contactPanPerformanceRef = useRef<ReturnType<
+    typeof createContactPanPerformanceTracker
+  > | null>(null);
+  if (contactPanPerformanceRef.current === null) {
+    contactPanPerformanceRef.current = createContactPanPerformanceTracker({
+      enabled: contactTileIpcPerformanceEnabled,
+      emit: (output) => {
+        console.info(output.logfmt);
+        setContactPanPerformanceLog(output.logfmt);
+        void invoke("log_contact_pan_frontend_performance", {
+          request: output.record,
+        }).catch(() => undefined);
+      },
+    });
+  }
+  const contactPanPerformance = contactPanPerformanceRef.current;
+  const handleContactViewportPreview = useCallback((preview: ContactPanPreview | null) => {
+    if (preview) {
+      pendingPanPerformancePreviewRef.current = preview;
+    }
+    setContactTilePreviewViewport(preview);
+  }, []);
   const latestUiStateRef = useRef(uiState);
   latestUiStateRef.current = uiState;
   const pendingResolutionPerformanceRef = useRef<PendingResolutionPerformance | null>(null);
@@ -493,11 +790,20 @@ export function App() {
       completeLayer?.visibleLayerComplete === true
       && completeLayer.renderGeneration === event.generation
     ) {
+      setContactTileDeltaStream((current) => (
+        current?.generation === event.generation ? null : current
+      ));
       setPaintedContactTileGeneration((current) => (
         current === event.generation ? current : event.generation
       ));
     }
-    if (!contactTilePerformance.snapshot(event.generation)) {
+    const tracksResolutionPerformance = Boolean(
+      contactTilePerformance.snapshot(event.generation),
+    );
+    const tracksPanPerformance = Boolean(
+      contactPanPerformance.snapshot(event.generation),
+    );
+    if (!tracksResolutionPerformance && !tracksPanPerformance) {
       return;
     }
     const previous = contactTilePresentationScheduleRef.current;
@@ -531,10 +837,15 @@ export function App() {
           return;
         }
         contactTilePresentationScheduleRef.current = null;
-        contactTilePerformance.markLastTilePaint(event.generation, event.canvasCount);
+        if (tracksResolutionPerformance) {
+          contactTilePerformance.markLastTilePaint(event.generation, event.canvasCount);
+        }
+        if (tracksPanPerformance) {
+          contactPanPerformance.markGpuPaint(event.generation);
+        }
       });
     });
-  }, [contactTilePerformance]);
+  }, [contactPanPerformance, contactTilePerformance]);
   const contactCoolPath = dataset?.cool_path ?? null;
   const datasetAgpLayout = dataset?.agp_layout ?? null;
   const assemblyBlocks = uiState.assembly.blocks.length > 0
@@ -602,7 +913,13 @@ export function App() {
   useEffect(() => {
     const generation = contactTileGenerationRef.current + 1;
     contactTileGenerationRef.current = generation;
+    setContactTileDeltaStream((current) => (
+      current?.generation === generation ? current : null
+    ));
     contactTilePerformance.supersedeBefore(generation);
+    if (!contactTilePreviewViewport) {
+      contactPanPerformance.continueGeneration(generation);
+    }
     const presentationSchedule = contactTilePresentationScheduleRef.current;
     if (presentationSchedule && presentationSchedule.generation !== generation) {
       cancelContactTilePresentationSchedule(presentationSchedule);
@@ -642,7 +959,7 @@ export function App() {
     const documentIsHidden = () => document.visibilityState === "hidden";
     const targetResolution = resolutionToBasePairs(uiState.contact.resolution);
     const totalSpanBp = Math.max(targetResolution, assemblyLayout.totalSpan);
-    const viewport = buildCenteredContactViewport({
+    const committedViewport = buildCenteredContactViewport({
       centerMb: uiState.contact.viewportCenterMb,
       centerXMb: uiState.contact.viewportCenterXMb,
       centerYMb: uiState.contact.viewportCenterYMb,
@@ -651,6 +968,10 @@ export function App() {
       viewportWidthPx: uiState.contact.viewportWidthPx,
       viewportHeightPx: uiState.contact.viewportHeightPx,
     });
+    const viewport = contactTilePreviewViewport?.viewport ?? committedViewport;
+    const prefetchViewport = contactTilePreviewViewport?.prefetchViewport ?? viewport;
+    const panPerformancePreview = contactTilePreviewViewport
+      ?? pendingPanPerformancePreviewRef.current;
     const tileSizeBins = contactTileSizeBins;
     const normalization = contactNormalizationForBackend(uiState.normalization);
     const tileScope = contactTileScope(
@@ -678,6 +999,7 @@ export function App() {
     );
     const untouchTileWorld = buildContactTileWorld({
       viewport,
+      prefetchViewport,
       resolution: targetResolution,
       tileSizeBins,
       totalSpanBp,
@@ -702,6 +1024,7 @@ export function App() {
     contactTileCacheRef.current = contactTileCacheLru.toMap();
     const tileWorld = buildContactTileWorld({
       viewport,
+      prefetchViewport,
       resolution: targetResolution,
       tileSizeBins,
       totalSpanBp,
@@ -709,6 +1032,168 @@ export function App() {
       cache: contactTileCacheRef.current,
       cacheKeyForTile,
     });
+    const mainLodPlan = contactMainLodEnabled
+      ? buildContactMainLodPlan({
+          viewport,
+          selectedResolution: targetResolution,
+          viewportWidthPx: uiState.contact.viewportWidthPx,
+          viewportHeightPx: uiState.contact.viewportHeightPx,
+          visibleTileCount: tileWorld.visibleTiles.length,
+        }, contactAvailableResolutions)
+      : null;
+    if (mainLodPlan) {
+      const mainLodScope = contactTileScope(
+        contactCoolPath,
+        mainLodPlan.targetResolution,
+        Math.max(
+          1,
+          Math.ceil((viewport.xEnd - viewport.xStart) / mainLodPlan.targetResolution),
+          Math.ceil((viewport.yEnd - viewport.yStart) / mainLodPlan.targetResolution),
+        ),
+        normalization,
+        assemblyLayout.blocks,
+      );
+      const retainedMainLod = lastCompleteContactMapRef.current;
+      const hasMatchingMainLod = Boolean(
+        retainedMainLod
+        && retainedMainLod.layoutScope === mainLodScope
+        && retainedMainLod.normalization === normalization
+        && retainedMainLod.viewport.xStart === viewport.xStart
+        && retainedMainLod.viewport.xEnd === viewport.xEnd
+        && retainedMainLod.viewport.yStart === viewport.yStart
+        && retainedMainLod.viewport.yEnd === viewport.yEnd
+      );
+      const mainLodAutoColorScaleKey = contactAutoColorScaleKey(
+        contactCoolPath,
+        mainLodPlan.targetResolution,
+        tileSizeBins,
+        uiState.contact.colorScale.log,
+      );
+      if (hasMatchingMainLod && retainedMainLod) {
+        setContactMap((current) => (current === retainedMainLod ? current : retainedMainLod));
+      } else {
+        setStatusMessage(
+          `Loading screen-scale contact map at ${formatBasePairResolution(mainLodPlan.targetResolution)}…`,
+        );
+      }
+
+      // The dedicated command registers against the current generation, so
+      // advance/cancel foreground work before starting this LOD request.
+      const generationStart = invoke<number[]>("begin_contact_tile_generation", {
+        request: { generation, retainedRequestIds: [] },
+      });
+      void (async () => {
+        await generationStart;
+        if (cancelled || generation !== contactTileGenerationRef.current) {
+          return;
+        }
+        setBackendStartedContactTileGeneration((current) => (
+          current === generation ? current : generation
+        ));
+        if (hasMatchingMainLod) {
+          setStatusMessage(
+            `Contact map preview at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
+          );
+          return;
+        }
+
+        const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+        contactTileBackendRequestIdRef.current = nextRequestId;
+        const response = await loadContactOverviewWithLayoutHandle(
+          contactLayoutHandleRegistry,
+          assemblyLayout.blocks,
+          {
+            requestId: nextRequestId,
+            generation,
+            coolPath: contactCoolPath,
+            sourceResolution: mainLodPlan.sourceResolution,
+            targetResolution: mainLodPlan.targetResolution,
+            normalization,
+            viewport: mainLodPlan.viewport,
+          },
+        );
+        if (cancelled || generation !== contactTileGenerationRef.current) {
+          return;
+        }
+        const mainLodMap: ContactMapView = {
+          resolution: response.resolution,
+          normalization,
+          viewport: response.viewport,
+          cells: response.cells,
+          layoutBlocks: assemblyLayout.blocks,
+          layoutScope: mainLodScope,
+          visibleLayerComplete: true,
+          renderGeneration: generation,
+        };
+        if (uiState.contact.colorScale.auto && hasContactMapData(mainLodMap)) {
+          const cachedScale = autoColorScaleCacheRef.current.get(mainLodAutoColorScaleKey);
+          if (cachedScale) {
+            dispatchUi({ type: "setAutoColorScale", scale: cachedScale });
+          } else {
+            const counts = contactCountSampleForColorScale(mainLodMap);
+            if (counts.some((value) => Number.isFinite(value) && value > 0)) {
+              const scale = estimateContactColorScale(
+                counts,
+                uiState.contact.colorScale.log,
+              );
+              autoColorScaleCacheRef.current.set(mainLodAutoColorScaleKey, scale);
+              dispatchUi({ type: "setAutoColorScale", scale });
+            }
+          }
+        }
+        lastCompleteContactMapRef.current = mainLodMap;
+        setContactMap(mainLodMap);
+        const coversWholeAssembly = response.viewport.xStart === 0
+          && response.viewport.yStart === 0
+          && response.viewport.xEnd >= assemblyLayout.totalSpan
+          && response.viewport.yEnd >= assemblyLayout.totalSpan;
+        if (coversWholeAssembly) {
+          overviewContactMapRef.current = mainLodMap;
+          setOverviewContactMap(mainLodMap);
+        }
+        setStatusMessage(
+          `Contact map preview at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
+        );
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            if (!cancelled && generation === contactTileGenerationRef.current) {
+              setPaintedContactTileGeneration((current) => (
+                current === generation ? current : generation
+              ));
+            }
+          });
+        });
+      })().catch((error) => {
+        if (
+          cancelled
+          || generation !== contactTileGenerationRef.current
+          || isContactTileRequestCancelled(error)
+        ) {
+          return;
+        }
+        setStatusMessage(`Contact map LOD failed: ${String(error)}`);
+        dispatchUi({
+          type: "appendLog",
+          message: `Contact map LOD failed: ${String(error)}`,
+        });
+      });
+
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (panPerformancePreview) {
+      contactPanPerformance.startGeneration({
+        generation,
+        sequence: panPerformancePreview.sequence,
+        pointerTimestamp: panPerformancePreview.pointerTimestamp,
+        visibleTiles: tileWorld.visibleTiles.length,
+        cacheHit: tileWorld.missingVisibleTiles.length === 0,
+      });
+      if (!contactTilePreviewViewport) {
+        pendingPanPerformancePreviewRef.current = null;
+      }
+    }
     const foregroundProtectedKeys = new Set(
       tileWorld.prefetchTiles.map(cacheKeyForTile),
     );
@@ -732,9 +1217,21 @@ export function App() {
       tileSizeBins,
       tileScope,
     );
+    const streamsCompatiblePan = Boolean(
+      previousCompleteMap
+      && !holdsPreviousCompleteFrame
+      && (
+        previousCompleteMap.viewport.xStart !== viewport.xStart
+        || previousCompleteMap.viewport.xEnd !== viewport.xEnd
+        || previousCompleteMap.viewport.yStart !== viewport.yStart
+        || previousCompleteMap.viewport.yEnd !== viewport.yEnd
+      ),
+    );
     const visibleBatchSize = holdsPreviousCompleteFrame
       ? Math.max(1, tileWorld.missingVisibleTiles.length)
-      : visibleContactTileRequestBatchSize;
+      : contactTilePreviewViewport || streamsCompatiblePan
+        ? panVisibleContactTileRequestBatchSize
+        : visibleContactTileRequestBatchSize;
     const loadPlan = buildContactTileLoadPlan(
       tileWorld,
       maxBackgroundPrefetchTiles,
@@ -864,6 +1361,7 @@ export function App() {
             const availableResolutions = availableContactResolutions(
               currentUiState.contact,
               assemblyLayout.totalSpan / 1_000_000,
+              contactCoolPath.toLowerCase().endsWith(".mcool"),
             );
             const adjacentLayerScopeIds = new Set([activeLayerScope.id]);
             const jobQueues = adjacentContactResolutions(
@@ -873,6 +1371,7 @@ export function App() {
               const candidateUiState = reduceUiState(currentUiState, {
                 type: "setContactResolution",
                 resolution: candidateResolution,
+                preserveViewport: contactCoolPath.toLowerCase().endsWith(".mcool"),
               });
               if (candidateUiState.contact.resolution !== candidateResolution) {
                 return [];
@@ -1094,6 +1593,91 @@ export function App() {
       }
 
       let visibleReady = loadPlan.visibleBatches.length === 0;
+      const commitLoadedTiles = (
+        kind: "visible" | "prefetch",
+        tiles: ContactMapTile[],
+      ) => {
+        if (
+          tiles.length === 0
+          || cancelled
+          || generation !== contactTileGenerationRef.current
+        ) {
+          return;
+        }
+        if (kind === "visible") {
+          contactTilePerformance.markIpcResponse(generation);
+          contactPanPerformance.markIpcResponse(generation);
+          for (const tile of tiles) {
+            assemblingVisibleTiles.set(cacheKeyForTile(tile), tile);
+          }
+        }
+
+        contactTileCacheLru.merge(
+          activeLayerScope,
+          tiles.map((tile) => ({
+            key: cacheKeyForTile(tile),
+            value: tile,
+            cellCount: contactTileCellCount(tile),
+          })),
+          {
+            keys: foregroundProtectedKeys,
+            scopes: new Set([activeLayerScope.id]),
+          },
+        );
+        const nextCache = contactTileCacheLru.toMap();
+        contactTileCacheRef.current = nextCache;
+        const renderCache = contactTileRenderCache(nextCache, assemblingVisibleTiles);
+        if (kind === "visible") {
+          contactTilePerformance.markCacheMerge(generation);
+          contactPanPerformance.markCacheMerge(generation);
+        }
+
+        const updatedTileWorld = buildContactTileWorld({
+          viewport,
+          resolution: targetResolution,
+          tileSizeBins,
+          totalSpanBp,
+          scope: tileScope,
+          cache: renderCache,
+          cacheKeyForTile,
+        });
+        const updatedContactMap = contactMapForWorld(updatedTileWorld);
+        const displayedContactMap = displayContactMapForPendingLayer(
+          updatedContactMap,
+          lastCompleteContactMapRef.current,
+          updatedTileWorld.missingVisibleTiles.length === 0,
+        );
+        if (updatedTileWorld.missingVisibleTiles.length === 0) {
+          lastCompleteContactMapRef.current = updatedContactMap;
+        }
+        if (shouldPublishContactMapLayer(
+          holdsPreviousCompleteFrame,
+          updatedTileWorld.missingVisibleTiles.length === 0,
+        )) {
+          if (kind === "visible" && updatedTileWorld.missingVisibleTiles.length === 0) {
+            applyAutoColorScale(updatedContactMap);
+          }
+          setContactMap(displayedContactMap);
+          const pendingPanPaint = (
+            kind === "visible"
+            && updatedTileWorld.missingVisibleTiles.length === 0
+          ) ? contactPanPerformance.activeSnapshot() : null;
+          if (pendingPanPaint) {
+            window.requestAnimationFrame(() => {
+              window.requestAnimationFrame(() => {
+                contactPanPerformance.markGpuPaintForSequence(
+                  pendingPanPaint.panSequence,
+                );
+              });
+            });
+          }
+        }
+
+        if (kind === "visible" && updatedTileWorld.missingVisibleTiles.length === 0) {
+          visibleReady = true;
+          setStatusMessage(renderedStatusMessage);
+        }
+      };
       void (async () => {
         // Promotion and generation advance happen under one backend lock. An
         // overlapping old batch therefore remains reusable while unrelated
@@ -1118,7 +1702,193 @@ export function App() {
           setStatusMessage(renderedStatusMessage);
         }
 
+        const shouldStreamVisibleBatches = contactTileBinaryEnabled
+          && contactTileStreamEnabled
+          && loadPlan.visibleBatches.length > 1;
+        const usesAdaptiveMcoolRefinement = normalization === "raw"
+          && targetResolution === 2_500_000
+          && contactCoolPath.toLowerCase().endsWith(".mcool");
+        const shouldSingleScanVisibleTiles = contactTileBinaryEnabled
+          && contactTileStreamEnabled
+          && contactTileSingleScanEnabled
+          && !usesAdaptiveMcoolRefinement
+          && loadPlan.visibleBatches.length > 0
+          // Keep the dense frontend accumulator bounded even in a diagnostic
+          // build where main-canvas LOD has been explicitly disabled.
+          && tileWorld.visibleTiles.length <= maxExactMainContactTiles;
+        let streamedVisibleBatches = false;
         for (const batch of tileBatches) {
+          if (batch.kind === "visible" && shouldSingleScanVisibleTiles) {
+            if (streamedVisibleBatches) {
+              continue;
+            }
+            streamedVisibleBatches = true;
+            contactPanPerformance.markIpcStart(generation);
+            const visibleTiles = loadPlan.visibleBatches.flat();
+            let directDeltaPaintReported = false;
+            const loadVisibleDeltas = () => contactTileFlightsRef.current.loadBatch({
+              scope: tileScope,
+              tiles: visibleTiles,
+              cacheKeyForTile,
+              nextRequestId: () => {
+                const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+                contactTileBackendRequestIdRef.current = nextRequestId;
+                return nextRequestId;
+              },
+              load: (backendRequestId, requestedTiles) => (
+                streamContactTileDeltasWithLayoutHandle(
+                  contactLayoutHandleRegistry,
+                  assemblyLayout.blocks,
+                  {
+                    requestId: backendRequestId,
+                    generation,
+                    purpose: "visible",
+                    coolPath: contactCoolPath,
+                    baseResolution: 1000,
+                    targetResolution,
+                    tileSizeBins,
+                    normalization,
+                    tiles: requestedTiles,
+                  },
+                  {
+                    onStart: contactTileDirectDeltaEnabled
+                      ? (accumulator) => {
+                          if (cancelled || generation !== contactTileGenerationRef.current) {
+                            return;
+                          }
+                          setContactTileDeltaStream({
+                            generation,
+                            resolution: targetResolution,
+                            viewport,
+                            accumulator,
+                            onFirstPaint: () => {
+                              if (
+                                directDeltaPaintReported
+                                || cancelled
+                                || generation !== contactTileGenerationRef.current
+                              ) {
+                                return;
+                              }
+                              directDeltaPaintReported = true;
+                              const pending = contactPanPerformance.activeSnapshot();
+                              if (!pending || pending.generation !== generation) {
+                                return;
+                              }
+                              window.requestAnimationFrame(() => {
+                                window.requestAnimationFrame(() => {
+                                  contactPanPerformance.markGpuPaintForSequence(
+                                    pending.panSequence,
+                                  );
+                                });
+                              });
+                            },
+                          });
+                        }
+                      : undefined,
+                    onDelta: () => {
+                      contactTilePerformance.markIpcResponse(generation);
+                      contactPanPerformance.markIpcResponse(generation);
+                      contactTilePerformance.markCacheMerge(generation);
+                      contactPanPerformance.markCacheMerge(generation);
+                    },
+                    onChunk: contactTileDirectDeltaEnabled
+                      ? undefined
+                      : (changedTiles) => commitLoadedTiles("visible", changedTiles),
+                  },
+                )
+              ),
+            });
+            let tiles: ContactMapTile[];
+            try {
+              tiles = await loadVisibleDeltas();
+            } catch (error) {
+              if (cancelled || generation !== contactTileGenerationRef.current) {
+                return;
+              }
+              if (!isContactTileRequestCancelled(error)) {
+                throw error;
+              }
+              tiles = await loadVisibleDeltas();
+            }
+            if (cancelled || generation !== contactTileGenerationRef.current) {
+              return;
+            }
+            // Final cumulative snapshots include requested empty tiles and make
+            // the visible layer authoritative only after the sentinel arrives.
+            commitLoadedTiles("visible", tiles);
+            continue;
+          }
+          if (batch.kind === "visible" && shouldStreamVisibleBatches) {
+            if (streamedVisibleBatches) {
+              continue;
+            }
+            streamedVisibleBatches = true;
+            contactPanPerformance.markIpcStart(generation);
+            const visibleTiles = loadPlan.visibleBatches.flat();
+            const streamedKeys = new Set<string>();
+            const loadVisibleStream = () => contactTileFlightsRef.current.loadBatch({
+              scope: tileScope,
+              tiles: visibleTiles,
+              cacheKeyForTile,
+              nextRequestId: () => {
+                const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+                contactTileBackendRequestIdRef.current = nextRequestId;
+                return nextRequestId;
+              },
+              load: (backendRequestId, requestedTiles) => {
+                const requestedKeys = new Set(requestedTiles.map(cacheKeyForTile));
+                const streamChunks = loadPlan.visibleBatches
+                  .map((chunk) => chunk.filter((tile) => requestedKeys.has(cacheKeyForTile(tile))))
+                  .filter((chunk) => chunk.length > 0);
+                return streamContactTilesWithLayoutHandle(
+                  contactLayoutHandleRegistry,
+                  assemblyLayout.blocks,
+                  {
+                    requestId: backendRequestId,
+                    generation,
+                    purpose: "visible",
+                    coolPath: contactCoolPath,
+                    baseResolution: 1000,
+                    targetResolution,
+                    tileSizeBins,
+                    normalization,
+                    tiles: requestedTiles,
+                  },
+                  streamChunks,
+                  (chunkTiles) => {
+                    for (const tile of chunkTiles) {
+                      streamedKeys.add(cacheKeyForTile(tile));
+                    }
+                    commitLoadedTiles("visible", chunkTiles);
+                  },
+                );
+              },
+            });
+
+            let tiles: ContactMapTile[];
+            try {
+              tiles = await loadVisibleStream();
+            } catch (error) {
+              if (cancelled || generation !== contactTileGenerationRef.current) {
+                return;
+              }
+              if (!isContactTileRequestCancelled(error)) {
+                throw error;
+              }
+              tiles = await loadVisibleStream();
+            }
+            if (cancelled || generation !== contactTileGenerationRef.current) {
+              return;
+            }
+            commitLoadedTiles(
+              "visible",
+              tiles.filter((tile) => !streamedKeys.has(cacheKeyForTile(tile))),
+            );
+            continue;
+          }
+          if (batch.kind === "visible") {
+            contactPanPerformance.markIpcStart(generation);
+          }
           const loadBatch = () => contactTileFlightsRef.current.loadBatch({
             scope: tileScope,
             tiles: batch.tiles,
@@ -1163,69 +1933,19 @@ export function App() {
           if (cancelled || generation !== contactTileGenerationRef.current) {
             return;
           }
-          if (batch.kind === "visible") {
-            contactTilePerformance.markIpcResponse(generation);
-            for (const tile of tiles) {
-              assemblingVisibleTiles.set(cacheKeyForTile(tile), tile);
-            }
-          }
-
-          contactTileCacheLru.merge(
-            activeLayerScope,
-            tiles.map((tile) => ({
-              key: cacheKeyForTile(tile),
-              value: tile,
-              cellCount: contactTileCellCount(tile),
-            })),
-            {
-              keys: foregroundProtectedKeys,
-              scopes: new Set([activeLayerScope.id]),
-            },
-          );
-          const nextCache = contactTileCacheLru.toMap();
-          contactTileCacheRef.current = nextCache;
-          const renderCache = contactTileRenderCache(nextCache, assemblingVisibleTiles);
-          if (batch.kind === "visible") {
-            contactTilePerformance.markCacheMerge(generation);
-          }
-
-          const updatedTileWorld = buildContactTileWorld({
-            viewport,
-            resolution: targetResolution,
-            tileSizeBins,
-            totalSpanBp,
-            scope: tileScope,
-            cache: renderCache,
-            cacheKeyForTile,
-          });
-          const updatedContactMap = contactMapForWorld(updatedTileWorld);
-          const displayedContactMap = displayContactMapForPendingLayer(
-            updatedContactMap,
-            lastCompleteContactMapRef.current,
-            updatedTileWorld.missingVisibleTiles.length === 0,
-          );
-          if (updatedTileWorld.missingVisibleTiles.length === 0) {
-            lastCompleteContactMapRef.current = updatedContactMap;
-          }
-          if (shouldPublishContactMapLayer(
-            holdsPreviousCompleteFrame,
-            updatedTileWorld.missingVisibleTiles.length === 0,
-          )) {
-            if (
-              batch.kind === "visible"
-              && updatedTileWorld.missingVisibleTiles.length === 0
-            ) {
-              applyAutoColorScale(updatedContactMap);
-            }
-            setContactMap(displayedContactMap);
-          }
-
-          if (batch.kind === "visible" && updatedTileWorld.missingVisibleTiles.length === 0) {
-            visibleReady = true;
-            setStatusMessage(renderedStatusMessage);
-          }
+          commitLoadedTiles(batch.kind, tiles);
         }
         if (visibleReady) {
+          const pendingPanPaint = contactPanPerformance.activeSnapshot();
+          if (pendingPanPaint) {
+            window.requestAnimationFrame(() => {
+              window.requestAnimationFrame(() => {
+                contactPanPerformance.markGpuPaintForSequence(
+                  pendingPanPaint.panSequence,
+                );
+              });
+            });
+          }
           scheduleAdjacentResolutionPrefetch();
         }
       })().catch((error) => {
@@ -1249,10 +1969,15 @@ export function App() {
           message: `${visibleReady ? "Contact prefetch" : "Contact map render"} failed: ${String(error)}`,
         });
       });
-    }, holdsPreviousCompleteFrame ? 0 : contactViewportRequestDelayMs);
+    }, holdsPreviousCompleteFrame || contactTilePreviewViewport
+      ? 0
+      : contactViewportRequestDelayMs);
 
     return () => {
       cancelled = true;
+      setContactTileDeltaStream((current) => (
+        current?.generation === generation ? null : current
+      ));
       window.clearTimeout(timeout);
       if (adjacentPrefetchFirstFrame !== null) {
         window.cancelAnimationFrame(adjacentPrefetchFirstFrame);
@@ -1264,8 +1989,10 @@ export function App() {
     };
   }, [
     contactTileCacheLru,
+    contactPanPerformance,
     contactTilePerformance,
     contactCoolPath,
+    contactAvailableResolutions,
     assemblyLayout,
     uiState.contact.resolution,
     uiState.contact.viewportCenterMb,
@@ -1274,6 +2001,11 @@ export function App() {
     uiState.contact.viewportSpanMb,
     uiState.contact.viewportWidthPx,
     uiState.contact.viewportHeightPx,
+    contactTilePreviewViewport?.sequence,
+    contactTilePreviewViewport?.viewport.xStart,
+    contactTilePreviewViewport?.viewport.xEnd,
+    contactTilePreviewViewport?.viewport.yStart,
+    contactTilePreviewViewport?.viewport.yEnd,
     uiState.contact.colorScale.auto,
     uiState.contact.colorScale.log,
     uiState.normalization,
@@ -1293,32 +2025,35 @@ export function App() {
     }
 
     const totalSpanBp = Math.max(1, assemblyLayout.totalSpan);
-    const tileSizeBins = contactTileSizeBins;
-    const plan = buildContactOverviewTilePlan(totalSpanBp, tileSizeBins);
-    const normalization = contactNormalizationForBackend(uiState.normalization);
-    const tileScope = contactTileScope(
-      contactCoolPath,
-      plan.targetResolution,
-      tileSizeBins,
-      normalization,
-      assemblyLayout.blocks,
+    const plan = buildContactOverviewTilePlan(
+      totalSpanBp,
+      contactAvailableResolutions,
     );
-    const cacheKeyForTile = createContactTileCacheKeyResolver(
+    const normalization = contactNormalizationForBackend(uiState.normalization);
+    const overviewScope = contactTileScope(
       contactCoolPath,
       plan.targetResolution,
-      tileSizeBins,
+      plan.targetBins,
       normalization,
       assemblyLayout.blocks,
     );
     const currentOverview = overviewContactMapRef.current;
+    const currentOverviewUsesCurrentLayout = currentOverview?.layoutBlocks
+      === assemblyLayout.blocks;
     if (
-      currentOverview?.resolution === plan.targetResolution
+      currentOverview
       && currentOverview.normalization === normalization
-      && currentOverview.layoutScope === tileScope
       && currentOverview.viewport.xStart === plan.viewport.xStart
       && currentOverview.viewport.xEnd === plan.viewport.xEnd
       && currentOverview.viewport.yStart === plan.viewport.yStart
       && currentOverview.viewport.yEnd === plan.viewport.yEnd
+      && (
+        currentOverviewUsesCurrentLayout
+        || (
+          currentOverview.resolution === plan.targetResolution
+          && currentOverview.layoutScope === overviewScope
+        )
+      )
     ) {
       return;
     }
@@ -1343,120 +2078,34 @@ export function App() {
       && generation === contactTileGenerationRef.current
     );
 
-    const loadOverviewTiles = async () => {
+    const loadOverview = async () => {
       requestStarted = true;
-      const overviewTilesByKey = new Map<string, ContactMapTile>();
-      const missingTiles: ContactMapTileKey[] = [];
-      for (const tile of plan.tiles) {
-        const key = cacheKeyForTile(tile);
-        const cachedTile = contactTileCacheLru.peek(key);
-        if (cachedTile) {
-          overviewTilesByKey.set(key, cachedTile);
-        } else {
-          missingTiles.push(tile);
-        }
-      }
-
       try {
-        if (missingTiles.length > 0) {
-          const loadedTiles = await contactTileFlightsRef.current.loadBatch({
-            scope: tileScope,
-            tiles: missingTiles,
-            cacheKeyForTile,
-            nextRequestId: () => {
-              const nextRequestId = contactTileBackendRequestIdRef.current + 1;
-              contactTileBackendRequestIdRef.current = nextRequestId;
-              return nextRequestId;
-            },
-            load: (backendRequestId, tiles) => loadContactTilesWithLayoutHandle(
-              contactLayoutHandleRegistry,
-              assemblyLayout.blocks,
-              {
-                requestId: backendRequestId,
-                generation,
-                purpose: "overview",
-                coolPath: contactCoolPath,
-                baseResolution: 1000,
-                targetResolution: plan.targetResolution,
-                tileSizeBins,
-                normalization,
-                tiles,
-              },
-            ),
-          });
-          if (!requestIsCurrent()) {
-            return;
-          }
-          for (const tile of loadedTiles) {
-            overviewTilesByKey.set(cacheKeyForTile(tile), tile);
-          }
-
-          const foregroundLayer = lastCompleteContactMapRef.current;
-          const foregroundKeys = new Set<string>();
-          const foregroundScopes = new Set<string>();
-          if (
-            foregroundLayer?.layoutBlocks
-            && foregroundLayer.normalization
-            && foregroundLayer.tiles
-          ) {
-            const foregroundTileSizeBins = foregroundLayer.tileSizeBins ?? contactTileSizeBins;
-            const foregroundKeyForTile = createContactTileCacheKeyResolver(
-              contactCoolPath,
-              foregroundLayer.resolution,
-              foregroundTileSizeBins,
-              foregroundLayer.normalization,
-              foregroundLayer.layoutBlocks,
-            );
-            for (const tile of foregroundLayer.tiles) {
-              foregroundKeys.add(foregroundKeyForTile(tile));
-            }
-            foregroundScopes.add(contactTileDataScope(
-              contactCoolPath,
-              foregroundLayer.resolution,
-              foregroundTileSizeBins,
-              foregroundLayer.normalization,
-            ));
-          }
-          contactTileCacheLru.merge(
-            {
-              id: contactTileDataScope(
-                contactCoolPath,
-                plan.targetResolution,
-                tileSizeBins,
-                normalization,
-              ),
-              resolution: plan.targetResolution,
-            },
-            loadedTiles.map((tile) => ({
-              key: cacheKeyForTile(tile),
-              value: tile,
-              cellCount: contactTileCellCount(tile),
-            })),
-            {
-              recency: "background",
-              keys: foregroundKeys,
-              scopes: foregroundScopes,
-            },
-          );
-          contactTileCacheRef.current = contactTileCacheLru.toMap();
-        }
-
+        const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+        contactTileBackendRequestIdRef.current = nextRequestId;
+        const response = await loadContactOverviewWithLayoutHandle(
+          contactLayoutHandleRegistry,
+          assemblyLayout.blocks,
+          {
+            requestId: nextRequestId,
+            generation,
+            coolPath: contactCoolPath,
+            sourceResolution: plan.sourceResolution,
+            targetResolution: plan.targetResolution,
+            normalization,
+            viewport: plan.viewport,
+          },
+        );
         if (!requestIsCurrent()) {
           return;
         }
-        const tiles = plan.tiles.map((tile) => overviewTilesByKey.get(cacheKeyForTile(tile)));
-        if (tiles.some((tile) => tile === undefined)) {
-          throw new Error("overview tile assembly incomplete");
-        }
         const overviewMap: ContactMapView = {
-          resolution: plan.targetResolution,
+          resolution: response.resolution,
           normalization,
-          viewport: plan.viewport,
-          cells: [],
-          tileSizeBins,
-          tiles: tiles as ContactMapTile[],
+          viewport: response.viewport,
+          cells: response.cells,
           layoutBlocks: assemblyLayout.blocks,
-          layoutScope: tileScope,
+          layoutScope: overviewScope,
           visibleLayerComplete: true,
         };
         overviewContactMapRef.current = overviewMap;
@@ -1491,7 +2140,7 @@ export function App() {
       })) {
         return;
       }
-      void loadOverviewTiles();
+      void loadOverview();
     };
     const handleVisibilityChange = () => {
       if (document.visibilityState !== "hidden") {
@@ -1508,8 +2157,8 @@ export function App() {
   }, [
     assemblyLayout,
     backendStartedContactTileGeneration,
+    contactAvailableResolutions,
     contactCoolPath,
-    contactTileCacheLru,
     paintedContactTileGeneration,
     uiState.normalization,
   ]);
@@ -1658,25 +2307,31 @@ export function App() {
     setCoverageView(null);
     setSyntenyView(null);
     try {
-      const summary = await invoke<ExampleDatasetSummary>("load_example_dataset");
+      const [summary, gfaText] = await Promise.all([
+        invoke<ExampleDatasetSummary>("load_example_dataset"),
+        invoke<string>("load_example_gfa_text"),
+      ]);
       const importedDataset = ensureImportedDataset(summary);
       savedAgpPathRef.current = null;
       setSavedAgpPath(null);
       setSavedAgpText(exportAgpText(importedDataset.agp_layout.blocks));
       setDataset(importedDataset);
+      setContactAvailableResolutions(importedDataset.available_resolutions ?? []);
       setCoverageRecords([]);
       setPafPath(importedDataset.paf_path);
       setPafText("");
       setPafImported(Boolean(importedDataset.paf_path));
+      setGfaDocument(parseGfaText(gfaText, "hifi.asm.bp.p_utg.noseq.gfa"));
       dispatchUi({ type: "setAssemblyBlocks", blocks: importedDataset.agp_layout.blocks });
+      dispatchUi({ type: "setOverviewMode", mode: "gfa" });
       dispatchUi({
         type: "fitContactViewport",
         totalSpanMb: importedDataset.agp_layout.totalSpan / 1_000_000,
       });
-      setStatusMessage("Example dataset loaded with coverage and PAF");
+      setStatusMessage("Example dataset loaded with coverage, PAF and GFA");
       dispatchUi({
         type: "appendLog",
-        message: "Example dataset loaded: assembly, contact map, coverage and PAF",
+        message: "Example dataset loaded: assembly, contact map, coverage, PAF and GFA",
       });
     } catch {
       const example = await loadBrowserExampleBundle();
@@ -1684,19 +2339,22 @@ export function App() {
       setSavedAgpPath(null);
       setSavedAgpText(exportAgpText(example.dataset.agp_layout.blocks));
       setDataset(example.dataset);
+      setContactAvailableResolutions(example.dataset.available_resolutions ?? [1_000]);
       setCoverageRecords(example.coverageRecords);
       setPafPath(null);
       setPafText(example.pafText);
       setPafImported(true);
+      setGfaDocument(example.gfaDocument);
       dispatchUi({ type: "setAssemblyBlocks", blocks: example.dataset.agp_layout.blocks });
+      dispatchUi({ type: "setOverviewMode", mode: "gfa" });
       dispatchUi({
         type: "fitContactViewport",
         totalSpanMb: example.dataset.agp_layout.totalSpan / 1_000_000,
       });
-      setStatusMessage("Example dataset loaded with coverage and PAF in browser preview");
+      setStatusMessage("Example dataset loaded with coverage, PAF and GFA in browser preview");
       dispatchUi({
         type: "appendLog",
-        message: `Example dataset loaded in browser preview: ${example.coverageRecords.length.toLocaleString()} coverage records and ${summarizePafText(example.pafText).alignmentCount.toLocaleString()} PAF alignments`,
+        message: `Example dataset loaded in browser preview: ${example.coverageRecords.length.toLocaleString()} coverage records, ${summarizePafText(example.pafText).alignmentCount.toLocaleString()} PAF alignments and ${example.gfaDocument.summary.segmentCount.toLocaleString()} GFA segments`,
       });
     }
   }
@@ -1722,6 +2380,7 @@ export function App() {
         mcoolSizeBytes: current?.mcool_size_bytes ?? 0,
         coveragePath: current?.coverage_path ?? null,
         agpLayout,
+        availableResolutions: current?.available_resolutions,
       }),
     }));
     dispatchUi({ type: "setAssemblyBlocks", blocks: agpLayout.blocks });
@@ -1731,6 +2390,27 @@ export function App() {
     });
     setStatusMessage(`AGP imported: ${file.name}`);
     dispatchUi({ type: "appendLog", message: `AGP imported: ${file.name}` });
+  }
+
+  async function importGfaFile(file: File) {
+    try {
+      const document = parseGfaText(await file.text(), file.name);
+      if (document.summary.segmentCount === 0) {
+        throw new Error("no S records found");
+      }
+      setGfaDocument(document);
+      dispatchUi({ type: "setOverviewMode", mode: "gfa" });
+      setStatusMessage(
+        `GFA imported: ${file.name} (${document.summary.segmentCount.toLocaleString()} segments)`,
+      );
+      dispatchUi({
+        type: "appendLog",
+        message: `GFA evidence imported: ${file.name}; ${document.summary.segmentCount.toLocaleString()} segments, ${document.summary.linkCount.toLocaleString()} links, ${document.summary.aRecordCount.toLocaleString()} A records`,
+      });
+    } catch (error) {
+      setStatusMessage(`GFA import failed: ${String(error)}`);
+      dispatchUi({ type: "appendLog", message: `GFA import failed: ${String(error)}` });
+    }
   }
 
   async function importContactFile() {
@@ -1764,8 +2444,10 @@ export function App() {
         mcoolSizeBytes: selected.size_bytes,
         coveragePath: current?.coverage_path ?? null,
         agpLayout: current?.agp_layout ?? emptyAgpLayout(),
+        availableResolutions: selected.available_resolutions,
       }),
     }));
+    setContactAvailableResolutions(selected.available_resolutions ?? []);
     setStatusMessage(`Contact map imported: ${selected.name}`);
     dispatchUi({ type: "appendLog", message: `Contact map imported: ${selected.name}` });
   }
@@ -1830,6 +2512,7 @@ export function App() {
           mcoolSizeBytes: current?.mcool_size_bytes ?? 0,
           coveragePath: selected.path,
           agpLayout: current?.agp_layout ?? emptyAgpLayout(),
+          availableResolutions: current?.available_resolutions,
         }),
       }));
       setStatusMessage(`Coverage imported: ${selected.name}`);
@@ -1859,6 +2542,7 @@ export function App() {
           mcoolSizeBytes: current?.mcool_size_bytes ?? 0,
           coveragePath: file.name,
           agpLayout: current?.agp_layout ?? emptyAgpLayout(),
+          availableResolutions: current?.available_resolutions,
         }),
       }));
       setStatusMessage(`Coverage imported: ${file.name}`);
@@ -1870,6 +2554,63 @@ export function App() {
       setStatusMessage(`Coverage import failed: ${String(error)}`);
       dispatchUi({ type: "appendLog", message: `Coverage import failed: ${String(error)}` });
     }
+  }
+
+  function clearAllLoadedData() {
+    const generation = contactTileGenerationRef.current + 1;
+    contactTileGenerationRef.current = generation;
+    contactTilePerformance.supersedeBefore(generation);
+    pendingPanPerformancePreviewRef.current = null;
+    pendingResolutionPerformanceRef.current = null;
+
+    const presentationSchedule = contactTilePresentationScheduleRef.current;
+    cancelContactTilePresentationSchedule(presentationSchedule);
+    contactTilePresentationScheduleRef.current = null;
+
+    contactTileCacheLru.clear();
+    contactTileCacheRef.current = new Map();
+    contactTileFlightsRef.current.clear();
+    autoColorScaleCacheRef.current.clear();
+    lastCompleteContactMapRef.current = null;
+    overviewContactMapRef.current = null;
+    contactLayoutHandleRegistryRef.current = new ContactLayoutHandleRegistry();
+
+    savedAgpPathRef.current = null;
+    setSavedAgpPath(null);
+    setSavedAgpText("");
+    setDataset(null);
+    setContactAvailableResolutions([]);
+    setContactMap(null);
+    setOverviewContactMap(null);
+    setContactTilePreviewViewport(null);
+    setBackendStartedContactTileGeneration(null);
+    setPaintedContactTileGeneration(null);
+    setCoverageView(null);
+    setCoverageRecords([]);
+    setSyntenyView(null);
+    setPafPath(null);
+    setPafText("");
+    setPafImported(false);
+    setGfaDocument(null);
+    dispatchUi({ type: "clearLoadedData" });
+    setStatusMessage("All loaded data cleared");
+
+    if (agpInputRef.current) {
+      agpInputRef.current.value = "";
+    }
+    if (gfaInputRef.current) {
+      gfaInputRef.current.value = "";
+    }
+    if (pafInputRef.current) {
+      pafInputRef.current.value = "";
+    }
+    if (coverageInputRef.current) {
+      coverageInputRef.current.value = "";
+    }
+
+    void invoke("begin_contact_tile_generation", {
+      request: { generation, retainedRequestIds: [] },
+    }).catch(() => undefined);
   }
 
   async function exportEditedAgp(options: { automatic?: boolean } = {}) {
@@ -1957,19 +2698,27 @@ export function App() {
     <AppShell
       dataset={dataset}
       contactMap={contactMap}
+      contactTileDeltaStream={contactTileDeltaStream}
+      contactIsMcool={contactCoolPath?.toLowerCase().endsWith(".mcool") ?? false}
+      contactAvailableResolutions={contactAvailableResolutions}
       overviewContactMap={overviewContactMap}
       syntenyView={syntenyView}
       coverageView={coverageView}
       pafText={pafText}
       pafImported={pafImported}
+      gfaDocument={gfaDocument}
+      gfaHomologPattern={gfaHomologPattern}
+      onGfaHomologPatternChange={setGfaHomologPattern}
       onPafTextChange={(value) => {
         setPafPath(null);
         setPafText(value);
       }}
       agpInputRef={agpInputRef}
+      gfaInputRef={gfaInputRef}
       pafInputRef={pafInputRef}
       coverageInputRef={coverageInputRef}
       onAgpFileSelected={importAgpFile}
+      onGfaFileSelected={importGfaFile}
       onContactFileSelected={importContactFile}
       onPafFileRequested={requestPafFile}
       onPafFileSelected={importPafFile}
@@ -1981,10 +2730,13 @@ export function App() {
       isAgpDirty={isAgpDirty}
       onAutoSaveEnabledChange={setAutoSaveEnabled}
       onLoadExample={loadExamples}
+      onClearAllData={clearAllLoadedData}
       status={status}
       statusMessage={statusMessage}
+      contactPanPerformanceLog={contactPanPerformanceLog}
       uiState={uiState}
       onUiAction={dispatchMeasuredUiAction}
+      onContactViewportPreview={handleContactViewportPreview}
       onContactTileLayerCommit={contactTilePerformance.enabled
         ? handleContactTileLayerCommit
         : undefined}
@@ -1997,39 +2749,43 @@ export interface BrowserExampleBundle {
   dataset: ExampleDatasetSummary;
   coverageRecords: BedGraphRecord[];
   pafText: string;
+  gfaDocument: GfaEvidenceDocument;
 }
 
 export async function loadBrowserExampleBundle(
   fetchResource: (path: string) => Promise<Response> = (path) => fetch(path),
 ): Promise<BrowserExampleBundle> {
-  const [agpText, coverageText, pafText] = await Promise.all([
+  const [agpText, coverageText, pafText, gfaText] = await Promise.all([
     fetchExampleText(fetchResource, "/examples/groups.agp", "example AGP"),
     fetchExampleText(
       fetchResource,
-      "/examples/input.1000.coverage.bedgraph",
+      "/examples/hifi.asm.bp.p_utg.noseq.depth",
       "example coverage",
     ),
-    fetchExampleText(fetchResource, "/examples/ref_vs_contig.paf", "example PAF"),
+    fetchExampleText(fetchResource, "/examples/mono.hifi.asm.bp.p_utg.paf", "example PAF"),
+    fetchExampleText(fetchResource, "/examples/hifi.asm.bp.p_utg.noseq.gfa", "example GFA"),
   ]);
   const summary = summarizeAgpText(agpText);
 
   return {
     dataset: buildDatasetSummary({
       agpPath: "examples/groups.agp",
-      mcoolPath: "examples/input.q1.1k.cool",
+      mcoolPath: "examples/input.1k.cool",
       coolPath: "",
-      pafPath: "examples/ref_vs_contig.paf",
+      pafPath: "examples/mono.hifi.asm.bp.p_utg.paf",
       agpLines: summary.lineCount,
       agpObjects: summary.objectCount,
       agpComponents: summary.componentCount,
       agpGaps: summary.gapCount,
       maxObjectSpan: summary.maxObjectSpan,
-      mcoolSizeBytes: 26_324 * 1024,
-      coveragePath: "examples/input.1000.coverage.bedgraph",
+      mcoolSizeBytes: 18_713_472,
+      coveragePath: "examples/hifi.asm.bp.p_utg.noseq.depth",
       agpLayout: parseAgpLayout(agpText),
+      availableResolutions: [1_000],
     }),
     coverageRecords: parseBedGraphText(coverageText),
     pafText,
+    gfaDocument: parseGfaText(gfaText, "hifi.asm.bp.p_utg.noseq.gfa"),
   };
 }
 
@@ -2058,6 +2814,7 @@ interface DatasetSummaryInput {
   mcoolSizeBytes: number;
   coveragePath: string | null;
   agpLayout: AgpLayout;
+  availableResolutions?: number[];
 }
 
 function buildDatasetSummary(input: DatasetSummaryInput): ExampleDatasetSummary {
@@ -2074,6 +2831,7 @@ function buildDatasetSummary(input: DatasetSummaryInput): ExampleDatasetSummary 
     mcool_size_bytes: input.mcoolSizeBytes,
     coverage_path: input.coveragePath,
     agp_layout: input.agpLayout,
+    available_resolutions: input.availableResolutions,
   };
 }
 
@@ -2091,6 +2849,7 @@ function ensureImportedDataset(summary: ExampleDatasetSummary): ExampleDatasetSu
     mcoolSizeBytes: summary.mcool_size_bytes,
     coveragePath: summary.coverage_path,
     agpLayout: normalizeImportedAgpLayout(summary.agp_layout ?? emptyAgpLayout()),
+    availableResolutions: summary.available_resolutions,
   });
 }
 
@@ -2152,6 +2911,16 @@ function totalVisualSpan(blocks: AgpLayout["blocks"], fallback: number) {
 
 function resolutionToBasePairs(resolution: ContactResolution) {
   return contactResolutionToBasePairs(resolution);
+}
+
+function formatBasePairResolution(resolution: number) {
+  if (resolution >= 1_000_000) {
+    return `${Number((resolution / 1_000_000).toFixed(2))} Mb`;
+  }
+  if (resolution >= 1_000) {
+    return `${Number((resolution / 1_000).toFixed(2))} kb`;
+  }
+  return `${resolution} bp`;
 }
 
 function formatViewportLabel(viewport: { xStart: number; xEnd: number }) {

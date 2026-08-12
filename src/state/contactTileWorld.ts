@@ -13,6 +13,7 @@ export const contactTileWorldPrefetchPadding = 1;
 
 export interface ContactTileWorldInput {
   viewport: ContactViewport;
+  prefetchViewport?: ContactViewport;
   resolution: number;
   tileSizeBins: number;
   totalSpanBp?: number;
@@ -23,6 +24,7 @@ export interface ContactTileWorldInput {
 
 export interface ContactTileWorld {
   viewport: ContactViewport;
+  prefetchViewport: ContactViewport;
   resolution: number;
   tileSizeBins: number;
   scope: string;
@@ -41,6 +43,7 @@ export interface ContactTileLoadPlan {
 
 export function buildContactTileWorld({
   viewport,
+  prefetchViewport = viewport,
   resolution,
   tileSizeBins,
   totalSpanBp,
@@ -57,7 +60,13 @@ export function buildContactTileWorld({
   const maximumTileIndex = Number.isFinite(totalSpanBp)
     ? Math.max(0, Math.ceil(totalSpanBp! / Math.max(1, resolution * tileSizeBins)) - 1)
     : Number.POSITIVE_INFINITY;
-  const prefetchTiles = padTileKeys(visibleTiles, contactTileWorldPrefetchPadding)
+  const prefetchBasisTiles = contactTilesForViewport(
+    prefetchViewport,
+    resolution,
+    tileSizeBins,
+    totalSpanBp,
+  );
+  const prefetchTiles = padTileKeys(prefetchBasisTiles, contactTileWorldPrefetchPadding)
     .filter((tile) => tile.tileX <= maximumTileIndex && tile.tileY <= maximumTileIndex);
   const cachedVisibleTiles = visibleTiles
     .map((tile) => cache.get(cacheKeyForTile(tile)))
@@ -74,6 +83,7 @@ export function buildContactTileWorld({
 
   return {
     viewport,
+    prefetchViewport,
     resolution,
     tileSizeBins,
     scope,
@@ -108,22 +118,36 @@ export function buildContactTileLoadPlan(
   const tileSpan = Math.max(1, world.resolution * world.tileSizeBins);
   const centerTileX = ((world.viewport.xStart + world.viewport.xEnd) / 2) / tileSpan;
   const centerTileY = ((world.viewport.yStart + world.viewport.yEnd) / 2) / tileSpan;
-  const distanceFromViewportCenter = (tile: ContactMapTileKey) => {
-    const direct = (tile.tileX + 0.5 - centerTileX) ** 2
-      + (tile.tileY + 0.5 - centerTileY) ** 2;
-    const transposed = (tile.tileY + 0.5 - centerTileX) ** 2
-      + (tile.tileX + 0.5 - centerTileY) ** 2;
+  const prefetchCenterTileX = (
+    (world.prefetchViewport.xStart + world.prefetchViewport.xEnd) / 2
+  ) / tileSpan;
+  const prefetchCenterTileY = (
+    (world.prefetchViewport.yStart + world.prefetchViewport.yEnd) / 2
+  ) / tileSpan;
+  const distanceFromCenter = (
+    tile: ContactMapTileKey,
+    centerX: number,
+    centerY: number,
+  ) => {
+    const direct = (tile.tileX + 0.5 - centerX) ** 2
+      + (tile.tileY + 0.5 - centerY) ** 2;
+    const transposed = (tile.tileY + 0.5 - centerX) ** 2
+      + (tile.tileX + 0.5 - centerY) ** 2;
     return Math.min(direct, transposed);
   };
-  const byDistance = (left: ContactMapTileKey, right: ContactMapTileKey) => {
-    const distance = distanceFromViewportCenter(left) - distanceFromViewportCenter(right);
+  const byDistanceFrom = (centerX: number, centerY: number) => (
+    left: ContactMapTileKey,
+    right: ContactMapTileKey,
+  ) => {
+    const distance = distanceFromCenter(left, centerX, centerY)
+      - distanceFromCenter(right, centerX, centerY);
     return distance || left.tileY - right.tileY || left.tileX - right.tileX;
   };
-  const visible = [...world.missingVisibleTiles].sort(byDistance);
+  const visible = [...world.missingVisibleTiles].sort(byDistanceFrom(centerTileX, centerTileY));
   const visibleKeys = new Set(world.visibleTiles.map(contactTileKey));
   const prefetch = world.missingPrefetchTiles
     .filter((tile) => !visibleKeys.has(contactTileKey(tile)))
-    .sort(byDistance)
+    .sort(byDistanceFrom(prefetchCenterTileX, prefetchCenterTileY))
     .slice(0, Math.max(0, Math.floor(maxPrefetchTiles)));
 
   return {

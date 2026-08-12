@@ -1,17 +1,20 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     sync::{Arc, Condvar, Mutex, OnceLock},
     time::{Duration, UNIX_EPOCH},
 };
 
 use hdf5::{
-    types::{FixedAscii, VarLenUnicode},
-    File,
+    types::{FixedAscii, TypeDescriptor, VarLenAscii, VarLenUnicode},
+    Dataset, File,
 };
 
 use crate::{
-    contact_map::ContactBin,
+    contact_map::{
+        build_contact_map_view_from_contacts_cancellable, ContactBin, ContactMapCell,
+        ContactMapQuery, ContactMapView, LayoutBlock,
+    },
     contact_normalization::{
         compute_normalization_weights, ContactNormalization, SparseContactMatrix,
     },
@@ -21,10 +24,20 @@ use crate::{
 const MAX_COOL_INDEX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COOL_NORMALIZATION_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_RUNTIME_NORMALIZATION_MATRIX_BYTES: usize = 512 * 1024 * 1024;
-// Each chunk holds bin1, bin2, and count arrays simultaneously. At the
-// widest supported element types this caps their combined raw payload near
-// 12 MiB, while keeping HDF5 call overhead low for ordinary tile requests.
+const MAX_COOL_READER_CACHE_ENTRIES: usize = 8;
+const MAX_ADAPTIVE_CHILD_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const ADAPTIVE_TARGET_RESOLUTION: u64 = 2_500_000;
+const ADAPTIVE_RESOLUTION_CHAIN: [u64; 5] = [2_500_000, 500_000, 100_000, 10_000, 1_000];
+// bin1 is derived from the Cooler CSR bin1_offset index, so each chunk only
+// holds bin2 and count arrays. At the widest supported element types this caps
+// their combined raw payload near 8 MiB while keeping HDF5 call overhead low.
 const MAX_COOL_PIXEL_READ_CHUNK: usize = 500_000;
+// Delta streaming drains projection state after every chunk. A smaller bound
+// keeps the transient sparse HashMap comfortably below whole-view tile memory.
+const MAX_COOL_STREAM_PIXEL_READ_CHUNK: usize = 100_000;
+// Reading a small unselected gap is cheaper than issuing another three HDF5
+// hyperslab calls. Bridged pixels are still rejected by SelectedBinIndex.
+const MAX_COOL_PIXEL_BATCH_GAP: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CoolIndexCacheKey {
@@ -38,6 +51,7 @@ struct CoolIndexCacheKey {
 struct CoolIndex {
     prefix: String,
     chrom_names: Vec<String>,
+    chrom_lengths: Vec<u64>,
     bin_chrom_ids: Vec<i32>,
     chrom_offsets: Vec<usize>,
     bin_starts: Vec<u64>,
@@ -70,8 +84,309 @@ struct CoolNormalizationCache {
     in_flight: HashMap<CoolNormalizationCacheKey, Arc<CoolNormalizationFlight>>,
 }
 
+#[derive(Debug, Default)]
+struct CoolReaderCache {
+    entries: VecDeque<(CoolIndexCacheKey, Arc<CoolReader>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AdaptivePixel {
+    bin1: u64,
+    bin2: u64,
+    count: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AdaptiveFileKey {
+    path: Arc<str>,
+    size_bytes: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AdaptiveChildBlockKey {
+    file: AdaptiveFileKey,
+    parent_resolution: u64,
+    child_resolution: u64,
+    parent_bin1: u64,
+    parent_bin2: u64,
+}
+
+#[derive(Debug)]
+struct AdaptiveChildCacheEntry {
+    pixels: Arc<Vec<AdaptivePixel>>,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct AdaptiveChildCache {
+    max_bytes: usize,
+    used_bytes: usize,
+    tick: u64,
+    entries: HashMap<AdaptiveChildBlockKey, AdaptiveChildCacheEntry>,
+}
+
+impl Default for AdaptiveChildCache {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_ADAPTIVE_CHILD_CACHE_BYTES,
+            used_bytes: 0,
+            tick: 0,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdaptiveCoolStats {
+    pub candidate_pixels: usize,
+    pub child_rows_read: usize,
+    pub bin2_ids_scanned: usize,
+    pub child_blocks_requested: usize,
+    pub child_blocks_cached: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveContactMapResult {
+    pub view: ContactMapView,
+    pub stats: AdaptiveCoolStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdaptiveEndpointDecision {
+    Drop,
+    Safe(u64),
+    Refine,
+}
+
+#[derive(Debug)]
+struct CoolReader {
+    file: File,
+    index: Arc<CoolIndex>,
+    // Opening still validates the required Cooler column and its integer type;
+    // scan paths derive its values from indexes/bin1_offset without reading it.
+    _pixel_bin1: CoolUnsignedDataset,
+    pixel_bin2: CoolUnsignedDataset,
+    pixel_counts: CoolCountDataset,
+}
+
+#[derive(Debug)]
+enum CoolUnsignedDataset {
+    U64(Dataset),
+    U32(Dataset),
+    I64(Dataset),
+    I32(Dataset),
+}
+
+#[derive(Debug)]
+enum CoolCountDataset {
+    F64(Dataset),
+    F32(Dataset),
+    I64(Dataset),
+    I32(Dataset),
+    U64(Dataset),
+    U32(Dataset),
+}
+
 static COOL_INDEX_CACHE: OnceLock<Mutex<CoolIndexCache>> = OnceLock::new();
 static COOL_NORMALIZATION_CACHE: OnceLock<Mutex<CoolNormalizationCache>> = OnceLock::new();
+static COOL_READER_CACHE: OnceLock<Mutex<CoolReaderCache>> = OnceLock::new();
+static ADAPTIVE_CHILD_CACHE: OnceLock<Mutex<AdaptiveChildCache>> = OnceLock::new();
+
+pub fn list_mcool_resolutions(path: &str) -> CStudioResult<Vec<u64>> {
+    let file = File::open(path).map_err(cool_error)?;
+    let group = file.group("resolutions").map_err(cool_error)?;
+    let mut resolutions = group
+        .member_names()
+        .map_err(cool_error)?
+        .into_iter()
+        .filter_map(|name| name.parse::<u64>().ok())
+        .filter(|resolution| *resolution > 0)
+        .collect::<Vec<_>>();
+    resolutions.sort_unstable_by(|left, right| right.cmp(left));
+    resolutions.dedup();
+    Ok(resolutions)
+}
+
+pub fn list_contact_resolutions(path: &str) -> CStudioResult<Vec<u64>> {
+    let file = File::open(path).map_err(cool_error)?;
+    if file.group("resolutions").is_ok() {
+        return list_mcool_resolutions(path);
+    }
+    if let Ok(attribute) = file.attr("bin-size") {
+        if let Ok(resolution) = attribute.read_scalar::<u64>() {
+            if resolution > 0 {
+                return Ok(vec![resolution]);
+            }
+        }
+        if let Ok(resolution) = attribute.read_scalar::<i64>() {
+            if resolution > 0 {
+                return Ok(vec![resolution as u64]);
+            }
+        }
+    }
+
+    let starts = CoolUnsignedDataset::open(&file, "bins/start")?;
+    let ends = CoolUnsignedDataset::open(&file, "bins/end")?;
+    let sample_len = file
+        .dataset("bins/start")
+        .map_err(cool_error)?
+        .size()
+        .min(1_024);
+    let starts = starts.read_slice(0, sample_len)?;
+    let ends = ends.read_slice(0, sample_len)?;
+    if starts.len() != ends.len() {
+        return Err(CStudioError::InvalidContactMapQuery(
+            ".cool bins/start and bins/end have different lengths".to_string(),
+        ));
+    }
+    let resolution = starts
+        .into_iter()
+        .zip(ends)
+        .filter_map(|(start, end)| end.checked_sub(start))
+        .filter(|span| *span > 0)
+        .max()
+        .ok_or_else(|| {
+            CStudioError::InvalidContactMapQuery(
+                ".cool file does not contain a positive fixed-bin span".to_string(),
+            )
+        })?;
+    Ok(vec![resolution])
+}
+
+impl CoolUnsignedDataset {
+    fn open(file: &File, path: &str) -> CStudioResult<Self> {
+        let dataset = file.dataset(path).map_err(cool_error)?;
+        let datatype = dataset.dtype().map_err(cool_error)?;
+        if datatype.is::<u64>() {
+            Ok(Self::U64(dataset))
+        } else if datatype.is::<u32>() {
+            Ok(Self::U32(dataset))
+        } else if datatype.is::<i64>() {
+            Ok(Self::I64(dataset))
+        } else if datatype.is::<i32>() {
+            Ok(Self::I32(dataset))
+        } else {
+            Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool dataset {path} must contain 32-bit or 64-bit integer values"
+            )))
+        }
+    }
+
+    fn read_slice(&self, start: usize, end: usize) -> CStudioResult<Vec<u64>> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        match self {
+            Self::U64(dataset) => dataset
+                .read_slice_1d::<u64, _>(start..end)
+                .map(|values| values.to_vec())
+                .map_err(cool_error),
+            Self::U32(dataset) => dataset
+                .read_slice_1d::<u32, _>(start..end)
+                .map(|values| values.iter().map(|value| *value as u64).collect())
+                .map_err(cool_error),
+            Self::I64(dataset) => dataset
+                .read_slice_1d::<i64, _>(start..end)
+                .map_err(cool_error)
+                .and_then(|values| signed_bin_ids_to_u64(values.iter().copied())),
+            Self::I32(dataset) => dataset
+                .read_slice_1d::<i32, _>(start..end)
+                .map_err(cool_error)
+                .and_then(|values| signed_bin_ids_to_u64(values.iter().copied())),
+        }
+    }
+}
+
+fn signed_bin_ids_to_u64<T, I>(values: I) -> CStudioResult<Vec<u64>>
+where
+    T: Copy + TryInto<u64> + std::fmt::Display,
+    I: IntoIterator<Item = T>,
+{
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.try_into().map_err(|_| {
+                CStudioError::InvalidContactMapQuery(format!(
+                    ".cool pixel bin id {value} at slice index {index} is negative"
+                ))
+            })
+        })
+        .collect()
+}
+
+impl CoolCountDataset {
+    fn open(file: &File, path: &str) -> CStudioResult<Self> {
+        let dataset = file.dataset(path).map_err(cool_error)?;
+        let datatype = dataset.dtype().map_err(cool_error)?;
+        if datatype.is::<f64>() {
+            Ok(Self::F64(dataset))
+        } else if datatype.is::<f32>() {
+            Ok(Self::F32(dataset))
+        } else if datatype.is::<i64>() {
+            Ok(Self::I64(dataset))
+        } else if datatype.is::<i32>() {
+            Ok(Self::I32(dataset))
+        } else if datatype.is::<u64>() {
+            Ok(Self::U64(dataset))
+        } else if datatype.is::<u32>() {
+            Ok(Self::U32(dataset))
+        } else {
+            Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool dataset {path} has an unsupported count type"
+            )))
+        }
+    }
+
+    fn read_slice(&self, start: usize, end: usize) -> CStudioResult<Vec<f64>> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        macro_rules! read_counts {
+            ($dataset:expr, $value_type:ty) => {
+                $dataset
+                    .read_slice_1d::<$value_type, _>(start..end)
+                    .map(|values| values.iter().map(|value| *value as f64).collect())
+                    .map_err(cool_error)
+            };
+        }
+        match self {
+            Self::F64(dataset) => read_counts!(dataset, f64),
+            Self::F32(dataset) => read_counts!(dataset, f32),
+            Self::I64(dataset) => read_counts!(dataset, i64),
+            Self::I32(dataset) => read_counts!(dataset, i32),
+            Self::U64(dataset) => read_counts!(dataset, u64),
+            Self::U32(dataset) => read_counts!(dataset, u32),
+        }
+    }
+}
+
+impl CoolReader {
+    fn open(
+        path: &str,
+        resolution: Option<u64>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CStudioResult<Self> {
+        ensure_not_cancelled(should_cancel)?;
+        let file = File::open(path).map_err(cool_error)?;
+        ensure_not_cancelled(should_cancel)?;
+        let index = cached_cool_index(&file, path, resolution, should_cancel)?;
+        let pixel_bin1 =
+            CoolUnsignedDataset::open(&file, &format!("{}pixels/bin1_id", index.prefix))?;
+        let pixel_bin2 =
+            CoolUnsignedDataset::open(&file, &format!("{}pixels/bin2_id", index.prefix))?;
+        let pixel_counts = CoolCountDataset::open(&file, &format!("{}pixels/count", index.prefix))?;
+        Ok(Self {
+            file,
+            index,
+            _pixel_bin1: pixel_bin1,
+            pixel_bin2,
+            pixel_counts,
+        })
+    }
+}
 
 pub fn read_cool_contacts_for_sources(
     path: &str,
@@ -160,11 +475,107 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
     normalization: ContactNormalization,
     should_cancel: &dyn Fn() -> bool,
 ) -> CStudioResult<Vec<ContactBin>> {
+    let mut contacts = Vec::new();
+    visit_cool_contact_chunks_with_limit(
+        path,
+        source_ranges,
+        resolution,
+        normalization,
+        should_cancel,
+        MAX_COOL_PIXEL_READ_CHUNK,
+        |source1, start1, source2, start2, count| {
+            contacts.push(ContactBin {
+                source1: source1.to_string(),
+                start1,
+                source2: source2.to_string(),
+                start2,
+                count,
+            });
+            Ok(())
+        },
+        || Ok(()),
+    )?;
+    Ok(contacts)
+}
+
+/// Visits selected Cooler contacts without allocating owned source names or a
+/// whole-request `Vec<ContactBin>`. `finish_chunk` runs after each bounded HDF5
+/// pixel chunk, which lets callers drain and emit an additive projection delta.
+pub fn visit_cool_contact_chunks_for_source_ranges_at_resolution_with_normalization_cancellable<
+    Visit,
+    Finish,
+>(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+    visit: Visit,
+    finish_chunk: Finish,
+) -> CStudioResult<usize>
+where
+    Visit: FnMut(&str, u64, &str, u64, f64) -> CStudioResult<()>,
+    Finish: FnMut() -> CStudioResult<()>,
+{
+    visit_cool_contact_chunks_with_limit(
+        path,
+        source_ranges,
+        resolution,
+        normalization,
+        should_cancel,
+        MAX_COOL_STREAM_PIXEL_READ_CHUNK,
+        visit,
+        finish_chunk,
+    )
+}
+
+fn bin1_for_pixel_offset(bin1_offsets: &[u64], pixel_offset: usize) -> CStudioResult<usize> {
+    let pixel_offset = u64::try_from(pixel_offset).map_err(|_| {
+        CStudioError::InvalidContactMapQuery(".cool pixel offset exceeds u64".to_string())
+    })?;
+    let Some(&pixel_end) = bin1_offsets.last() else {
+        return Err(CStudioError::InvalidContactMapQuery(
+            ".cool indexes/bin1_offset is empty".to_string(),
+        ));
+    };
+    if pixel_offset >= pixel_end {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool pixel offset {pixel_offset} is outside indexes/bin1_offset end {pixel_end}"
+        )));
+    }
+    // Empty bin1 rows repeat an offset. partition_point selects the final row
+    // beginning at or before this pixel, which is the first non-empty owner.
+    let upper = bin1_offsets.partition_point(|offset| *offset <= pixel_offset);
+    let bin1 = upper.saturating_sub(1);
+    if bin1 + 1 >= bin1_offsets.len()
+        || bin1_offsets[bin1] > pixel_offset
+        || bin1_offsets[bin1 + 1] <= pixel_offset
+    {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool indexes/bin1_offset does not own pixel {pixel_offset}"
+        )));
+    }
+    Ok(bin1)
+}
+
+fn visit_cool_contact_chunks_with_limit<Visit, Finish>(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+    pixel_read_chunk: usize,
+    mut visit: Visit,
+    mut finish_chunk: Finish,
+) -> CStudioResult<usize>
+where
+    Visit: FnMut(&str, u64, &str, u64, f64) -> CStudioResult<()>,
+    Finish: FnMut() -> CStudioResult<()>,
+{
     ensure_not_cancelled(should_cancel)?;
-    let file = File::open(path).map_err(cool_error)?;
-    ensure_not_cancelled(should_cancel)?;
-    let index = cached_cool_index(&file, path, resolution, should_cancel)?;
-    let prefix = &index.prefix;
+    let reader = cached_cool_reader(path, resolution, should_cancel)?;
+    let file = &reader.file;
+    let index = &reader.index;
     let normalization_weights = cached_normalization_weights(
         &file,
         path,
@@ -176,46 +587,53 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
     let source_range_index = SourceRangeIndex::new(source_ranges);
     let selected_bins = SelectedBinIndex::new(&index, &source_range_index, should_cancel)?;
 
-    let mut contacts = Vec::new();
+    let mut visited_contacts = 0usize;
     ensure_not_cancelled(should_cancel)?;
     let pixel_ranges = pixel_ranges_for_selected_bin_ranges_cancellable(
         selected_bins.ranges(),
         &index.bin1_offsets,
         should_cancel,
     )?;
-    let pixel_bin1_path = format!("{prefix}pixels/bin1_id");
-    let pixel_bin2_path = format!("{prefix}pixels/bin2_id");
-    let pixel_count_path = format!("{prefix}pixels/count");
+    let pixel_ranges = batch_nearby_pixel_ranges(&pixel_ranges, MAX_COOL_PIXEL_BATCH_GAP);
 
     for (pixel_start, pixel_end) in pixel_ranges {
-        for chunk_start in (pixel_start..pixel_end).step_by(MAX_COOL_PIXEL_READ_CHUNK) {
+        for chunk_start in (pixel_start..pixel_end).step_by(pixel_read_chunk) {
             ensure_not_cancelled(should_cancel)?;
-            let chunk_end = chunk_start
-                .saturating_add(MAX_COOL_PIXEL_READ_CHUNK)
-                .min(pixel_end);
-            let pixel_bin1 =
-                read_u64_dataset_slice(&file, &pixel_bin1_path, chunk_start, chunk_end)?;
+            let chunk_end = chunk_start.saturating_add(pixel_read_chunk).min(pixel_end);
+            let pixel_bin2 = reader.pixel_bin2.read_slice(chunk_start, chunk_end)?;
             ensure_not_cancelled(should_cancel)?;
-            let pixel_bin2 =
-                read_u64_dataset_slice(&file, &pixel_bin2_path, chunk_start, chunk_end)?;
-            ensure_not_cancelled(should_cancel)?;
-            let pixel_counts =
-                read_f64_dataset_slice(&file, &pixel_count_path, chunk_start, chunk_end)?;
-            if pixel_bin1.len() != pixel_bin2.len() || pixel_bin1.len() != pixel_counts.len() {
+            let pixel_counts = reader.pixel_counts.read_slice(chunk_start, chunk_end)?;
+            if pixel_bin2.len() != pixel_counts.len() {
                 return Err(CStudioError::InvalidContactMapQuery(
-                    ".cool pixels/bin1_id, bin2_id, and count have different lengths".to_string(),
+                    ".cool pixels/bin2_id and count have different lengths".to_string(),
                 ));
             }
+            let mut bin1_index = bin1_for_pixel_offset(&index.bin1_offsets, chunk_start)?;
 
-            for (pixel_index, ((bin1, bin2), count)) in pixel_bin1
+            for (pixel_index, (bin2, count)) in pixel_bin2
                 .into_iter()
-                .zip(pixel_bin2.into_iter())
                 .zip(pixel_counts.into_iter())
                 .enumerate()
             {
                 if pixel_index % 16_384 == 0 {
                     ensure_not_cancelled(should_cancel)?;
                 }
+                let pixel_offset =
+                    u64::try_from(chunk_start.saturating_add(pixel_index)).map_err(|_| {
+                        CStudioError::InvalidContactMapQuery(
+                            ".cool pixel offset exceeds u64".to_string(),
+                        )
+                    })?;
+                while index
+                    .bin1_offsets
+                    .get(bin1_index + 1)
+                    .is_some_and(|next_offset| *next_offset <= pixel_offset)
+                {
+                    bin1_index += 1;
+                }
+                let bin1 = u64::try_from(bin1_index).map_err(|_| {
+                    CStudioError::InvalidContactMapQuery(".cool bin1 index exceeds u64".to_string())
+                })?;
                 if !selected_bins.contains(bin1) || !selected_bins.contains(bin2) {
                     continue;
                 }
@@ -231,19 +649,741 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
                 let (source1_index, start1) = bin_source_and_start(&index, bin1, "bin1_id")?;
                 let (source2_index, start2) = bin_source_and_start(&index, bin2, "bin2_id")?;
 
-                contacts.push(ContactBin {
-                    source1: index.chrom_names[source1_index].clone(),
+                visit(
+                    &index.chrom_names[source1_index],
                     start1,
-                    source2: index.chrom_names[source2_index].clone(),
+                    &index.chrom_names[source2_index],
                     start2,
                     count,
-                });
+                )?;
+                visited_contacts = visited_contacts.saturating_add(1);
             }
+            ensure_not_cancelled(should_cancel)?;
+            finish_chunk()?;
         }
     }
 
     ensure_not_cancelled(should_cancel)?;
-    Ok(contacts)
+    Ok(visited_contacts)
+}
+
+fn cached_cool_reader(
+    path: &str,
+    resolution: Option<u64>,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Arc<CoolReader>> {
+    ensure_not_cancelled(should_cancel)?;
+    let key = cool_index_cache_key(path, resolution);
+    let cache = COOL_READER_CACHE.get_or_init(|| Mutex::new(CoolReaderCache::default()));
+    {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = cache
+            .entries
+            .iter()
+            .position(|(entry_key, _)| *entry_key == key)
+        {
+            let entry = cache
+                .entries
+                .remove(position)
+                .expect("cached reader position exists");
+            let reader = Arc::clone(&entry.1);
+            cache.entries.push_back(entry);
+            return Ok(reader);
+        }
+    }
+
+    // Opening the HDF5 file and resolving dataset types happens outside the
+    // cache mutex so an unrelated visible request never waits for this setup.
+    let opened = Arc::new(CoolReader::open(path, resolution, should_cancel)?);
+    ensure_not_cancelled(should_cancel)?;
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(position) = cache
+        .entries
+        .iter()
+        .position(|(entry_key, _)| *entry_key == key)
+    {
+        let entry = cache
+            .entries
+            .remove(position)
+            .expect("concurrently cached reader position exists");
+        let reader = Arc::clone(&entry.1);
+        cache.entries.push_back(entry);
+        return Ok(reader);
+    }
+
+    cache.entries.retain(|(entry_key, _)| {
+        entry_key.path != key.path || entry_key.resolution != key.resolution
+    });
+    while cache.entries.len() >= MAX_COOL_READER_CACHE_ENTRIES {
+        cache.entries.pop_front();
+    }
+    cache.entries.push_back((key, Arc::clone(&opened)));
+    Ok(opened)
+}
+
+pub fn build_contact_map_view_from_mcool_adaptive_raw_cancellable(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    query: &ContactMapQuery,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Option<AdaptiveContactMapResult>> {
+    if query.target_resolution != ADAPTIVE_TARGET_RESOLUTION
+        || query.base_resolution != *ADAPTIVE_RESOLUTION_CHAIN.last().unwrap()
+        || std::env::var("CSTUDIO_ADAPTIVE_MCOOL").as_deref() == Ok("0")
+    {
+        if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
+            eprintln!(
+                "CSTUDIO_PERF event=adaptive_mcool status=fallback reason=request_gate base_resolution={} target_resolution={}",
+                query.base_resolution, query.target_resolution,
+            );
+        }
+        return Ok(None);
+    }
+    let file = File::open(path).map_err(cool_error)?;
+    if ADAPTIVE_RESOLUTION_CHAIN
+        .iter()
+        .any(|resolution| !file.link_exists(&format!("/resolutions/{resolution}")))
+    {
+        if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
+            eprintln!(
+                "CSTUDIO_PERF event=adaptive_mcool status=fallback reason=missing_resolution"
+            );
+        }
+        return Ok(None);
+    }
+    drop(file);
+    ensure_not_cancelled(should_cancel)?;
+
+    let file_key = adaptive_file_key(path);
+    let top_resolution = ADAPTIVE_RESOLUTION_CHAIN[0];
+    let top_reader = cached_cool_reader(path, Some(top_resolution), should_cancel)?;
+    if has_duplicate_chrom_names(&top_reader.index.chrom_names) {
+        if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
+            eprintln!(
+                "CSTUDIO_PERF event=adaptive_mcool status=fallback reason=duplicate_source_name"
+            );
+        }
+        return Ok(None);
+    }
+    let top_ranges =
+        expand_source_ranges_to_resolution(source_ranges, top_resolution, &top_reader.index);
+    let top_contacts = read_cool_contacts_for_source_ranges_at_resolution_cancellable(
+        path,
+        &top_ranges,
+        Some(top_resolution),
+        should_cancel,
+    )?;
+    let mut candidates = contacts_to_adaptive_pixels(&top_contacts, &top_reader.index)?;
+    let mut aggregate = HashMap::<(u64, u64), f64>::new();
+    let layout_index = AdaptiveLayoutIndex::new(&query.layout_blocks);
+    let mut stats = AdaptiveCoolStats::default();
+
+    for (level_index, resolution) in ADAPTIVE_RESOLUTION_CHAIN.iter().copied().enumerate() {
+        ensure_not_cancelled(should_cancel)?;
+        stats.candidate_pixels = stats.candidate_pixels.saturating_add(candidates.len());
+        let reader = cached_cool_reader(path, Some(resolution), should_cancel)?;
+        if resolution == query.base_resolution {
+            let contacts = adaptive_pixels_to_contacts(&candidates, &reader.index)?;
+            let refined =
+                build_contact_map_view_from_contacts_cancellable(query, contacts, should_cancel)?;
+            merge_contact_cells(&mut aggregate, refined.cells);
+            candidates.clear();
+            break;
+        }
+
+        let mut rejected = HashSet::<(u64, u64)>::new();
+        for (pixel_index, pixel) in candidates.drain(..).enumerate() {
+            if pixel_index % 4_096 == 0 {
+                ensure_not_cancelled(should_cancel)?;
+            }
+            let (source1, start1, end1) = adaptive_bin_interval(&reader.index, pixel.bin1)?;
+            let (source2, start2, end2) = adaptive_bin_interval(&reader.index, pixel.bin2)?;
+            match (
+                layout_index.endpoint_decision(source1, start1, end1, query.target_resolution),
+                layout_index.endpoint_decision(source2, start2, end2, query.target_resolution),
+            ) {
+                (AdaptiveEndpointDecision::Drop, _) | (_, AdaptiveEndpointDecision::Drop) => {}
+                (AdaptiveEndpointDecision::Safe(x_bin), AdaptiveEndpointDecision::Safe(y_bin)) => {
+                    let (x_bin, y_bin) = if x_bin <= y_bin {
+                        (x_bin, y_bin)
+                    } else {
+                        (y_bin, x_bin)
+                    };
+                    if query
+                        .viewport
+                        .contains_bin(x_bin, y_bin, query.target_resolution)
+                    {
+                        *aggregate.entry((x_bin, y_bin)).or_insert(0.0) += pixel.count;
+                    }
+                }
+                _ => {
+                    rejected.insert((pixel.bin1, pixel.bin2));
+                }
+            }
+        }
+        let child_resolution = ADAPTIVE_RESOLUTION_CHAIN[level_index + 1];
+        candidates = read_adaptive_child_pixels(
+            path,
+            &file_key,
+            resolution,
+            child_resolution,
+            &rejected,
+            should_cancel,
+            &mut stats,
+        )?;
+    }
+
+    let mut cells = aggregate
+        .into_iter()
+        .map(|((x_bin, y_bin), count)| ContactMapCell {
+            x_bin,
+            y_bin,
+            count,
+        })
+        .collect::<Vec<_>>();
+    cells.sort_by_key(|cell| (cell.x_bin, cell.y_bin));
+    Ok(Some(AdaptiveContactMapResult {
+        view: ContactMapView {
+            resolution: query.target_resolution,
+            viewport: query.viewport,
+            cells,
+        },
+        stats,
+    }))
+}
+
+fn adaptive_file_key(path: &str) -> AdaptiveFileKey {
+    let (size_bytes, modified_nanos) = fs::metadata(path)
+        .map(|metadata| {
+            let modified_nanos = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            (metadata.len(), modified_nanos)
+        })
+        .unwrap_or((0, 0));
+    AdaptiveFileKey {
+        path: Arc::from(path),
+        size_bytes,
+        modified_nanos,
+    }
+}
+
+fn has_duplicate_chrom_names(names: &[String]) -> bool {
+    let mut seen = HashSet::with_capacity(names.len());
+    names.iter().any(|name| !seen.insert(name.as_str()))
+}
+
+fn expand_source_ranges_to_resolution(
+    ranges: &[(String, u64, u64)],
+    resolution: u64,
+    index: &CoolIndex,
+) -> Vec<(String, u64, u64)> {
+    let lengths = index
+        .chrom_names
+        .iter()
+        .zip(index.chrom_lengths.iter().copied())
+        .map(|(source, length)| (source.as_str(), length))
+        .collect::<HashMap<_, _>>();
+    ranges
+        .iter()
+        .filter_map(|(source, start, end)| {
+            let length = lengths.get(source.as_str()).copied()?;
+            let expanded_start = start / resolution * resolution;
+            let expanded_end = end
+                .saturating_add(resolution - 1)
+                .checked_div(resolution)
+                .unwrap_or(0)
+                .saturating_mul(resolution)
+                .min(length);
+            (expanded_start < expanded_end).then(|| (source.clone(), expanded_start, expanded_end))
+        })
+        .collect()
+}
+
+fn adaptive_bin_interval(index: &CoolIndex, bin: u64) -> CStudioResult<(&str, u64, u64)> {
+    let (source_index, start, end) = adaptive_bin_source_interval(index, bin)?;
+    Ok((index.chrom_names[source_index].as_str(), start, end))
+}
+
+fn adaptive_bin_source_interval(index: &CoolIndex, bin: u64) -> CStudioResult<(usize, u64, u64)> {
+    let (source_index, start) = bin_source_and_start(index, bin, "bin_id")?;
+    let bin_index = usize::try_from(bin).map_err(|_| {
+        CStudioError::InvalidContactMapQuery("adaptive bin exceeds platform range".to_string())
+    })?;
+    let chrom_end = index.chrom_offsets[source_index + 1];
+    let end = if bin_index + 1 < chrom_end {
+        index.bin_starts[bin_index + 1]
+    } else {
+        index.chrom_lengths[source_index]
+    };
+    Ok((source_index, start, end))
+}
+
+fn contacts_to_adaptive_pixels(
+    contacts: &[ContactBin],
+    index: &CoolIndex,
+) -> CStudioResult<Vec<AdaptivePixel>> {
+    let source_indices = index
+        .chrom_names
+        .iter()
+        .enumerate()
+        .map(|(source_index, source)| (source.as_str(), source_index))
+        .collect::<HashMap<_, _>>();
+    contacts
+        .iter()
+        .map(|contact| {
+            let source1 = source_indices
+                .get(contact.source1.as_str())
+                .ok_or_else(|| {
+                    CStudioError::InvalidContactMapQuery(format!(
+                        "adaptive source {} is missing from .mcool",
+                        contact.source1
+                    ))
+                })?;
+            let source2 = source_indices
+                .get(contact.source2.as_str())
+                .ok_or_else(|| {
+                    CStudioError::InvalidContactMapQuery(format!(
+                        "adaptive source {} is missing from .mcool",
+                        contact.source2
+                    ))
+                })?;
+            let bin1 = source_bin_for_start(index, *source1, contact.start1)?;
+            let bin2 = source_bin_for_start(index, *source2, contact.start2)?;
+            Ok(AdaptivePixel {
+                bin1,
+                bin2,
+                count: contact.count,
+            })
+        })
+        .collect()
+}
+
+fn source_bin_for_start(index: &CoolIndex, source: usize, start: u64) -> CStudioResult<u64> {
+    let chrom_start = index.chrom_offsets[source];
+    let chrom_end = index.chrom_offsets[source + 1];
+    let starts = &index.bin_starts[chrom_start..chrom_end];
+    let relative = starts.binary_search(&start).map_err(|_| {
+        CStudioError::InvalidContactMapQuery(format!(
+            "adaptive bin start {start} is absent from source {}",
+            index.chrom_names[source]
+        ))
+    })?;
+    u64::try_from(chrom_start + relative).map_err(|_| {
+        CStudioError::InvalidContactMapQuery("adaptive bin exceeds u64 range".to_string())
+    })
+}
+
+fn adaptive_pixels_to_contacts(
+    pixels: &[AdaptivePixel],
+    index: &CoolIndex,
+) -> CStudioResult<Vec<ContactBin>> {
+    pixels
+        .iter()
+        .map(|pixel| {
+            let (source1, start1, _) = adaptive_bin_interval(index, pixel.bin1)?;
+            let (source2, start2, _) = adaptive_bin_interval(index, pixel.bin2)?;
+            Ok(ContactBin {
+                source1: source1.to_string(),
+                start1,
+                source2: source2.to_string(),
+                start2,
+                count: pixel.count,
+            })
+        })
+        .collect()
+}
+
+fn merge_contact_cells(aggregate: &mut HashMap<(u64, u64), f64>, cells: Vec<ContactMapCell>) {
+    for cell in cells {
+        *aggregate.entry((cell.x_bin, cell.y_bin)).or_insert(0.0) += cell.count;
+    }
+}
+
+struct AdaptiveLayoutIndex<'a> {
+    by_source: HashMap<&'a str, Vec<&'a LayoutBlock>>,
+}
+
+impl<'a> AdaptiveLayoutIndex<'a> {
+    fn new(blocks: &'a [LayoutBlock]) -> Self {
+        let mut by_source = HashMap::<&str, Vec<&LayoutBlock>>::new();
+        for block in blocks {
+            by_source
+                .entry(block.source_id.as_str())
+                .or_default()
+                .push(block);
+        }
+        Self { by_source }
+    }
+
+    fn endpoint_decision(
+        &self,
+        source: &str,
+        start: u64,
+        end: u64,
+        target_resolution: u64,
+    ) -> AdaptiveEndpointDecision {
+        let overlaps = self
+            .by_source
+            .get(source)
+            .into_iter()
+            .flatten()
+            .filter(|block| start < block.source_end && end > block.source_start)
+            .copied()
+            .collect::<Vec<_>>();
+        if overlaps.is_empty() {
+            return AdaptiveEndpointDecision::Drop;
+        }
+        if overlaps.len() != 1 {
+            return AdaptiveEndpointDecision::Refine;
+        }
+        let block = overlaps[0];
+        if start < block.source_start || end > block.source_end || start >= end {
+            return AdaptiveEndpointDecision::Refine;
+        }
+        let (visual_low, visual_high) = match block.orientation {
+            crate::agp::Orientation::Forward | crate::agp::Orientation::Unknown => (
+                block.visual_start + start - block.source_start,
+                block.visual_start + end - block.source_start,
+            ),
+            crate::agp::Orientation::Reverse => (
+                block.visual_start + block.source_end - end,
+                block.visual_start + block.source_end - start,
+            ),
+        };
+        let low_bin = visual_low / target_resolution;
+        let high_bin = (visual_high - 1) / target_resolution;
+        if low_bin == high_bin {
+            AdaptiveEndpointDecision::Safe(low_bin)
+        } else {
+            AdaptiveEndpointDecision::Refine
+        }
+    }
+}
+
+fn read_adaptive_child_pixels(
+    path: &str,
+    file_key: &AdaptiveFileKey,
+    parent_resolution: u64,
+    child_resolution: u64,
+    parents: &HashSet<(u64, u64)>,
+    should_cancel: &dyn Fn() -> bool,
+    stats: &mut AdaptiveCoolStats,
+) -> CStudioResult<Vec<AdaptivePixel>> {
+    if parents.is_empty() {
+        return Ok(Vec::new());
+    }
+    stats.child_blocks_requested = stats.child_blocks_requested.saturating_add(parents.len());
+    let parent_reader = cached_cool_reader(path, Some(parent_resolution), should_cancel)?;
+    let child_reader = cached_cool_reader(path, Some(child_resolution), should_cancel)?;
+    validate_adaptive_resolution_pair(&parent_reader.index, &child_reader.index)?;
+
+    let requested_keys = parents
+        .iter()
+        .map(|&(parent_bin1, parent_bin2)| AdaptiveChildBlockKey {
+            file: file_key.clone(),
+            parent_resolution,
+            child_resolution,
+            parent_bin1,
+            parent_bin2,
+        })
+        .collect::<Vec<_>>();
+    let (cached, missing) = {
+        let cache = ADAPTIVE_CHILD_CACHE.get_or_init(|| Mutex::new(AdaptiveChildCache::default()));
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.lookup(&requested_keys)
+    };
+    stats.child_blocks_cached = stats.child_blocks_cached.saturating_add(cached.len());
+
+    let loaded = if missing.is_empty() {
+        HashMap::new()
+    } else {
+        load_adaptive_child_blocks(
+            &parent_reader,
+            &child_reader,
+            parent_resolution,
+            child_resolution,
+            &missing,
+            should_cancel,
+            stats,
+        )?
+    };
+    let mut pixels = Vec::new();
+    for key in &requested_keys {
+        if let Some(block) = cached.get(key).or_else(|| loaded.get(key)) {
+            pixels.extend(block.iter().copied());
+        }
+    }
+    if !loaded.is_empty() {
+        let cache = ADAPTIVE_CHILD_CACHE.get_or_init(|| Mutex::new(AdaptiveChildCache::default()));
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert_batch(loaded);
+    }
+    Ok(pixels)
+}
+
+impl AdaptiveChildCache {
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1).max(1);
+        self.tick
+    }
+
+    fn lookup(
+        &mut self,
+        keys: &[AdaptiveChildBlockKey],
+    ) -> (
+        HashMap<AdaptiveChildBlockKey, Arc<Vec<AdaptivePixel>>>,
+        Vec<AdaptiveChildBlockKey>,
+    ) {
+        let tick = self.next_tick();
+        let mut found = HashMap::new();
+        let mut missing = Vec::new();
+        for key in keys {
+            if let Some(entry) = self.entries.get_mut(key) {
+                entry.last_used = tick;
+                found.insert(key.clone(), Arc::clone(&entry.pixels));
+            } else {
+                missing.push(key.clone());
+            }
+        }
+        (found, missing)
+    }
+
+    fn insert_batch(&mut self, blocks: HashMap<AdaptiveChildBlockKey, Arc<Vec<AdaptivePixel>>>) {
+        let tick = self.next_tick();
+        for (key, pixels) in blocks {
+            if self.entries.contains_key(&key) {
+                continue;
+            }
+            let bytes = adaptive_cache_entry_bytes(&key, pixels.len());
+            if bytes > self.max_bytes {
+                continue;
+            }
+            self.used_bytes = self.used_bytes.saturating_add(bytes);
+            self.entries.insert(
+                key,
+                AdaptiveChildCacheEntry {
+                    pixels,
+                    bytes,
+                    last_used: tick,
+                },
+            );
+        }
+        if self.used_bytes <= self.max_bytes {
+            return;
+        }
+        let mut recency = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (entry.last_used, key.clone()))
+            .collect::<Vec<_>>();
+        recency.sort_by_key(|(last_used, _)| *last_used);
+        for (_, key) in recency {
+            if self.used_bytes <= self.max_bytes {
+                break;
+            }
+            if let Some(entry) = self.entries.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+            }
+        }
+    }
+}
+
+fn adaptive_cache_entry_bytes(key: &AdaptiveChildBlockKey, pixel_count: usize) -> usize {
+    std::mem::size_of::<AdaptiveChildBlockKey>()
+        .saturating_add(key.file.path.len())
+        .saturating_add(std::mem::size_of::<AdaptiveChildCacheEntry>())
+        .saturating_add(pixel_count.saturating_mul(std::mem::size_of::<AdaptivePixel>()))
+}
+
+fn validate_adaptive_resolution_pair(parent: &CoolIndex, child: &CoolIndex) -> CStudioResult<()> {
+    if parent.chrom_names != child.chrom_names || parent.chrom_lengths != child.chrom_lengths {
+        return Err(CStudioError::InvalidContactMapQuery(
+            "adaptive .mcool resolutions have inconsistent chromosomes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_adaptive_child_blocks(
+    parent_reader: &CoolReader,
+    child_reader: &CoolReader,
+    parent_resolution: u64,
+    child_resolution: u64,
+    missing: &[AdaptiveChildBlockKey],
+    should_cancel: &dyn Fn() -> bool,
+    stats: &mut AdaptiveCoolStats,
+) -> CStudioResult<HashMap<AdaptiveChildBlockKey, Arc<Vec<AdaptivePixel>>>> {
+    let mut blocks = missing
+        .iter()
+        .cloned()
+        .map(|key| (key, Vec::new()))
+        .collect::<HashMap<_, Vec<AdaptivePixel>>>();
+    let mut row_requests = HashMap::<u64, Vec<(u64, u64)>>::new();
+    for (parent_index, key) in missing.iter().enumerate() {
+        if parent_index % 4_096 == 0 {
+            ensure_not_cancelled(should_cancel)?;
+        }
+        let (bin1_start, bin1_end) = adaptive_child_bin_range(
+            &parent_reader.index,
+            &child_reader.index,
+            key.parent_bin1,
+            parent_resolution,
+            child_resolution,
+        )?;
+        let (bin2_start, bin2_end) = adaptive_child_bin_range(
+            &parent_reader.index,
+            &child_reader.index,
+            key.parent_bin2,
+            parent_resolution,
+            child_resolution,
+        )?;
+        for bin1 in bin1_start..bin1_end {
+            row_requests
+                .entry(bin1)
+                .or_default()
+                .push((bin2_start, bin2_end));
+        }
+    }
+    let mut rows = row_requests.into_iter().collect::<Vec<_>>();
+    rows.sort_by_key(|(row, _)| *row);
+    for (_, ranges) in &mut rows {
+        ranges.sort_unstable();
+        let mut merged = Vec::<(u64, u64)>::new();
+        for (start, end) in ranges.iter().copied() {
+            if let Some((_, previous_end)) = merged.last_mut() {
+                if start <= *previous_end {
+                    *previous_end = (*previous_end).max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        *ranges = merged;
+    }
+
+    let mut span_start = 0;
+    while span_start < rows.len() {
+        ensure_not_cancelled(should_cancel)?;
+        let mut span_end = span_start + 1;
+        while span_end < rows.len() && rows[span_end].0 == rows[span_end - 1].0 + 1 {
+            span_end += 1;
+        }
+        let first_row = rows[span_start].0 as usize;
+        let last_row = rows[span_end - 1].0 as usize;
+        let pixel_start = child_reader.index.bin1_offsets[first_row] as usize;
+        let pixel_end = child_reader.index.bin1_offsets[last_row + 1] as usize;
+        stats.child_rows_read = stats.child_rows_read.saturating_add(span_end - span_start);
+        stats.bin2_ids_scanned = stats
+            .bin2_ids_scanned
+            .saturating_add(pixel_end.saturating_sub(pixel_start));
+        if pixel_start == pixel_end {
+            span_start = span_end;
+            continue;
+        }
+        let bin2_ids = child_reader.pixel_bin2.read_slice(pixel_start, pixel_end)?;
+        let counts = child_reader
+            .pixel_counts
+            .read_slice(pixel_start, pixel_end)?;
+        if bin2_ids.len() != counts.len() {
+            return Err(CStudioError::InvalidContactMapQuery(
+                "adaptive child bin2 and count slices differ in length".to_string(),
+            ));
+        }
+        for (row, requested_ranges) in &rows[span_start..span_end] {
+            let row = *row as usize;
+            let row_start = child_reader.index.bin1_offsets[row] as usize - pixel_start;
+            let row_end = child_reader.index.bin1_offsets[row + 1] as usize - pixel_start;
+            let row_bin2 = &bin2_ids[row_start..row_end];
+            for &(requested_start, requested_end) in requested_ranges {
+                let local_start = row_bin2.partition_point(|bin| *bin < requested_start);
+                let local_end = row_bin2.partition_point(|bin| *bin < requested_end);
+                for local_index in local_start..local_end {
+                    let pixel = AdaptivePixel {
+                        bin1: row as u64,
+                        bin2: row_bin2[local_index],
+                        count: counts[row_start + local_index],
+                    };
+                    let parent_bin1 = adaptive_parent_bin_for_child(
+                        &parent_reader.index,
+                        &child_reader.index,
+                        pixel.bin1,
+                    )?;
+                    let parent_bin2 = adaptive_parent_bin_for_child(
+                        &parent_reader.index,
+                        &child_reader.index,
+                        pixel.bin2,
+                    )?;
+                    let key = AdaptiveChildBlockKey {
+                        file: missing[0].file.clone(),
+                        parent_resolution,
+                        child_resolution,
+                        parent_bin1,
+                        parent_bin2,
+                    };
+                    if let Some(block) = blocks.get_mut(&key) {
+                        block.push(pixel);
+                    }
+                }
+            }
+        }
+        span_start = span_end;
+    }
+    Ok(blocks
+        .into_iter()
+        .map(|(key, pixels)| (key, Arc::new(pixels)))
+        .collect())
+}
+
+fn adaptive_child_bin_range(
+    parent: &CoolIndex,
+    child: &CoolIndex,
+    parent_bin: u64,
+    _parent_resolution: u64,
+    _child_resolution: u64,
+) -> CStudioResult<(u64, u64)> {
+    let (source_index, start, end) = adaptive_bin_source_interval(parent, parent_bin)?;
+    let child_start = child.chrom_offsets[source_index]
+        + child.bin_starts
+            [child.chrom_offsets[source_index]..child.chrom_offsets[source_index + 1]]
+            .partition_point(|position| *position < start);
+    let child_end = child.chrom_offsets[source_index]
+        + child.bin_starts
+            [child.chrom_offsets[source_index]..child.chrom_offsets[source_index + 1]]
+            .partition_point(|position| *position < end);
+    Ok((child_start as u64, child_end as u64))
+}
+
+fn adaptive_parent_bin_for_child(
+    parent: &CoolIndex,
+    child: &CoolIndex,
+    child_bin: u64,
+) -> CStudioResult<u64> {
+    let (source_index, start) = bin_source_and_start(child, child_bin, "child_bin")?;
+    source_bin_at_or_before(parent, source_index, start)
+}
+
+fn source_bin_at_or_before(index: &CoolIndex, source: usize, start: u64) -> CStudioResult<u64> {
+    let chrom_start = index.chrom_offsets[source];
+    let chrom_end = index.chrom_offsets[source + 1];
+    let starts = &index.bin_starts[chrom_start..chrom_end];
+    let relative = starts
+        .partition_point(|position| *position <= start)
+        .saturating_sub(1);
+    u64::try_from(chrom_start + relative).map_err(|_| {
+        CStudioError::InvalidContactMapQuery("adaptive parent bin exceeds u64 range".to_string())
+    })
 }
 
 #[derive(Debug)]
@@ -456,6 +1596,12 @@ fn cached_cool_index(
     let prefix = cool_dataset_prefix(file, resolution)?;
     ensure_not_cancelled(should_cancel)?;
     let chrom_names = read_string_dataset(file, &format!("{prefix}chroms/name"))?;
+    let chrom_lengths = read_u64_dataset(file, &format!("{prefix}chroms/length"))?;
+    if chrom_names.len() != chrom_lengths.len() {
+        return Err(CStudioError::InvalidContactMapQuery(
+            ".cool chroms/name and chroms/length have different lengths".to_string(),
+        ));
+    }
     ensure_not_cancelled(should_cancel)?;
     let bin_chrom_ids = read_i32_dataset(file, &format!("{prefix}bins/chrom"))?;
     ensure_not_cancelled(should_cancel)?;
@@ -484,6 +1630,7 @@ fn cached_cool_index(
     validate_bin1_offsets(&bin1_offsets, bin_starts.len(), should_cancel)?;
     ensure_not_cancelled(should_cancel)?;
     let bytes = chrom_names.iter().map(String::capacity).sum::<usize>()
+        + chrom_lengths.capacity() * std::mem::size_of::<u64>()
         + bin_chrom_ids.capacity() * std::mem::size_of::<i32>()
         + chrom_offsets.capacity() * std::mem::size_of::<usize>()
         + bin_starts.capacity() * std::mem::size_of::<u64>()
@@ -491,6 +1638,7 @@ fn cached_cool_index(
     let index = Arc::new(CoolIndex {
         prefix,
         chrom_names,
+        chrom_lengths,
         bin_chrom_ids,
         chrom_offsets,
         bin_starts,
@@ -1072,6 +2220,26 @@ fn pixel_ranges_for_selected_bin_ranges_cancellable(
     Ok(ranges)
 }
 
+fn batch_nearby_pixel_ranges(
+    pixel_ranges: &[(usize, usize)],
+    max_gap: usize,
+) -> Vec<(usize, usize)> {
+    let mut batches = Vec::<(usize, usize)>::with_capacity(pixel_ranges.len());
+    for &(start, end) in pixel_ranges {
+        if start >= end {
+            continue;
+        }
+        if let Some((_, previous_end)) = batches.last_mut() {
+            if start.saturating_sub(*previous_end) <= max_gap {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        batches.push((start, end));
+    }
+    batches
+}
+
 fn cool_dataset_prefix(file: &File, resolution: Option<u64>) -> CStudioResult<String> {
     if file.group("resolutions").is_ok() {
         let resolution = resolution.ok_or_else(|| {
@@ -1089,24 +2257,46 @@ fn cool_dataset_prefix(file: &File, resolution: Option<u64>) -> CStudioResult<St
 }
 
 fn read_string_dataset(file: &File, path: &str) -> CStudioResult<Vec<String>> {
-    if let Ok(values) = file
-        .dataset(path)
-        .and_then(|dataset| dataset.read_1d::<FixedAscii<11>>())
+    let dataset = file.dataset(path).map_err(cool_error)?;
+    match dataset
+        .dtype()
+        .and_then(|datatype| datatype.to_descriptor())
     {
-        return Ok(values
-            .iter()
-            .map(|value| String::from(value.clone()))
-            .collect());
+        Ok(TypeDescriptor::VarLenUnicode) => dataset
+            .read_1d::<VarLenUnicode>()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().to_string())
+                    .collect()
+            })
+            .map_err(cool_error),
+        Ok(TypeDescriptor::VarLenAscii) => dataset
+            .read_1d::<VarLenAscii>()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().to_string())
+                    .collect()
+            })
+            .map_err(cool_error),
+        Ok(TypeDescriptor::FixedAscii(length)) if length <= 256 => dataset
+            .read_1d::<FixedAscii<256>>()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| String::from(value.clone()))
+                    .collect()
+            })
+            .map_err(cool_error),
+        Ok(TypeDescriptor::FixedAscii(length)) => Err(CStudioError::InvalidContactMapQuery(
+            format!(".cool string width {length} exceeds the supported 256-byte limit"),
+        )),
+        Ok(descriptor) => Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool dataset {path} must contain ASCII or Unicode strings, found {descriptor}"
+        ))),
+        Err(error) => Err(cool_error(error)),
     }
-
-    let values = file
-        .dataset(path)
-        .and_then(|dataset| dataset.read_1d::<VarLenUnicode>())
-        .map_err(cool_error)?;
-    Ok(values
-        .iter()
-        .map(|value| value.as_str().to_string())
-        .collect())
 }
 
 fn read_i32_dataset(file: &File, path: &str) -> CStudioResult<Vec<i32>> {
@@ -1206,6 +2396,7 @@ fn cool_error(error: hdf5::Error) -> CStudioError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         path::PathBuf,
         sync::{
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -1218,13 +2409,22 @@ mod tests {
     use hdf5::{types::FixedAscii, File};
 
     use super::{
-        cached_normalization_vector, normalized_contact_count,
+        batch_nearby_pixel_ranges, bin1_for_pixel_offset, cached_cool_reader,
+        cached_normalization_vector, list_contact_resolutions, normalized_contact_count,
         pixel_ranges_for_selected_bin_ranges, read_cool_contacts_for_source_ranges_at_resolution,
         read_cool_contacts_for_source_ranges_at_resolution_cancellable,
         read_cool_contacts_for_sources,
         read_cool_contacts_for_sources_at_resolution_with_normalization, resolve_chrom_offsets,
-        validate_bin1_offsets, CoolIndex, CoolIndexCacheKey, CoolNormalizationCacheKey,
-        SelectedBinIndex, SourceRangeIndex,
+        validate_bin1_offsets,
+        visit_cool_contact_chunks_for_source_ranges_at_resolution_with_normalization_cancellable,
+        CoolIndex, CoolIndexCacheKey, CoolNormalizationCacheKey, SelectedBinIndex,
+        SourceRangeIndex,
+    };
+    use crate::{
+        agp::Orientation,
+        contact_map::{
+            build_contact_map_view_from_contacts, ContactMapQuery, LayoutBlock, Viewport,
+        },
     };
     use crate::{contact_normalization::ContactNormalization, CStudioError, CStudioResult};
 
@@ -1284,6 +2484,10 @@ mod tests {
                 .with_data(&names)
                 .create("chroms/name")
                 .expect("write chromosome names");
+            file.new_dataset_builder()
+                .with_data(&[2_000_u64])
+                .create("chroms/length")
+                .expect("write chromosome lengths");
             file.new_dataset_builder()
                 .with_data(&[0_i32, 0])
                 .create("bins/chrom")
@@ -1347,6 +2551,128 @@ mod tests {
         }
     }
 
+    struct TestAdaptiveMcool {
+        path: PathBuf,
+    }
+
+    impl TestAdaptiveMcool {
+        fn create() -> Self {
+            let id = NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cstudio-adaptive-{}-{id}.mcool",
+                std::process::id(),
+            ));
+            let file = File::create(&path).expect("create adaptive test mcool");
+            file.create_group("resolutions")
+                .expect("create resolutions");
+            let observations = [
+                (0_u64, 0_u64, 2_i32),
+                (1_249_000, 1_249_000, 3),
+                (1_250_000, 1_250_000, 5),
+                (2_499_000, 2_499_000, 7),
+            ];
+            for resolution in super::ADAPTIVE_RESOLUTION_CHAIN {
+                Self::write_resolution(&file, resolution, &observations);
+            }
+            drop(file);
+            Self { path }
+        }
+
+        fn write_resolution(file: &File, resolution: u64, observations: &[(u64, u64, i32)]) {
+            let prefix = format!("resolutions/{resolution}");
+            file.create_group(&prefix).expect("create resolution");
+            for group in ["chroms", "bins", "indexes", "pixels"] {
+                file.create_group(&format!("{prefix}/{group}"))
+                    .expect("create resolution subgroup");
+            }
+            let names = [FixedAscii::<8>::from_ascii("chr1").expect("ASCII source")];
+            file.new_dataset_builder()
+                .with_data(&names)
+                .create(format!("{prefix}/chroms/name").as_str())
+                .expect("write names");
+            file.new_dataset_builder()
+                .with_data(&[3_000_000_u64])
+                .create(format!("{prefix}/chroms/length").as_str())
+                .expect("write lengths");
+            let bin_count = 3_000_000_u64.div_ceil(resolution) as usize;
+            let bin_chrom = vec![0_i32; bin_count];
+            let bin_starts = (0..bin_count)
+                .map(|bin| bin as u64 * resolution)
+                .collect::<Vec<_>>();
+            let bin_ends = bin_starts
+                .iter()
+                .map(|start| start.saturating_add(resolution).min(3_000_000))
+                .collect::<Vec<_>>();
+            file.new_dataset_builder()
+                .with_data(&bin_chrom)
+                .create(format!("{prefix}/bins/chrom").as_str())
+                .expect("write bin chroms");
+            file.new_dataset_builder()
+                .with_data(&bin_starts)
+                .create(format!("{prefix}/bins/start").as_str())
+                .expect("write bin starts");
+            file.new_dataset_builder()
+                .with_data(&bin_ends)
+                .create(format!("{prefix}/bins/end").as_str())
+                .expect("write bin ends");
+            file.new_dataset_builder()
+                .with_data(&[0_u64, bin_count as u64])
+                .create(format!("{prefix}/indexes/chrom_offset").as_str())
+                .expect("write chrom offsets");
+
+            let mut aggregated = HashMap::<(u64, u64), i32>::new();
+            for &(start1, start2, count) in observations {
+                *aggregated
+                    .entry((start1 / resolution, start2 / resolution))
+                    .or_insert(0) += count;
+            }
+            let mut pixels = aggregated.into_iter().collect::<Vec<_>>();
+            pixels.sort_by_key(|((bin1, bin2), _)| (*bin1, *bin2));
+            let pixel_bin1 = pixels
+                .iter()
+                .map(|((bin1, _), _)| *bin1)
+                .collect::<Vec<_>>();
+            let pixel_bin2 = pixels
+                .iter()
+                .map(|((_, bin2), _)| *bin2)
+                .collect::<Vec<_>>();
+            let pixel_counts = pixels.iter().map(|(_, count)| *count).collect::<Vec<_>>();
+            let mut bin1_offsets = vec![0_u64; bin_count + 1];
+            for &bin1 in &pixel_bin1 {
+                bin1_offsets[bin1 as usize + 1] += 1;
+            }
+            for index in 1..bin1_offsets.len() {
+                bin1_offsets[index] += bin1_offsets[index - 1];
+            }
+            file.new_dataset_builder()
+                .with_data(&bin1_offsets)
+                .create(format!("{prefix}/indexes/bin1_offset").as_str())
+                .expect("write bin1 offsets");
+            file.new_dataset_builder()
+                .with_data(&pixel_bin1)
+                .create(format!("{prefix}/pixels/bin1_id").as_str())
+                .expect("write bin1 ids");
+            file.new_dataset_builder()
+                .with_data(&pixel_bin2)
+                .create(format!("{prefix}/pixels/bin2_id").as_str())
+                .expect("write bin2 ids");
+            file.new_dataset_builder()
+                .with_data(&pixel_counts)
+                .create(format!("{prefix}/pixels/count").as_str())
+                .expect("write counts");
+        }
+
+        fn path(&self) -> &str {
+            self.path.to_str().expect("UTF-8 adaptive path")
+        }
+    }
+
+    impl Drop for TestAdaptiveMcool {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
     #[test]
     fn reads_contacts_from_example_1k_cool_file() {
         let contacts = read_cool_contacts_for_sources(
@@ -1356,6 +2682,80 @@ mod tests {
         .expect("example .cool should read");
 
         assert!(!contacts.is_empty());
+    }
+
+    #[test]
+    fn reports_the_native_resolution_for_single_resolution_cool() {
+        let file = TestCoolFile::without_weights();
+
+        assert_eq!(
+            list_contact_resolutions(file.path()).expect("read .cool resolution"),
+            vec![1_000],
+        );
+    }
+
+    #[test]
+    fn chunk_visitor_matches_owned_contact_reader_without_source_name_allocation_contract() {
+        let file = TestCoolFile::without_weights();
+        let ranges = vec![("chr1".to_string(), 0, 2_000)];
+        let expected =
+            read_cool_contacts_for_source_ranges_at_resolution(file.path(), &ranges, None)
+                .expect("owned reader should work");
+        let mut observed = Vec::new();
+        let mut finished_chunks = 0;
+        let visited = visit_cool_contact_chunks_for_source_ranges_at_resolution_with_normalization_cancellable(
+            file.path(),
+            &ranges,
+            None,
+            ContactNormalization::Raw,
+            &|| false,
+            |source1, start1, source2, start2, count| {
+                observed.push((source1.to_string(), start1, source2.to_string(), start2, count));
+                Ok(())
+            },
+            || {
+                finished_chunks += 1;
+                Ok(())
+            },
+        )
+        .expect("chunk visitor should work");
+
+        let expected_tuples = expected
+            .iter()
+            .map(|contact| {
+                (
+                    contact.source1.clone(),
+                    contact.start1,
+                    contact.source2.clone(),
+                    contact.start2,
+                    contact.count,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected_tuples);
+        assert_eq!(visited, expected.len());
+        assert_eq!(finished_chunks, 1);
+    }
+
+    #[test]
+    fn derives_bin1_from_offsets_across_empty_rows() {
+        let offsets = [0, 0, 2, 2, 5];
+
+        assert_eq!(bin1_for_pixel_offset(&offsets, 0).unwrap(), 1);
+        assert_eq!(bin1_for_pixel_offset(&offsets, 1).unwrap(), 1);
+        assert_eq!(bin1_for_pixel_offset(&offsets, 2).unwrap(), 3);
+        assert_eq!(bin1_for_pixel_offset(&offsets, 4).unwrap(), 3);
+        assert!(bin1_for_pixel_offset(&offsets, 5).is_err());
+    }
+
+    #[test]
+    fn reports_all_stored_mcool_resolutions_coarsest_first() {
+        let file = TestAdaptiveMcool::create();
+
+        assert_eq!(
+            list_contact_resolutions(file.path()).expect("read .mcool resolutions"),
+            vec![2_500_000, 500_000, 100_000, 10_000, 1_000],
+        );
     }
 
     #[test]
@@ -1371,6 +2771,169 @@ mod tests {
         assert!(contacts
             .iter()
             .all(|contact| contact.start1 < 100_000 && contact.start2 < 100_000));
+    }
+
+    #[test]
+    fn reuses_open_cool_reader_and_dataset_handles() {
+        let file = TestCoolFile::without_weights();
+        let first = cached_cool_reader(file.path(), None, &|| false)
+            .expect("open the first persistent reader");
+        let second =
+            cached_cool_reader(file.path(), None, &|| false).expect("reuse the persistent reader");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.index.bin_starts, vec![0, 1_000]);
+    }
+
+    #[test]
+    fn batches_only_nearby_pixel_ranges() {
+        assert_eq!(
+            batch_nearby_pixel_ranges(&[(10, 20), (20, 25), (30, 40), (100, 110)], 5),
+            vec![(10, 40), (100, 110)],
+        );
+        assert_eq!(
+            batch_nearby_pixel_ranges(&[(0, 1), (17, 18)], 15),
+            vec![(0, 1), (17, 18)],
+        );
+        assert_eq!(
+            batch_nearby_pixel_ranges(&[(4, 4), (5, 9)], 16),
+            vec![(5, 9)],
+        );
+    }
+
+    #[test]
+    fn reads_fixed_ascii_source_names_without_truncating_them() {
+        let id = NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cstudio-long-source-names-{}-{id}.h5",
+            std::process::id(),
+        ));
+        let file = File::create(&path).expect("create long-name test file");
+        let names = [
+            FixedAscii::<32>::from_ascii("shared-prefix-source-A").expect("ASCII name"),
+            FixedAscii::<32>::from_ascii("shared-prefix-source-B").expect("ASCII name"),
+        ];
+        file.new_dataset_builder()
+            .with_data(&names)
+            .create("names")
+            .expect("write long names");
+
+        let read = super::read_string_dataset(&file, "names").expect("read full names");
+        drop(file);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(
+            read,
+            vec![
+                "shared-prefix-source-A".to_string(),
+                "shared-prefix-source-B".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn adaptive_mcool_refines_agp_boundaries_to_the_exact_base_result_and_reuses_children() {
+        let file = TestAdaptiveMcool::create();
+        let ranges = [("chr1".to_string(), 0, 3_000_000)];
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 2_500_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 5_000_000,
+                y_start: 0,
+                y_end: 5_000_000,
+            },
+            layout_blocks: vec![LayoutBlock {
+                id: "shifted".to_string(),
+                source_id: "chr1".to_string(),
+                source_start: 0,
+                source_end: 3_000_000,
+                visual_start: 1_250_000,
+                orientation: Orientation::Forward,
+            }],
+        };
+        let base_contacts =
+            read_cool_contacts_for_source_ranges_at_resolution(file.path(), &ranges, Some(1_000))
+                .expect("read exact base contacts");
+        let baseline = build_contact_map_view_from_contacts(&query, base_contacts)
+            .expect("build exact baseline");
+
+        let first = super::build_contact_map_view_from_mcool_adaptive_raw_cancellable(
+            file.path(),
+            &ranges,
+            &query,
+            &|| false,
+        )
+        .expect("adaptive read")
+        .expect("adaptive chain should be supported");
+        let second = super::build_contact_map_view_from_mcool_adaptive_raw_cancellable(
+            file.path(),
+            &ranges,
+            &query,
+            &|| false,
+        )
+        .expect("cached adaptive read")
+        .expect("adaptive chain should remain supported");
+
+        assert_eq!(first.view, baseline);
+        assert_eq!(second.view, baseline);
+        assert!(first.stats.child_blocks_requested > 0);
+        assert_eq!(first.stats.child_blocks_cached, 0);
+        assert!(second.stats.child_blocks_cached > 0);
+        assert_eq!(second.stats.child_rows_read, 0);
+        assert_eq!(second.stats.bin2_ids_scanned, 0);
+    }
+
+    #[test]
+    fn adaptive_mcool_declines_unsupported_target_resolution() {
+        let file = TestAdaptiveMcool::create();
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 500_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 1_000_000,
+                y_start: 0,
+                y_end: 1_000_000,
+            },
+            layout_blocks: Vec::new(),
+        };
+        assert!(
+            super::build_contact_map_view_from_mcool_adaptive_raw_cancellable(
+                file.path(),
+                &[("chr1".to_string(), 0, 1_000_000)],
+                &query,
+                &|| false,
+            )
+            .expect("unsupported target should not error")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn adaptive_mcool_observes_cancellation_before_contact_io() {
+        let file = TestAdaptiveMcool::create();
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 2_500_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 2_500_000,
+                y_start: 0,
+                y_end: 2_500_000,
+            },
+            layout_blocks: Vec::new(),
+        };
+        let error = super::build_contact_map_view_from_mcool_adaptive_raw_cancellable(
+            file.path(),
+            &[("chr1".to_string(), 0, 1_000_000)],
+            &query,
+            &|| true,
+        )
+        .expect_err("cancelled adaptive request should stop before contact reads");
+
+        assert_eq!(error, CStudioError::RequestCancelled);
     }
 
     #[test]
@@ -1426,6 +2989,7 @@ mod tests {
         let index = CoolIndex {
             prefix: String::new(),
             chrom_names: vec!["duplicate".to_string(), "duplicate".to_string()],
+            chrom_lengths: vec![200, 200],
             bin_chrom_ids: vec![0, 0, 1, 1],
             chrom_offsets: vec![0, 2, 4],
             bin_starts: vec![0, 100, 0, 100],

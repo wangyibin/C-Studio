@@ -92,6 +92,42 @@ export function buildWholeGenomeContactViewport(totalSpanBp: number): ContactVie
   };
 }
 
+/**
+ * Shift a transient pan viewport toward its current motion so the next tile
+ * edge can be requested before it becomes visible. The displayed viewport is
+ * unchanged; this viewport is only a prefetch hint.
+ */
+export function contactViewportWithDirectionalLead(
+  source: ContactViewport,
+  target: ContactViewport,
+  leadBp: number,
+  totalSpanBp: number,
+): ContactViewport {
+  const safeLead = Number.isFinite(leadBp) ? Math.max(0, leadBp) : 0;
+  const safeTotalSpan = Number.isFinite(totalSpanBp) ? Math.max(1, totalSpanBp) : 1;
+  const direction = (sourceStart: number, sourceEnd: number, targetStart: number, targetEnd: number) => (
+    Math.sign((targetStart + targetEnd) - (sourceStart + sourceEnd))
+  );
+  const shiftAxis = (start: number, end: number, axisDirection: number) => {
+    const span = Math.max(1, end - start);
+    const maxStart = Math.max(0, safeTotalSpan - span);
+    const nextStart = clamp(start + axisDirection * safeLead, 0, maxStart);
+    return [nextStart, nextStart + span] as const;
+  };
+  const [xStart, xEnd] = shiftAxis(
+    target.xStart,
+    target.xEnd,
+    direction(source.xStart, source.xEnd, target.xStart, target.xEnd),
+  );
+  const [yStart, yEnd] = shiftAxis(
+    target.yStart,
+    target.yEnd,
+    direction(source.yStart, source.yEnd, target.yStart, target.yEnd),
+  );
+
+  return { xStart, xEnd, yStart, yEnd };
+}
+
 export function horizontalViewportDragDeltaMb(
   deltaXPx: number,
   widthPx: number,

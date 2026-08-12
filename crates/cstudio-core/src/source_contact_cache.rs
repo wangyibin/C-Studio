@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     contact_map::{
@@ -34,9 +37,19 @@ struct CachedSourceContact {
 
 #[derive(Debug)]
 struct SourceContactCacheEntry {
-    contacts: Vec<CachedSourceContact>,
+    contacts: Arc<Vec<CachedSourceContact>>,
     bytes: usize,
     last_used: u64,
+}
+
+#[derive(Debug)]
+pub struct PreparedSourceContactCacheEntries {
+    entries: Vec<(SourceContactCacheKey, Vec<CachedSourceContact>)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceContactCacheSnapshot {
+    entries: Vec<(SourceContactCacheKey, Arc<Vec<CachedSourceContact>>)>,
 }
 
 #[derive(Debug)]
@@ -107,41 +120,50 @@ impl SourceContactCache {
         contacts: &[ContactBin],
         should_cancel: &dyn Fn() -> bool,
     ) -> CStudioResult<()> {
+        let prepared = Self::prepare_contacts_for_windows_cancellable(
+            path,
+            resolution,
+            windows,
+            contacts,
+            should_cancel,
+        )?;
+        self.insert_prepared_cancellable(prepared, should_cancel)
+    }
+
+    pub fn prepare_contacts_for_windows_cancellable(
+        path: &str,
+        resolution: u64,
+        windows: &[SourceWindow],
+        contacts: &[ContactBin],
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CStudioResult<PreparedSourceContactCacheEntries> {
         if should_cancel() {
             return Err(crate::CStudioError::RequestCancelled);
         }
         let keys = Self::keys_for_windows(path, resolution, windows);
-        let mut contacts_by_key = keys
-            .iter()
-            .cloned()
-            .map(|key| (key, Vec::new()))
-            .collect::<HashMap<_, Vec<CachedSourceContact>>>();
+        let window_index = SourceWindowIndex::new(windows);
+        let mut contacts_by_key = (0..keys.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<CachedSourceContact>>>();
 
         for (contact_index, contact) in contacts.iter().enumerate() {
             if contact_index % 4_096 == 0 && should_cancel() {
                 return Err(crate::CStudioError::RequestCancelled);
             }
-            let Some(first_window) = window_for_position(windows, &contact.source1, contact.start1)
-            else {
+            let Some(first_index) = window_index.find(&contact.source1, contact.start1) else {
                 continue;
             };
-            let Some(second_window) =
-                window_for_position(windows, &contact.source2, contact.start2)
-            else {
+            let Some(second_index) = window_index.find(&contact.source2, contact.start2) else {
                 continue;
             };
-            let (first, second, first_start, second_start) = if first_window <= second_window {
-                (first_window, second_window, contact.start1, contact.start2)
-            } else {
-                (second_window, first_window, contact.start2, contact.start1)
-            };
-            let key = SourceContactCacheKey {
-                path: path.to_string(),
-                resolution,
-                first: first.clone(),
-                second: second.clone(),
-            };
-            if let Some(entry_contacts) = contacts_by_key.get_mut(&key) {
+            let (first_index, second_index, first_start, second_start) =
+                if first_index <= second_index {
+                    (first_index, second_index, contact.start1, contact.start2)
+                } else {
+                    (second_index, first_index, contact.start2, contact.start1)
+                };
+            let entry_index = upper_triangle_index(windows.len(), first_index, second_index);
+            if let Some(entry_contacts) = contacts_by_key.get_mut(entry_index) {
                 entry_contacts.push(CachedSourceContact {
                     first_start,
                     second_start,
@@ -153,7 +175,17 @@ impl SourceContactCache {
         if should_cancel() {
             return Err(crate::CStudioError::RequestCancelled);
         }
-        for (entry_index, (key, entry_contacts)) in contacts_by_key.into_iter().enumerate() {
+        Ok(PreparedSourceContactCacheEntries {
+            entries: keys.into_iter().zip(contacts_by_key).collect(),
+        })
+    }
+
+    pub fn insert_prepared_cancellable(
+        &mut self,
+        prepared: PreparedSourceContactCacheEntries,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CStudioResult<()> {
+        for (entry_index, (key, entry_contacts)) in prepared.entries.into_iter().enumerate() {
             if entry_index % 128 == 0 && should_cancel() {
                 return Err(crate::CStudioError::RequestCancelled);
             }
@@ -176,6 +208,19 @@ impl SourceContactCache {
         query: &ContactMapQuery,
         should_cancel: &dyn Fn() -> bool,
     ) -> CStudioResult<Option<ContactMapView>> {
+        let Some(snapshot) = self.snapshot_for_keys_cancellable(keys, should_cancel)? else {
+            return Ok(None);
+        };
+        snapshot
+            .build_view_cancellable(query, should_cancel)
+            .map(Some)
+    }
+
+    pub fn snapshot_for_keys_cancellable(
+        &mut self,
+        keys: &[SourceContactCacheKey],
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CStudioResult<Option<SourceContactCacheSnapshot>> {
         if should_cancel() {
             return Err(crate::CStudioError::RequestCancelled);
         }
@@ -190,17 +235,18 @@ impl SourceContactCache {
                 entry.last_used = tick;
             }
         }
-        let contacts = keys.iter().flat_map(|key| {
-            let entry = self
-                .entries
-                .get(key)
-                .expect("cache keys were checked above");
-            entry
-                .contacts
+        Ok(Some(SourceContactCacheSnapshot {
+            entries: keys
                 .iter()
-                .map(move |contact| CachedSourceContactRef { key, contact })
-        });
-        build_contact_map_view_from_contacts_cancellable(query, contacts, should_cancel).map(Some)
+                .map(|key| {
+                    let entry = self
+                        .entries
+                        .get(key)
+                        .expect("cache keys were checked above");
+                    (key.clone(), Arc::clone(&entry.contacts))
+                })
+                .collect(),
+        }))
     }
 
     pub fn used_bytes(&self) -> usize {
@@ -242,12 +288,27 @@ impl SourceContactCache {
         self.entries.insert(
             key,
             SourceContactCacheEntry {
-                contacts,
+                contacts: Arc::new(contacts),
                 bytes,
                 last_used: self.clock,
             },
         );
         self.used_bytes += bytes;
+    }
+}
+
+impl SourceContactCacheSnapshot {
+    pub fn build_view_cancellable(
+        &self,
+        query: &ContactMapQuery,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CStudioResult<ContactMapView> {
+        let contacts = self.entries.iter().flat_map(|(key, contacts)| {
+            contacts
+                .iter()
+                .map(move |contact| CachedSourceContactRef { key, contact })
+        });
+        build_contact_map_view_from_contacts_cancellable(query, contacts, should_cancel)
     }
 }
 
@@ -322,14 +383,63 @@ pub fn source_windows_for_ranges_with_limit(
     Some(windows)
 }
 
-fn window_for_position<'a>(
+struct SourceWindowIndex<'a> {
     windows: &'a [SourceWindow],
-    source_id: &str,
-    position: u64,
-) -> Option<&'a SourceWindow> {
-    windows.iter().find(|window| {
-        window.source_id == source_id && position >= window.start && position < window.end
-    })
+    exact_by_start: HashMap<(&'a str, u64), usize>,
+    uniform_window_size: Option<u64>,
+    ranges_by_source: HashMap<&'a str, Vec<(u64, u64, usize)>>,
+}
+
+impl<'a> SourceWindowIndex<'a> {
+    fn new(windows: &'a [SourceWindow]) -> Self {
+        let first_window_size = windows
+            .first()
+            .map(|window| window.end.saturating_sub(window.start))
+            .filter(|size| *size > 0);
+        let uniform_window_size = first_window_size.filter(|size| {
+            windows.iter().all(|window| {
+                window.end.saturating_sub(window.start) == *size && window.start % *size == 0
+            })
+        });
+        let mut exact_by_start = HashMap::with_capacity(windows.len());
+        let mut ranges_by_source = HashMap::<&str, Vec<(u64, u64, usize)>>::new();
+        for (index, window) in windows.iter().enumerate() {
+            exact_by_start.insert((window.source_id.as_str(), window.start), index);
+            ranges_by_source
+                .entry(window.source_id.as_str())
+                .or_default()
+                .push((window.start, window.end, index));
+        }
+        for ranges in ranges_by_source.values_mut() {
+            ranges.sort_unstable_by_key(|range| range.0);
+        }
+        Self {
+            windows,
+            exact_by_start,
+            uniform_window_size,
+            ranges_by_source,
+        }
+    }
+
+    fn find(&self, source_id: &str, position: u64) -> Option<usize> {
+        if let Some(window_size) = self.uniform_window_size {
+            let start = position / window_size * window_size;
+            if let Some(index) = self.exact_by_start.get(&(source_id, start)).copied() {
+                return (position < self.windows[index].end).then_some(index);
+            }
+        }
+        let ranges = self.ranges_by_source.get(source_id)?;
+        let insertion = ranges.partition_point(|(start, _, _)| *start <= position);
+        let (_, end, index) = insertion
+            .checked_sub(1)
+            .and_then(|index| ranges.get(index))?;
+        (position < *end).then_some(*index)
+    }
+}
+
+fn upper_triangle_index(size: usize, first: usize, second: usize) -> usize {
+    debug_assert!(first <= second && second < size);
+    first * size - first.saturating_mul(first.saturating_sub(1)) / 2 + (second - first)
 }
 
 fn estimated_entry_bytes(key: &SourceContactCacheKey, contact_capacity: usize) -> usize {
@@ -487,5 +597,93 @@ mod tests {
 
         assert_eq!(within_limit.len(), 3);
         assert!(over_limit.is_none());
+    }
+
+    #[test]
+    fn indexed_preparation_assigns_contacts_to_the_expected_window_pair() {
+        let windows = vec![
+            SourceWindow {
+                source_id: "a".to_string(),
+                start: 0,
+                end: 100,
+            },
+            SourceWindow {
+                source_id: "a".to_string(),
+                start: 100,
+                end: 200,
+            },
+            SourceWindow {
+                source_id: "b".to_string(),
+                start: 0,
+                end: 100,
+            },
+        ];
+        let contacts = vec![
+            ContactBin {
+                source1: "b".to_string(),
+                start1: 25,
+                source2: "a".to_string(),
+                start2: 125,
+                count: 4.0,
+            },
+            ContactBin {
+                source1: "a".to_string(),
+                start1: 50,
+                source2: "missing".to_string(),
+                start2: 50,
+                count: 8.0,
+            },
+        ];
+
+        let prepared = SourceContactCache::prepare_contacts_for_windows_cancellable(
+            "map.cool",
+            100,
+            &windows,
+            &contacts,
+            &|| false,
+        )
+        .expect("preparation succeeds");
+        let populated = prepared
+            .entries
+            .iter()
+            .filter(|(_, contacts)| !contacts.is_empty())
+            .collect::<Vec<_>>();
+
+        assert_eq!(populated.len(), 1);
+        assert_eq!(populated[0].0.first, windows[1]);
+        assert_eq!(populated[0].0.second, windows[2]);
+        assert_eq!(populated[0].1[0].first_start, 125);
+        assert_eq!(populated[0].1[0].second_start, 25);
+    }
+
+    #[test]
+    fn cache_snapshot_remains_usable_after_the_cache_is_dropped() {
+        let windows = source_windows_for_ranges(&[("ctg-a".to_string(), 0, 1_000)], 1_000);
+        let keys = SourceContactCache::keys_for_windows("map.cool", 100, &windows);
+        let mut cache = SourceContactCache::new(16_384);
+        cache.insert_contacts_for_windows(
+            "map.cool",
+            100,
+            &windows,
+            &[ContactBin {
+                source1: "ctg-a".to_string(),
+                start1: 100,
+                source2: "ctg-a".to_string(),
+                start2: 300,
+                count: 5.0,
+            }],
+        );
+        let snapshot = cache
+            .snapshot_for_keys_cancellable(&keys, &|| false)
+            .expect("snapshot lookup succeeds")
+            .expect("entry is cached");
+        drop(cache);
+
+        let view = snapshot
+            .build_view_cancellable(&query(0), &|| false)
+            .expect("snapshot projects without the cache lock");
+
+        assert_eq!(view.cells.len(), 1);
+        assert_eq!(view.cells[0].count, 5.0);
     }
 }

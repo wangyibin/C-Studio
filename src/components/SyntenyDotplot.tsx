@@ -12,6 +12,10 @@ import {
   type AssemblySelectionModifiers,
 } from "../state/assemblyEditing";
 import {
+  buildAssemblyBoundaryBands,
+  fallbackAssemblyBoundaryViewportWidthPx,
+} from "../state/assemblyBoundaryLod";
+import {
   horizontalViewportDragDeltaMb,
   horizontalViewportFocusRatio,
 } from "../state/contactViewport";
@@ -114,20 +118,34 @@ export function SyntenyDotplot({
   totalSpanMb,
 }: SyntenyDotplotProps) {
   const isInteractive = interactionMode === "interactive";
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const [canvasAspectRatio, setCanvasAspectRatio] = useState(1);
+  const [canvasWidthPx, setCanvasWidthPx] = useState(
+    fallbackAssemblyBoundaryViewportWidthPx,
+  );
   const displaySyntenyView = useMemo(
     () => syntenyViewForAssemblyExtent(syntenyView, assemblyBlocks),
     [assemblyBlocks, syntenyView],
   );
-  const layout = useMemo(() => buildDotplotLayout(displaySyntenyView), [displaySyntenyView]);
+  const layout = useMemo(
+    () => buildDotplotLayout(displaySyntenyView, canvasAspectRatio),
+    [canvasAspectRatio, displaySyntenyView],
+  );
   const assemblyTrack = useMemo(
-    () => buildAssemblyTrack(displaySyntenyView, assemblyBlocks),
-    [assemblyBlocks, displaySyntenyView],
+    () => buildAssemblyTrack(
+      displaySyntenyView,
+      assemblyBlocks,
+      canvasWidthPx * ((syntenyPlotRightPercent - syntenyPlotLeftPercent) / 100),
+    ),
+    [assemblyBlocks, canvasWidthPx, displaySyntenyView],
   );
   const dominantTargetByChromosome = useMemo(
     () => dominantSyntenyTargetByChromosome(syntenyView, assemblyBlocks),
     [assemblyBlocks, syntenyView],
   );
-  const lastVisibleChromosomeId = assemblyTrack.chromosomes[assemblyTrack.chromosomes.length - 1]?.id;
+  const lastVisibleBoundaryBandId = assemblyTrack.chromosomeBands[
+    assemblyTrack.chromosomeBands.length - 1
+  ]?.id;
   const selected = new Set(selectedAssemblyBlockIds);
   const [contextMenu, setContextMenu] = useState<AssemblyContextMenuPosition | null>(null);
   const [selectionDrag, setSelectionDrag] = useState<SyntenySelectionDrag | null>(null);
@@ -135,6 +153,41 @@ export function SyntenyDotplot({
   const [panDrag, setPanDrag] = useState<SyntenyPanDrag | null>(null);
   const panDragRef = useRef<SyntenyPanDrag | null>(null);
   const suppressClickRef = useRef(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    const updateAspectRatio = (width: number, height: number) => {
+      if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+        return;
+      }
+      setCanvasWidthPx((currentWidth) => (
+        Math.abs(currentWidth - width) < 0.5 ? currentWidth : width
+      ));
+      const nextAspectRatio = width / height;
+      setCanvasAspectRatio((currentAspectRatio) => (
+        Math.abs(currentAspectRatio - nextAspectRatio) < 0.0001
+          ? currentAspectRatio
+          : nextAspectRatio
+      ));
+    };
+
+    updateAspectRatio(canvas.clientWidth, canvas.clientHeight);
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) {
+        updateAspectRatio(entry.contentRect.width, entry.contentRect.height);
+      }
+    });
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     function abandonSyntenySelection(event: KeyboardEvent) {
@@ -442,6 +495,7 @@ export function SyntenyDotplot({
   return (
     <div className="synteny-view">
       <div
+        ref={canvasRef}
         className={`synteny-canvas ${!isInteractive ? "synteny-preview-only" : ""} ${
           panDrag?.moved ? "synteny-panning" : ""
         }`}
@@ -459,21 +513,25 @@ export function SyntenyDotplot({
         onPointerMove={moveSyntenyPointer}
         onPointerUp={stopSyntenyPointer}
         onPointerCancel={cancelSyntenyPointer}
+        onLostPointerCapture={cancelSyntenyPointer}
       >
         <div className="synteny-plot-frame" aria-hidden="true" />
         <div className="synteny-axis query-axis">Assembly</div>
         <div className="synteny-axis target-axis">Reference</div>
 
         <div className="synteny-query-track" aria-label="Assembly contigs in heatmap X region">
-          {assemblyTrack.chromosomes.map((chromosome) => (
+          {assemblyTrack.chromosomeBands.map((band) => (
             <span
               className={`synteny-chromosome-band ${
-                chromosome.id === lastVisibleChromosomeId ? "last-visible" : ""
+                band.id === lastVisibleBoundaryBandId ? "last-visible" : ""
               }`}
-              key={chromosome.id}
-              data-chromosome-id={chromosome.id}
-              style={{ left: `${chromosome.left}%`, width: `${chromosome.width}%` }}
-              title={chromosome.id}
+              key={band.id}
+              data-chromosome-id={band.objectIds.length === 1 ? band.objectIds[0] : undefined}
+              data-boundary-object-count={band.objectIds.length}
+              style={{ left: `${band.left}%`, width: `${band.width}%` }}
+              title={band.objectIds.length === 1
+                ? band.objectIds[0]
+                : `${band.objectIds.length} compact assembly objects`}
             />
           ))}
           {isInteractive ? (
@@ -618,7 +676,10 @@ export function SyntenyDotplot({
   );
 }
 
-export function buildDotplotLayout(syntenyView: SyntenyView | null): DotplotLayout {
+export function buildDotplotLayout(
+  syntenyView: SyntenyView | null,
+  canvasAspectRatio = 1,
+): DotplotLayout {
   if (!syntenyView || syntenyView.viewport.xEnd <= syntenyView.viewport.xStart) {
     return { blocks: [], targetLanes: [] };
   }
@@ -664,6 +725,9 @@ export function buildDotplotLayout(syntenyView: SyntenyView | null): DotplotLayo
   });
   const lanesById = new Map(targetLanes.map((lane) => [lane.id, lane]));
   const viewportWidth = syntenyView.viewport.xEnd - syntenyView.viewport.xStart;
+  const safeCanvasAspectRatio = Number.isFinite(canvasAspectRatio) && canvasAspectRatio > 0
+    ? canvasAspectRatio
+    : 1;
 
   const blocks = syntenyView.blocks.flatMap((block) => {
     const lane = lanesById.get(block.targetId);
@@ -694,6 +758,10 @@ export function buildDotplotLayout(syntenyView: SyntenyView | null): DotplotLayo
       + (1 - clamp(targetAtVisibleEnd, 0, lane.targetLength) / lane.targetLength) * lane.height;
     const deltaX = x2 - x1;
     const deltaY = y2 - y1;
+    // CSS percentage widths resolve against the canvas width, while percentage
+    // top positions resolve against its height. Convert the vertical delta into
+    // width-relative units before deriving the rotated segment geometry.
+    const widthRelativeDeltaY = deltaY / safeCanvasAspectRatio;
 
     return [{
       key: `${block.assemblyBlockId}-${block.targetId}-${block.visualStart}-${block.targetStart}`,
@@ -701,8 +769,8 @@ export function buildDotplotLayout(syntenyView: SyntenyView | null): DotplotLayo
       targetId: block.targetId,
       left: x1,
       top: y1,
-      width: Math.max(0.35, Math.hypot(deltaX, deltaY)),
-      angle: (Math.atan2(deltaY, deltaX) * 180) / Math.PI,
+      width: Math.hypot(deltaX, widthRelativeDeltaY),
+      angle: (Math.atan2(widthRelativeDeltaY, deltaX) * 180) / Math.PI,
       strand: block.strand,
       mapq: block.mapq,
       title: `${block.querySourceId}:${Math.round(visibleStart)}-${Math.round(visibleEnd)} → ${
@@ -798,6 +866,10 @@ interface AssemblyTrackSegment {
   width: number;
 }
 
+interface AssemblyBoundaryTrackSegment extends AssemblyTrackSegment {
+  objectIds: string[];
+}
+
 interface AssemblyContigTrackSegment extends AssemblyTrackSegment {
   objectId: string;
   sourceId: string;
@@ -807,9 +879,14 @@ interface AssemblyContigTrackSegment extends AssemblyTrackSegment {
 export function buildAssemblyTrack(
   syntenyView: SyntenyView | null,
   assemblyBlocks: ContactMapLayoutBlock[],
-): { chromosomes: AssemblyTrackSegment[]; contigs: AssemblyContigTrackSegment[] } {
+  viewportWidthPx = fallbackAssemblyBoundaryViewportWidthPx,
+): {
+  chromosomes: AssemblyTrackSegment[];
+  chromosomeBands: AssemblyBoundaryTrackSegment[];
+  contigs: AssemblyContigTrackSegment[];
+} {
   if (!syntenyView || syntenyView.viewport.xEnd <= syntenyView.viewport.xStart) {
-    return { chromosomes: [], contigs: [] };
+    return { chromosomes: [], chromosomeBands: [], contigs: [] };
   }
   const { xStart, xEnd } = syntenyView.viewport;
   const viewportSpan = xEnd - xStart;
@@ -826,11 +903,20 @@ export function buildAssemblyTrack(
     };
   };
 
-  const chromosomes = buildAssemblyEditModel(assemblyBlocks).chromosomes
+  const assemblyChromosomes = buildAssemblyEditModel(assemblyBlocks).chromosomes;
+  const chromosomes = assemblyChromosomes
     .sort((a, b) => a.visualStart - b.visualStart)
     .map(toTrackSegment)
     .filter((segment): segment is NonNullable<typeof segment> => segment !== null)
     .map(({ id, left, width }) => ({ id, left, width }));
+  const chromosomeBands = buildAssemblyBoundaryBands(
+    assemblyChromosomes,
+    syntenyView.viewport,
+    viewportWidthPx,
+  )
+    .map(toTrackSegment)
+    .filter((segment): segment is NonNullable<typeof segment> => segment !== null)
+    .map(({ id, left, width, objectIds }) => ({ id, left, width, objectIds }));
   const contigs = [...assemblyBlocks]
     .sort((a, b) => a.visualStart - b.visualStart)
     .map(toTrackSegment)
@@ -849,7 +935,7 @@ export function buildAssemblyTrack(
       width,
     }));
 
-  return { chromosomes, contigs };
+  return { chromosomes, chromosomeBands, contigs };
 }
 
 function selectionModifiers(event: ReactMouseEvent<HTMLElement>): SyntenySelectionModifiers {

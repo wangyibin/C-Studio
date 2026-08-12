@@ -10,6 +10,7 @@ import {
   reduceUiState,
 } from "./uiState";
 import type { ContactMapLayoutBlock } from "./importers";
+import { selectedBlockIds } from "./assemblyEditing";
 
 describe("reduceUiState", () => {
   const assemblyBlocks = [
@@ -338,6 +339,88 @@ describe("reduceUiState", () => {
     );
   });
 
+  it("centers and exactly selects a clicked contig segment from the inspector", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = {
+      ...state,
+      contact: {
+        ...state.contact,
+        viewportWidthPx: 800,
+        viewportHeightPx: 600,
+        viewportSpanMb: 200,
+      },
+    };
+
+    state = reduceUiState(state, {
+      type: "focusAssemblyContig",
+      id: "Chr01:2:ctg2",
+    });
+
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01:2:ctg2"],
+      exact: true,
+    });
+    expect(state.contact.viewportCenterXMb).toBe(0.000175);
+    expect(state.contact.viewportCenterYMb).toBe(0.000175);
+    expect(state.contact.viewportCenterMb).toBe(0.000175);
+    expect(state.contact.viewportSpanMb).toBeLessThan(200);
+    expect(state.contact.resolution).toBe("5 kb");
+    expect(state.contact.colorScale.auto).toBe(true);
+    expect(state.logEntries[state.logEntries.length - 1]?.message).toBe(
+      "Focused contig ctg2 at Chr01",
+    );
+  });
+
+  it("keeps a locked contact resolution when focusing a contig from the inspector", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "100 kb" });
+    state = reduceUiState(state, { type: "toggleContactResolutionLock" });
+
+    state = reduceUiState(state, {
+      type: "focusAssemblyContig",
+      id: "Chr01:2:ctg2",
+    });
+
+    expect(state.contact.resolution).toBe("100 kb");
+    expect(state.contact.resolutionLocked).toBe(true);
+  });
+
+  it("fits and selects a chromosome from its inspector locate button", () => {
+    const chromosomeBlocks: ContactMapLayoutBlock[] = [
+      {
+        ...assemblyBlocks[0],
+        visualStart: 20_000_000,
+        visualEnd: 30_000_000,
+      },
+      {
+        ...assemblyBlocks[1],
+        visualStart: 30_000_000,
+        visualEnd: 50_000_000,
+      },
+      {
+        ...assemblyBlocks[2],
+        visualStart: 50_000_000,
+        visualEnd: 100_000_000,
+      },
+    ];
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: chromosomeBlocks });
+
+    state = reduceUiState(state, { type: "focusAssemblyChromosome", id: "Chr01" });
+
+    expect(state.assembly.selection).toEqual({ kind: "chromosome", id: "Chr01" });
+    expect(state.contact.viewportCenterXMb).toBe(35);
+    expect(state.contact.viewportCenterYMb).toBe(35);
+    expect(state.contact.viewportSpanMb).toBe(30);
+    expect(state.contact.resolution).toBe("50 kb");
+    expect(state.logEntries[state.logEntries.length - 1]?.message).toBe(
+      "Focused chromosome Chr01",
+    );
+  });
+
   it("uses the dynamic fitted level for the whole map", () => {
     let state = createInitialUiState("Browser preview mode");
 
@@ -364,6 +447,50 @@ describe("reduceUiState", () => {
     expect(state.contact.viewportSpanMb).toBe(26.8);
     expect(state.contact.viewportCenterXMb).toBe(98.42);
     expect(state.contact.viewportCenterYMb).toBe(98.42);
+  });
+
+  it("switches mcool pyramid levels without changing the genomic viewport", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 536,
+      totalSpanMb: 200,
+    });
+    const viewportSpanMb = state.contact.viewportSpanMb;
+
+    state = reduceUiState(state, {
+      type: "setContactResolution",
+      resolution: "250 kb",
+      preserveViewport: true,
+    });
+
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSpanMb).toBe(viewportSpanMb);
+    expect(state.contact.viewportCenterXMb).toBe(98.42);
+    expect(state.contact.viewportCenterYMb).toBe(98.42);
+  });
+
+  it("limits mcool manual levels that would exceed the visible tile budget", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 536,
+      totalSpanMb: 10_327,
+    });
+
+    expect(availableContactResolutions(state.contact, 10_327, true)).toEqual([
+      "2.5 Mb",
+      "2 Mb",
+    ]);
+
+    state = reduceUiState(state, {
+      type: "setContactResolution",
+      resolution: "250 kb",
+      preserveViewport: true,
+    });
+
+    expect(state.contact.resolution).toBe("2 Mb");
+    expect(state.contact.viewportSpanMb).toBe(10_327);
   });
 
   it("clamps resolutions coarser than the fitted whole-map level", () => {
@@ -1187,6 +1314,29 @@ describe("reduceUiState", () => {
     });
   });
 
+  it("keeps an explicit GFA block selection whole even when its utgs are source segments", () => {
+    const sourceSegmentBlocks = structuredAssemblyBlocks.map((block) => (
+      block.assemblyBlockId === "Chr01_block_1"
+        ? { ...block, isSourceSegment: true }
+        : block
+    ));
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: sourceSegmentBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContigs",
+      ids: ["Chr01_block_1"],
+    });
+
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01_block_1"],
+    });
+    expect(selectedBlockIds(state.assembly.blocks, state.assembly.selection)).toEqual([
+      "Chr01:1:ctgA",
+      "Chr01:2:ctgB",
+    ]);
+  });
+
   it("expands a selected chromosome before additively toggling contigs", () => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
@@ -1875,5 +2025,32 @@ describe("reduceUiState", () => {
 
     state = reduceUiState(state, { type: "undo" });
     expect(state.assembly.blocks).toEqual(nextAssembly);
+  });
+
+  it("clears loaded-data state and edit history while preserving workspace preferences", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state.layout.rightCollapsed = true;
+    state.layout.syntenySplitOpen = true;
+    state.activeOverviewMode = "gfa";
+    state.contact.colormap = "Viridis";
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:1:ctg1",
+      additive: false,
+    });
+    state = reduceUiState(state, { type: "copyAssemblySelection" });
+
+    state = reduceUiState(state, { type: "clearLoadedData" });
+
+    expect(state.assembly.blocks).toEqual([]);
+    expect(state.assembly.selection).toBeNull();
+    expect(state.operationHistory).toEqual([]);
+    expect(state.redoStack).toEqual([]);
+    expect(state.activeOverviewMode).toBe("overview");
+    expect(state.layout.syntenySplitOpen).toBe(false);
+    expect(state.layout.rightCollapsed).toBe(true);
+    expect(state.contact.colormap).toBe("Viridis");
+    expect(state.logEntries[state.logEntries.length - 1]?.message).toBe("All loaded data cleared");
   });
 });

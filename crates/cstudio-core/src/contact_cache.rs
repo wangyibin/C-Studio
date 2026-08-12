@@ -64,9 +64,10 @@ impl ContactCacheEntry {
     }
 
     fn contacts(&self) -> impl Iterator<Item = CachedContactRef<'_>> {
-        self.contacts
-            .iter()
-            .map(|contact| CachedContactRef { entry: self, contact })
+        self.contacts.iter().map(|contact| CachedContactRef {
+            entry: self,
+            contact,
+        })
     }
 }
 
@@ -124,8 +125,10 @@ impl ContactCache {
         let entry = match self.entries.get_mut(&key) {
             Some(entry) => entry,
             None => {
-                self.entries
-                    .insert(key.clone(), ContactCacheEntry::from_contacts(load_contacts(&key)?));
+                self.entries.insert(
+                    key.clone(),
+                    ContactCacheEntry::from_contacts(load_contacts(&key)?),
+                );
                 self.entries
                     .get_mut(&key)
                     .expect("contact cache entry was just inserted")
@@ -214,9 +217,11 @@ impl VisibleSourceIndex {
     }
 
     fn contains_source_position(&self, source_id: &str, source_start: u64) -> bool {
-        self.ranges_by_source
-            .get(source_id)
-            .is_some_and(|ranges| ranges.iter().any(|(start, end)| source_start >= *start && source_start < *end))
+        self.ranges_by_source.get(source_id).is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|(start, end)| source_start >= *start && source_start < *end)
+        })
     }
 }
 

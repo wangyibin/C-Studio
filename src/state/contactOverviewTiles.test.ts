@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildContactOverviewTilePlan,
+  closestContactResolution,
   contactOverviewGenerationIsReady,
   contactOverviewRequestIsReady,
   overviewResolutionForSpan,
@@ -10,20 +11,58 @@ import {
 
 describe("contact overview tile planning", () => {
   it("keeps a whole-genome overview close to the 320-bin canvas budget", () => {
-    const plan = buildContactOverviewTilePlan(476_713_192, 256);
+    const plan = buildContactOverviewTilePlan(476_713_192, [1_000]);
 
-    expect(plan.targetResolution).toBe(2_000_000);
+    expect(plan).toMatchObject({
+      sourceResolution: 1_000,
+      targetResolution: 1_490_000,
+      targetBins: 320,
+    });
     expect(plan.viewport).toEqual({
       xStart: 0,
       xEnd: 476_713_192,
       yStart: 0,
       yEnd: 476_713_192,
     });
-    expect(plan.tiles).toEqual([{ tileX: 0, tileY: 0 }]);
   });
 
-  it("uses the largest supported coarse resolution for very large spans", () => {
-    expect(overviewResolutionForSpan(10_000_000_000)).toBe(10_000_000);
+  it("reads the mcool level nearest to the overview pixel scale", () => {
+    const levels = [20_000_000, 10_000_000, 2_500_000, 1_000];
+    const plan = buildContactOverviewTilePlan(10_327_171_329, levels);
+
+    expect(plan.sourceResolution).toBe(20_000_000);
+    expect(plan.targetResolution).toBe(40_000_000);
+    expect(Math.ceil(10_327_171_329 / plan.targetResolution)).toBeLessThanOrEqual(320);
+  });
+
+  it("uses the coarsest stored level when a large mcool has no screen-scale level", () => {
+    const levels = [
+      2_500_000,
+      1_000_000,
+      500_000,
+      250_000,
+      100_000,
+      50_000,
+      25_000,
+      10_000,
+      5_000,
+      2_000,
+      1_000,
+    ];
+    const plan = buildContactOverviewTilePlan(10_327_171_329, levels);
+
+    expect(plan.sourceResolution).toBe(2_500_000);
+    expect(plan.targetResolution).toBe(32_500_000);
+    expect(Math.ceil(10_327_171_329 / plan.targetResolution)).toBe(318);
+  });
+
+  it("aggregates a single-resolution cool directly to the overview scale", () => {
+    expect(overviewResolutionForSpan(10_000_000_000, [1_000])).toBe(31_250_000);
+  });
+
+  it("prefers the coarser level when two stored levels are equally close", () => {
+    expect(closestContactResolution(15_000_000, [10_000_000, 20_000_000]))
+      .toBe(20_000_000);
   });
 });
 

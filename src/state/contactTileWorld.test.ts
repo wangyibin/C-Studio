@@ -41,6 +41,33 @@ describe("contact tile world", () => {
     expect(contactTileWorldPrefetchPadding).toBe(1);
   });
 
+  it("uses a directional look-ahead viewport only for prefetch coverage", () => {
+    const prefetchViewport = {
+      xStart: 512_000,
+      xEnd: 1_024_000,
+      yStart: 256_000,
+      yEnd: 768_000,
+    };
+    const world = buildContactTileWorld({
+      viewport,
+      prefetchViewport,
+      resolution: 1_000,
+      tileSizeBins: 256,
+      totalSpanBp: 2_000_000,
+      scope,
+      cache: new Map(),
+    });
+
+    expect(world.visibleTiles).toEqual([
+      { tileX: 0, tileY: 1 },
+      { tileX: 1, tileY: 1 },
+      { tileX: 0, tileY: 2 },
+      { tileX: 1, tileY: 2 },
+    ]);
+    expect(world.prefetchViewport).toEqual(prefetchViewport);
+    expect(world.prefetchTiles).toContainEqual({ tileX: 3, tileY: 4 });
+  });
+
   it("requests only cache-missing padded tiles while projecting cached visible tiles", () => {
     const visibleTile: ContactMapTile = {
       tileX: 0,

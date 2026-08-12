@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { ContactMapCell } from "../App";
+import type { ContactMapCell, ContactMapTile } from "../App";
 import { contactColorAt, contactColorLut } from "./contactColor";
 import { normalizeContactValue, type ContactColorScale } from "./contactColorScale";
 import type { ContactTileData } from "./contactTileData";
-import { rasterizeContactTile } from "./contactTileRaster";
+import { ContactTileDeltaAccumulator } from "./contactTileDelta";
+import {
+  rasterizeContactTile,
+  rasterizeContactTileDelta,
+  rasterizeContactTileDenseBuffer,
+} from "./contactTileRaster";
 import type { ContactColormap } from "./uiState";
 
 const tileSizeBins = 4;
@@ -45,6 +50,60 @@ function rasterize(
 }
 
 describe("rasterizeContactTile", () => {
+  it("keeps direct incremental paint byte-identical to one final sparse snapshot", () => {
+    const scale = { log: false, min: 0, max: 100 };
+    const colorLut = contactColorLut("Viridis", paletteOpacity);
+    const deltas: ContactMapTile[] = [
+      {
+        tileX: 2,
+        tileY: 3,
+        cells: [],
+        packedCells: {
+          xLocal: new Uint16Array([1, 3]),
+          yLocal: new Uint16Array([2, 0]),
+          counts: new Float64Array([25, 50]),
+        },
+      },
+      {
+        tileX: 2,
+        tileY: 3,
+        cells: [],
+        packedCells: {
+          xLocal: new Uint16Array([1, 0]),
+          yLocal: new Uint16Array([2, 3]),
+          counts: new Float64Array([50, 100]),
+        },
+      },
+    ];
+
+    for (const transpose of [false, true]) {
+      const accumulator = new ContactTileDeltaAccumulator([{ tileX: 2, tileY: 3 }], 4);
+      const buffer = accumulator.denseBuffer({ tileX: 2, tileY: 3 })!;
+      const incremental = new Uint8ClampedArray(4 * 4 * 4);
+      for (const delta of deltas) {
+        accumulator.merge([delta]);
+        rasterizeContactTileDelta({
+          buffer,
+          delta,
+          tileSizeBins: 4,
+          transpose,
+          colorScale: scale,
+          colormap: "Viridis",
+          colorLut,
+        }, incremental);
+      }
+      const finalTile = accumulator.finish()[0]!;
+      expect(incremental).toEqual(rasterize(finalTile, "Viridis", scale, transpose));
+      expect(rasterizeContactTileDenseBuffer({
+        buffer,
+        tileSizeBins: 4,
+        transpose,
+        colorScale: scale,
+        colormap: "Viridis",
+        colorLut,
+      })).toEqual(incremental);
+    }
+  });
   it("matches the old color calculation for every palette and hard stop boundary", () => {
     const counts = [
       0,

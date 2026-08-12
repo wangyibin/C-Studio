@@ -100,11 +100,17 @@ describe("InspectorPanel", () => {
         selectedAssemblyBlockIds={[]}
         pafText=""
         onPafTextChange={() => undefined}
+        onExpandHeatmap={() => undefined}
       />,
     );
 
     expect(markup).toContain('aria-label="Contact map overview"');
     expect(markup).toContain('class="overview-heatmap-canvas"');
+    expect(markup).toContain('class="overview-expand-button"');
+    expect(markup).toContain('aria-label="Expand heatmap window"');
+    expect(markup).toContain(
+      'title="Click to preview; double-click to expand the heatmap"',
+    );
     expect(markup).toContain("Overview");
   });
 
@@ -169,6 +175,74 @@ describe("InspectorPanel", () => {
 
     expect(markup).toContain("inspector-overview synteny-overview-active");
     expect(markup).toContain("synteny-panel");
+    expect(markup).not.toContain('class="synteny-preview-header"');
+    expect(markup).not.toContain('class="synteny-preview-title"');
+    expect(markup).toContain('class="synteny-preview-expand-button"');
+    expect(markup).toContain('aria-label="Open interactive synteny view"');
+    expect(markup).toContain(
+      'title="Click to preview; double-click to open the interactive synteny view"',
+    );
+    expect(markup).not.toContain("Drag to pan the shared heatmap region");
+  });
+
+  it("renders GFA Preview as the third overview tab and uses the shared preview area", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.activeOverviewMode = "gfa";
+
+    const markup = renderToStaticMarkup(
+      <InspectorPanel
+        dataset={dataset}
+        contactMap={contactMap}
+        overviewContactMap={contactMap}
+        status={status}
+        statusMessage="ready"
+        uiState={uiState}
+        onUiAction={() => undefined}
+        syntenyView={null}
+        assemblyBlocks={[]}
+        selectedAssemblyBlockIds={[]}
+        pafText=""
+        onPafTextChange={() => undefined}
+        gfaDocument={{
+          fileName: "a-very-long-hifiasm-primary-assembly-graph-file-name.gfa",
+          segments: {
+            utg1: {
+              name: "utg1",
+              length: 100,
+              readDepth: 10,
+              hasSequence: false,
+              aRecordCount: 1,
+              haplotypeCounts: {},
+            },
+          },
+          segmentOrder: ["utg1"],
+          links: [],
+          summary: {
+            lineCount: 2,
+            segmentCount: 1,
+            linkCount: 0,
+            aRecordCount: 1,
+            warningCount: 0,
+          },
+          warnings: [],
+        }}
+      />,
+    );
+
+    expect(markup).toContain("Overview");
+    expect(markup).toContain("Synteny");
+    expect(markup).toContain("GFA Preview");
+    expect(markup).toContain("inspector-overview gfa-overview-active");
+    expect(markup).toContain("gfa-preview-card embedded");
+    expect(markup).toContain('class="gfa-preview-title"');
+    expect(markup).toContain(
+      'title="a-very-long-hifiasm-primary-assembly-graph-file-name.gfa"',
+    );
+    expect(markup).toContain('class="gfa-preview-expand-button"');
+    expect(markup).toContain(
+      'title="Click to preview; double-click to open the GFA graph panel"',
+    );
+    expect(markup).not.toContain("Double-click to inspect and elastically reposition the graph.");
   });
 
   it("renders live multi-block selection details and chromosome groups", () => {
@@ -294,6 +368,9 @@ describe("InspectorPanel", () => {
     expect(markup).toContain('title="ctg1"');
     expect(markup).toContain('title="ctg2"');
     expect(markup).toContain('title="Double-click to rename Chr01"');
+    expect(markup).toContain('class="selection-group-heading"');
+    expect(markup).toContain('class="selection-group-locate-button"');
+    expect(markup).toContain('aria-label="Center and select chromosome Chr01"');
     expect(markup).not.toContain("Chr02");
     expect(markup).not.toContain("ctg3");
   });
@@ -350,6 +427,14 @@ describe("InspectorPanel", () => {
     expect(markup).toContain('class="selection-block-entry composite"');
     expect(markup).toContain("ctg1");
     expect(markup).toContain("ctg2");
+    expect(markup).toContain('aria-label="Center and select ctg1, orientation +"');
+    expect(markup).toContain('aria-label="Center and select ctg2, orientation -"');
+    expect(markup).toContain(
+      'class="selection-contig-orientation orientation-forward" aria-hidden="true">+</strong>',
+    );
+    expect(markup).toContain(
+      'class="selection-contig-orientation orientation-reverse" aria-hidden="true">-</strong>',
+    );
   });
 
   it("groups split copy segments and exposes every related location", () => {
@@ -461,6 +546,11 @@ describe("InspectorPanel", () => {
     expect(markup).toContain("Covers current interval");
     expect(markup).toContain("Chr02");
     expect(markup).toContain("debris");
+    expect(markup).toContain('aria-label="Center and select utg1:1-50"');
+    expect(markup).toContain(
+      'aria-label="Center and select utg1:51-100 at Chr01 · Chr01:1:utg1:right · 151-200 bp · +"',
+    );
+    expect(markup).not.toContain('aria-label="Select utg1:51-100');
   });
 
   it("renders an actionable history timeline with impacted objects and an undone branch", () => {

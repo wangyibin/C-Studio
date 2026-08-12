@@ -235,6 +235,25 @@ export function contactTilesForViewport(
   return [...tiles.values()];
 }
 
+/**
+ * A compact identity for the tile coverage of a viewport. Pointer panning can
+ * move every animation frame, but the backend only needs another request when
+ * the set of intersecting tiles changes.
+ */
+export function contactTileViewportSignature(
+  viewport: ContactViewport,
+  resolution: number,
+  tileSizeBins: number,
+  totalSpanBp?: number,
+): string {
+  return contactTilesForViewport(
+    viewport,
+    resolution,
+    tileSizeBins,
+    totalSpanBp,
+  ).map(contactTileKey).join("|");
+}
+
 export function missingContactTiles<Tile extends ContactMapTileKey>(
   requiredTiles: ContactMapTileKey[],
   cache: Map<string, Tile>,

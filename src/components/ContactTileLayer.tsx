@@ -7,15 +7,29 @@ import {
   useRef,
   useState,
 } from "react";
+import type { MutableRefObject } from "react";
 import type { ContactMapTile, ContactMapView } from "../App";
 import { contactColorLut } from "../state/contactColor";
 import type { ContactColorScale } from "../state/contactColorScale";
 import { contactTileCellCount } from "../state/contactTileData";
+import type {
+  ContactTileDeltaBatch,
+  ContactTileDeltaRenderStream,
+  ContactTileDenseDeltaBuffer,
+} from "../state/contactTileDelta";
 import { contactTilesWithPreviewFallback } from "../state/contactMapView";
-import { rasterizeContactTile } from "../state/contactTileRaster";
+import {
+  rasterizeContactTile,
+  rasterizeContactTileDelta,
+  rasterizeContactTileDenseBuffer,
+} from "../state/contactTileRaster";
 import { canonicalContactTile, contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
 import type { ContactColormap } from "../state/uiState";
+import {
+  createContactTileGpuRenderer,
+  type ContactTileGpuRenderer,
+} from "./contactTileGpu";
 
 export interface ContactTileLayerPaintEvent {
   renderEpoch: number;
@@ -27,6 +41,7 @@ export interface ContactTileLayerPaintEvent {
 
 export interface ContactTileLayerProps {
   contactMap: ContactMapView | null;
+  deltaStream?: ContactTileDeltaRenderStream | null;
   viewport?: ContactViewport;
   renderStyle: ContactTileRenderStyle;
   /** One cached tile beyond the viewport, only on the active pan axes. */
@@ -35,6 +50,8 @@ export interface ContactTileLayerProps {
   freezePresentedStyle?: boolean;
   layerRef: React.RefObject<HTMLDivElement>;
   transformRef?: React.RefObject<HTMLDivElement>;
+  /** Imperative camera used during pointer movement without translating the canvas element. */
+  panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
   onPointerDown: (event: React.PointerEvent<HTMLDivElement>) => void;
   onPointerMove: (event: React.PointerEvent<HTMLDivElement>) => void;
   onPointerUp: (event: React.PointerEvent<HTMLDivElement>) => void;
@@ -468,6 +485,7 @@ export function createContactTilePaintCoordinator({
 
 export function ContactTileLayer({
   contactMap,
+  deltaStream,
   freezePresentedStyle = false,
   layerRef,
   transformRef,
@@ -480,6 +498,7 @@ export function ContactTileLayer({
   onPointerMove,
   onPointerUp,
   overscanDirection = "all",
+  panRendererRef,
   renderStyle,
   viewport,
 }: ContactTileLayerProps) {
@@ -642,7 +661,7 @@ export function ContactTileLayer({
 
   return (
     <div
-      className="contact-tile-viewport"
+      className={`contact-tile-viewport${contactMap ? "" : " delta-only"}`}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -672,6 +691,7 @@ export function ContactTileLayer({
                 ? reportSlotZeroUnavailable
                 : reportSlotOneUnavailable}
               paintRevision={frame.contactMap.renderGeneration ?? paintRevision}
+              panRendererRef={phase === "presented" ? panRendererRef : undefined}
               phase={phase}
               renderStyle={frame.renderStyle}
               overscanDirection={overscanDirection}
@@ -679,8 +699,151 @@ export function ContactTileLayer({
             />
           );
         })}
+        {deltaStream ? (
+          <ContactTileDeltaOverlay
+            stream={deltaStream}
+            renderStyle={renderStyle}
+          />
+        ) : null}
       </div>
     </div>
+  );
+}
+
+function ContactTileDeltaOverlay({
+  renderStyle,
+  stream,
+}: {
+  renderStyle: ContactTileRenderStyle;
+  stream: ContactTileDeltaRenderStream;
+}) {
+  const descriptors = useMemo(() => contactTileCanvasDescriptorsForViewport(
+    stream.accumulator.denseBuffers().map(({ tile }) => ({
+      tileX: tile.tileX,
+      tileY: tile.tileY,
+      cells: [],
+    })),
+    stream.resolution,
+    stream.accumulator.tileSizeBins,
+    stream.viewport,
+    { x: 0, y: 0 },
+  ), [stream]);
+
+  return (
+    <div className="contact-tile-delta-overlay" aria-hidden="true">
+      {descriptors.map(({ key, tile, transpose }) => {
+        const buffer = stream.accumulator.denseBuffer(tile);
+        return buffer ? (
+          <ContactTileDeltaCanvas
+            key={key}
+            buffer={buffer}
+            renderStyle={renderStyle}
+            stream={stream}
+            transpose={transpose}
+          />
+        ) : null;
+      })}
+    </div>
+  );
+}
+
+function ContactTileDeltaCanvas({
+  buffer,
+  renderStyle,
+  stream,
+  transpose,
+}: {
+  buffer: ContactTileDenseDeltaBuffer;
+  renderStyle: ContactTileRenderStyle;
+  stream: ContactTileDeltaRenderStream;
+  transpose: boolean;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const tileSizeBins = stream.accumulator.tileSizeBins;
+  const box = contactTileCanvasBox({
+    tileX: transpose ? buffer.tile.tileY : buffer.tile.tileX,
+    tileY: transpose ? buffer.tile.tileX : buffer.tile.tileY,
+    resolution: stream.resolution,
+    tileSizeBins,
+    viewport: stream.viewport,
+    viewportPixelSize: 100,
+  });
+
+  usePrePaintEffect(() => {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) {
+      return;
+    }
+    const imageData = context.createImageData(tileSizeBins, tileSizeBins);
+    const colorLut = contactColorLut(renderStyle.colormap, 0.88);
+    const rasterInput = {
+      buffer,
+      tileSizeBins,
+      transpose,
+      colorScale: renderStyle.colorScale,
+      colormap: renderStyle.colormap,
+      colorLut,
+    };
+    let animationFrame: number | null = null;
+    let painted = false;
+    const publish = () => {
+      animationFrame = null;
+      context.putImageData(imageData, 0, 0);
+      if (!painted) {
+        painted = true;
+        stream.onFirstPaint?.();
+      }
+    };
+    const scheduleBatch = (batch: ContactTileDeltaBatch) => {
+      let changed = false;
+      for (const delta of batch.deltas) {
+        if (contactTileKey(delta) === contactTileKey(buffer.tile)) {
+          rasterizeContactTileDelta({ ...rasterInput, delta }, imageData.data);
+          changed = true;
+        }
+      }
+      if (changed && animationFrame === null) {
+        animationFrame = window.requestAnimationFrame(publish);
+      }
+    };
+    const unsubscribe = stream.accumulator.subscribe(scheduleBatch);
+    rasterizeContactTileDenseBuffer(rasterInput, imageData.data);
+    context.putImageData(imageData, 0, 0);
+    if (buffer.occupiedCount > 0) {
+      painted = true;
+      stream.onFirstPaint?.();
+    }
+    return () => {
+      unsubscribe();
+      if (animationFrame !== null) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+    };
+  }, [
+    buffer,
+    renderStyle.colormap,
+    renderStyle.colorScale.log,
+    renderStyle.colorScale.max,
+    renderStyle.colorScale.min,
+    stream,
+    tileSizeBins,
+    transpose,
+  ]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="contact-tile-canvas"
+      width={tileSizeBins}
+      height={tileSizeBins}
+      style={{
+        left: `${box.left}%`,
+        top: `${box.top}%`,
+        width: `${box.width}%`,
+        height: `${box.height}%`,
+      }}
+    />
   );
 }
 
@@ -691,6 +854,7 @@ function ContactTileSurface({
   onTileLayerCommit,
   onTileLayerPaintComplete,
   onTileLayerPaintUnavailable,
+  panRendererRef,
   phase,
   renderStyle,
   overscanDirection,
@@ -702,6 +866,7 @@ function ContactTileSurface({
   onTileLayerCommit: (event: ContactTileLayerPaintEvent) => void;
   onTileLayerPaintComplete: (event: ContactTileLayerPaintEvent) => void;
   onTileLayerPaintUnavailable: (event: ContactTileLayerPaintEvent) => void;
+  panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
   phase: "presented" | "staging";
   renderStyle: ContactTileRenderStyle;
   overscanDirection: ContactTileOverscanMode;
@@ -818,24 +983,159 @@ function ContactTileSurface({
     paintCoordinator?.commit();
   }, [paintCoordinator]);
 
+  const [gpuAvailable, setGpuAvailable] = useState(() => typeof document !== "undefined");
+  const disableGpu = useCallback(() => setGpuAvailable(false), []);
+
+  usePrePaintEffect(() => {
+    if (!gpuAvailable && panRendererRef) {
+      panRendererRef.current = null;
+    }
+  }, [gpuAvailable, panRendererRef]);
+
   return (
     <div className="contact-tile-surface" data-phase={phase} aria-hidden={phase === "staging"}>
       <div ref={layerRef} className="contact-tile-layer">
-        {renderCanvases.map(({ key, tile, transpose }) => (
-          <ContactTileCanvas
-            key={key}
+        {gpuAvailable ? (
+          <ContactTileGpuCanvas
             contactMap={contactMap}
-            tile={tile}
-            tileSizeBins={tileSizeBins}
-            transpose={transpose}
-            paintCanvasKey={key}
+            descriptors={renderCanvases}
+            onUnavailable={disableGpu}
+            paintCanvasKeys={paintCanvasKeys}
             paintCoordinator={paintCoordinator}
+            panRendererRef={panRendererRef}
             renderStyle={renderStyle}
+            tileSizeBins={tileSizeBins}
             viewport={viewport}
           />
-        ))}
+        ) : renderCanvases.map(({ key, tile, transpose }) => (
+            <ContactTileCanvas
+              key={key}
+              contactMap={contactMap}
+              tile={tile}
+              tileSizeBins={tileSizeBins}
+              transpose={transpose}
+              paintCanvasKey={key}
+              paintCoordinator={paintCoordinator}
+              renderStyle={renderStyle}
+              viewport={viewport}
+            />
+          ))}
       </div>
     </div>
+  );
+}
+
+function ContactTileGpuCanvas({
+  contactMap,
+  descriptors,
+  onUnavailable,
+  paintCanvasKeys,
+  paintCoordinator,
+  panRendererRef,
+  renderStyle,
+  tileSizeBins,
+  viewport,
+}: {
+  contactMap: ContactMapView;
+  descriptors: readonly ContactTileCanvasDescriptor[];
+  onUnavailable: () => void;
+  paintCanvasKeys: readonly string[];
+  paintCoordinator: ContactTilePaintCoordinator | null;
+  panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
+  renderStyle: ContactTileRenderStyle;
+  tileSizeBins: number;
+  viewport: ContactViewport;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rendererRef = useRef<ContactTileGpuRenderer | null>(null);
+
+  usePrePaintEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      onUnavailable();
+      return;
+    }
+    const renderer = createContactTileGpuRenderer(canvas);
+    if (!renderer) {
+      onUnavailable();
+      return;
+    }
+    rendererRef.current = renderer;
+    const handleContextLost = (event: Event) => {
+      event.preventDefault();
+      onUnavailable();
+    };
+    canvas.addEventListener("webglcontextlost", handleContextLost);
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(() => renderer.redraw());
+    observer?.observe(canvas);
+    return () => {
+      observer?.disconnect();
+      canvas.removeEventListener("webglcontextlost", handleContextLost);
+      if (panRendererRef?.current === renderer) {
+        panRendererRef.current = null;
+      }
+      rendererRef.current = null;
+      renderer.destroy();
+    };
+  }, [onUnavailable]);
+
+  usePrePaintEffect(() => {
+    const renderer = rendererRef.current;
+    if (!panRendererRef || !renderer) {
+      return;
+    }
+    panRendererRef.current = renderer;
+    return () => {
+      if (panRendererRef.current === renderer) {
+        panRendererRef.current = null;
+      }
+    };
+  }, [panRendererRef]);
+
+  usePrePaintEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) {
+      return;
+    }
+    const painted = renderer.setScene({
+      descriptors,
+      resolution: contactMap.resolution,
+      tileSizeBins,
+      viewport,
+      renderStyle,
+    });
+    if (!painted) {
+      onUnavailable();
+      return;
+    }
+    for (const key of paintCanvasKeys) {
+      paintCoordinator?.reportCanvasPaint(key);
+    }
+  }, [
+    contactMap.resolution,
+    descriptors,
+    onUnavailable,
+    paintCanvasKeys,
+    paintCoordinator,
+    renderStyle.colormap,
+    renderStyle.colorScale.log,
+    renderStyle.colorScale.max,
+    renderStyle.colorScale.min,
+    tileSizeBins,
+    viewport.xEnd,
+    viewport.xStart,
+    viewport.yEnd,
+    viewport.yStart,
+  ]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="contact-tile-canvas contact-tile-gpu-canvas"
+      aria-hidden="true"
+    />
   );
 }
 

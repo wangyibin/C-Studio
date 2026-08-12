@@ -2,10 +2,12 @@ import {
   Check,
   ChevronDown,
   Ellipsis,
+  Maximize2,
   PanelRight,
   Plus,
   Redo2,
   Save,
+  Trash2,
   Undo2,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -21,7 +23,17 @@ import {
   selectedBlockIds,
 } from "../state/assemblyEditing";
 import type { CoverageView } from "../state/coverageView";
+import type { GfaEvidenceDocument } from "../state/gfa";
+import { classifyGfaScaffolds } from "../state/gfaHomologLayout";
+import { buildCenteredContactViewport } from "../state/contactViewport";
+import {
+  gfaContigsForHeatmapViewport,
+  gfaPrimaryHomologScaffoldsForHeatmapViewport,
+  gfaScaffoldsForHeatmapViewport,
+} from "../state/gfaViewportSync";
 import type { ContactTileRenderMilestone } from "../state/contactTilePerformance";
+import type { ContactPanPreview } from "../state/contactPanPerformance";
+import type { ContactTileDeltaRenderStream } from "../state/contactTileDelta";
 import type { SyntenyView } from "../state/syntenyView";
 import {
   contactNormalizationForBackend,
@@ -35,6 +47,7 @@ import {
 } from "../state/juiceboxShortcuts";
 import { keyboardShortcutLabels } from "../state/keyboardShortcutLabels";
 import { ContactMapViewport } from "./ContactMapViewport";
+import { GfaGraphPanel } from "./GfaGraphPanel";
 import { HeatmapToolbar } from "./HeatmapToolbar";
 import { InspectorPanel } from "./InspectorPanel";
 import {
@@ -45,16 +58,24 @@ import {
 interface AppShellProps {
   dataset: ExampleDatasetSummary | null;
   contactMap: ContactMapView | null;
+  contactTileDeltaStream?: ContactTileDeltaRenderStream | null;
+  contactIsMcool?: boolean;
+  contactAvailableResolutions?: number[];
   overviewContactMap: ContactMapView | null;
   syntenyView: SyntenyView | null;
   coverageView: CoverageView | null;
   pafText: string;
   pafImported: boolean;
+  gfaDocument: GfaEvidenceDocument | null;
+  gfaHomologPattern: string;
+  onGfaHomologPatternChange: (pattern: string) => void;
   onPafTextChange: (value: string) => void;
   agpInputRef: RefObject<HTMLInputElement>;
+  gfaInputRef: RefObject<HTMLInputElement>;
   pafInputRef: RefObject<HTMLInputElement>;
   coverageInputRef: RefObject<HTMLInputElement>;
   onAgpFileSelected: (file: File) => void;
+  onGfaFileSelected: (file: File) => void;
   onContactFileSelected: () => void;
   onPafFileRequested: () => void;
   onPafFileSelected: (file: File) => void;
@@ -66,10 +87,13 @@ interface AppShellProps {
   isAgpDirty: boolean;
   onAutoSaveEnabledChange: (enabled: boolean) => void;
   onLoadExample: () => void;
+  onClearAllData: () => void;
   status: AppStatus;
   statusMessage: string;
+  contactPanPerformanceLog?: string | null;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
+  onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
   onContactTileLayerPaintComplete?: (event: ContactTileRenderMilestone) => void;
 }
@@ -79,6 +103,16 @@ export const inspectorPanelMaxWidth = 520;
 const inspectorPanelDefaultWidth = 326;
 const inspectorPanelCompactWidth = 276;
 const inspectorPanelKeyboardStep = 16;
+export const gfaPanelMinHeight = 180;
+export const gfaPanelMaxWorkspaceShare = 0.65;
+
+export function clampGfaPanelHeight(height: number, workspaceHeight: number) {
+  const responsiveMaximum = Math.max(
+    gfaPanelMinHeight,
+    workspaceHeight * gfaPanelMaxWorkspaceShare,
+  );
+  return Math.round(Math.min(responsiveMaximum, Math.max(gfaPanelMinHeight, height)));
+}
 
 export function clampInspectorPanelWidth(width: number, workspaceWidth: number) {
   const responsiveMaximum = Math.max(
@@ -105,16 +139,24 @@ function fileName(path: string | undefined, fallback: string) {
 export function AppShell({
   dataset,
   contactMap,
+  contactTileDeltaStream,
+  contactIsMcool = false,
+  contactAvailableResolutions = [],
   overviewContactMap,
   syntenyView,
   coverageView,
   pafText,
   pafImported,
+  gfaDocument,
+  gfaHomologPattern,
+  onGfaHomologPatternChange,
   onPafTextChange,
   agpInputRef,
+  gfaInputRef,
   pafInputRef,
   coverageInputRef,
   onAgpFileSelected,
+  onGfaFileSelected,
   onContactFileSelected,
   onPafFileRequested,
   onPafFileSelected,
@@ -126,21 +168,34 @@ export function AppShell({
   isAgpDirty,
   onAutoSaveEnabledChange,
   onLoadExample,
+  onClearAllData,
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
+  onContactViewportPreview,
   onUiAction,
   status,
   statusMessage,
+  contactPanPerformanceLog,
   uiState,
 }: AppShellProps) {
   const shortcuts = keyboardShortcutLabels();
   const workspaceRef = useRef<HTMLElement>(null);
+  const centerWorkspaceRef = useRef<HTMLElement>(null);
+  const gfaResizeRef = useRef<{
+    pointerId: number;
+    startY: number;
+    startHeight: number;
+  } | null>(null);
   const inspectorResizeRef = useRef<{
     pointerId: number;
     startX: number;
     startWidth: number;
   } | null>(null);
   const [inspectorWidth, setInspectorWidth] = useState<number | null>(null);
+  const [gfaPanelOpen, setGfaPanelOpen] = useState(false);
+  const [heatmapPanelOpen, setHeatmapPanelOpen] = useState(true);
+  const [gfaPanelHeight, setGfaPanelHeight] = useState<number | null>(null);
+  const [confirmingClearData, setConfirmingClearData] = useState(false);
   const projectMenuRef = useRef<HTMLDetailsElement>(null);
   const addDataMenuRef = useRef<HTMLDetailsElement>(null);
   const appMenuRef = useRef<HTMLDetailsElement>(null);
@@ -150,9 +205,39 @@ export function AppShell({
     contig: boolean;
   } | null>(null);
   const syntenySelectionAnchorRef = useRef<string | null>(null);
-  const agpImported = Boolean(dataset?.agp_path);
-  const contactImported = Boolean(dataset?.mcool_path || dataset?.cool_path);
-  const coverageImported = Boolean(dataset?.coverage_path);
+  const agpImported = Boolean(dataset?.agp_path || uiState.assembly.blocks.length > 0);
+  const contactImported = Boolean(dataset?.mcool_path || dataset?.cool_path || contactMap);
+  const coverageImported = Boolean(dataset?.coverage_path || coverageView);
+  const syntenyImported = Boolean(pafImported || pafText.trim() || syntenyView);
+  const gfaImported = gfaDocument !== null;
+  const gfaHomologPatternError = classifyGfaScaffolds([], gfaHomologPattern).error;
+  const loadedDataLabels = [
+    agpImported ? "assembly" : null,
+    contactImported ? "contact map" : null,
+    syntenyImported ? "PAF alignments" : null,
+    coverageImported ? "coverage" : null,
+    gfaImported ? "assembly graph" : null,
+  ].filter((label): label is string => label !== null);
+  const hasLoadedData = loadedDataLabels.length > 0;
+
+  function closeHeatmapPanel() {
+    setHeatmapPanelOpen(false);
+    if (!uiState.layout.syntenySplitOpen && !gfaPanelOpen) {
+      if (syntenyImported) {
+        onUiAction({ type: "setSyntenySplitOpen", open: true });
+      } else if (gfaImported) {
+        setGfaPanelOpen(true);
+      }
+    }
+  }
+
+  function expandHeatmapPanel() {
+    setHeatmapPanelOpen(true);
+    if (uiState.layout.syntenySplitOpen) {
+      onUiAction({ type: "setSyntenySplitOpen", open: false });
+    }
+    setGfaPanelOpen(false);
+  }
   const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
     ? uiState.assembly.blocks
     : dataset?.agp_layout.blocks ?? [];
@@ -171,6 +256,33 @@ export function AppShell({
   const selectedAssemblyBlockIds = selectedBlockIds(
     activeAssemblyBlocks,
     uiState.assembly.selection,
+  );
+  const heatmapViewport = buildCenteredContactViewport({
+    centerMb: uiState.contact.viewportCenterMb,
+    centerXMb: uiState.contact.viewportCenterXMb,
+    centerYMb: uiState.contact.viewportCenterYMb,
+    totalSpanBp: Math.max(1, activeAssemblyTotalBp),
+    windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
+    viewportWidthPx: uiState.contact.viewportWidthPx,
+    viewportHeightPx: uiState.contact.viewportHeightPx,
+  });
+  const gfaHomologs = classifyGfaScaffolds(
+    [...new Set(activeAssemblyBlocks.map((block) => block.objectId))],
+    gfaHomologPattern,
+  );
+  const gfaVisibleScaffoldIds = gfaScaffoldsForHeatmapViewport(
+    activeAssemblyBlocks,
+    heatmapViewport,
+    gfaHomologs,
+  );
+  const gfaPreviewScaffoldIds = gfaPrimaryHomologScaffoldsForHeatmapViewport(
+    activeAssemblyBlocks,
+    heatmapViewport,
+    gfaHomologs,
+  );
+  const gfaVisibleContigIds = gfaContigsForHeatmapViewport(
+    activeAssemblyBlocks,
+    heatmapViewport,
   );
   const selectedContactNormalization = contactNormalizationForBackend(uiState.normalization);
   const displayedContactNormalization = contactMap?.normalization;
@@ -239,6 +351,51 @@ export function AppShell({
       event.preventDefault();
       setInspectorWidth(null);
     }
+  }
+
+  function centerWorkspaceHeight() {
+    return centerWorkspaceRef.current?.clientHeight
+      ?? (typeof window === "undefined" ? 720 : window.innerHeight - 120);
+  }
+
+  function currentGfaPanelHeight() {
+    return centerWorkspaceRef.current
+      ?.querySelector<HTMLElement>(".gfa-graph-panel")
+      ?.getBoundingClientRect().height
+      ?? gfaPanelHeight
+      ?? centerWorkspaceHeight() / 3;
+  }
+
+  function beginGfaResize(event: ReactPointerEvent<HTMLButtonElement>) {
+    gfaResizeRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startHeight: currentGfaPanelHeight(),
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    document.documentElement.classList.add("gfa-panel-resizing");
+  }
+
+  function resizeGfaPanel(event: ReactPointerEvent<HTMLButtonElement>) {
+    const resize = gfaResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) {
+      return;
+    }
+    setGfaPanelHeight(clampGfaPanelHeight(
+      resize.startHeight + resize.startY - event.clientY,
+      centerWorkspaceHeight(),
+    ));
+  }
+
+  function endGfaResize(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (gfaResizeRef.current?.pointerId !== event.pointerId) {
+      return;
+    }
+    gfaResizeRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    document.documentElement.classList.remove("gfa-panel-resizing");
   }
 
   function selectSyntenyBlock(id: string, modifiers: SyntenySelectionModifiers) {
@@ -352,13 +509,24 @@ export function AppShell({
 
   useEffect(() => () => {
     document.documentElement.classList.remove("inspector-resizing");
+    document.documentElement.classList.remove("gfa-panel-resizing");
   }, []);
+
+  useEffect(() => {
+    if (!gfaDocument) {
+      setGfaPanelOpen(false);
+      setGfaPanelHeight(null);
+    }
+  }, [gfaDocument]);
 
   useEffect(() => {
     function closeToolbarMenusOutside(event: PointerEvent) {
       for (const menu of [projectMenuRef.current, addDataMenuRef.current]) {
         if (menu?.open && !menu.contains(event.target as Node)) {
           menu.open = false;
+          if (menu === addDataMenuRef.current) {
+            setConfirmingClearData(false);
+          }
         }
       }
     }
@@ -371,6 +539,9 @@ export function AppShell({
         if (menu?.open) {
           menu.open = false;
           menu.querySelector<HTMLElement>("summary")?.focus();
+          if (menu === addDataMenuRef.current) {
+            setConfirmingClearData(false);
+          }
         }
       }
     }
@@ -385,6 +556,7 @@ export function AppShell({
 
   function runAddDataAction(action: () => void) {
     addDataMenuRef.current?.removeAttribute("open");
+    setConfirmingClearData(false);
     action();
   }
 
@@ -424,7 +596,15 @@ export function AppShell({
 
             <span className={`project-health ${agpImported ? "ready" : "idle"}`} aria-label={agpImported ? "Assembly loaded" : "Assembly not loaded"} />
 
-            <details ref={addDataMenuRef} className="toolbar-disclosure add-data-disclosure">
+            <details
+              ref={addDataMenuRef}
+              className="toolbar-disclosure add-data-disclosure"
+              onToggle={(event) => {
+                if (!event.currentTarget.open) {
+                  setConfirmingClearData(false);
+                }
+              }}
+            >
               <summary
                 className="global-action-button"
                 aria-keyshortcuts="F10"
@@ -438,6 +618,10 @@ export function AppShell({
                 <button type="button" onClick={() => runAddDataAction(() => agpInputRef.current?.click())}>
                   <span>Assembly (.agp)</span>
                   {agpImported ? <Check size={14} aria-label="Loaded" /> : null}
+                </button>
+                <button type="button" onClick={() => runAddDataAction(() => gfaInputRef.current?.click())}>
+                  <span>Assembly graph (.gfa)</span>
+                  {gfaImported ? <Check size={14} aria-label="Loaded" /> : null}
                 </button>
                 <button type="button" onClick={() => runAddDataAction(onContactFileSelected)}>
                   <span>Contact map (.cool/.mcool)</span>
@@ -455,8 +639,61 @@ export function AppShell({
                 <button type="button" onClick={() => runAddDataAction(onLoadExample)}>
                   <span>Load example project</span>
                 </button>
+                <span className="popover-divider" aria-hidden="true" />
+                {confirmingClearData ? (
+                  <section
+                    className="add-data-clear-confirmation"
+                    role="alertdialog"
+                    aria-labelledby="clear-loaded-data-title"
+                    aria-describedby="clear-loaded-data-description"
+                  >
+                    <strong id="clear-loaded-data-title">Clear all loaded data?</strong>
+                    <p id="clear-loaded-data-description">
+                      This removes {loadedDataLabels.join(", ")} from the workspace.
+                      {isAgpDirty ? " Unsaved assembly edits will be lost." : ""}
+                    </p>
+                    <div className="add-data-clear-actions">
+                      <button type="button" onClick={() => setConfirmingClearData(false)}>
+                        Cancel
+                      </button>
+                      <button
+                        className="add-data-clear-confirm"
+                        type="button"
+                        onClick={() => runAddDataAction(onClearAllData)}
+                      >
+                        Clear all
+                      </button>
+                    </div>
+                  </section>
+                ) : (
+                  <button
+                    className="add-data-clear-button"
+                    type="button"
+                    disabled={!hasLoadedData}
+                    title={hasLoadedData ? "Remove every loaded data source" : "No loaded data"}
+                    onClick={() => setConfirmingClearData(true)}
+                  >
+                    <span>Clear all loaded data…</span>
+                    <Trash2 size={14} aria-hidden="true" />
+                  </button>
+                )}
               </div>
             </details>
+
+            <label
+              className={`global-homolog-pattern${gfaHomologPatternError ? " invalid" : ""}`}
+            >
+              <span>Homolog regex</span>
+              <input
+                type="text"
+                aria-label="Homologous chromosome regular expression"
+                value={gfaHomologPattern}
+                spellCheck={false}
+                onChange={(event) => onGfaHomologPatternChange(event.currentTarget.value)}
+                title={gfaHomologPatternError
+                  ?? "Global setting: capture group 1 defines a homolog column; group 2 orders chromosomes within it"}
+              />
+            </label>
           </div>
 
           <div className="global-toolbar-trailing" aria-label="Project actions">
@@ -482,6 +719,19 @@ export function AppShell({
                 const file = event.target.files?.[0];
                 if (file) {
                   onPafFileSelected(file);
+                }
+                event.currentTarget.value = "";
+              }}
+            />
+            <input
+              ref={gfaInputRef}
+              className="file-input"
+              type="file"
+              accept=".gfa,.gfa1,.txt"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  onGfaFileSelected(file);
                 }
                 event.currentTarget.value = "";
               }}
@@ -566,6 +816,7 @@ export function AppShell({
                     <div><dt>Move to debris</dt><dd>{shortcuts.moveToDebris}</dd></div>
                     <div><dt>Delete gap / join</dt><dd>{shortcuts.deleteGap}</dd></div>
                     <div><dt>Delete contig</dt><dd>{shortcuts.deleteContig}</dd></div>
+                    <div><dt>Switch resolution</dt><dd>{shortcuts.resolutionWheel}</dd></div>
                     <div><dt>Deselect / cancel</dt><dd>Esc</dd></div>
                     <div><dt>Toggle annotations</dt><dd>F2</dd></div>
                     <div><dt>Toggle inspector</dt><dd>F9</dd></div>
@@ -577,7 +828,13 @@ export function AppShell({
           </div>
         </div>
 
-        <HeatmapToolbar uiState={uiState} onUiAction={onUiAction} totalSpanMb={totalSpanMb} />
+        <HeatmapToolbar
+          uiState={uiState}
+          onUiAction={onUiAction}
+          totalSpanMb={totalSpanMb}
+          preserveResolutionViewport={contactIsMcool}
+          availableResolutionBasePairs={contactAvailableResolutions}
+        />
       </header>
 
       <section
@@ -587,30 +844,68 @@ export function AppShell({
           ? undefined
           : ({ "--inspector-width": `${inspectorWidth}px` } as CSSProperties)}
       >
-        <section className="center-workspace" aria-label="Assembly contact map workspace">
+        <section
+          ref={centerWorkspaceRef}
+          className={`center-workspace${gfaPanelOpen && gfaDocument ? " gfa-open" : ""}${
+            heatmapPanelOpen ? "" : " heatmap-closed"
+          }${uiState.layout.syntenySplitOpen ? " synteny-open" : ""}`}
+          aria-label="Assembly contact map workspace"
+          style={gfaPanelHeight === null
+            ? undefined
+            : ({ "--gfa-panel-height": `${gfaPanelHeight}px` } as CSSProperties)}
+        >
           <section className="map-stack">
-            <section className={`main-view${uiState.layout.syntenySplitOpen ? " split-open" : ""}`}>
-              <ContactMapViewport
-                dataset={dataset}
-                contactMap={contactMap}
-                coverageView={coverageView}
-                uiState={uiState}
-                onUiAction={onUiAction}
-                onContactTileLayerCommit={onContactTileLayerCommit}
-                onContactTileLayerPaintComplete={onContactTileLayerPaintComplete}
-              />
+            <section className={`main-view${
+              heatmapPanelOpen && uiState.layout.syntenySplitOpen ? " split-open" : ""
+            }${heatmapPanelOpen ? "" : " heatmap-closed"}`}>
+              {heatmapPanelOpen ? (
+                <ContactMapViewport
+                  dataset={dataset}
+                  contactMap={contactMap}
+                  contactTileDeltaStream={contactTileDeltaStream}
+                  coverageView={coverageView}
+                  uiState={uiState}
+                  homologPattern={gfaHomologPattern}
+                  preserveResolutionViewport={contactIsMcool}
+                  availableResolutionBasePairs={contactAvailableResolutions}
+                  onClosePanel={closeHeatmapPanel}
+                  onExpandPanel={expandHeatmapPanel}
+                  onUiAction={onUiAction}
+                  onContactViewportPreview={onContactViewportPreview}
+                  onContactTileLayerCommit={onContactTileLayerCommit}
+                  onContactTileLayerPaintComplete={onContactTileLayerPaintComplete}
+                />
+              ) : null}
               {uiState.layout.syntenySplitOpen ? (
                 <aside className="synteny-split-pane" aria-label="Synteny split view">
                   <div className="split-pane-header">
                     <strong>Synteny</strong>
-                    <button
-                      className="global-icon-button"
-                      type="button"
-                      aria-label="Close synteny split view"
-                      onClick={() => onUiAction({ type: "setSyntenySplitOpen", open: false })}
-                    >
-                      ×
-                    </button>
+                    <span className="split-pane-actions">
+                      {!heatmapPanelOpen ? (
+                        <button
+                          className="global-icon-button"
+                          type="button"
+                          aria-label="Restore heatmap window"
+                          title="Restore heatmap window"
+                          onClick={() => setHeatmapPanelOpen(true)}
+                        >
+                          <Maximize2 size={11} aria-hidden="true" />
+                        </button>
+                      ) : null}
+                      <button
+                        className="global-icon-button"
+                        type="button"
+                        aria-label="Close synteny split view"
+                        onClick={() => {
+                          onUiAction({ type: "setSyntenySplitOpen", open: false });
+                          if (!heatmapPanelOpen && !gfaPanelOpen) {
+                            setHeatmapPanelOpen(true);
+                          }
+                        }}
+                      >
+                        ×
+                      </button>
+                    </span>
                   </div>
                   <SyntenyDotplot
                     syntenyView={syntenyView}
@@ -626,6 +921,46 @@ export function AppShell({
               ) : null}
             </section>
           </section>
+          {gfaPanelOpen && gfaDocument ? (
+            <>
+              {heatmapPanelOpen || uiState.layout.syntenySplitOpen ? <button
+                type="button"
+                className="gfa-panel-resize-handle"
+                role="separator"
+                aria-label="Resize GFA graph panel"
+                aria-orientation="horizontal"
+                aria-valuemin={gfaPanelMinHeight}
+                aria-valuenow={Math.round(gfaPanelHeight ?? centerWorkspaceHeight() / 3)}
+                title="Drag to resize the GFA graph panel; double-click to reset"
+                onPointerDown={beginGfaResize}
+                onPointerMove={resizeGfaPanel}
+                onPointerUp={endGfaResize}
+                onPointerCancel={endGfaResize}
+                onDoubleClick={() => setGfaPanelHeight(null)}
+              /> : null}
+              <GfaGraphPanel
+                document={gfaDocument}
+                assemblyBlocks={activeAssemblyBlocks}
+                selectedAssemblyBlockIds={selectedAssemblyBlockIds}
+                homologPattern={gfaHomologPattern}
+                visibleScaffoldIds={gfaVisibleScaffoldIds}
+                visibleContigIds={gfaVisibleContigIds}
+                onRestoreHeatmap={!heatmapPanelOpen && !uiState.layout.syntenySplitOpen
+                  ? () => setHeatmapPanelOpen(true)
+                  : undefined}
+                onClose={() => {
+                  setGfaPanelOpen(false);
+                  if (!heatmapPanelOpen && !uiState.layout.syntenySplitOpen) {
+                    setHeatmapPanelOpen(true);
+                  }
+                }}
+                onSelectOccurrences={(ids) => onUiAction({
+                  type: "selectAssemblyContigs",
+                  ids,
+                })}
+              />
+            </>
+          ) : null}
         </section>
 
         {uiState.layout.rightCollapsed ? null : (
@@ -661,6 +996,11 @@ export function AppShell({
               selectedAssemblyBlockIds={selectedAssemblyBlockIds}
               pafText={pafText}
               onPafTextChange={onPafTextChange}
+              gfaDocument={gfaDocument}
+              gfaHomologPattern={gfaHomologPattern}
+              gfaPreviewScaffoldIds={gfaPreviewScaffoldIds}
+              onExpandHeatmap={expandHeatmapPanel}
+              onOpenGfaPanel={() => setGfaPanelOpen(true)}
             />
           </>
         )}
@@ -677,6 +1017,9 @@ export function AppShell({
         <span>X: {uiState.contact.viewportCenterXMb.toFixed(2)} Mb</span>
         <span>Y: {uiState.contact.viewportCenterYMb.toFixed(2)} Mb</span>
         <strong>{statusMessage}</strong>
+        {contactPanPerformanceLog ? (
+          <output aria-label="Contact pan performance">{contactPanPerformanceLog}</output>
+        ) : null}
       </footer>
     </main>
   );
