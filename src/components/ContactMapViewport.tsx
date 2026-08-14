@@ -8,7 +8,7 @@ import {
   Scissors,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ContactMapCell, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   assemblyContigDisplayName,
@@ -43,10 +43,12 @@ import {
 import { contactTileViewportSignature } from "../state/contactTiles";
 import {
   contactWheelNavigationMode,
+  contactWheelPanMode,
   contactWheelPanIntent,
 } from "../state/contactWheel";
 export {
   contactWheelNavigationMode,
+  contactWheelPanMode,
   contactWheelPanIntent,
 } from "../state/contactWheel";
 import type { CoverageView } from "../state/coverageView";
@@ -623,11 +625,17 @@ export function ContactMapViewport({
     [assemblyModel, displayViewport.xStart, displayViewport.xEnd],
   );
   const visibleAssemblyChromosomes = useMemo(
-    () =>
-      assemblyModel.chromosomes.filter(
-        (chromosome) => chromosome.visualEnd > displayViewport.xStart && chromosome.visualStart < displayViewport.xEnd,
-      ),
-    [assemblyModel, displayViewport.xStart, displayViewport.xEnd],
+    () => {
+      const xSpan = displayViewport.xEnd - displayViewport.xStart;
+      const ySpan = displayViewport.yEnd - displayViewport.yStart;
+      return assemblyModel.chromosomes.filter(
+        (chromosome) => chromosome.visualEnd > displayViewport.xStart - xSpan
+          && chromosome.visualStart < displayViewport.xEnd + xSpan
+          && chromosome.visualEnd > displayViewport.yStart - ySpan
+          && chromosome.visualStart < displayViewport.yEnd + ySpan,
+      );
+    },
+    [assemblyModel, displayViewport],
   );
   const totalSpanMb = Math.max(
     0.000001,
@@ -813,7 +821,6 @@ export function ContactMapViewport({
 
     function handleWheelPan(event: WheelEvent) {
       const sourceContactMap = latestContactMapRef.current;
-      const diagonalWheelPan = event.shiftKey && (event.ctrlKey || event.metaKey);
       const navigationMode = contactWheelNavigationMode(event);
       if (navigationMode === "resolution") {
         event.preventDefault();
@@ -884,8 +891,7 @@ export function ContactMapViewport({
         deltaX: event.deltaX,
         deltaY: event.deltaY,
         deltaMode: event.deltaMode,
-        shiftKey: event.shiftKey,
-        diagonalKey: diagonalWheelPan,
+        panMode: contactWheelPanMode(event),
         bounds,
         viewport: currentViewport,
       });
@@ -1888,7 +1894,7 @@ interface AssemblyOverlayProps {
   onPointerLeave: () => void;
 }
 
-function AssemblyOverlay({
+const AssemblyOverlay = memo(function AssemblyOverlay({
   overlayLayerRef,
   selectionVerticalBandRef,
   selectionHorizontalBandRef,
@@ -2062,7 +2068,7 @@ function AssemblyOverlay({
       <div ref={overlayLayerRef} className="assembly-overlay-layer">
         {showChromosomeBoxes
           ? visibleChromosomes.map((chromosome) => {
-          const box = intervalBox(
+          const boundary = overscannedBoundaryIntervalBox(
             chromosome.visualStart,
             chromosome.visualEnd,
             viewportXStart,
@@ -2072,7 +2078,7 @@ function AssemblyOverlay({
             viewportYEnd,
             viewportYSpan,
           );
-          if (!box) {
+          if (!boundary) {
             return null;
           }
 
@@ -2081,8 +2087,8 @@ function AssemblyOverlay({
               key={chromosome.id}
               className={`assembly-box chromosome-box ${
                 selection?.kind === "chromosome" && selection.id === chromosome.id ? "selected" : ""
-              }`}
-              style={box}
+              } ${boundary.clipClassName}`.trim()}
+              style={boundary.style}
               title={chromosome.id}
             />
           );
@@ -2260,6 +2266,26 @@ function AssemblyOverlay({
       </div>
     </div>
   );
+}, sameAssemblyOverlayPresentation);
+
+export function sameAssemblyOverlayPresentation(
+  previous: AssemblyOverlayProps,
+  next: AssemblyOverlayProps,
+) {
+  return previous.model === next.model
+    && previous.viewportXStart === next.viewportXStart
+    && previous.viewportXEnd === next.viewportXEnd
+    && previous.viewportYStart === next.viewportYStart
+    && previous.viewportYEnd === next.viewportYEnd
+    && previous.selection === next.selection
+    && previous.showChromosomeBoxes === next.showChromosomeBoxes
+    && previous.showBlockBoxes === next.showBlockBoxes
+    && previous.showContigBoxes === next.showContigBoxes
+    && previous.visibleBlocks === next.visibleBlocks
+    && previous.visibleContigs === next.visibleContigs
+    && previous.visibleChromosomes === next.visibleChromosomes
+    && previous.selectionBox === next.selectionBox
+    && previous.pointerState === next.pointerState;
 }
 
 function nearestAssemblyBlockIndex(model: AssemblyEditModel, visualPosition: number) {
@@ -2310,6 +2336,61 @@ function intervalBox(
     width: `${width}%`,
     height: `${height}%`,
   };
+}
+
+function overscannedBoundaryIntervalBox(
+  visualStart: number,
+  visualEnd: number,
+  viewportXStart: number,
+  viewportXEnd: number,
+  viewportXSpan: number,
+  viewportYStart: number,
+  viewportYEnd: number,
+  viewportYSpan: number,
+) {
+  const overscanXStart = viewportXStart - viewportXSpan;
+  const overscanXEnd = viewportXEnd + viewportXSpan;
+  const overscanYStart = viewportYStart - viewportYSpan;
+  const overscanYEnd = viewportYEnd + viewportYSpan;
+  const clippedXStart = Math.max(visualStart, overscanXStart);
+  const clippedXEnd = Math.min(visualEnd, overscanXEnd);
+  const clippedYStart = Math.max(visualStart, overscanYStart);
+  const clippedYEnd = Math.min(visualEnd, overscanYEnd);
+  if (clippedXStart >= clippedXEnd || clippedYStart >= clippedYEnd) {
+    return null;
+  }
+  return {
+    style: {
+      left: `${((clippedXStart - viewportXStart) / viewportXSpan) * 100}%`,
+      top: `${((clippedYStart - viewportYStart) / viewportYSpan) * 100}%`,
+      width: `${((clippedXEnd - clippedXStart) / viewportXSpan) * 100}%`,
+      height: `${((clippedYEnd - clippedYStart) / viewportYSpan) * 100}%`,
+    },
+    clipClassName: assemblyBoundaryViewportClipClassName(
+      visualStart,
+      visualEnd,
+      overscanXStart,
+      overscanXEnd,
+      overscanYStart,
+      overscanYEnd,
+    ),
+  };
+}
+
+export function assemblyBoundaryViewportClipClassName(
+  visualStart: number,
+  visualEnd: number,
+  viewportXStart: number,
+  viewportXEnd: number,
+  viewportYStart: number,
+  viewportYEnd: number,
+) {
+  return [
+    visualStart < viewportXStart ? "viewport-clipped-left" : "",
+    visualEnd > viewportXEnd ? "viewport-clipped-right" : "",
+    visualStart < viewportYStart ? "viewport-clipped-top" : "",
+    visualEnd > viewportYEnd ? "viewport-clipped-bottom" : "",
+  ].filter(Boolean).join(" ");
 }
 
 function visualPositionFromPointer(

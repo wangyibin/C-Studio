@@ -105,6 +105,7 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain("Delete gap / join");
     expect(markup).toContain(`<dt>Delete contig</dt><dd>${shortcuts.deleteContig}</dd>`);
     expect(markup).toContain(`<dt>Pan diagonally</dt><dd>${shortcuts.diagonalWheel}</dd>`);
+    expect(markup).toContain(`<dt>Pan vertically</dt><dd>${shortcuts.verticalWheel}</dd>`);
   });
 
   it("marks an invalid global homolog regex in the top toolbar", () => {

@@ -8,8 +8,7 @@ interface ContactWheelPanInput {
   deltaX: number;
   deltaY: number;
   deltaMode: number;
-  shiftKey: boolean;
-  diagonalKey?: boolean;
+  panMode?: ContactWheelPanMode;
   bounds: {
     width: number;
     height: number;
@@ -31,6 +30,7 @@ interface ContactWheelModifierInput {
 }
 
 export type ContactWheelNavigationMode = "pan" | "resolution";
+export type ContactWheelPanMode = "natural" | "horizontal" | "diagonal" | "vertical";
 
 /** Shift reserves a modified wheel gesture for panning instead of resolution changes. */
 export function contactWheelNavigationMode({
@@ -41,13 +41,28 @@ export function contactWheelNavigationMode({
   return (ctrlKey || metaKey) && !shiftKey ? "resolution" : "pan";
 }
 
+/** Map heatmap wheel modifiers without changing the Command/Ctrl resolution gesture. */
+export function contactWheelPanMode({
+  ctrlKey,
+  metaKey,
+  shiftKey,
+}: ContactWheelModifierInput): ContactWheelPanMode {
+  const commandKey = ctrlKey || metaKey;
+  if (commandKey && shiftKey) {
+    return "vertical";
+  }
+  if (shiftKey) {
+    return "horizontal";
+  }
+  return commandKey ? "natural" : "diagonal";
+}
+
 /** Shared Contact Map / Dotplot wheel-to-viewport pan normalization. */
 export function contactWheelPanIntent({
   deltaX,
   deltaY,
   deltaMode,
-  shiftKey,
-  diagonalKey = false,
+  panMode = "natural",
   bounds,
   viewport,
 }: ContactWheelPanInput): ContactWheelPanIntent | null {
@@ -62,15 +77,21 @@ export function contactWheelPanIntent({
 
   const rawDeltaX = Number.isFinite(deltaX) ? deltaX : 0;
   const rawDeltaY = Number.isFinite(deltaY) ? deltaY : 0;
-  const diagonalDelta = Math.abs(rawDeltaY) >= Math.abs(rawDeltaX)
+  const primaryDelta = Math.abs(rawDeltaY) >= Math.abs(rawDeltaX)
     ? rawDeltaY
     : rawDeltaX;
-  const mappedDeltaX = diagonalKey
-    ? diagonalDelta
-    : shiftKey
-      ? (rawDeltaX !== 0 ? rawDeltaX : rawDeltaY)
-      : rawDeltaX;
-  const mappedDeltaY = diagonalKey ? diagonalDelta : shiftKey ? 0 : rawDeltaY;
+  const mappedDeltaX = panMode === "diagonal"
+    ? primaryDelta
+    : panMode === "vertical"
+      ? 0
+      : panMode === "horizontal"
+        ? (rawDeltaX !== 0 ? rawDeltaX : rawDeltaY)
+        : rawDeltaX;
+  const mappedDeltaY = panMode === "diagonal" || panMode === "vertical"
+    ? primaryDelta
+    : panMode === "horizontal"
+      ? 0
+      : rawDeltaY;
   const deltaScaleX = deltaMode === wheelDeltaLineMode
     ? wheelLinePixels
     : deltaMode === wheelDeltaPageMode

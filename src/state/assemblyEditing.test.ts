@@ -458,10 +458,8 @@ describe("assemblyEditing", () => {
       "contig-3",
       { ...none, shiftKey: true },
     )).toEqual({
-      type: "select",
-      id: "contig-3",
-      additive: false,
-      anchorId: "contig-3",
+      type: "clear",
+      anchorId: null,
     });
   });
 

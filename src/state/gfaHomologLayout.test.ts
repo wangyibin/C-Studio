@@ -7,6 +7,7 @@ import {
   gfaCurationNodeWidths,
   gfaHomologRowGap,
   gfaLinkScope,
+  layoutGfaNodePathsBandage,
   layoutGfaNodesBandage,
   layoutGfaNodesForCuration,
   layoutGfaNodesGuided,
@@ -85,6 +86,27 @@ describe("GFA homologous chromosome grouping", () => {
     }
   });
 
+  it("expands homolog lane spacing when long chromosome rows are fit to width", () => {
+    const scaffoldIds = ["Chr01g1", "Chr01g2"];
+    const homologs = classifyGfaScaffolds(scaffoldIds);
+    const nodes = scaffoldIds.flatMap((groupId, row) => (
+      Array.from({ length: 80 }, (_, index) => ({
+        id: `row-${row + 1}-node-${index + 1}`,
+        groupId,
+        assemblyBlockId: `row-${row + 1}-block-${index + 1}`,
+        order: index,
+      }))
+    ));
+    const positions = layoutGfaNodesByHomolog(nodes, homologs);
+
+    expect(gfaHomologRowGap(4, 900)).toBe(44);
+    expect(gfaHomologRowGap(4, 3_600)).toBe(88);
+    expect(gfaHomologRowGap(12, 900)).toBe(84);
+    expect(gfaHomologRowGap(4, 20_000)).toBe(144);
+    expect(positions.get("row-2-node-1")!.y - positions.get("row-1-node-1")!.y)
+      .toBeGreaterThan(44);
+  });
+
   it("keeps unitigs inside one block touching and separates consecutive blocks", () => {
     const homologs = classifyGfaScaffolds(["Chr01g1"]);
     const positions = layoutGfaNodesByHomolog([
@@ -124,7 +146,7 @@ describe("GFA homologous chromosome grouping", () => {
     expect(gfaLinkScope("Chr01g1", "debris", homologs)).toBe("non-homolog");
   });
 
-  it("lays out Bandage topology while keeping each AGP block rigid", () => {
+  it("lays out each Bandage node from GFA topology even inside one AGP block", () => {
     const nodes = [
       { id: "a", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 1 },
       { id: "b", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 2 },
@@ -138,16 +160,88 @@ describe("GFA homologous chromosome grouping", () => {
     const second = layoutGfaNodesBandage(nodes, edges);
 
     expect([...first]).toEqual([...second]);
-    const widths = gfaBandageNodeWidths(nodes);
-    expect(first.get("a")!.y).toBe(first.get("b")!.y);
-    expect(first.get("a")!.x).toBeLessThan(first.get("b")!.x);
-    expect(first.get("b")!.x - first.get("a")!.x).toBe(
-      widths.get("a")! / 2 + 4 + widths.get("b")! / 2,
-    );
+    expect(first.get("a")!.y).not.toBe(first.get("b")!.y);
     expect(Math.hypot(
       first.get("a")!.x - first.get("c")!.x,
       first.get("a")!.y - first.get("c")!.y,
     )).toBeLessThan(260);
+  });
+
+  it("does not let hidden AGP relations change the Bandage topology", () => {
+    const nodes = [
+      { id: "a", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 1 },
+      { id: "b", groupId: "Chr01g1", assemblyBlockId: "block-2", order: 2 },
+      { id: "c", groupId: "Chr01g1", assemblyBlockId: "block-3", order: 3 },
+    ];
+    const gfaEdges = [
+      { source: "a", target: "c", kind: "gfa-link" as const },
+    ];
+    const withAgp = layoutGfaNodesBandage(nodes, [
+      ...gfaEdges,
+      { source: "a", target: "b", kind: "agp-joined" },
+      { source: "b", target: "c", kind: "agp-gap" },
+    ]);
+
+    expect([...withAgp]).toEqual([...layoutGfaNodesBandage(nodes, gfaEdges)]);
+  });
+
+  it("subdivides long Bandage unitigs into more layout control points", () => {
+    const paths = layoutGfaNodePathsBandage([
+      { id: "short", groupId: "Unplaced", order: 1, length: 1_000 },
+      { id: "medium", groupId: "Unplaced", order: 2, length: 10_000 },
+      { id: "long", groupId: "Unplaced", order: 3, length: 100_000 },
+    ], []);
+
+    expect(paths.get("short")!.length).toBeLessThan(paths.get("medium")!.length);
+    expect(paths.get("medium")!.length).toBeLessThan(paths.get("long")!.length);
+  });
+
+  it("points linked physical endpoints toward one another", () => {
+    const paths = layoutGfaNodePathsBandage([
+      { id: "a", groupId: "Unplaced", order: 1, length: 10_000, orientation: "+" },
+      { id: "b", groupId: "Unplaced", order: 2, length: 10_000, orientation: "+" },
+    ], [{
+      source: "a",
+      target: "b",
+      kind: "gfa-link",
+      sourceSide: "end",
+      targetSide: "start",
+    }]);
+    const a = paths.get("a")!;
+    const b = paths.get("b")!;
+    const linkedDistance = Math.hypot(
+      a[a.length - 1].x - b[0].x,
+      a[a.length - 1].y - b[0].y,
+    );
+    const oppositeDistance = Math.hypot(
+      a[0].x - b[b.length - 1].x,
+      a[0].y - b[b.length - 1].y,
+    );
+
+    expect(linkedDistance).toBeLessThan(oppositeDistance);
+  });
+
+  it("does not let AGP display edges change Bandage control paths", () => {
+    const nodes = [
+      { id: "a", groupId: "Chr01g1", order: 1, length: 10_000 },
+      { id: "b", groupId: "Chr01g1", order: 2, length: 10_000 },
+      { id: "c", groupId: "Chr01g1", order: 3, length: 10_000 },
+    ];
+    const gfaEdges = [{
+      source: "a",
+      target: "c",
+      kind: "gfa-link" as const,
+      sourceSide: "end" as const,
+      targetSide: "start" as const,
+    }];
+    const baseline = layoutGfaNodePathsBandage(nodes, gfaEdges);
+    const withAgp = layoutGfaNodePathsBandage(nodes, [
+      ...gfaEdges,
+      { source: "a", target: "b", kind: "agp-joined" },
+      { source: "b", target: "c", kind: "agp-gap" },
+    ]);
+
+    expect([...withAgp]).toEqual([...baseline]);
   });
 
   it("keeps the Guided AGP backbone ordered and places one-hop neighbors in lanes", () => {

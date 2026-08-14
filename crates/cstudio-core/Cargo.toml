@@ -9,7 +9,13 @@ license = "MIT"
 name = "cstudio_core"
 path = "src/lib.rs"
 
+[features]
+# Release packaging enables this feature so end users do not need to install
+# HDF5 separately. Local development keeps using the system HDF5 by default.
+portable-hdf5 = ["dep:hdf5-sys"]
+
 [dependencies]
 hdf5 = "0.8"
+hdf5-sys = { version = "0.8", features = ["static", "zlib"], optional = true }
 libc = "0.2"
 rayon = "1.12"

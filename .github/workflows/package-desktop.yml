@@ -1,0 +1,110 @@
+name: Package desktop apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-macos:
+    name: macOS universal
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build macOS app and DMG
+        uses: tauri-apps/tauri-action@v1
+        env:
+          # Ad-hoc signing avoids unsigned Apple Silicon bundles being reported
+          # as damaged. Production distribution can replace this with a
+          # Developer ID certificate and notarization secrets later.
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          args: --target universal-apple-darwin --features portable-hdf5 --bundles app,dmg
+
+      - name: Archive macOS app bundle
+        run: >-
+          ditto -c -k --sequesterRsrc --keepParent
+          "src-tauri/target/universal-apple-darwin/release/bundle/macos/C-Studio.app"
+          "src-tauri/target/universal-apple-darwin/release/bundle/macos/C-Studio-universal.app.zip"
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-studio-macos-universal-${{ github.run_number }}
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.zip
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  package-windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Windows installers
+        uses: tauri-apps/tauri-action@v1
+        with:
+          args: --target x86_64-pc-windows-msvc --features portable-hdf5 --bundles nsis,msi
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-studio-windows-x64-${{ github.run_number }}
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 7

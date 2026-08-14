@@ -1221,7 +1221,7 @@ describe("reduceUiState", () => {
     expect(state.logEntries[state.logEntries.length - 1]?.message).toBe("Contact resolution unlocked");
   });
 
-  it("does not let a locked finer resolution zoom out below one pixel per bin", () => {
+  it("lets a locked resolution expand through subpixel bins while staying within its tile budget", () => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, { type: "setContactResolution", resolution: "250 kb" });
     state = reduceUiState(state, { type: "toggleContactResolutionLock" });
@@ -1233,7 +1233,7 @@ describe("reduceUiState", () => {
       totalSpanMb: 200,
     });
 
-    expect(state.contact.viewportSpanMb).toBe(160);
+    expect(state.contact.viewportSpanMb).toBe(200);
     expect(state.contact.resolution).toBe("250 kb");
   });
 
@@ -1347,6 +1347,28 @@ describe("reduceUiState", () => {
     expect(state.contact.viewportSpanMb).toBe(0.020938);
     expect(state.contact.viewportSpanMb).toBeLessThan(1);
     expect(state.contact.resolution).toBe("5 kb");
+  });
+
+  it("expands a locked 1 kb genomic viewport without changing its data resolution", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 536,
+      totalSpanMb: 200,
+    });
+    state = reduceUiState(state, { type: "setContactResolution", resolution: "1 kb" });
+    state = reduceUiState(state, { type: "toggleContactResolutionLock" });
+    state = reduceUiState(state, {
+      type: "zoomContactViewport",
+      direction: "out",
+      focusRatioX: 0.5,
+      focusRatioY: 0.5,
+      scaleFactor: 0.000001,
+      totalSpanMb: 200,
+    });
+
+    expect(state.contact.resolution).toBe("1 kb");
+    expect(state.contact.viewportSpanMb).toBe(6.144);
   });
 
   it("clamps overview-driven viewport centers to visible bounds", () => {

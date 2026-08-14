@@ -693,6 +693,52 @@ pub struct AppStatus {
     pub supported_operations: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GfaBandageLayoutRequest {
+    pub nodes: Vec<GfaBandageLayoutNodeRequest>,
+    pub edges: Vec<GfaBandageLayoutEdgeRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GfaBandageLayoutNodeRequest {
+    pub id: String,
+    pub width: f64,
+    pub orientation: String,
+    pub layout_unit_id: String,
+    pub layout_order: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GfaBandageLayoutEdgeRequest {
+    pub source: String,
+    pub target: String,
+    pub source_side: String,
+    pub target_side: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GfaBandageLayoutResponse {
+    pub algorithm: String,
+    pub paths: Vec<GfaBandageLayoutPathResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GfaBandageLayoutPathResponse {
+    pub id: String,
+    pub points: Vec<GfaBandageLayoutPointResponse>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct GfaBandageLayoutPointResponse {
+    pub x: f64,
+    pub y: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExampleDatasetSummary {
     pub agp_path: String,
@@ -1295,6 +1341,78 @@ pub fn get_app_status() -> AppStatus {
             .into_iter()
             .map(str::to_string)
             .collect(),
+    }
+}
+
+#[tauri::command]
+pub async fn layout_gfa_bandage(
+    request: GfaBandageLayoutRequest,
+) -> Result<GfaBandageLayoutResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || layout_gfa_bandage_response(request))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn layout_gfa_bandage_response(
+    request: GfaBandageLayoutRequest,
+) -> Result<GfaBandageLayoutResponse, String> {
+    let mut ids = BTreeSet::new();
+    let nodes = request
+        .nodes
+        .into_iter()
+        .map(|node| {
+            if node.id.is_empty() {
+                return Err("GFA layout node id must not be empty".to_string());
+            }
+            if !ids.insert(node.id.clone()) {
+                return Err(format!("duplicate GFA layout node id: {}", node.id));
+            }
+            Ok(cstudio_core::gfa_layout::GfaLayoutNode {
+                id: node.id,
+                width: node.width,
+                reverse: node.orientation == "-",
+                layout_unit_id: node.layout_unit_id,
+                layout_order: node.layout_order,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let edges = request
+        .edges
+        .into_iter()
+        .map(|edge| {
+            Ok(cstudio_core::gfa_layout::GfaLayoutEdge {
+                source: edge.source,
+                target: edge.target,
+                source_side: parse_gfa_layout_side(&edge.source_side)?,
+                target_side: parse_gfa_layout_side(&edge.target_side)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let paths = cstudio_core::gfa_layout::layout_gfa_multilevel(&nodes, &edges)
+        .into_iter()
+        .map(|path| GfaBandageLayoutPathResponse {
+            id: path.id,
+            points: path
+                .points
+                .into_iter()
+                .map(|point| GfaBandageLayoutPointResponse {
+                    x: point.x,
+                    y: point.y,
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(GfaBandageLayoutResponse {
+        algorithm: "cstudio-rust-multilevel-v1".to_string(),
+        paths,
+    })
+}
+
+fn parse_gfa_layout_side(side: &str) -> Result<cstudio_core::gfa_layout::GfaLayoutSide, String> {
+    match side {
+        "start" => Ok(cstudio_core::gfa_layout::GfaLayoutSide::Start),
+        "end" => Ok(cstudio_core::gfa_layout::GfaLayoutSide::End),
+        _ => Err(format!("invalid GFA layout side: {side}")),
     }
 }
 
@@ -4470,14 +4588,109 @@ mod tests {
     use super::{
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
         build_synteny_view, contact_overview_aggregate_cell_bound, get_app_status,
-        open_text_reader, persistent_lod_cache_key, scan_project_directory,
-        sort_project_contact_candidates, write_existing_agp_path, BedGraphRecordRequest,
-        ContactMapBinRequest, ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest,
-        ContactMapTileKeyRequest, ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest,
-        ContactMapViewRequest, ContactMapViewportRequest, ContactNormalizationRequest,
-        ContactTileRequestPurpose, CoverageViewFromBedGraphRequest, CoverageViewRequest,
-        PafRecordRequest, SyntenyViewRequest, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
+        layout_gfa_bandage_response, open_text_reader, persistent_lod_cache_key,
+        scan_project_directory, sort_project_contact_candidates, write_existing_agp_path,
+        BedGraphRecordRequest, ContactMapBinRequest, ContactMapLayoutBlockRequest,
+        ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
+        ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
+        ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
+        CoverageViewFromBedGraphRequest, CoverageViewRequest, GfaBandageLayoutEdgeRequest,
+        GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest, PafRecordRequest, SyntenyViewRequest,
+        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
+
+    #[test]
+    fn gfa_bandage_layout_command_maps_nodes_edges_and_orientation() {
+        let response = layout_gfa_bandage_response(GfaBandageLayoutRequest {
+            nodes: vec![
+                GfaBandageLayoutNodeRequest {
+                    id: "a".to_string(),
+                    width: 120.0,
+                    orientation: "+".to_string(),
+                    layout_unit_id: "unitig:a".to_string(),
+                    layout_order: 0,
+                },
+                GfaBandageLayoutNodeRequest {
+                    id: "b".to_string(),
+                    width: 192.0,
+                    orientation: "-".to_string(),
+                    layout_unit_id: "unitig:b".to_string(),
+                    layout_order: 0,
+                },
+            ],
+            edges: vec![GfaBandageLayoutEdgeRequest {
+                source: "a".to_string(),
+                target: "b".to_string(),
+                source_side: "end".to_string(),
+                target_side: "end".to_string(),
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(response.algorithm, "cstudio-rust-multilevel-v1");
+        assert_eq!(response.paths.len(), 2);
+        assert_eq!(response.paths[0].id, "a");
+        assert_eq!(response.paths[1].id, "b");
+        assert!(response.paths.iter().all(|path| {
+            path.points.len() >= 2
+                && path
+                    .points
+                    .iter()
+                    .all(|point| point.x.is_finite() && point.y.is_finite())
+        }));
+    }
+
+    #[test]
+    fn gfa_bandage_layout_command_rejects_duplicate_ids_and_invalid_sides() {
+        let duplicate = layout_gfa_bandage_response(GfaBandageLayoutRequest {
+            nodes: vec![
+                GfaBandageLayoutNodeRequest {
+                    id: "a".to_string(),
+                    width: 80.0,
+                    orientation: "+".to_string(),
+                    layout_unit_id: "unitig:a".to_string(),
+                    layout_order: 0,
+                },
+                GfaBandageLayoutNodeRequest {
+                    id: "a".to_string(),
+                    width: 80.0,
+                    orientation: "+".to_string(),
+                    layout_unit_id: "unitig:a".to_string(),
+                    layout_order: 0,
+                },
+            ],
+            edges: vec![],
+        })
+        .unwrap_err();
+        assert!(duplicate.contains("duplicate GFA layout node id"));
+
+        let invalid_side = layout_gfa_bandage_response(GfaBandageLayoutRequest {
+            nodes: vec![
+                GfaBandageLayoutNodeRequest {
+                    id: "a".to_string(),
+                    width: 80.0,
+                    orientation: "+".to_string(),
+                    layout_unit_id: "unitig:a".to_string(),
+                    layout_order: 0,
+                },
+                GfaBandageLayoutNodeRequest {
+                    id: "b".to_string(),
+                    width: 80.0,
+                    orientation: "+".to_string(),
+                    layout_unit_id: "unitig:b".to_string(),
+                    layout_order: 0,
+                },
+            ],
+            edges: vec![GfaBandageLayoutEdgeRequest {
+                source: "a".to_string(),
+                target: "b".to_string(),
+                source_side: "left".to_string(),
+                target_side: "start".to_string(),
+            }],
+        })
+        .unwrap_err();
+        assert!(invalid_side.contains("invalid GFA layout side"));
+    }
 
     #[test]
     fn scans_project_directory_and_reads_gzip_text_inputs() {

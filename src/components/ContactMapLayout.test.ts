@@ -27,10 +27,16 @@ describe("confirmed contact map layout styles", () => {
   });
 
   it("provides a responsive draggable inspector column", () => {
-    expect(confirmedRedesignStyles).toContain("var(--inspector-width, 326px)");
+    expect(confirmedRedesignStyles).toContain("var(--inspector-width, 280px)");
     expect(confirmedRedesignStyles).toContain(".inspector-resize-handle");
     expect(confirmedRedesignStyles).toContain("cursor: col-resize;");
     expect(confirmedRedesignStyles).toContain("touch-action: none;");
+  });
+
+  it("lets inspector width drive a stable square heatmap overview", () => {
+    expect(confirmedRedesignStyles).toMatch(
+      /\.inspector \.inspector-overview:not\(\.synteny-overview-active\):not\(\.gfa-overview-active\) \.interactive-overview\s*\{[^}]*width:\s*100%;[^}]*height:\s*auto;[^}]*aspect-ratio:\s*1 \/ 1;/,
+    );
   });
 
   it("lets the outer heatmap stage consume independent available width and height", () => {

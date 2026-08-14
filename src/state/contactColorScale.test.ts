@@ -15,8 +15,17 @@ function sortedPercentileOracle(counts: number[]): number {
     return 1;
   }
 
-  const thresholdIndex = Math.min(values.length - 1, Math.floor((95 / 100) * values.length));
-  return values[thresholdIndex];
+  const position = (99 * (values.length + 1)) / 100;
+  if (position < 1) {
+    return values[0];
+  }
+  if (position >= values.length) {
+    return values[values.length - 1];
+  }
+  const lowerPosition = Math.floor(position);
+  const lower = values[lowerPosition - 1];
+  const upper = values[lowerPosition];
+  return Math.fround(lower + (position - lowerPosition) * (upper - lower));
 }
 
 describe("contactAutoColorScaleKey", () => {
@@ -49,30 +58,27 @@ describe("estimateContactColorScale", () => {
     }
   });
 
-  it("uses Juicebox's nearest-index P95 as the automatic threshold", () => {
+  it("uses Juicebox Desktop's interpolated whole-genome P99 threshold", () => {
     const scale = estimateContactColorScale(
       Array.from({ length: 100 }, (_, index) => index + 1),
       false,
     );
 
-    expect(scale).toEqual({ log: false, min: 0, max: 96, auto: true });
+    expect(scale).toEqual({ log: false, min: 0, max: Math.fround(99.99), auto: true });
   });
 
-  it("clips a long-tail outlier without inflating the P95 threshold", () => {
+  it("clips a sparse long-tail outlier at the P99 threshold", () => {
     const scale = estimateContactColorScale(
-      [...Array.from({ length: 100 }, (_, index) => index + 1), 2_500],
+      [...Array.from({ length: 1_000 }, (_, index) => index + 1), 25_000],
       false,
     );
 
-    expect(scale.max).toBe(96);
+    expect(scale.max).toBe(Math.fround(991.98));
   });
 
-  it("keeps the same percentile rule on both sides of the old 1,000-value boundary", () => {
-    const values999 = Array.from({ length: 999 }, (_, index) => index + 1);
-    const values1000 = Array.from({ length: 1_000 }, (_, index) => index + 1);
-
-    expect(estimateContactColorScale(values999, false).max).toBe(950);
-    expect(estimateContactColorScale(values1000, false).max).toBe(951);
+  it("uses the Apache legacy N-plus-one interpolation between adjacent records", () => {
+    const values = Array.from({ length: 1_000 }, (_, index) => index + 1);
+    expect(estimateContactColorScale(values, false).max).toBe(Math.fround(990.99));
   });
 
   it("handles repeated values on and around the percentile boundary", () => {
@@ -113,9 +119,9 @@ describe("estimateContactColorScale", () => {
       false,
     );
 
-    expect(coarseScale).toEqual({ log: false, min: 0, max: 230, auto: true });
+    expect(coarseScale).toEqual({ log: false, min: 0, max: Math.fround(237.98), auto: true });
     expect(fineScale.min).toBe(0);
-    expect(fineScale.max).toBeCloseTo(1, 10);
+    expect(fineScale.max).toBeCloseTo(1.0399, 6);
   });
 
   it("falls back to a usable zero-based range when no stored positive counts are visible", () => {
@@ -140,7 +146,7 @@ describe("normalizeContactValue", () => {
 });
 
 describe("contactCountSampleForColorScale", () => {
-  it("uses all stored counts from visible tiles and excludes prefetched cached tiles", () => {
+  it("matches Juicebox's per-block stride, diagonal filter, and visible-tile scope", () => {
     const visibleCounts = Array.from({ length: 20_005 }, (_, index) => index + 1);
     const counts = contactCountSampleForColorScale({
       resolution: 1_000,
@@ -151,7 +157,11 @@ describe("contactCountSampleForColorScale", () => {
         {
           tileX: 0,
           tileY: 0,
-          cells: visibleCounts.map((count, index) => ({ xBin: index, yBin: 1, count })),
+          cells: visibleCounts.map((count, index) => ({
+            xBin: index,
+            yBin: index % 20 === 0 ? index : 1,
+            count,
+          })),
         },
       ],
       cachedTiles: [
@@ -163,9 +173,10 @@ describe("contactCountSampleForColorScale", () => {
       ],
     });
 
-    expect(counts).toHaveLength(visibleCounts.length);
-    expect(counts[0]).toBe(1);
-    expect(counts[counts.length - 1]).toBe(20_005);
+    // Every twentieth sampled record is diagonal and therefore omitted.
+    expect(counts).toHaveLength(1_000);
+    expect(counts[0]).toBe(11);
+    expect(counts[counts.length - 1]).toBe(19_991);
     expect(counts).not.toContain(999_999);
   });
 
@@ -175,9 +186,9 @@ describe("contactCountSampleForColorScale", () => {
       tileY: 3,
       cells: [],
       packedCells: {
-        xLocal: new Uint16Array([1, 2, 3]),
-        yLocal: new Uint16Array([4, 5, 6]),
-        counts: new Float64Array([0.25, 7, 42]),
+        xLocal: new Uint16Array(Array.from({ length: 21 }, (_, index) => index)),
+        yLocal: new Uint16Array(Array.from({ length: 21 }, () => 40)),
+        counts: new Float64Array(Array.from({ length: 21 }, (_, index) => index + 0.25)),
       },
     };
     const counts = contactCountSampleForColorScale({
@@ -198,6 +209,20 @@ describe("contactCountSampleForColorScale", () => {
       }],
     });
 
-    expect(counts).toEqual([0.25, 7, 42]);
+    expect(counts).toEqual([0.25, 10.25, 20.25]);
+  });
+
+  it("applies the same stride and diagonal filter to untiled overview cells", () => {
+    const counts = contactCountSampleForColorScale({
+      resolution: 1_000,
+      viewport: { xStart: 0, xEnd: 1_000_000, yStart: 0, yEnd: 1_000_000 },
+      cells: Array.from({ length: 21 }, (_, index) => ({
+        xBin: index,
+        yBin: index === 10 ? index : 30,
+        count: index + 1,
+      })),
+    });
+
+    expect(counts).toEqual([1, 21]);
   });
 });

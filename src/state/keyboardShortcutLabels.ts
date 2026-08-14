@@ -15,6 +15,7 @@ export interface KeyboardShortcutLabels {
   resolutionWheel: string;
   resolutionLock: string;
   diagonalWheel: string;
+  verticalWheel: string;
 }
 
 export function detectDesktopShortcutPlatform(
@@ -43,7 +44,8 @@ export function keyboardShortcutLabels(
       deleteContig: "⇧⌫",
       resolutionWheel: "⌘+Scroll",
       resolutionLock: "L",
-      diagonalWheel: "⇧⌘+Scroll",
+      diagonalWheel: "Scroll",
+      verticalWheel: "⇧⌘+Scroll",
     };
   }
 
@@ -61,6 +63,7 @@ export function keyboardShortcutLabels(
     deleteContig: "Shift+Del",
     resolutionWheel: "Ctrl+Scroll",
     resolutionLock: "L",
-    diagonalWheel: "Ctrl+Shift+Scroll",
+    diagonalWheel: "Scroll",
+    verticalWheel: "Ctrl+Shift+Scroll",
   };
 }

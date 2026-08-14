@@ -457,7 +457,7 @@ button {
   width: 100%;
   height: 12px;
   border: 0;
-  background: linear-gradient(90deg, #ffffff, #ffd6d6 15%, #ff7777 50%, #ff0000);
+  background: linear-gradient(90deg, #ffffff, #ff0000);
 }
 
 .color-range-controls {
@@ -1257,6 +1257,8 @@ button {
   position: absolute;
   inset: 0;
   will-change: transform;
+  contain: layout style paint;
+  isolation: isolate;
 }
 
 .assembly-overlay {
@@ -1274,6 +1276,7 @@ button {
   user-select: none;
   -webkit-user-select: none;
   will-change: transform;
+  overflow: hidden;
 }
 
 .shift-selection-active .map-content,
@@ -1353,6 +1356,31 @@ button {
   z-index: 1;
   border: 1px solid rgba(56, 165, 255, 0.92);
   box-shadow: inset 0 0 0 0.5px rgba(7, 28, 58, 0.48);
+}
+
+.chromosome-box.viewport-clipped-left {
+  border-left: 0;
+}
+
+.chromosome-box.viewport-clipped-right {
+  border-right: 0;
+}
+
+.chromosome-box.viewport-clipped-top {
+  border-top: 0;
+}
+
+.chromosome-box.viewport-clipped-bottom {
+  border-bottom: 0;
+}
+
+.chromosome-box:is(
+  .viewport-clipped-left,
+  .viewport-clipped-right,
+  .viewport-clipped-top,
+  .viewport-clipped-bottom
+) {
+  box-shadow: none;
 }
 
 .block-box {
@@ -2004,7 +2032,7 @@ button {
   width: 18px;
   height: 174px;
   border: 1px solid var(--border);
-  background: linear-gradient(180deg, #ff0000, #ff6666, #ffb3b3, #ffe5e5, #ffffff);
+  background: linear-gradient(180deg, #ff0000, #ffffff);
 }
 
 .gradient-scale.viridis {
@@ -2365,8 +2393,32 @@ button {
 }
 
 .synteny-contig-segment.selected {
+  background: transparent;
+  box-shadow: none;
+}
+
+.synteny-contig-selection-range {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  height: 100%;
+  border-left: 0.5px solid color-mix(in srgb, #4f86c6 58%, transparent);
+  border-right: 0.5px solid color-mix(in srgb, #4f86c6 58%, transparent);
   background: color-mix(in srgb, #4f86c6 9%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, #4f86c6 45%, transparent);
+  pointer-events: none;
+}
+
+.synteny-contig-reference-shadow {
+  position: absolute;
+  z-index: 2;
+  right: 3%;
+  left: 9%;
+  min-height: 2px;
+  border-top: 0.5px solid color-mix(in srgb, #4f86c6 58%, transparent);
+  border-bottom: 0.5px solid color-mix(in srgb, #4f86c6 58%, transparent);
+  background: color-mix(in srgb, #4f86c6 9%, transparent);
+  box-shadow: none;
+  pointer-events: none;
 }
 
 .synteny-target-lane {
@@ -3855,7 +3907,7 @@ summary:focus-visible,
   height: 10px;
   border: 1px solid #d4d4d6;
   border-radius: 2px;
-  background: linear-gradient(90deg, #fff4f2, #ff8b75 60%, #e0140f);
+  background: linear-gradient(90deg, #ffffff, #ff0000);
 }
 
 .heatmap-color-field {
@@ -3937,7 +3989,7 @@ summary:focus-visible,
   grid-template-columns:
     minmax(0, 1fr)
     8px
-    clamp(260px, var(--inspector-width, 326px), min(45vw, 520px));
+    clamp(260px, var(--inspector-width, 280px), min(45vw, 520px));
   gap: 0;
   padding: 8px 8px 0;
   background: #f4f4f6;
@@ -4941,11 +4993,6 @@ summary:focus-visible,
   cursor: grabbing;
 }
 
-.gfa-graph-canvas.gfa-reshaping,
-.gfa-graph-canvas.gfa-reshaping:active {
-  cursor: cell;
-}
-
 .gfa-graph-canvas.gfa-selecting,
 .gfa-graph-canvas.gfa-selecting:active {
   cursor: crosshair;
@@ -5475,6 +5522,17 @@ summary:focus-visible,
   border-radius: 0;
   background: #fff;
   box-shadow: none;
+}
+
+.inspector .inspector-overview:not(.synteny-overview-active):not(.gfa-overview-active) {
+  flex-basis: auto;
+  grid-template-rows: 43px auto;
+}
+
+.inspector .inspector-overview:not(.synteny-overview-active):not(.gfa-overview-active) .interactive-overview {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1 / 1;
 }
 
 .inspector .inspector-overview.synteny-overview-active {

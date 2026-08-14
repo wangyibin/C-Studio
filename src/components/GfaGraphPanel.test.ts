@@ -7,20 +7,21 @@ import {
   defaultGfaReviewOpen,
   gfaAgpJunctionPoints,
   gfaAgpBandageJunctionPoints,
+  gfaBandageDragPlan,
   gfaAssemblyUnitId,
   gfaAssemblyUnitIdsInSelection,
   gfaChromosomeLabelSelection,
   gfaContextMenuSelectionIntent,
   gfaNodeMatchesAssemblySelection,
-  gfaAutomaticBandagePaths,
   gfaBandagePathContainsPoint,
   gfaBandagePathPort,
   gfaBandageFocalNodeIds,
   gfaEndpointHiCRequestBatchSize,
   gfaEndpointHiCLinksForRelationVisibility,
   gfaInitialBandagePathPoints,
+  gfaLayoutLayerDefaults,
+  gfaMoveBandagePath,
   gfaPreviewPlacements,
-  gfaReshapeBandageBlockPaths,
   gfaRigidBlockNodeIds,
   graphForChromosomeConnectionVisibility,
   graphForGfaOnlyNodeVisibility,
@@ -132,6 +133,26 @@ describe("GFA endpoint contact loading", () => {
   });
 });
 
+describe("GFA layout layer defaults", () => {
+  it("opens Bandage as a GFA-first view without AGP links", () => {
+    expect(gfaLayoutLayerDefaults("bandage")).toEqual({
+      showGfaOnlyNodes: true,
+      showDisconnectedNodes: true,
+      showAgpLinks: false,
+    });
+    expect(gfaLayoutLayerDefaults("curation")).toEqual({
+      showGfaOnlyNodes: false,
+      showDisconnectedNodes: false,
+      showAgpLinks: true,
+    });
+    expect(gfaLayoutLayerDefaults("guided")).toEqual({
+      showGfaOnlyNodes: false,
+      showDisconnectedNodes: false,
+      showAgpLinks: true,
+    });
+  });
+});
+
 describe("GFA review panel", () => {
   it("starts closed while retaining the Review toggle", () => {
     expect(defaultGfaReviewOpen).toBe(false);
@@ -215,6 +236,7 @@ describe("GFA rigid block dragging", () => {
     { id: "b", groupId: "Chr01g1", assemblyBlockId: "block-1" },
     { id: "copy", groupId: "Chr01g2", assemblyBlockId: "block-1" },
     { id: "single", groupId: "Chr01g1", assemblyBlockId: null },
+    { id: "solo-block", groupId: "Chr01g1", assemblyBlockId: "block-solo" },
   ];
 
   it("moves every unitig in the selected block, but not another chromosome", () => {
@@ -224,6 +246,21 @@ describe("GFA rigid block dragging", () => {
   it("keeps an unblocked unitig as a singleton drag target", () => {
     expect(gfaRigidBlockNodeIds(nodes, "single")).toEqual(["single"]);
     expect(gfaRigidBlockNodeIds(nodes, "missing")).toEqual([]);
+  });
+
+  it("locks every block unitig for Bandage Move while unblocked unitigs stay deformable", () => {
+    expect(gfaBandageDragPlan(nodes, "b")).toEqual({
+      nodeIds: ["a", "b"],
+      adaptive: false,
+    });
+    expect(gfaBandageDragPlan(nodes, "solo-block")).toEqual({
+      nodeIds: ["solo-block"],
+      adaptive: false,
+    });
+    expect(gfaBandageDragPlan(nodes, "single")).toEqual({
+      nodeIds: ["single"],
+      adaptive: true,
+    });
   });
 
   it("expands a Bandage contig window to the complete boundary block", () => {
@@ -237,86 +274,38 @@ describe("GFA rigid block dragging", () => {
   });
 });
 
-describe("Bandage-only block reshaping", () => {
-  it("automatically bends one rigid block toward linked topology without changing x order", () => {
-    const nodes = [
-      { id: "a", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 1 },
-      { id: "b", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 2 },
-      { id: "c", groupId: "Chr02g1", assemblyBlockId: "block-2", order: 3 },
-    ];
-    const positions = new Map([
-      ["a", { x: 40, y: 100 }],
-      ["b", { x: 120, y: 100 }],
-      ["c", { x: 150, y: 220 }],
-    ]);
-    const widths = new Map([["a", 76], ["b", 76], ["c", 60]]);
-    const paths = gfaAutomaticBandagePaths(
-      nodes,
-      [{ source: "b", target: "c", kind: "gfa-link" }],
-      positions,
-      widths,
-    );
-    const first = paths.get("a")!;
-    const second = paths.get("b")!;
-
-    expect(first[0].x).toBeLessThan(first[first.length - 1].x);
-    expect(first[first.length - 1].x).toBeLessThan(second[0].x);
-    expect(second[1].y).toBeGreaterThan(100);
-    expect(second[1].y - 100).toBeGreaterThan(first[0].y - 100);
-  });
-
-  it("keeps the automatic route straight when no external GFA link supports a bend", () => {
-    const nodes = [
-      { id: "a", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 1 },
-      { id: "b", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 2 },
-    ];
-    const positions = new Map([
-      ["a", { x: 40, y: 100 }],
-      ["b", { x: 120, y: 100 }],
-    ]);
-    const widths = new Map([["a", 76], ["b", 76]]);
-    const paths = gfaAutomaticBandagePaths(nodes, [], positions, widths);
-
-    expect(paths.get("a")!.every((point) => point.y === 100)).toBe(true);
-    expect(paths.get("b")!.every((point) => point.y === 100)).toBe(true);
-  });
-
+describe("Bandage adaptive movement", () => {
   it("creates a straight, length-scaled control path", () => {
     const points = gfaInitialBandagePathPoints(100, 40, 144);
 
-    expect(points).toHaveLength(3);
+    expect(points).toHaveLength(4);
     expect(points[0]).toEqual({ x: 28, y: 40 });
-    expect(points[2]).toEqual({ x: 172, y: 40 });
+    expect(points[3]).toEqual({ x: 172, y: 40 });
   });
 
-  it("moves the grabbed point most and bends adjacent block points with falloff", () => {
-    const paths = [
-      { id: "a", width: 72, pathPoints: gfaInitialBandagePathPoints(36, 0, 72) },
-      { id: "b", width: 72, pathPoints: gfaInitialBandagePathPoints(108, 0, 72) },
-    ];
-    const reshaped = gfaReshapeBandageBlockPaths(paths, "a", 2, { x: 20, y: 40 });
-    const active = reshaped.get("a")!;
-    const neighbour = reshaped.get("b")!;
+  it("moves the grabbed point most and deforms neighboring control points with Bandage falloff", () => {
+    const path = gfaInitialBandagePathPoints(96, 0, 192);
+    const moved = gfaMoveBandagePath(path, 2, { x: 20, y: 40 });
 
-    expect(active[2].y).toBe(40);
-    expect(active[1].y).toBeGreaterThan(0);
-    expect(active[1].y).toBeLessThan(active[2].y);
-    expect(neighbour[0].y).toBeGreaterThan(neighbour[2].y);
-    expect(neighbour[0].y).toBeGreaterThan(0);
+    expect(moved[2].y).toBe(40);
+    expect(moved[1].y).toBeGreaterThan(moved[0].y);
+    expect(moved[1].y).toBeLessThan(moved[2].y);
+    expect(moved[3].y).toBeCloseTo(moved[1].y);
+    expect(moved[4].y).toBeCloseTo(moved[0].y);
   });
 
-  it("caps deformation and keeps GFA ports on the bent visual endpoints", () => {
+  it("keeps GFA ports on the visual endpoints after adaptive movement", () => {
     const path = gfaInitialBandagePathPoints(50, 20, 100);
-    const reshaped = gfaReshapeBandageBlockPaths(
-      [{ id: "a", width: 100, pathPoints: path }],
-      "a",
+    const moved = gfaMoveBandagePath(
+      path,
       0,
-      { x: 1_000, y: -1_000 },
-    ).get("a")!;
+      { x: 30, y: -60 },
+    );
 
-    expect(reshaped[0]).toEqual({ x: 18, y: -45 });
-    expect(gfaBandagePathPort(reshaped, "+", "start")).toEqual(reshaped[0]);
-    expect(gfaBandagePathPort(reshaped, "-", "start")).toEqual(reshaped[reshaped.length - 1]);
+    expect(moved[0]).toEqual({ x: 30, y: -40 });
+    expect(moved[moved.length - 1].y).toBeGreaterThan(moved[0].y);
+    expect(gfaBandagePathPort(moved, "+", "start")).toEqual(moved[0]);
+    expect(gfaBandagePathPort(moved, "-", "start")).toEqual(moved[moved.length - 1]);
   });
 
   it("hits the bent polyline rather than its old rectangular centre", () => {

@@ -392,14 +392,25 @@ export function assemblyContigIdsBetween(
 }
 
 export function assemblyContigSelectionIntent(
-  _blocks: ContactMapLayoutBlock[],
-  _selection: AssemblySelection | null,
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
   _anchorId: string | null,
   targetId: string,
   modifiers: AssemblySelectionModifiers,
 ): AssemblyContigSelectionIntent {
   if (modifiers.metaKey || modifiers.ctrlKey) {
     return { type: "select", id: targetId, additive: true, anchorId: targetId };
+  }
+
+  if (
+    modifiers.shiftKey
+    && selection?.kind === "contigs"
+    && (
+      selection.ids.includes(targetId)
+      || selectedBlockIds(blocks, selection).includes(targetId)
+    )
+  ) {
+    return { type: "clear", anchorId: null };
   }
 
   return { type: "select", id: targetId, additive: false, anchorId: targetId };

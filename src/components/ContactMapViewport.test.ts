@@ -5,6 +5,7 @@ import type { ExampleDatasetSummary } from "../App";
 import { createInitialUiState } from "../state/uiState";
 import {
   assemblyCutTargetAtScreenPoint,
+  assemblyBoundaryViewportClipClassName,
   assemblySelectionProjectionBands,
   assemblyShiftClickIntent,
   ContactMapViewport,
@@ -15,8 +16,10 @@ import {
   contactViewportSizePxFromBounds,
   contactTileOverscanDirectionForViewports,
   contactWheelNavigationMode,
+  contactWheelPanMode,
   contactWheelPanIntent,
   historyPreviewBoxes,
+  sameAssemblyOverlayPresentation,
 } from "./ContactMapViewport";
 import { buildAssemblyEditModel } from "../state/assemblyEditing";
 
@@ -30,6 +33,58 @@ const viewport = {
   yStart: 75_000_000,
   yEnd: 175_000_000,
 };
+
+describe("sameAssemblyOverlayPresentation", () => {
+  it("keeps boundaries mounted across unrelated parent and contact-tile refreshes", () => {
+    const model = {};
+    const visibleBlocks: unknown[] = [];
+    const visibleContigs: unknown[] = [];
+    const visibleChromosomes: unknown[] = [];
+    const pointerState = { kind: "select" };
+    const base = {
+      model,
+      viewportXStart: 0,
+      viewportXEnd: 100,
+      viewportYStart: 0,
+      viewportYEnd: 100,
+      selection: null,
+      showChromosomeBoxes: true,
+      showBlockBoxes: true,
+      showContigBoxes: true,
+      visibleBlocks,
+      visibleContigs,
+      visibleChromosomes,
+      selectionBox: null,
+      pointerState,
+      onPointerMove: () => undefined,
+    } as unknown as Parameters<typeof sameAssemblyOverlayPresentation>[0];
+
+    expect(sameAssemblyOverlayPresentation(base, {
+      ...base,
+      onPointerMove: () => undefined,
+    })).toBe(true);
+    expect(sameAssemblyOverlayPresentation(base, {
+      ...base,
+      viewportXEnd: 200,
+    })).toBe(false);
+    expect(sameAssemblyOverlayPresentation(base, {
+      ...base,
+      visibleContigs: [],
+    })).toBe(false);
+  });
+});
+
+describe("assemblyBoundaryViewportClipClassName", () => {
+  it("suppresses viewport crop edges while preserving real chromosome endpoints", () => {
+    expect(assemblyBoundaryViewportClipClassName(100, 300, 150, 250, 120, 280)).toBe(
+      "viewport-clipped-left viewport-clipped-right viewport-clipped-top viewport-clipped-bottom",
+    );
+    expect(assemblyBoundaryViewportClipClassName(100, 300, 100, 300, 100, 300)).toBe("");
+    expect(assemblyBoundaryViewportClipClassName(100, 300, 50, 250, 50, 350)).toBe(
+      "viewport-clipped-right",
+    );
+  });
+});
 
 describe("assemblySelectionProjectionBands", () => {
   it("projects one selected interval into full-height and full-width alignment bands", () => {
@@ -142,7 +197,7 @@ describe("lockedContactResolutionWheelZoomIntent", () => {
 });
 
 describe("contactWheelPanIntent", () => {
-  it("gives Command/Ctrl-Shift wheel priority over modified resolution changes", () => {
+  it("maps plain wheel to diagonal pan and Command/Ctrl-Shift wheel to vertical pan", () => {
     expect(contactWheelNavigationMode({
       ctrlKey: false,
       metaKey: true,
@@ -158,14 +213,29 @@ describe("contactWheelPanIntent", () => {
       metaKey: false,
       shiftKey: true,
     })).toBe("pan");
+    expect(contactWheelPanMode({
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+    })).toBe("diagonal");
+    expect(contactWheelPanMode({
+      ctrlKey: false,
+      metaKey: true,
+      shiftKey: true,
+    })).toBe("vertical");
+    expect(contactWheelPanMode({
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: true,
+    })).toBe("horizontal");
   });
 
-  it("maps trackpad movement independently across both genomic axes", () => {
+  it("can preserve natural trackpad movement for shared non-heatmap consumers", () => {
     expect(contactWheelPanIntent({
       deltaX: 40,
       deltaY: 20,
       deltaMode: 0,
-      shiftKey: false,
+      panMode: "natural",
       bounds,
       viewport,
     })).toEqual({
@@ -179,7 +249,7 @@ describe("contactWheelPanIntent", () => {
       deltaX: -80,
       deltaY: 0,
       deltaMode: 0,
-      shiftKey: false,
+      panMode: "natural",
       bounds,
       viewport,
     })).toMatchObject({ deltaXMb: -40, deltaYMb: 0 });
@@ -190,7 +260,7 @@ describe("contactWheelPanIntent", () => {
       deltaX: 0,
       deltaY: 25,
       deltaMode: 0,
-      shiftKey: true,
+      panMode: "horizontal",
       bounds,
       viewport,
     })).toEqual({ deltaXPx: 25, deltaYPx: 0, deltaXMb: 12.5, deltaYMb: 0 });
@@ -199,7 +269,7 @@ describe("contactWheelPanIntent", () => {
       deltaX: 1,
       deltaY: -2,
       deltaMode: 1,
-      shiftKey: false,
+      panMode: "natural",
       bounds,
       viewport,
     })).toEqual({ deltaXPx: 16, deltaYPx: -32, deltaXMb: 8, deltaYMb: -16 });
@@ -208,19 +278,18 @@ describe("contactWheelPanIntent", () => {
       deltaX: 1,
       deltaY: -0.5,
       deltaMode: 2,
-      shiftKey: false,
+      panMode: "natural",
       bounds,
       viewport,
     })).toEqual({ deltaXPx: 400, deltaYPx: -100, deltaXMb: 200, deltaYMb: -50 });
   });
 
-  it("uses Command/Ctrl-Shift-wheel for 45-degree diagonal movement", () => {
+  it("uses plain wheel for 45-degree diagonal movement", () => {
     expect(contactWheelPanIntent({
       deltaX: 0,
       deltaY: 25,
       deltaMode: 0,
-      shiftKey: true,
-      diagonalKey: true,
+      panMode: "diagonal",
       bounds,
       viewport,
     })).toEqual({
@@ -234,11 +303,26 @@ describe("contactWheelPanIntent", () => {
       deltaX: -30,
       deltaY: 8,
       deltaMode: 0,
-      shiftKey: true,
-      diagonalKey: true,
+      panMode: "diagonal",
       bounds,
       viewport,
     })).toMatchObject({ deltaXPx: -30, deltaYPx: -30 });
+  });
+
+  it("uses Command/Ctrl-Shift-wheel for vertical movement only", () => {
+    expect(contactWheelPanIntent({
+      deltaX: -30,
+      deltaY: 8,
+      deltaMode: 0,
+      panMode: "vertical",
+      bounds,
+      viewport,
+    })).toEqual({
+      deltaXPx: 0,
+      deltaYPx: -30,
+      deltaXMb: 0,
+      deltaYMb: -15,
+    });
   });
 
   it("ignores empty, invalid, or dimensionless wheel input", () => {
@@ -246,7 +330,6 @@ describe("contactWheelPanIntent", () => {
       deltaX: 0,
       deltaY: 0,
       deltaMode: 0,
-      shiftKey: false,
       bounds,
       viewport,
     })).toBeNull();
@@ -254,7 +337,6 @@ describe("contactWheelPanIntent", () => {
       deltaX: Number.NaN,
       deltaY: Number.NaN,
       deltaMode: 0,
-      shiftKey: false,
       bounds,
       viewport,
     })).toBeNull();
@@ -262,7 +344,6 @@ describe("contactWheelPanIntent", () => {
       deltaX: 10,
       deltaY: 10,
       deltaMode: 0,
-      shiftKey: false,
       bounds: { width: 0, height: 200 },
       viewport,
     })).toBeNull();

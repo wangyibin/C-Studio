@@ -19,9 +19,10 @@ const colormapStops: Record<Exclude<ContactColormap, "Reds">, number[]> = {
 const colorLutCache = new Map<ContactColormap, Map<number, Uint8ClampedArray>>();
 
 /**
- * Match Juicebox's default contact-map color scale: solid red whose alpha is
- * the count divided by the automatic threshold. Other optional C-Studio
- * palettes retain their existing discrete presentation.
+ * Match Juicebox Desktop's default observed-map scale. Juicebox constructs an
+ * opaque ContinuousColorScale from white to java.awt.Color.RED; keeping the
+ * interpolation in RGB rather than alpha also makes the result independent of
+ * whatever happens to be painted behind the heatmap.
  */
 export function contactColorAt(
   colormap: ContactColormap,
@@ -30,11 +31,13 @@ export function contactColorAt(
 ): ContactRgba {
   const value = clamp01(intensity);
   if (colormap === "Reds") {
+    const redAmount = Math.floor(255 * value);
+    const whiteComponent = 255 - redAmount;
     return {
       red: 255,
-      green: 0,
-      blue: 0,
-      alpha: Math.floor(255 * value) / 255,
+      green: whiteComponent,
+      blue: whiteComponent,
+      alpha: 1,
     };
   }
 
@@ -64,10 +67,10 @@ export function contactColorCss(
  * Entry `i` occupies bytes `i * 4..i * 4 + 4`. RGB values reuse the existing
  * `contactColorAt` definition at intensity `i / 255`; alpha is rounded to its
  * nearest 8-bit byte, as required by ImageData. Consumers map an arbitrary
- * intensity with `contactColorLutIndex`. Reds uses its exact 8-bit alpha index;
- * the discrete palettes select a representative entry from the same color stop,
- * so their existing hard boundaries remain exact. The returned cached table is
- * shared and must be treated as read-only.
+ * intensity with `contactColorLutIndex`. Reds uses an opaque white-to-red entry
+ * at every 8-bit intensity; the discrete palettes select a representative entry
+ * from the same color stop, so their existing hard boundaries remain exact. The
+ * returned cached table is shared and must be treated as read-only.
  */
 export function contactColorLut(
   colormap: ContactColormap,

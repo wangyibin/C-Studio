@@ -162,7 +162,7 @@ export function InspectorPanel({
             onClick={() => onUiAction({ type: "setOverviewMode", mode: "gfa" })}
             onDoubleClick={onOpenGfaPanel}
           >
-            GFA Preview
+            GFA
           </button>
         </div>
         {uiState.activeOverviewMode === "overview" ? (

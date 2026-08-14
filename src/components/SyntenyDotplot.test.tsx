@@ -6,6 +6,8 @@ import {
   buildDotplotLayout,
   dominantSyntenyTargetByChromosome,
   syntenyBlockIdsInSelection,
+  syntenySelectedContigRanges,
+  syntenySelectedReferenceRanges,
   syntenyHorizontalWheelDelta,
   syntenyViewForAssemblyExtent,
   syntenyTargetLaneTopRatio,
@@ -71,6 +73,10 @@ describe("SyntenyDotplot", () => {
     expect(markup).toContain('data-target-id="target-1"');
     expect(markup).toContain('aria-pressed="true"');
     expect(markup).toContain("dotplot-segment  selected");
+    expect(markup).toMatch(
+      /class="synteny-contig-reference-shadow"[^>]*data-target-id="target-1"[^>]*style="top:28.5%;height:21.5%"/,
+    );
+    expect(markup).toContain('class="synteny-contig-selection-range"');
     expect(markup).toContain('class="synteny-plot-frame"');
     expect(markup).toContain('class="synteny-chromosome-band last-visible"');
     expect(markup).toContain('class="synteny-chromosome-hit"');
@@ -111,6 +117,10 @@ describe("SyntenyDotplot", () => {
     expect(reverse?.left).toBe(53);
     expect(reverse?.angle).toBeLessThan(0);
     expect(reverse?.top).toBeGreaterThan(positive?.top ?? 0);
+    expect(positive?.targetTop).toBe(28.5);
+    expect(reverse?.targetTop).toBe(28.5);
+    expect(positive?.targetHeight).toBe(21.5);
+    expect(reverse?.targetHeight).toBe(21.5);
   });
 
   it("keeps segment endpoints aligned on a non-square canvas", () => {
@@ -299,4 +309,45 @@ describe("SyntenyDotplot", () => {
     ]);
   });
 
+});
+
+describe("synteny selection shadows", () => {
+  it("joins adjacent selected contigs into one filled range with only two endpoints", () => {
+    const contigs = [
+      { id: "a", objectId: "chr1", sourceId: "a", displayName: "a", left: 10, width: 10 },
+      { id: "b", objectId: "chr1", sourceId: "b", displayName: "b", left: 20, width: 15 },
+      { id: "c", objectId: "chr1", sourceId: "c", displayName: "c", left: 35, width: 5 },
+    ];
+    expect(syntenySelectedContigRanges(contigs, new Set(["a", "b"]))).toEqual([{
+      firstId: "a",
+      lastId: "b",
+      left: 10,
+      width: 25,
+    }]);
+  });
+
+  it("fills between selected alignments per reference lane instead of outlining each contig", () => {
+    const block = (assemblyBlockId: string, targetId: string, top: number, height: number) => ({
+      key: `${assemblyBlockId}:${targetId}`,
+      assemblyBlockId,
+      targetId,
+      left: 0,
+      top,
+      targetTop: top,
+      targetHeight: height,
+      width: 1,
+      angle: 0,
+      strand: "+",
+      mapq: 60,
+      title: assemblyBlockId,
+    });
+    expect(syntenySelectedReferenceRanges([
+      block("a", "ref1", 20, 5),
+      block("b", "ref1", 35, 5),
+      block("b", "ref2", 70, 4),
+    ], new Set(["a", "b"]))).toEqual([
+      { targetId: "ref1", top: 20, height: 20 },
+      { targetId: "ref2", top: 70, height: 4 },
+    ]);
+  });
 });

@@ -942,11 +942,19 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         state.contact.viewportWidthPx,
         state.contact.viewportHeightPx,
       );
+      const viewportAspectExpansion = Math.max(
+        state.contact.viewportWidthPx,
+        state.contact.viewportHeightPx,
+      ) / Math.max(1, Math.min(
+        state.contact.viewportWidthPx,
+        state.contact.viewportHeightPx,
+      ));
       const fittedZoomMaximumViewportSpanMb = state.contact.resolutionLocked
-        ? contactViewportSpanForResolution(
-            state.contact.resolution,
-            viewportSizePx,
+        ? Math.min(
             maximumViewportSpanMb,
+            maxManualContactBinsPerAxis
+              * (contactResolutionToBasePairs(state.contact.resolution) / 1_000_000)
+              / viewportAspectExpansion,
           )
         : maximumViewportSpanMb;
       const currentViewportSpanMb = Number.isFinite(state.contact.viewportSpanMb)

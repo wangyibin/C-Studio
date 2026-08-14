@@ -1,5 +1,5 @@
 import type { ContactMapView } from "../App";
-import { appendContactTileCounts } from "./contactTileData";
+import { forEachContactTileCell } from "./contactTileData";
 
 export interface ContactColorScale {
   log: boolean;
@@ -8,7 +8,11 @@ export interface ContactColorScale {
   auto: boolean;
 }
 
-const juiceboxAutoThresholdPercentile = 95;
+// C-Studio displays the assembly-wide matrix, which corresponds to Juicebox
+// Desktop's whole-genome view. Juicebox uses P99 there (P95 for a chromosome
+// pair), samples every tenth record in each block, and excludes the diagonal.
+const juiceboxAssemblyAutoThresholdPercentile = 99;
+const juiceboxRecordSampleStride = 10;
 
 const defaultColorScale = {
   log: false,
@@ -37,17 +41,30 @@ export function contactAutoColorScaleKey(
 }
 
 export function contactCountSampleForColorScale(contactMap: ContactMapView): number[] {
+  const counts: number[] = [];
+
   if (contactMap.tiles && contactMap.tiles.length > 0) {
-    const counts: number[] = [];
+    const tileSizeBins = contactMap.tileSizeBins ?? 256;
 
     for (const tile of contactMap.tiles) {
-      appendContactTileCounts(tile, counts);
+      forEachContactTileCell(tile, tileSizeBins, (xBin, yBin, count, index) => {
+        if (index % juiceboxRecordSampleStride === 0 && xBin !== yBin) {
+          counts.push(count);
+        }
+      });
     }
 
     return counts;
   }
 
-  return contactMap.cells.map((cell) => cell.count);
+  for (let index = 0; index < contactMap.cells.length; index += juiceboxRecordSampleStride) {
+    const cell = contactMap.cells[index];
+    if (cell.xBin !== cell.yBin) {
+      counts.push(cell.count);
+    }
+  }
+
+  return counts;
 }
 
 export function estimateContactColorScale(counts: number[], log: boolean): ContactColorScale {
@@ -60,14 +77,13 @@ export function estimateContactColorScale(counts: number[], log: boolean): Conta
     };
   }
 
-  // Juicebox uses the raw 95th percentile of the visible, stored contact
-  // records as the automatic threshold. Sparse matrices do not contain zero
-  // records, so filtering non-positive values mirrors that record set.
-  const thresholdIndex = Math.min(
-    values.length - 1,
-    Math.floor((juiceboxAutoThresholdPercentile / 100) * values.length),
-  );
-  const max = selectKthInPlace(values, thresholdIndex);
+  // DescriptiveStatistics#getPercentile uses Apache Commons Math's legacy
+  // (N + 1) percentile interpolation. Juicebox stores the result as a float.
+  values.sort((left, right) => left - right);
+  const max = Math.fround(legacyPercentile(
+    values,
+    juiceboxAssemblyAutoThresholdPercentile,
+  ));
 
   return {
     log,
@@ -77,70 +93,19 @@ export function estimateContactColorScale(counts: number[], log: boolean): Conta
   };
 }
 
-/**
- * Select the zero-based kth value without sorting the whole sample. The
- * median-of-three pivot keeps monotonic inputs balanced, while the three-way
- * partition collapses repeated values in one pass.
- */
-function selectKthInPlace(values: number[], kth: number): number {
-  let left = 0;
-  let right = values.length - 1;
-
-  while (left < right) {
-    const middle = left + Math.floor((right - left) / 2);
-    const pivot = medianOfThree(values[left], values[middle], values[right]);
-    let lower = left;
-    let cursor = left;
-    let upper = right;
-
-    while (cursor <= upper) {
-      if (values[cursor] < pivot) {
-        swap(values, lower, cursor);
-        lower += 1;
-        cursor += 1;
-      } else if (values[cursor] > pivot) {
-        swap(values, cursor, upper);
-        upper -= 1;
-      } else {
-        cursor += 1;
-      }
-    }
-
-    if (kth < lower) {
-      right = lower - 1;
-    } else if (kth > upper) {
-      left = upper + 1;
-    } else {
-      return values[kth];
-    }
+function legacyPercentile(sortedValues: number[], percentile: number): number {
+  const position = (percentile * (sortedValues.length + 1)) / 100;
+  if (position < 1) {
+    return sortedValues[0];
+  }
+  if (position >= sortedValues.length) {
+    return sortedValues[sortedValues.length - 1];
   }
 
-  return values[left];
-}
-
-function medianOfThree(first: number, middle: number, last: number): number {
-  if (first < middle) {
-    if (middle < last) {
-      return middle;
-    }
-    return first < last ? last : first;
-  }
-
-  if (first < last) {
-    return first;
-  }
-
-  return middle < last ? last : middle;
-}
-
-function swap(values: number[], firstIndex: number, secondIndex: number) {
-  if (firstIndex === secondIndex) {
-    return;
-  }
-
-  const first = values[firstIndex];
-  values[firstIndex] = values[secondIndex];
-  values[secondIndex] = first;
+  const lowerPosition = Math.floor(position);
+  const lower = sortedValues[lowerPosition - 1];
+  const upper = sortedValues[lowerPosition];
+  return lower + (position - lowerPosition) * (upper - lower);
 }
 
 export function normalizeContactValue(value: number, scale: Pick<ContactColorScale, "log" | "min" | "max">) {

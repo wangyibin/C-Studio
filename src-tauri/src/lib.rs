@@ -23,6 +23,7 @@ pub fn run() {
         .manage(commands::SyntenyCacheState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_app_status,
+            commands::layout_gfa_bandage,
             commands::load_example_dataset,
             commands::load_example_gfa_text,
             commands::select_contact_file,

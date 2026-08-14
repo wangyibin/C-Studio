@@ -91,6 +91,10 @@ import {
   summarizeAgpText,
 } from "./state/importers";
 import { parseGfaText, type GfaEvidenceDocument } from "./state/gfa";
+import type {
+  GfaBandageLayoutLoader,
+  GfaBandageLayoutResponse,
+} from "./state/gfaBandageLayout";
 import {
   planGfaEndpointHiCQuery,
   scoreGfaEndpointHiC,
@@ -307,6 +311,10 @@ const contactTileStreamEnabled = import.meta.env.VITE_CSTUDIO_TILE_STREAM !== "0
 const contactTileSingleScanEnabled = import.meta.env.VITE_CSTUDIO_TILE_SINGLE_SCAN !== "0";
 const contactTileDirectDeltaEnabled = import.meta.env.VITE_CSTUDIO_TILE_DIRECT_DELTA !== "0";
 const contactMainLodEnabled = import.meta.env.VITE_CSTUDIO_MAIN_LOD !== "0";
+
+const loadGfaBandageLayout: GfaBandageLayoutLoader = (request) => (
+  invoke<GfaBandageLayoutResponse>("layout_gfa_bandage", { request })
+);
 
 async function readImportedTextFile(file: File): Promise<string> {
   if (!file.name.toLowerCase().endsWith(".gz")) return file.text();
@@ -3328,6 +3336,7 @@ export function App() {
       pafText={pafText}
       pafImported={pafImported}
       gfaDocument={gfaDocument}
+      onLayoutGfaBandage={loadGfaBandageLayout}
       onLoadGfaEndpointHiC={loadGfaEndpointHiC}
       onLoadGfaEndpointHiCBatch={loadGfaEndpointHiCBatch}
       gfaHomologPattern={gfaHomologPattern}

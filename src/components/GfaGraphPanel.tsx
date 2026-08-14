@@ -16,12 +16,18 @@ import {
   type GfaSegmentSide,
 } from "../state/gfa";
 import {
+  buildGfaBandageLayoutRequest,
+  gfaBandageLayoutRequestKey,
+  validatedGfaBandagePathMap,
+  type GfaBandageLayoutLoader,
+} from "../state/gfaBandageLayout";
+import {
   classifyGfaScaffolds,
   gfaBandageControlPoint,
   gfaBandageNodeWidths,
   gfaCurationNodeWidths,
   gfaLinkScope,
-  layoutGfaNodesBandage,
+  layoutGfaNodePathsBandage,
   layoutGfaNodesForCuration,
   layoutGfaNodesGuided,
   type GfaLayoutMode,
@@ -75,6 +81,7 @@ interface GfaGraphPanelProps {
   document: GfaEvidenceDocument;
   assemblyBlocks: ContactMapLayoutBlock[];
   contactMap: ContactMapView | null;
+  onLayoutBandage?: GfaBandageLayoutLoader;
   onLoadEndpointHiC?: GfaEndpointHiCLoader;
   onLoadEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
   selectedAssemblyBlockIds: string[];
@@ -108,13 +115,6 @@ export interface GfaPathPoint {
   y: number;
 }
 
-export interface GfaBandagePathSnapshot {
-  id: string;
-  width: number;
-  pathPoints: GfaPathPoint[];
-}
-
-type BandageInteractionMode = "move" | "reshape";
 type CurationAssistantView = "queue" | "evidence";
 
 interface SelectedEndpointHiCPair {
@@ -158,7 +158,7 @@ interface ViewTransform {
 
 interface GraphInteraction {
   pointerId: number;
-  kind: "node" | "pan" | "selection" | "reshape";
+  kind: "node" | "bandage-node" | "pan" | "selection";
   nodeId?: string;
   draggedNodes?: Array<{
     id: string;
@@ -187,6 +187,14 @@ interface GfaSelectionBox {
 const defaultView: ViewTransform = { x: 24, y: 24, scale: 0.72 };
 const graphNodeLimit = 1_200;
 export const defaultGfaReviewOpen = false;
+
+export function gfaLayoutLayerDefaults(layoutMode: GfaLayoutMode) {
+  return {
+    showGfaOnlyNodes: layoutMode === "bandage",
+    showDisconnectedNodes: layoutMode === "bandage",
+    showAgpLinks: layoutMode !== "bandage",
+  };
+}
 
 export function gfaEndpointHiCRequestBatchSize(batchLoaderConnected: boolean) {
   return batchLoaderConnected ? 32 : 1;
@@ -284,180 +292,60 @@ export function gfaRigidBlockNodeIds(
     .map((node) => node.id);
 }
 
-/** Build the straight polyline used as a Bandage node before manual reshaping. */
+/**
+ * AGP block membership is the manual-move lock boundary in Bandage mode.
+ * Unblocked GFA-only unitigs retain adaptive control-point deformation.
+ */
+export function gfaBandageDragPlan(
+  nodes: ReadonlyArray<Pick<GfaGraphNode, "id" | "groupId" | "assemblyBlockId">>,
+  nodeId: string,
+) {
+  const selected = nodes.find((node) => node.id === nodeId);
+  return {
+    nodeIds: gfaRigidBlockNodeIds(nodes, nodeId),
+    adaptive: Boolean(selected && !selected.assemblyBlockId),
+  };
+}
+
+/** Build a straight fallback chain when no automatic Bandage path is available. */
 export function gfaInitialBandagePathPoints(
   x: number,
   y: number,
   width: number,
 ): GfaPathPoint[] {
-  const pointCount = clamp(Math.ceil(width / 72) + 1, 3, 7);
+  const pointCount = Math.max(2, Math.ceil(Math.max(1, width) / 48) + 1);
   return Array.from({ length: pointCount }, (_, index) => ({
     x: x - width / 2 + width * index / (pointCount - 1),
     y,
   }));
 }
 
-interface GfaAutomaticBandageNode {
-  id: string;
-  groupId: string;
-  assemblyBlockId?: string | null;
-  order: number;
-}
-
-interface GfaAutomaticBandageEdge {
-  source: string;
-  target: string;
-  kind: "agp-joined" | "agp-gap" | "gfa-link";
-}
-
 /**
- * Route each rigid AGP block as one smooth Bandage polyline after the topology
- * solve. External GFA neighbours pull the nearest part of a block towards
- * their lane; AGP order, node x positions, and the block's member order remain
- * unchanged. This is a one-shot deterministic route, not a live spring.
+ * Move one Bandage unitig by its nearest control point. Adjacent control points
+ * follow with Bandage's distance falloff, so the single Move interaction
+ * naturally translates a short node or bends a longer one.
  */
-export function gfaAutomaticBandagePaths(
-  nodes: ReadonlyArray<GfaAutomaticBandageNode>,
-  edges: ReadonlyArray<GfaAutomaticBandageEdge>,
-  positions: ReadonlyMap<string, GfaPathPoint>,
-  widths: ReadonlyMap<string, number>,
-) {
-  const blocksByKey = new Map<string, GfaAutomaticBandageNode[]>();
-  const blockKeyByNodeId = new Map<string, string>();
-  for (const node of nodes) {
-    const key = automaticBandageBlockKey(node);
-    const members = blocksByKey.get(key) ?? [];
-    members.push(node);
-    blocksByKey.set(key, members);
-    blockKeyByNodeId.set(node.id, key);
-  }
-  for (const members of blocksByKey.values()) {
-    members.sort((left, right) => left.order - right.order || left.id.localeCompare(right.id));
-  }
-  const geometryByKey = new Map<string, {
-    left: number;
-    right: number;
-    centerY: number;
-    samples: Array<{ x: number; bend: number }>;
-  }>();
-  for (const [key, members] of blocksByKey) {
-    const placed = members.flatMap((member) => {
-      const position = positions.get(member.id);
-      return position ? [{ member, position }] : [];
-    });
-    if (placed.length === 0) {
-      continue;
-    }
-    geometryByKey.set(key, {
-      left: Math.min(...placed.map(({ member, position }) => (
-        position.x - (widths.get(member.id) ?? 18) / 2
-      ))),
-      right: Math.max(...placed.map(({ member, position }) => (
-        position.x + (widths.get(member.id) ?? 18) / 2
-      ))),
-      centerY: placed.reduce((sum, { position }) => sum + position.y, 0) / placed.length,
-      samples: [],
-    });
-  }
-  function addPullSample(nodeId: string, otherNodeId: string) {
-    const key = blockKeyByNodeId.get(nodeId);
-    const otherKey = blockKeyByNodeId.get(otherNodeId);
-    const position = positions.get(nodeId);
-    const geometry = key ? geometryByKey.get(key) : undefined;
-    const otherGeometry = otherKey ? geometryByKey.get(otherKey) : undefined;
-    if (!key || !otherKey || key === otherKey || !position || !geometry || !otherGeometry) {
-      return;
-    }
-    const maximumBend = clamp((geometry.right - geometry.left) * 0.16, 16, 52);
-    geometry.samples.push({
-      x: position.x,
-      bend: clamp((otherGeometry.centerY - geometry.centerY) * 0.24, -maximumBend, maximumBend),
-    });
-  }
-  for (const edge of edges) {
-    if (edge.kind !== "gfa-link") {
-      continue;
-    }
-    addPullSample(edge.source, edge.target);
-    addPullSample(edge.target, edge.source);
-  }
-
-  const output = new Map<string, GfaPathPoint[]>();
-  for (const [key, members] of blocksByKey) {
-    const geometry = geometryByKey.get(key);
-    if (!geometry) {
-      continue;
-    }
-    const span = Math.max(1, geometry.right - geometry.left);
-    const influenceRadius = clamp(span * 0.24, 48, 150);
-    for (const member of members) {
-      const position = positions.get(member.id);
-      const width = widths.get(member.id) ?? 18;
-      if (!position) {
-        continue;
-      }
-      const points = gfaInitialBandagePathPoints(position.x, position.y, width);
-      output.set(member.id, points.map((point) => {
-        let weightedBend = 0;
-        let totalWeight = 0;
-        for (const sample of geometry.samples) {
-          const distance = (point.x - sample.x) / influenceRadius;
-          const weight = Math.exp(-(distance * distance) * 2.2);
-          weightedBend += sample.bend * weight;
-          totalWeight += weight;
-        }
-        return {
-          x: point.x,
-          y: point.y + weightedBend / Math.max(1, totalWeight),
-        };
-      }));
-    }
-  }
-  return output;
-}
-
-/**
- * Deform a local part of one rigid AGP block. The grabbed control point moves
- * most; neighbouring points across adjacent unitigs receive a smooth falloff.
- * The displacement is capped so Reshape remains a curation aid rather than an
- * unconstrained graph-layout force.
- */
-export function gfaReshapeBandageBlockPaths(
-  nodes: ReadonlyArray<GfaBandagePathSnapshot>,
-  grabbedNodeId: string,
+export function gfaMoveBandagePath(
+  pathPoints: ReadonlyArray<GfaPathPoint>,
   grabbedPointIndex: number,
   delta: GfaPathPoint,
+  dragStrength = 3,
 ) {
-  const flattened = nodes.flatMap((node) => (
-    node.pathPoints.map((point, pointIndex) => ({ node, point, pointIndex }))
-  ));
-  const grabbedGlobalIndex = flattened.findIndex((entry) => (
-    entry.node.id === grabbedNodeId && entry.pointIndex === grabbedPointIndex
-  ));
-  const grabbedNode = nodes.find((node) => node.id === grabbedNodeId);
-  if (grabbedGlobalIndex < 0 || !grabbedNode) {
-    return new Map(nodes.map((node) => [node.id, node.pathPoints.map(copyPathPoint)]));
+  if (grabbedPointIndex < 0 || grabbedPointIndex >= pathPoints.length) {
+    return pathPoints.map(copyPathPoint);
   }
-  const maximumX = clamp(grabbedNode.width * 0.18, 18, 48);
-  const maximumY = clamp(grabbedNode.width * 0.65, 42, 140);
-  const limitedDelta = {
-    x: clamp(delta.x, -maximumX, maximumX),
-    y: clamp(delta.y, -maximumY, maximumY),
-  };
-  const output = new Map<string, GfaPathPoint[]>();
-  let globalIndex = 0;
-  for (const node of nodes) {
-    output.set(node.id, node.pathPoints.map((point) => {
-      const distance = Math.abs(globalIndex - grabbedGlobalIndex);
-      const weight = Math.exp(-(distance * distance) / 7.5);
-      globalIndex += 1;
-      return {
-        x: point.x + limitedDelta.x * weight,
-        y: point.y + limitedDelta.y * weight,
-      };
-    }));
-  }
-  return output;
+  const safeDragStrength = Math.max(0.1, dragStrength);
+  return pathPoints.map((point, index) => {
+    const indexDistance = Math.abs(index - grabbedPointIndex);
+    const weight = Math.pow(
+      2,
+      -Math.pow(indexDistance, 1.8) / safeDragStrength,
+    );
+    return {
+      x: point.x + delta.x * weight,
+      y: point.y + delta.y * weight,
+    };
+  });
 }
 
 /** Resolve a GFA segment side to the current endpoint of a bent Bandage node. */
@@ -726,6 +614,7 @@ export function GfaGraphPanel({
   document,
   assemblyBlocks,
   contactMap,
+  onLayoutBandage,
   onLoadEndpointHiC,
   onLoadEndpointHiCBatch,
   selectedAssemblyBlockIds,
@@ -749,11 +638,34 @@ export function GfaGraphPanel({
   const bandagePathStateRef = useRef(new Map<string, GfaPathPoint[]>());
   const [layoutRevision, setLayoutRevision] = useState(0);
   const [layoutMode, setLayoutMode] = useState<GfaLayoutMode>("curation");
-  const [bandageInteractionMode, setBandageInteractionMode] = useState<BandageInteractionMode>("move");
-  const [showGfaOnlyNodes, setShowGfaOnlyNodes] = useState(false);
-  const [showDisconnectedNodes, setShowDisconnectedNodes] = useState(false);
+  const [nativeBandageLayout, setNativeBandageLayout] = useState<{
+    key: string;
+    paths: Map<string, GfaPathPoint[]>;
+  } | null>(null);
+  const [bandageLayoutEngine, setBandageLayoutEngine] = useState<
+    "loading" | "rust" | "fallback"
+  >(onLayoutBandage ? "loading" : "fallback");
+  const [showGfaOnlyNodesByLayout, setShowGfaOnlyNodesByLayout] = useState<Record<GfaLayoutMode, boolean>>({
+    curation: gfaLayoutLayerDefaults("curation").showGfaOnlyNodes,
+    guided: gfaLayoutLayerDefaults("guided").showGfaOnlyNodes,
+    bandage: gfaLayoutLayerDefaults("bandage").showGfaOnlyNodes,
+  });
+  const [showAgpLinksByLayout, setShowAgpLinksByLayout] = useState<Record<GfaLayoutMode, boolean>>({
+    curation: gfaLayoutLayerDefaults("curation").showAgpLinks,
+    guided: gfaLayoutLayerDefaults("guided").showAgpLinks,
+    bandage: gfaLayoutLayerDefaults("bandage").showAgpLinks,
+  });
+  const [showDisconnectedNodesByLayout, setShowDisconnectedNodesByLayout] = useState<
+    Record<GfaLayoutMode, boolean>
+  >({
+    curation: gfaLayoutLayerDefaults("curation").showDisconnectedNodes,
+    guided: gfaLayoutLayerDefaults("guided").showDisconnectedNodes,
+    bandage: gfaLayoutLayerDefaults("bandage").showDisconnectedNodes,
+  });
+  const showGfaOnlyNodes = showGfaOnlyNodesByLayout[layoutMode];
+  const showAgpLinks = showAgpLinksByLayout[layoutMode];
+  const showDisconnectedNodes = showDisconnectedNodesByLayout[layoutMode];
   const [showGfaLinks, setShowGfaLinks] = useState(true);
-  const [showAgpGaps, setShowAgpGaps] = useState(true);
   const [showHiCLinks, setShowHiCLinks] = useState(false);
   const [hiCLinkLimit, setHiCLinkLimit] = useState(defaultGfaEndpointHiCLinkLimit);
   const [showHomologLinks, setShowHomologLinks] = useState(true);
@@ -924,6 +836,15 @@ export function GfaGraphPanel({
   const activeGraph = layoutMode === "curation"
     ? visibleGraph
     : layoutMode === "guided" ? visibleGuidedGraph : visibleBandageGraph;
+  const bandageLayoutRequest = useMemo(() => buildGfaBandageLayoutRequest(
+    activeGraph.nodes,
+    activeGraph.edges,
+    gfaBandageNodeWidths(activeGraph.nodes),
+  ), [activeGraph]);
+  const bandageLayoutKey = useMemo(
+    () => gfaBandageLayoutRequestKey(bandageLayoutRequest, layoutRevision),
+    [bandageLayoutRequest, layoutRevision],
+  );
   const guidedGraphKey = visibleGuidedGraph.nodes.map((node) => node.id).join("\u0000");
   const hiCContactMapReady = Boolean(
     contactMap && gfaHiCContactMapUsesLayout(contactMap, assemblyBlocks),
@@ -1114,7 +1035,7 @@ export function GfaGraphPanel({
   })();
   const visibleGraphRelationCount = activeGraph.edges.filter((edge) => {
     if (edge.kind !== "gfa-link") {
-      return true;
+      return showAgpLinks;
     }
     if (!showGfaLinks) {
       return false;
@@ -1324,6 +1245,51 @@ export function GfaGraphPanel({
   ]);
 
   useEffect(() => {
+    if (layoutMode !== "bandage") {
+      return;
+    }
+    if (!onLayoutBandage) {
+      setBandageLayoutEngine("fallback");
+      return;
+    }
+    if (nativeBandageLayout?.key === bandageLayoutKey) {
+      return;
+    }
+    let cancelled = false;
+    setBandageLayoutEngine("loading");
+    void onLayoutBandage(bandageLayoutRequest)
+      .then((response) => validatedGfaBandagePathMap(
+        response,
+        new Set(bandageLayoutRequest.nodes.map((node) => node.id)),
+      ))
+      .then((paths) => {
+        if (cancelled) {
+          return;
+        }
+        nodesRef.current = [];
+        fitViewPendingRef.current = true;
+        setNativeBandageLayout({ key: bandageLayoutKey, paths });
+        setBandageLayoutEngine("rust");
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        console.warn("Rust GFA layout unavailable; using deterministic fallback", error);
+        setBandageLayoutEngine("fallback");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    bandageLayoutKey,
+    bandageLayoutRequest,
+    layoutMode,
+    nativeBandageLayout?.key,
+    onLayoutBandage,
+  ]);
+
+  useEffect(() => {
     const guidedFocusChanged = layoutMode === "guided"
       && guidedGraphKeyRef.current !== guidedGraphKey;
     if (guidedFocusChanged) {
@@ -1344,32 +1310,45 @@ export function GfaGraphPanel({
       graph,
       guidedFocalNodeIds,
       bandagePathStateRef.current,
+      nativeBandageLayout?.key === bandageLayoutKey
+        ? nativeBandageLayout.paths
+        : undefined,
     );
     if (firstLayout) {
       fitViewPendingRef.current = true;
     }
-  }, [activeGraph, graph, guidedFocalNodeIds, guidedGraphKey, homologs, layoutMode, layoutRevision]);
+  }, [
+    activeGraph,
+    bandageLayoutKey,
+    graph,
+    guidedFocalNodeIds,
+    guidedGraphKey,
+    homologs,
+    layoutMode,
+    layoutRevision,
+    nativeBandageLayout,
+  ]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (canvas) {
-      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
+      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks, selectionBoxRef.current);
     }
-  }, [homologs, selectedAssemblyBlockIds, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks]);
+  }, [homologs, selectedAssemblyBlockIds, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) {
       return;
     }
-    const draw = () => drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
+    const draw = () => drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks, selectionBoxRef.current);
     draw();
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
     return () => {
       observer.disconnect();
     };
-  }, [graph, homologs, layoutMode, layoutRevision, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks]);
+  }, [graph, homologs, layoutMode, layoutRevision, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks]);
 
   function switchLayoutMode(mode: GfaLayoutMode) {
     if (mode === layoutMode) {
@@ -1408,13 +1387,26 @@ export function GfaGraphPanel({
   function toggleGfaOnlyNodes() {
     nodesRef.current = [];
     fitViewPendingRef.current = true;
-    setShowGfaOnlyNodes((visible) => !visible);
+    setShowGfaOnlyNodesByLayout((current) => ({
+      ...current,
+      [layoutMode]: !current[layoutMode],
+    }));
+  }
+
+  function toggleAgpLinks() {
+    setShowAgpLinksByLayout((current) => ({
+      ...current,
+      [layoutMode]: !current[layoutMode],
+    }));
   }
 
   function toggleDisconnectedNodes() {
     nodesRef.current = [];
     fitViewPendingRef.current = true;
-    setShowDisconnectedNodes((visible) => !visible);
+    setShowDisconnectedNodesByLayout((current) => ({
+      ...current,
+      [layoutMode]: !current[layoutMode],
+    }));
   }
 
   function inspectCurationIssue(issue: GfaCurationIssue) {
@@ -1464,22 +1456,32 @@ export function GfaGraphPanel({
     const canvas = event.currentTarget;
     const point = graphPointFromPointer(canvas, event.clientX, event.clientY, viewRef.current);
     const node = nodeAtPoint(nodesRef.current, point.x, point.y);
-    const rigidNodeIds = node
-      ? new Set(gfaRigidBlockNodeIds(nodesRef.current, node.id))
+    const bandageDragPlan = node && layoutMode === "bandage"
+      ? gfaBandageDragPlan(nodesRef.current, node.id)
+      : null;
+    const draggedNodeIds = node
+      ? new Set(
+        bandageDragPlan?.nodeIds
+        ?? gfaRigidBlockNodeIds(nodesRef.current, node.id),
+      )
       : new Set<string>();
-    const reshape = Boolean(
+    const adaptiveBandageMove = Boolean(
       node
       && !event.shiftKey
       && layoutMode === "bandage"
-      && bandageInteractionMode === "reshape",
+      && bandageDragPlan?.adaptive,
     );
     interactionRef.current = {
       pointerId: event.pointerId,
-      kind: event.shiftKey ? "selection" : node ? reshape ? "reshape" : "node" : "pan",
+      kind: event.shiftKey
+        ? "selection"
+        : node
+          ? adaptiveBandageMove ? "bandage-node" : "node"
+          : "pan",
       nodeId: event.shiftKey ? undefined : node?.id,
       draggedNodes: node && !event.shiftKey
         ? nodesRef.current
-          .filter((candidate) => rigidNodeIds.has(candidate.id))
+          .filter((candidate) => draggedNodeIds.has(candidate.id))
           .map((candidate) => ({
             id: candidate.id,
             x: candidate.x,
@@ -1488,7 +1490,7 @@ export function GfaGraphPanel({
             pathPoints: candidate.pathPoints.map(copyPathPoint),
           }))
         : undefined,
-      grabbedPointIndex: reshape && node
+      grabbedPointIndex: adaptiveBandageMove && node
         ? closestBandageControlPointIndex(node.pathPoints, point)
         : undefined,
       startGraphX: node || event.shiftKey ? point.x : undefined,
@@ -1507,7 +1509,7 @@ export function GfaGraphPanel({
         currentY: point.y,
       };
       canvas.classList.add("gfa-selecting");
-      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
+      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks, selectionBoxRef.current);
     }
     canvas.setPointerCapture(event.pointerId);
   }
@@ -1526,13 +1528,13 @@ export function GfaGraphPanel({
         selectionBoxRef.current.currentX = point.x;
         selectionBoxRef.current.currentY = point.y;
       }
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks, selectionBoxRef.current);
       return;
     }
     if (interaction.kind === "pan") {
       viewRef.current.x = interaction.startViewX + deltaX;
       viewRef.current.y = interaction.startViewY + deltaY;
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks);
       return;
     }
     if (
@@ -1544,24 +1546,27 @@ export function GfaGraphPanel({
       const graphDeltaX = point.x - interaction.startGraphX;
       const graphDeltaY = point.y - interaction.startGraphY;
       if (
-        interaction.kind === "reshape"
+        interaction.kind === "bandage-node"
         && interaction.nodeId
         && interaction.grabbedPointIndex !== undefined
       ) {
-        const reshaped = gfaReshapeBandageBlockPaths(
-          interaction.draggedNodes,
-          interaction.nodeId,
+        const start = interaction.draggedNodes.find((candidate) => (
+          candidate.id === interaction.nodeId
+        ));
+        if (!start) {
+          return;
+        }
+        const movedPath = gfaMoveBandagePath(
+          start.pathPoints,
           interaction.grabbedPointIndex,
           { x: graphDeltaX, y: graphDeltaY },
         );
-        for (const node of nodesRef.current) {
-          const pathPoints = reshaped.get(node.id);
-          if (pathPoints) {
-            node.pathPoints = pathPoints;
-            updateNodeCenterFromPath(node);
-          }
+        const movedNode = nodesRef.current.find((candidate) => candidate.id === interaction.nodeId);
+        if (movedNode) {
+          movedNode.pathPoints = movedPath;
+          updateNodeCenterFromPath(movedNode);
         }
-        drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
+        drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks);
         return;
       }
       const startsById = new Map(interaction.draggedNodes.map((node) => [node.id, node]));
@@ -1576,7 +1581,7 @@ export function GfaGraphPanel({
           }));
         }
       }
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks);
     }
   }
 
@@ -1609,7 +1614,7 @@ export function GfaGraphPanel({
           onSelectOccurrences(chromosomeSelection);
           selectionBoxRef.current = null;
           event.currentTarget.classList.remove("gfa-selecting");
-          drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
+          drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks);
           interactionRef.current = null;
           event.currentTarget.releasePointerCapture(event.pointerId);
           return;
@@ -1625,8 +1630,8 @@ export function GfaGraphPanel({
       }
       selectionBoxRef.current = null;
       event.currentTarget.classList.remove("gfa-selecting");
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
-    } else if ((interaction.kind === "node" || interaction.kind === "reshape") && interaction.nodeId) {
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks);
+    } else if ((interaction.kind === "node" || interaction.kind === "bandage-node") && interaction.nodeId) {
       const node = nodesRef.current.find((candidate) => candidate.id === interaction.nodeId);
       const unitId = node ? gfaAssemblyUnitId(node) : null;
       if (!interaction.moved && unitId) {
@@ -1656,7 +1661,7 @@ export function GfaGraphPanel({
     if (!interaction || interaction.pointerId !== event.pointerId) {
       return;
     }
-    if ((interaction.kind === "node" || interaction.kind === "reshape") && interaction.draggedNodes) {
+    if ((interaction.kind === "node" || interaction.kind === "bandage-node") && interaction.draggedNodes) {
       const startsById = new Map(interaction.draggedNodes.map((node) => [node.id, node]));
       for (const node of nodesRef.current) {
         const start = startsById.get(node.id);
@@ -1673,7 +1678,7 @@ export function GfaGraphPanel({
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-    drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
+    drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks);
   }
 
   function zoom(event: React.WheelEvent<HTMLCanvasElement>) {
@@ -1689,7 +1694,7 @@ export function GfaGraphPanel({
     viewRef.current.scale = nextScale;
     viewRef.current.x = pointerX - graphX * nextScale;
     viewRef.current.y = pointerY - graphY * nextScale;
-    drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
+    drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks);
   }
 
   return (
@@ -1708,6 +1713,7 @@ export function GfaGraphPanel({
                 }`
                 : ""}
               {graph.ambiguousLinkCount ? ` · ${graph.ambiguousLinkCount.toLocaleString()} ambiguous links hidden` : ""}
+              {graph.truncated ? ` · graph limited to ${graphNodeLimit.toLocaleString()} nodes` : ""}
             </small>
           </span>
           <div className="gfa-toolbar-layout">
@@ -1728,34 +1734,23 @@ export function GfaGraphPanel({
               <button
                 type="button"
                 aria-pressed={layoutMode === "bandage"}
-                title="Arrange blocks by graph topology while preserving AGP order inside each block"
+                title="Arrange segments from GFA topology only; AGP links are a separate optional layer"
                 onClick={() => switchLayoutMode("bandage")}
-              >Bandage</button>
+              >Whole</button>
             </div>
             {layoutMode === "bandage" ? <>
               <span className="gfa-toolbar-divider" aria-hidden="true" />
               <button
                 type="button"
                 className="gfa-link-toggle gfa-auto-layout-button"
-                aria-label="Run Bandage automatic layout"
-                title="Recompute the block-aware topology layout and automatic bends"
+                aria-label="Run Whole automatic layout"
+                title={bandageLayoutEngine === "loading"
+                  ? "C-Studio's Rust multilevel graph layout is running"
+                  : bandageLayoutEngine === "rust"
+                    ? "Recompute with C-Studio's native Rust multilevel graph layout"
+                    : "Native Rust layout is unavailable; recompute with the deterministic browser fallback"}
                 onClick={autoLayoutBandage}
-              >Auto layout</button>
-              <span className="gfa-toolbar-section-label">Edit</span>
-              <div className="gfa-layout-mode gfa-bandage-edit-mode" role="group" aria-label="Bandage interaction mode">
-                <button
-                  type="button"
-                  aria-pressed={bandageInteractionMode === "move"}
-                  title="Move the complete AGP block without changing its shape"
-                  onClick={() => setBandageInteractionMode("move")}
-                >Move</button>
-                <button
-                  type="button"
-                  aria-pressed={bandageInteractionMode === "reshape"}
-                  title="Bend a local part of the AGP block; GFA links follow its endpoints"
-                  onClick={() => setBandageInteractionMode("reshape")}
-                >Reshape</button>
-              </div>
+              >{bandageLayoutEngine === "loading" ? "Laying out…" : "Auto layout"}</button>
             </> : null}
             <span className="gfa-toolbar-divider" aria-hidden="true" />
             <span className="gfa-toolbar-section-label">Layers</span>
@@ -1854,30 +1849,30 @@ export function GfaGraphPanel({
             <button
               type="button"
               className="gfa-link-toggle"
-              aria-label="Show non-AGP unitigs"
+              aria-label="Toggle unplaced unitigs"
               aria-pressed={showGfaOnlyNodes}
               title="Show or hide GFA unitigs that do not occur in the current AGP"
               onClick={toggleGfaOnlyNodes}
-            >Non-AGP utgs</button>
+            >Unplaced</button>
             <button
               type="button"
               className="gfa-link-toggle"
-              aria-label="Show nodes disconnected from chromosome groups"
+              aria-label="Toggle disconnected GFA islands"
               aria-pressed={showDisconnectedNodes}
-              title="Show or hide components with no GFA-link path to the displayed chromosome group"
+              title="Show or hide GFA components with no link path to any AGP chromosome"
               onClick={toggleDisconnectedNodes}
-            >Disconnected</button>
+            >Islands</button>
           </div>
           <div className="gfa-toolbar-link-filters" role="group" aria-label="GFA and 3D contact link visibility">
             <span className="gfa-toolbar-section-label">Show links</span>
             <button
               type="button"
               className="gfa-link-toggle"
-              aria-label="Toggle AGP gap links"
-              aria-pressed={showAgpGaps}
-              title="Show or hide AGP gap and adjacency junction lines"
-              onClick={() => setShowAgpGaps((visible) => !visible)}
-            >AGP gaps</button>
+              aria-label="Toggle AGP links"
+              aria-pressed={showAgpLinks}
+              title="Show or hide all AGP adjacency and gap lines; hidden by default in Whole"
+              onClick={toggleAgpLinks}
+            >AGP</button>
             <button
               type="button"
               className="gfa-link-toggle"
@@ -1919,9 +1914,9 @@ export function GfaGraphPanel({
       <div className={`gfa-canvas-frame${curationAssistantOpen ? " with-curation-assistant" : ""}`}>
         <canvas
           ref={canvasRef}
-          className={`gfa-graph-canvas${layoutMode === "bandage" && bandageInteractionMode === "reshape" ? " gfa-reshaping" : ""}`}
-          aria-label={layoutMode === "bandage" && bandageInteractionMode === "reshape"
-            ? "Interactive Bandage graph in Reshape mode; drag a unitig locally to bend its block, Shift-drag to select multiple blocks, right-click for assembly operations, drag empty space to pan, and scroll to zoom"
+          className="gfa-graph-canvas"
+          aria-label={layoutMode === "bandage"
+            ? "Interactive Whole graph; drag a unitig to move and smoothly deform nearby path points, Shift-drag to select multiple blocks, right-click for assembly operations, drag empty space to pan, and scroll to zoom"
             : "Interactive GFA curation graph; drag a unitig to move its whole block, Shift-drag to select multiple blocks, right-click for assembly operations, drag empty space to pan, and scroll to zoom"}
           aria-haspopup="menu"
           onPointerDown={pointerDown}
@@ -2648,7 +2643,7 @@ function drawCurrentGraph(
   showHomologLinks: boolean,
   showNonHomologLinks: boolean,
   showAnchorUnanchorLinks: boolean,
-  showAgpGaps: boolean,
+  showAgpLinks: boolean,
   hiCLinks: ReadonlyArray<GfaEndpointHiCLink>,
   selectionBox: GfaSelectionBox | null = null,
 ) {
@@ -2669,7 +2664,7 @@ function drawCurrentGraph(
     showHomologLinks,
     showNonHomologLinks,
     showAnchorUnanchorLinks,
-    showAgpGaps,
+    showAgpLinks,
     hiCLinks,
     selectionBox,
   );
@@ -2683,6 +2678,7 @@ function initializeLayoutNodes(
   evidenceGraph: GfaAssemblyGraph = graph,
   guidedFocalNodeIds: ReadonlySet<string> = new Set<string>(),
   savedBandagePaths: ReadonlyMap<string, GfaPathPoint[]> = new Map<string, GfaPathPoint[]>(),
+  nativeBandagePaths?: ReadonlyMap<string, GfaPathPoint[]>,
 ) {
   const previousById = new Map(previous.map((node) => [node.id, node]));
   const homologByScaffold = new Map(
@@ -2696,8 +2692,13 @@ function initializeLayoutNodes(
       ] as const)
     )),
   );
+  const automaticBandagePaths = layoutMode === "bandage"
+    ? nativeBandagePaths ?? layoutGfaNodePathsBandage(graph.nodes, graph.edges)
+    : new Map<string, GfaPathPoint[]>();
   const positions = layoutMode === "bandage"
-    ? layoutGfaNodesBandage(graph.nodes, graph.edges)
+    ? new Map([...automaticBandagePaths].map(([nodeId, pathPoints]) => (
+      [nodeId, bandagePathCenter(pathPoints)]
+    )))
     : layoutMode === "guided"
       ? layoutGfaNodesGuided(graph.nodes, graph.edges, guidedFocalNodeIds)
       : layoutGfaNodesForCuration(
@@ -2713,10 +2714,6 @@ function initializeLayoutNodes(
   const curationWidths = layoutMode === "curation"
     ? gfaCurationNodeWidths(graph.nodes)
     : new Map<string, number>();
-  const automaticBandagePaths = layoutMode === "bandage"
-    ? gfaAutomaticBandagePaths(graph.nodes, graph.edges, positions, bandageWidths)
-    : new Map<string, GfaPathPoint[]>();
-
   const output: LayoutNode[] = [];
   for (const node of graph.nodes) {
       const position = positions.get(node.id) ?? { x: 90, y: 64 };
@@ -2778,7 +2775,7 @@ function drawInteractiveGraph(
   showHomologLinks: boolean,
   showNonHomologLinks: boolean,
   showAnchorUnanchorLinks: boolean,
-  showAgpGaps: boolean,
+  showAgpLinks: boolean,
   hiCLinks: ReadonlyArray<GfaEndpointHiCLink>,
   selectionBox: GfaSelectionBox | null,
 ) {
@@ -2812,9 +2809,9 @@ function drawInteractiveGraph(
   for (const edge of graph.edges) {
     const source = byId.get(edge.source);
     const target = byId.get(edge.target);
-    const visible = edge.kind === "agp-gap"
-      ? showAgpGaps
-      : edge.kind !== "gfa-link" || (
+    const visible = edge.kind !== "gfa-link"
+      ? showAgpLinks
+      : (
         showGfaLinks
         && source
         && target
@@ -2836,6 +2833,7 @@ function drawInteractiveGraph(
         edge,
         view.scale,
         edge.kind === "gfa-link"
+          && showAgpLinks
           && agpGapPairs.has(unorderedNodePair(edge.source, edge.target)),
       );
     }
@@ -3664,12 +3662,6 @@ function layoutModeFromNodes(nodes: LayoutNode[]): GfaLayoutMode {
 
 function copyPathPoint(point: GfaPathPoint): GfaPathPoint {
   return { x: point.x, y: point.y };
-}
-
-function automaticBandageBlockKey(node: GfaAutomaticBandageNode) {
-  return node.assemblyBlockId
-    ? `block:${node.groupId}\0${node.assemblyBlockId}`
-    : `single:${node.id}`;
 }
 
 function bandagePathCenter(pathPoints: ReadonlyArray<GfaPathPoint>) {

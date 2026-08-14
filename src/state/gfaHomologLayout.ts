@@ -22,12 +22,15 @@ export interface GfaHomologLayoutNode {
   assemblyBlockId?: string | null;
   order: number;
   length?: number;
+  orientation?: "+" | "-" | "?" | "0" | "na";
 }
 
 export interface GfaCurationLayoutEdge {
   source: string;
   target: string;
   kind: "agp-joined" | "agp-gap" | "gfa-link";
+  sourceSide?: "start" | "end";
+  targetSide?: "start" | "end";
 }
 
 export type GfaLinkScope = "within-scaffold" | "homolog" | "non-homolog";
@@ -103,15 +106,22 @@ export interface GfaGraphPoint {
 }
 
 /**
- * Keep chromosome labels legible as ploidy grows. Tetraploid and smaller
- * groups retain the compact layout; higher-ploidy groups gain progressively
- * more lane separation, capped so a single group remains practical to pan.
+ * Keep chromosome labels legible as ploidy and chromosome span grow.
+ * Tetraploid groups with compact rows retain the existing layout. Longer rows
+ * need more graph-space separation because fit-to-width scales their vertical
+ * distance down together with their horizontal span. Both signals are capped
+ * so a single group remains practical to pan.
  */
-export function gfaHomologRowGap(memberCount: number) {
+export function gfaHomologRowGap(memberCount: number, chromosomeSpan = 0) {
   const safeMemberCount = Number.isFinite(memberCount)
     ? Math.max(1, Math.floor(memberCount))
     : 1;
-  return clampNumber(44 + Math.max(0, safeMemberCount - 4) * 5, 44, 96);
+  const safeChromosomeSpan = Number.isFinite(chromosomeSpan)
+    ? Math.max(0, chromosomeSpan)
+    : 0;
+  const ploidyGap = 44 + Math.max(0, safeMemberCount - 4) * 5;
+  const spanGap = 44 * Math.sqrt(Math.max(1, safeChromosomeSpan / 900));
+  return clampNumber(Math.max(ploidyGap, spanGap), 44, 144);
 }
 
 export function classifyGfaScaffolds(
@@ -187,6 +197,20 @@ export function layoutGfaNodesByHomolog(
   const blockSpacing = 30;
   let nextRowY = firstRowY;
 
+  function chromosomeRowSpan(scaffoldId: string) {
+    let previous: GfaHomologLayoutNode | undefined;
+    let span = 0;
+    for (const node of groups.get(scaffoldId) ?? []) {
+      const width = widths.get(node.id) ?? curationMinimumNodeWidth;
+      const spacing = previous
+        ? assemblyBlockKey(previous) === assemblyBlockKey(node) ? joinedSpacing : blockSpacing
+        : 0;
+      span += spacing + width;
+      previous = node;
+    }
+    return span;
+  }
+
   function placeChromosomeRow(scaffoldId: string, y: number) {
     let previous: GfaHomologLayoutNode | undefined;
     let rightEdge = chromosomeStartX;
@@ -203,7 +227,14 @@ export function layoutGfaNodesByHomolog(
   }
 
   for (const column of homologs.columns) {
-    const homologRowGap = gfaHomologRowGap(column.scaffolds.length);
+    const longestChromosomeSpan = Math.max(
+      0,
+      ...column.scaffolds.map((scaffold) => chromosomeRowSpan(scaffold.id)),
+    );
+    const homologRowGap = gfaHomologRowGap(
+      column.scaffolds.length,
+      longestChromosomeSpan,
+    );
     for (const scaffold of column.scaffolds) {
       placeChromosomeRow(scaffold.id, nextRowY);
       nextRowY += homologRowGap;
@@ -415,10 +446,10 @@ export function layoutGfaNodesForCuration(
 
 /**
  * Deterministic topology layout inspired by Bandage's force-directed view.
- * Chromosome and homolog coordinates are ignored, but an AGP assembly block is
- * a rigid editing unit: its unitigs keep AGP order and compact spacing while the
- * whole block participates in the topology solve. The force pass runs once;
- * interaction never continues the simulation.
+ * Chromosome, homolog, and AGP block coordinates are ignored. Every displayed
+ * GFA segment participates independently and only GFA links join topology
+ * components; AGP adjacency and gap edges are display-only evidence. The force
+ * pass runs once and interaction never continues the simulation.
  */
 export function layoutGfaNodesBandage(
   nodes: GfaHomologLayoutNode[],
@@ -428,34 +459,18 @@ export function layoutGfaNodesBandage(
     return new Map<string, GfaGraphPoint>();
   }
   const nodeWidths = gfaBandageNodeWidths(nodes);
-  const unitsByKey = new Map<string, {
+  const units = nodes.map((node, index): {
     id: string;
     memberIndices: number[];
     width: number;
     firstOrder: number;
-  }>();
-  for (const [index, node] of nodes.entries()) {
-    const key = rigidAssemblyBlockKey(node);
-    const unit = unitsByKey.get(key) ?? {
-      id: key,
-      memberIndices: [],
-      width: 0,
-      firstOrder: node.order,
-    };
-    unit.memberIndices.push(index);
-    unit.firstOrder = Math.min(unit.firstOrder, node.order);
-    unitsByKey.set(key, unit);
-  }
-  const units = [...unitsByKey.values()]
+  } => ({
+    id: node.id,
+    memberIndices: [index],
+    width: nodeWidths.get(node.id) ?? bandageMinimumNodeWidth,
+    firstOrder: node.order,
+  }))
     .sort((left, right) => left.firstOrder - right.firstOrder || naturalCompare(left.id, right.id));
-  for (const unit of units) {
-    unit.memberIndices.sort((left, right) => (
-      nodes[left].order - nodes[right].order || naturalCompare(nodes[left].id, nodes[right].id)
-    ));
-    unit.width = unit.memberIndices.reduce((total, index) => (
-      total + (nodeWidths.get(nodes[index].id) ?? bandageMinimumNodeWidth)
-    ), 0) + Math.max(0, unit.memberIndices.length - 1) * 4;
-  }
 
   const unitIndexByNodeId = new Map<string, number>();
   for (const [unitIndex, unit] of units.entries()) {
@@ -465,6 +480,9 @@ export function layoutGfaNodesBandage(
   }
   const adjacency = units.map(() => [] as number[]);
   const usableEdges = edges.flatMap((edge) => {
+    if (edge.kind !== "gfa-link") {
+      return [];
+    }
     const source = unitIndexByNodeId.get(edge.source);
     const target = unitIndexByNodeId.get(edge.target);
     if (source === undefined || target === undefined || source === target) {
@@ -636,6 +654,114 @@ export function layoutGfaNodesBandage(
     }
   }
   return nodePoints;
+}
+
+/**
+ * Expand the coarse topology result into Bandage-like multi-point unitigs.
+ * Each segment is a chain whose number of control points follows its rendered
+ * length. GFA links pull the matching physical endpoint toward its neighbour;
+ * AGP relations are deliberately ignored because they are display evidence in
+ * Bandage mode, not layout springs.
+ */
+export function layoutGfaNodePathsBandage(
+  nodes: GfaHomologLayoutNode[],
+  edges: GfaCurationLayoutEdge[],
+) {
+  const centers = layoutGfaNodesBandage(nodes, edges);
+  const widths = gfaBandageNodeWidths(nodes);
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const endpointDirections = new Map<string, {
+    start: GfaGraphPoint[];
+    end: GfaGraphPoint[];
+  }>();
+  for (const node of nodes) {
+    endpointDirections.set(node.id, { start: [], end: [] });
+  }
+
+  for (const edge of edges) {
+    if (edge.kind !== "gfa-link") {
+      continue;
+    }
+    const sourceNode = nodeById.get(edge.source);
+    const targetNode = nodeById.get(edge.target);
+    const sourceCenter = centers.get(edge.source);
+    const targetCenter = centers.get(edge.target);
+    if (!sourceNode || !targetNode || !sourceCenter || !targetCenter) {
+      continue;
+    }
+    const dx = targetCenter.x - sourceCenter.x;
+    const dy = targetCenter.y - sourceCenter.y;
+    const distance = Math.hypot(dx, dy);
+    if (distance <= Number.EPSILON) {
+      continue;
+    }
+    const sourceVisualSide = displayedBandageEndpoint(
+      sourceNode,
+      edge.sourceSide ?? "end",
+    );
+    const targetVisualSide = displayedBandageEndpoint(
+      targetNode,
+      edge.targetSide ?? "start",
+    );
+    endpointDirections.get(edge.source)![sourceVisualSide].push({
+      x: dx / distance,
+      y: dy / distance,
+    });
+    endpointDirections.get(edge.target)![targetVisualSide].push({
+      x: -dx / distance,
+      y: -dy / distance,
+    });
+  }
+
+  const paths = new Map<string, GfaGraphPoint[]>();
+  for (const [index, node] of nodes.entries()) {
+    const center = centers.get(node.id);
+    if (!center) {
+      continue;
+    }
+    const width = widths.get(node.id) ?? bandageMinimumNodeWidth;
+    const fallbackAngle = deterministicAngle(node.id, index + 101);
+    const fallbackAxis = { x: Math.cos(fallbackAngle), y: Math.sin(fallbackAngle) };
+    const directions = endpointDirections.get(node.id)!;
+    const startDirection = meanUnitDirection(directions.start);
+    const endDirection = meanUnitDirection(directions.end);
+    const axis = bandagePathAxis(startDirection, endDirection, fallbackAxis);
+    const startOut = startDirection ?? { x: -axis.x, y: -axis.y };
+    const endOut = endDirection ?? axis;
+    const halfWidth = width / 2;
+    let start = {
+      x: center.x + startOut.x * halfWidth,
+      y: center.y + startOut.y * halfWidth,
+    };
+    let end = {
+      x: center.x + endOut.x * halfWidth,
+      y: center.y + endOut.y * halfWidth,
+    };
+    if (Math.hypot(end.x - start.x, end.y - start.y) < width * 0.25) {
+      start = { x: center.x - axis.x * halfWidth, y: center.y - axis.y * halfWidth };
+      end = { x: center.x + axis.x * halfWidth, y: center.y + axis.y * halfWidth };
+    }
+    const handleLength = width * 0.32;
+    const startHandle = {
+      x: start.x - startOut.x * handleLength,
+      y: start.y - startOut.y * handleLength,
+    };
+    const endHandle = {
+      x: end.x - endOut.x * handleLength,
+      y: end.y - endOut.y * handleLength,
+    };
+    const pointCount = Math.max(2, Math.ceil(width / 48) + 1);
+    paths.set(node.id, Array.from({ length: pointCount }, (_, pointIndex) => (
+      cubicBandagePoint(
+        start,
+        startHandle,
+        endHandle,
+        end,
+        pointIndex / (pointCount - 1),
+      )
+    )));
+  }
+  return paths;
 }
 
 /**
@@ -930,6 +1056,71 @@ function deterministicOffset(value: string) {
 
 function deterministicAngle(value: string, salt: number) {
   return ((stableHash(value, salt) % 3_600) / 3_600) * Math.PI * 2;
+}
+
+function displayedBandageEndpoint(
+  node: GfaHomologLayoutNode,
+  physicalSide: "start" | "end",
+) {
+  return node.orientation === "-"
+    ? physicalSide === "start" ? "end" : "start"
+    : physicalSide;
+}
+
+function meanUnitDirection(points: ReadonlyArray<GfaGraphPoint>) {
+  if (points.length === 0) {
+    return null;
+  }
+  const sum = points.reduce((result, point) => ({
+    x: result.x + point.x,
+    y: result.y + point.y,
+  }), { x: 0, y: 0 });
+  const magnitude = Math.hypot(sum.x, sum.y);
+  if (magnitude <= 0.05) {
+    return null;
+  }
+  return { x: sum.x / magnitude, y: sum.y / magnitude };
+}
+
+function bandagePathAxis(
+  startDirection: GfaGraphPoint | null,
+  endDirection: GfaGraphPoint | null,
+  fallback: GfaGraphPoint,
+) {
+  const candidate = startDirection && endDirection
+    ? {
+      x: endDirection.x - startDirection.x,
+      y: endDirection.y - startDirection.y,
+    }
+    : endDirection
+      ? endDirection
+      : startDirection
+        ? { x: -startDirection.x, y: -startDirection.y }
+        : fallback;
+  const magnitude = Math.hypot(candidate.x, candidate.y);
+  return magnitude > 0.05
+    ? { x: candidate.x / magnitude, y: candidate.y / magnitude }
+    : fallback;
+}
+
+function cubicBandagePoint(
+  start: GfaGraphPoint,
+  startHandle: GfaGraphPoint,
+  endHandle: GfaGraphPoint,
+  end: GfaGraphPoint,
+  t: number,
+) {
+  const inverse = 1 - t;
+  return {
+    x: inverse ** 3 * start.x
+      + 3 * inverse ** 2 * t * startHandle.x
+      + 3 * inverse * t ** 2 * endHandle.x
+      + t ** 3 * end.x,
+    y: inverse ** 3 * start.y
+      + 3 * inverse ** 2 * t * startHandle.y
+      + 3 * inverse * t ** 2 * endHandle.y
+      + t ** 3 * end.y,
+  };
 }
 
 function deterministicNudge(value: string, salt: number) {

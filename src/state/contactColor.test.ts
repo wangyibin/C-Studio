@@ -10,21 +10,21 @@ import {
 import type { ContactColormap } from "./uiState";
 
 describe("contactColorAt", () => {
-  it("matches Juicebox's continuous red alpha mapping", () => {
-    expect(contactColorAt("Reds", 0)).toEqual({ red: 255, green: 0, blue: 0, alpha: 0 });
+  it("matches Juicebox Desktop's opaque white-to-red scale", () => {
+    expect(contactColorAt("Reds", 0)).toEqual({ red: 255, green: 255, blue: 255, alpha: 1 });
     expect(contactColorAt("Reds", 0.1)).toEqual({
       red: 255,
-      green: 0,
-      blue: 0,
-      alpha: 25 / 255,
+      green: 230,
+      blue: 230,
+      alpha: 1,
     });
-    expect(contactColorAt("Reds", 0.5).alpha).toBe(127 / 255);
-    expect(contactColorAt("Reds", 1).alpha).toBe(1);
-    expect(contactColorAt("Reds", 3).alpha).toBe(1);
+    expect(contactColorAt("Reds", 0.5)).toEqual({ red: 255, green: 128, blue: 128, alpha: 1 });
+    expect(contactColorAt("Reds", 1)).toEqual({ red: 255, green: 0, blue: 0, alpha: 1 });
+    expect(contactColorAt("Reds", 3)).toEqual({ red: 255, green: 0, blue: 0, alpha: 1 });
   });
 
   it("keeps low positive contacts visible instead of mapping the first 20% to white", () => {
-    expect(contactColorCss("Reds", 0.05)).toBe("rgba(255, 0, 0, 0.047058823529411764)");
+    expect(contactColorCss("Reds", 0.05)).toBe("rgba(255, 243, 243, 1)");
   });
 });
 
@@ -68,10 +68,10 @@ describe("contactColorLut", () => {
     expect(contactColorLutIndex("Reds", Number.POSITIVE_INFINITY)).toBe(0);
   });
 
-  it("is exact for Reds and exact at every LUT representative for every palette", () => {
-    const sampleIntensities = [-1, 0, 0.001, 0.05, 0.1, 0.5, 0.9, 0.999, 1, 3];
+  it("is exact at every LUT representative for every palette", () => {
     const reds = contactColorLut("Reds", 0.2);
-    for (const intensity of sampleIntensities) {
+    for (let index = 0; index < contactColorLutSize; index += 1) {
+      const intensity = index / (contactColorLutSize - 1);
       expect(contactColorFromLut(reds, "Reds", intensity)).toEqual(
         contactColorAt("Reds", intensity, 0.2),
       );
@@ -88,15 +88,11 @@ describe("contactColorLut", () => {
     }
   });
 
-  it("matches existing CSS colors exactly for Reds and within one alpha byte for palettes", () => {
-    const cssFromLut = (lut: Uint8ClampedArray, colormap: ContactColormap, intensity: number) => {
-      const color = contactColorFromLut(lut, colormap, intensity);
-      return `rgba(${color.red}, ${color.green}, ${color.blue}, ${color.alpha})`;
-    };
+  it("keeps Reds byte-identical and palette alpha within one byte of direct colors", () => {
     for (const intensity of [0, 0.05, 0.1, 0.5, 0.999, 1]) {
-      expect(cssFromLut(contactColorLut("Reds", 0.88), "Reds", intensity)).toBe(
-        contactColorCss("Reds", intensity, 0.88),
-      );
+      const quantized = contactColorFromLut(contactColorLut("Reds", 0.88), "Reds", intensity);
+      const direct = contactColorAt("Reds", intensity, 0.88);
+      expect(quantized).toEqual(direct);
     }
 
     for (const colormap of colormaps.filter((name) => name !== "Reds")) {
@@ -141,10 +137,10 @@ describe("contactColorLut", () => {
     }
   });
 
-  it("retains existing alpha rules and clamps palette opacity", () => {
+  it("keeps Juicebox Reds opaque and clamps optional palette opacity", () => {
     const reds = contactColorLut("Reds", 0.01);
-    expect(contactColorFromLut(reds, "Reds", 0).alpha).toBe(0);
-    expect(contactColorFromLut(reds, "Reds", 127 / 255).alpha).toBe(127 / 255);
+    expect(contactColorFromLut(reds, "Reds", 0).alpha).toBe(1);
+    expect(contactColorFromLut(reds, "Reds", 127 / 255).alpha).toBe(1);
     expect(contactColorFromLut(reds, "Reds", 1).alpha).toBe(1);
 
     for (const colormap of colormaps.filter((name) => name !== "Reds")) {

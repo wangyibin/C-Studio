@@ -25,6 +25,7 @@ import {
 } from "../state/assemblyEditing";
 import type { CoverageView } from "../state/coverageView";
 import type { GfaEvidenceDocument } from "../state/gfa";
+import type { GfaBandageLayoutLoader } from "../state/gfaBandageLayout";
 import type {
   GfaEndpointHiCBatchLoader,
   GfaEndpointHiCLoader,
@@ -72,6 +73,7 @@ interface AppShellProps {
   pafText: string;
   pafImported: boolean;
   gfaDocument: GfaEvidenceDocument | null;
+  onLayoutGfaBandage?: GfaBandageLayoutLoader;
   onLoadGfaEndpointHiC?: GfaEndpointHiCLoader;
   onLoadGfaEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
   gfaHomologPattern: string;
@@ -110,7 +112,7 @@ interface AppShellProps {
 
 export const inspectorPanelMinWidth = 260;
 export const inspectorPanelMaxWidth = 520;
-const inspectorPanelDefaultWidth = 326;
+const inspectorPanelDefaultWidth = 280;
 const inspectorPanelCompactWidth = 276;
 const inspectorPanelKeyboardStep = 16;
 export const gfaPanelMinHeight = 180;
@@ -158,6 +160,7 @@ export function AppShell({
   pafText,
   pafImported,
   gfaDocument,
+  onLayoutGfaBandage,
   onLoadGfaEndpointHiC,
   onLoadGfaEndpointHiCBatch,
   gfaHomologPattern,
@@ -898,6 +901,7 @@ export function AppShell({
                     <div><dt>Switch resolution</dt><dd>{shortcuts.resolutionWheel}</dd></div>
                     <div><dt>Lock resolution</dt><dd>{shortcuts.resolutionLock}</dd></div>
                     <div><dt>Pan diagonally</dt><dd>{shortcuts.diagonalWheel}</dd></div>
+                    <div><dt>Pan vertically</dt><dd>{shortcuts.verticalWheel}</dd></div>
                     <div><dt>Deselect / cancel</dt><dd>Esc</dd></div>
                     <div><dt>Toggle annotations</dt><dd>F2</dd></div>
                     <div><dt>Toggle inspector</dt><dd>F9</dd></div>
@@ -1023,6 +1027,7 @@ export function AppShell({
                 document={gfaDocument}
                 assemblyBlocks={activeAssemblyBlocks}
                 contactMap={overviewContactMap}
+                onLayoutBandage={onLayoutGfaBandage}
                 onLoadEndpointHiC={onLoadGfaEndpointHiC}
                 onLoadEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
                 selectedAssemblyBlockIds={selectedAssemblyBlockIds}

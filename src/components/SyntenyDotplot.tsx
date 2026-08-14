@@ -48,6 +48,8 @@ export interface DotplotBlock {
   targetId: string;
   left: number;
   top: number;
+  targetTop: number;
+  targetHeight: number;
   width: number;
   angle: number;
   strand: string;
@@ -186,6 +188,8 @@ export function SyntenyDotplot({
     assemblyTrack.chromosomeBands.length - 1
   ]?.id;
   const selected = new Set(selectedAssemblyBlockIds);
+  const selectedContigRanges = syntenySelectedContigRanges(assemblyTrack.contigs, selected);
+  const selectedReferenceRanges = syntenySelectedReferenceRanges(layout.blocks, selected);
   const [contextMenu, setContextMenu] = useState<AssemblyContextMenuPosition | null>(null);
   const [selectionDrag, setSelectionDrag] = useState<SyntenySelectionDrag | null>(null);
   const selectionDragRef = useRef<SyntenySelectionDrag | null>(null);
@@ -528,7 +532,6 @@ export function SyntenyDotplot({
       deltaX: horizontalDelta,
       deltaY: 0,
       deltaMode: event.deltaMode,
-      shiftKey: false,
       bounds,
       viewport: syntenyView.viewport,
     });
@@ -598,7 +601,7 @@ export function SyntenyDotplot({
           panDrag?.moved ? "synteny-panning" : ""
         }`}
         aria-label={isInteractive
-          ? "Interactive synteny dotplot; vertical or horizontal wheel movement pans the shared assembly X axis, Command or Control-wheel zooms at the pointer, drag horizontally pans, double-click zooms in, click replaces selection, Shift-drag selects multiple contigs, and Command or Control-click toggles individual contigs"
+          ? "Interactive synteny dotplot; vertical or horizontal wheel movement pans the shared assembly X axis, Command or Control-wheel zooms at the pointer, drag horizontally pans, double-click zooms in, click replaces selection, Shift-drag selects multiple contigs, Shift-click inside that selection clears it, and Command or Control-click toggles individual contigs"
           : "Synteny preview; drag horizontally to pan the shared assembly X region and double-click to open the interactive synteny view"}
         onDoubleClick={zoomSyntenyAtPointer}
         onWheel={handleSyntenyWheel}
@@ -619,6 +622,14 @@ export function SyntenyDotplot({
         <div className="synteny-axis target-axis">Reference</div>
 
         <div className="synteny-query-track" aria-label="Assembly contigs in heatmap X region">
+          {selectedContigRanges.map((range) => (
+            <span
+              className="synteny-contig-selection-range"
+              key={`contig-selection:${range.firstId}:${range.lastId}`}
+              aria-hidden="true"
+              style={{ left: `${range.left}%`, width: `${range.width}%` }}
+            />
+          ))}
           {assemblyTrack.chromosomeBands.map((band) => (
             <span
               className={`synteny-chromosome-band ${
@@ -707,6 +718,19 @@ export function SyntenyDotplot({
             <span>{lane.id}</span>
           </div>
         ))}
+
+        {selectedReferenceRanges.map((range) => (
+            <span
+              className="synteny-contig-reference-shadow"
+              key={`reference-shadow:${range.targetId}`}
+              data-target-id={range.targetId}
+              aria-hidden="true"
+              style={{
+                top: `${range.top}%`,
+                height: `${range.height}%`,
+              }}
+            />
+          ))}
 
         {layout.blocks.map((block) => {
           const shade = Math.max(0.32, Math.min(1, block.mapq / 60));
@@ -868,6 +892,8 @@ export function buildDotplotLayout(
       targetId: block.targetId,
       left: x1,
       top: y1,
+      targetTop: Math.min(y1, y2),
+      targetHeight: Math.abs(y2 - y1),
       width: Math.hypot(deltaX, widthRelativeDeltaY),
       angle: (Math.atan2(widthRelativeDeltaY, deltaX) * 180) / Math.PI,
       strand: block.strand,
@@ -973,6 +999,64 @@ interface AssemblyContigTrackSegment extends AssemblyTrackSegment {
   objectId: string;
   sourceId: string;
   displayName: string;
+}
+
+export function syntenySelectedContigRanges(
+  contigs: AssemblyContigTrackSegment[],
+  selectedIds: ReadonlySet<string>,
+) {
+  const ranges: Array<{
+    firstId: string;
+    lastId: string;
+    left: number;
+    width: number;
+  }> = [];
+  for (let index = 0; index < contigs.length; index += 1) {
+    const contig = contigs[index];
+    if (!selectedIds.has(contig.id)) {
+      continue;
+    }
+    const previousContig = contigs[index - 1];
+    const currentEnd = contig.left + contig.width;
+    const range = ranges[ranges.length - 1];
+    if (range && previousContig && selectedIds.has(previousContig.id)) {
+      range.lastId = contig.id;
+      range.width = Math.max(range.left + range.width, currentEnd) - range.left;
+    } else {
+      ranges.push({
+        firstId: contig.id,
+        lastId: contig.id,
+        left: contig.left,
+        width: contig.width,
+      });
+    }
+  }
+  return ranges;
+}
+
+export function syntenySelectedReferenceRanges(
+  blocks: DotplotBlock[],
+  selectedIds: ReadonlySet<string>,
+) {
+  const ranges = new Map<string, { targetId: string; top: number; bottom: number }>();
+  for (const block of blocks) {
+    if (!selectedIds.has(block.assemblyBlockId)) {
+      continue;
+    }
+    const bottom = block.targetTop + block.targetHeight;
+    const range = ranges.get(block.targetId);
+    if (range) {
+      range.top = Math.min(range.top, block.targetTop);
+      range.bottom = Math.max(range.bottom, bottom);
+    } else {
+      ranges.set(block.targetId, { targetId: block.targetId, top: block.targetTop, bottom });
+    }
+  }
+  return [...ranges.values()].map(({ targetId, top, bottom }) => ({
+    targetId,
+    top,
+    height: bottom - top,
+  }));
 }
 
 export function buildAssemblyTrack(

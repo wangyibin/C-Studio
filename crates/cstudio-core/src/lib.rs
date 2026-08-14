@@ -9,6 +9,7 @@ pub mod copy_model;
 pub mod coverage;
 pub mod coverage_cache;
 pub mod error;
+pub mod gfa_layout;
 pub mod ops;
 pub mod source_contact_cache;
 pub mod synteny;

@@ -185,7 +185,7 @@ describe("InspectorPanel", () => {
     expect(markup).not.toContain("Drag to pan the shared heatmap region");
   });
 
-  it("renders GFA Preview as the third overview tab and uses the shared preview area", () => {
+  it("renders GFA as the third overview tab and uses the shared preview area", () => {
     const uiState = createInitialUiState("ready");
     uiState.activeOverviewMode = "gfa";
 
@@ -231,7 +231,7 @@ describe("InspectorPanel", () => {
 
     expect(markup).toContain("Overview");
     expect(markup).toContain("Synteny");
-    expect(markup).toContain("GFA Preview");
+    expect(markup).toContain(">GFA</button>");
     expect(markup).toContain("inspector-overview gfa-overview-active");
     expect(markup).toContain("gfa-preview-card embedded");
     expect(markup).toContain('class="gfa-preview-title"');
