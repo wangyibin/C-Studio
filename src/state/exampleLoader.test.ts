@@ -43,12 +43,25 @@ describe("loadBrowserExampleBundle", () => {
     ]);
     expect(bundle.dataset).toMatchObject({
       agp_path: "examples/groups.agp",
-      mcool_path: "examples/input.1k.cool",
+      mcool_path: "examples/input.1k_allres.mcool",
       coverage_path: "examples/hifi.asm.bp.p_utg.noseq.depth",
       paf_path: "examples/mono.hifi.asm.bp.p_utg.paf",
       agp_lines: 1_177,
       agp_components: 798,
     });
+    expect(bundle.dataset.available_resolutions).toEqual([
+      2_500_000,
+      2_000_000,
+      1_000_000,
+      500_000,
+      250_000,
+      100_000,
+      50_000,
+      25_000,
+      10_000,
+      5_000,
+      1_000,
+    ]);
     expect(bundle.coverageRecords).toHaveLength(40_633);
     expect(summarizePafText(bundle.pafText)).toMatchObject({
       alignmentCount: 825,

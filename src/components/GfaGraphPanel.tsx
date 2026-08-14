@@ -2,7 +2,6 @@ import { ChevronDown, Maximize2, RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ContactMapView } from "../App";
 import type { ContactMapLayoutBlock } from "../state/importers";
-import { planGfaBlockCreation } from "../state/assemblyEditing";
 import {
   defaultAssemblyScaffoldColor,
   homologScaffoldColor,
@@ -14,7 +13,6 @@ import {
   type GfaEvidenceDocument,
   type GfaGraphEdge,
   type GfaGraphNode,
-  type GfaLinkEvidence,
   type GfaSegmentSide,
 } from "../state/gfa";
 import {
@@ -58,6 +56,11 @@ import {
   type GfaEndpointHiCLink,
   type GfaEndpointHiCResultEntry,
 } from "../state/gfaEndpointHiCLinks";
+import type { UiAction, UiState } from "../state/uiState";
+import {
+  AssemblyContextMenu,
+  type AssemblyContextMenuPosition,
+} from "./AssemblyContextMenu";
 
 interface GfaPreviewCardProps {
   document: GfaEvidenceDocument;
@@ -81,16 +84,9 @@ interface GfaGraphPanelProps {
   onRestoreHeatmap?: () => void;
   onClose: () => void;
   onSelectOccurrences: (ids: string[]) => void;
-  onSelectExactOccurrences?: (ids: string[]) => void;
-  onEditAssembly: (action: GfaAssemblyEditAction) => void;
+  uiState: UiState;
+  onUiAction: (action: UiAction) => void;
 }
-
-export type GfaAssemblyEditAction =
-  | { type: "reverseAssemblySelection" }
-  | { type: "moveAssemblySelectionBefore"; targetBlockId: string | null; targetObjectId?: string }
-  | { type: "deleteAssemblySelection" }
-  | { type: "createAssemblyBlockFromGfa"; links: GfaLinkEvidence[] }
-  | { type: "dissolveAssemblyBlockSelection" };
 
 interface LayoutNode extends GfaGraphNode {
   x: number;
@@ -120,12 +116,6 @@ export interface GfaBandagePathSnapshot {
 
 type BandageInteractionMode = "move" | "reshape";
 type CurationAssistantView = "queue" | "evidence";
-type GfaEditProposal =
-  | { kind: "reverse"; title: string; detail: string }
-  | { kind: "insert"; title: string; detail: string; targetBlockId: string; targetObjectId: string }
-  | { kind: "delete"; title: string; detail: string }
-  | { kind: "create-block"; title: string; detail: string }
-  | { kind: "dissolve-block"; title: string; detail: string };
 
 interface SelectedEndpointHiCPair {
   key: string;
@@ -200,6 +190,59 @@ export const defaultGfaReviewOpen = false;
 
 export function gfaEndpointHiCRequestBatchSize(batchLoaderConnected: boolean) {
   return batchLoaderConnected ? 32 : 1;
+}
+
+/** Resolve visibility shared by GFA and endpoint-contact links. */
+export function gfaRelationLinkVisible(
+  source: Pick<GfaGraphNode, "groupId">,
+  target: Pick<GfaGraphNode, "groupId">,
+  homologs: GfaHomologClassification,
+  anchoredScaffoldIds: ReadonlySet<string>,
+  showHomologLinks: boolean,
+  showNonHomologLinks: boolean,
+  showAnchorUnanchorLinks: boolean,
+) {
+  const sourceAnchored = anchoredScaffoldIds.has(source.groupId);
+  const targetAnchored = anchoredScaffoldIds.has(target.groupId);
+  if (sourceAnchored !== targetAnchored) {
+    return showAnchorUnanchorLinks;
+  }
+  if (!sourceAnchored) {
+    return true;
+  }
+  const scope = gfaLinkScope(source.groupId, target.groupId, homologs);
+  return scope === "within-scaffold"
+    || (scope === "homolog" ? showHomologLinks : showNonHomologLinks);
+}
+
+/** Apply the shared relation visibility rules to endpoint 3D contacts. */
+export function gfaEndpointHiCLinksForRelationVisibility<
+  T extends Pick<GfaEndpointHiCLink, "source" | "target">,
+>(
+  links: ReadonlyArray<T>,
+  nodesById: ReadonlyMap<string, Pick<GfaGraphNode, "groupId">>,
+  homologs: GfaHomologClassification,
+  showHomologLinks: boolean,
+  showNonHomologLinks: boolean,
+  showAnchorUnanchorLinks: boolean,
+): T[] {
+  const anchoredScaffoldIds = homologScaffoldIds(homologs);
+  return links.filter((link) => {
+    const source = nodesById.get(link.source);
+    const target = nodesById.get(link.target);
+    if (!source || !target) {
+      return false;
+    }
+    return gfaRelationLinkVisible(
+      source,
+      target,
+      homologs,
+      anchoredScaffoldIds,
+      showHomologLinks,
+      showNonHomologLinks,
+      showAnchorUnanchorLinks,
+    );
+  });
 }
 
 function waitForGfaInteractionIdle(isInteracting: () => boolean) {
@@ -447,6 +490,18 @@ export function gfaNodeMatchesAssemblySelection(
     || Boolean(node.assemblyBlockId && selectedIds.has(node.assemblyBlockId));
 }
 
+/** Right-clicking an unselected assembly node focuses it before opening the shared menu. */
+export function gfaContextMenuSelectionIntent(
+  node: Pick<GfaGraphNode, "id" | "occurrenceId" | "assemblyBlockId"> | null,
+  selectedIds: ReadonlySet<string>,
+) {
+  if (!node || gfaNodeMatchesAssemblySelection(node, selectedIds)) {
+    return null;
+  }
+  const unitId = gfaAssemblyUnitId(node);
+  return unitId ? [unitId] : null;
+}
+
 /** Return assembly units whose node rectangles intersect a graph-space box. */
 export function gfaAssemblyUnitIdsInSelection(
   nodes: ReadonlyArray<{
@@ -680,8 +735,8 @@ export function GfaGraphPanel({
   onRestoreHeatmap,
   onClose,
   onSelectOccurrences,
-  onSelectExactOccurrences = onSelectOccurrences,
-  onEditAssembly,
+  uiState,
+  onUiAction,
 }: GfaGraphPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const nodesRef = useRef<LayoutNode[]>([]);
@@ -703,9 +758,9 @@ export function GfaGraphPanel({
   const [hiCLinkLimit, setHiCLinkLimit] = useState(defaultGfaEndpointHiCLinkLimit);
   const [showHomologLinks, setShowHomologLinks] = useState(true);
   const [showNonHomologLinks, setShowNonHomologLinks] = useState(true);
+  const [showAnchorUnanchorLinks, setShowAnchorUnanchorLinks] = useState(true);
   const [toolbarDetailsOpen, setToolbarDetailsOpen] = useState(false);
-  const [pendingEditProposal, setPendingEditProposal] = useState<GfaEditProposal | null>(null);
-  const [pickingInsertTarget, setPickingInsertTarget] = useState(false);
+  const [contextMenu, setContextMenu] = useState<AssemblyContextMenuPosition | null>(null);
   const [curationAssistantOpen, setCurationAssistantOpen] = useState(defaultGfaReviewOpen);
   const [curationAssistantView, setCurationAssistantView] = useState<CurationAssistantView>("queue");
   const [selectedCurationIssueId, setSelectedCurationIssueId] = useState<string | null>(null);
@@ -718,19 +773,23 @@ export function GfaGraphPanel({
     result: null,
   });
   useEffect(() => {
-    if (!pickingInsertTarget && !pendingEditProposal) {
+    if (!contextMenu) {
       return;
     }
-    const cancelPendingEdit = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") {
-        return;
+    const closeContextMenu = () => setContextMenu(null);
+    const closeContextMenuOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeContextMenu();
       }
-      setPickingInsertTarget(false);
-      setPendingEditProposal(null);
     };
-    window.addEventListener("keydown", cancelPendingEdit);
-    return () => window.removeEventListener("keydown", cancelPendingEdit);
-  }, [pendingEditProposal, pickingInsertTarget]);
+    window.addEventListener("click", closeContextMenu);
+    window.addEventListener("keydown", closeContextMenuOnEscape, true);
+    return () => {
+      window.removeEventListener("click", closeContextMenu);
+      window.removeEventListener("keydown", closeContextMenuOnEscape, true);
+    };
+  }, [contextMenu]);
   const [endpointHiCOverlayRequest, setEndpointHiCOverlayRequest] = useState<EndpointHiCOverlayRequestState>({
     key: "",
     loading: false,
@@ -823,6 +882,10 @@ export function GfaGraphPanel({
   const homologs = useMemo(
     () => classifyGfaScaffolds(graph.groupOrder, homologPattern),
     [graph.groupOrder, homologPattern],
+  );
+  const anchoredScaffoldIds = useMemo(
+    () => homologScaffoldIds(homologs),
+    [homologs],
   );
   const visibleGraphWithGfaOnlyNodes = useMemo(
     () => graphForVisibleHomologScaffolds(
@@ -919,30 +982,6 @@ export function GfaGraphPanel({
     () => new Map(assemblyBlocks.map((block) => [block.id, block])),
     [assemblyBlocks],
   );
-  const selectedPlacedBlocks = useMemo(() => {
-    const ids = new Set(selectedAssemblyBlockIds);
-    return assemblyBlocks.filter((block) => ids.has(block.id));
-  }, [assemblyBlocks, selectedAssemblyBlockIds]);
-  const selectedBlockPlan = useMemo(() => planGfaBlockCreation(
-    assemblyBlocks,
-    selectedAssemblyBlockIds.length > 0
-      ? { kind: "contigs", ids: selectedAssemblyBlockIds, exact: true }
-      : null,
-    document.links,
-  ), [assemblyBlocks, document.links, selectedAssemblyBlockIds]);
-  const selectedCompositeBlockCount = useMemo(() => new Set(
-    selectedPlacedBlocks.flatMap((block) => block.assemblyBlockId ? [block.assemblyBlockId] : []),
-  ).size, [selectedPlacedBlocks]);
-  const editSelectionKey = [...selectedAssemblyBlockIds].sort().join("\u0000");
-  const previousEditSelectionKeyRef = useRef(editSelectionKey);
-  useEffect(() => {
-    if (previousEditSelectionKeyRef.current === editSelectionKey) {
-      return;
-    }
-    previousEditSelectionKeyRef.current = editSelectionKey;
-    setPendingEditProposal(null);
-    setPickingInsertTarget(false);
-  }, [editSelectionKey]);
   const endpointHiCCandidateRequests = useMemo<EndpointHiCCandidateRequest[]>(
     () => endpointHiCCandidates.flatMap((candidate) => {
       const sourceBlock = assemblyBlocksById.get(candidate.link.source);
@@ -982,19 +1021,31 @@ export function GfaGraphPanel({
   );
   const visibleEndpointHiCLinks = useMemo(
     () => showHiCLinks && endpointHiCOverlayRequest.key === endpointHiCOverlayKey
-      ? buildRankedGfaEndpointHiCLinks(
-        endpointHiCOverlayRequest.entries,
-        assemblyBlocks,
-        hiCLinkLimit,
+      ? gfaEndpointHiCLinksForRelationVisibility(
+        buildRankedGfaEndpointHiCLinks(
+          endpointHiCOverlayRequest.entries,
+          assemblyBlocks,
+          hiCLinkLimit,
+        ),
+        activeNodesById,
+        homologs,
+        showHomologLinks,
+        showNonHomologLinks,
+        showAnchorUnanchorLinks,
       )
       : [],
     [
+      activeNodesById,
       assemblyBlocks,
       endpointHiCOverlayKey,
       endpointHiCOverlayRequest.entries,
       endpointHiCOverlayRequest.key,
       hiCLinkLimit,
+      homologs,
+      showAnchorUnanchorLinks,
+      showHomologLinks,
       showHiCLinks,
+      showNonHomologLinks,
     ],
   );
   const curationIssues = useMemo(
@@ -1073,9 +1124,15 @@ export function GfaGraphPanel({
     if (!source || !target) {
       return false;
     }
-    const scope = gfaLinkScope(source.groupId, target.groupId, homologs);
-    return scope === "within-scaffold"
-      || (scope === "homolog" ? showHomologLinks : showNonHomologLinks);
+    return gfaRelationLinkVisible(
+      source,
+      target,
+      homologs,
+      anchoredScaffoldIds,
+      showHomologLinks,
+      showNonHomologLinks,
+      showAnchorUnanchorLinks,
+    );
   }).length + visibleEndpointHiCLinks.length;
 
   useEffect(() => {
@@ -1296,23 +1353,23 @@ export function GfaGraphPanel({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (canvas) {
-      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
+      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
     }
-  }, [homologs, selectedAssemblyBlockIds, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks]);
+  }, [homologs, selectedAssemblyBlockIds, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) {
       return;
     }
-    const draw = () => drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
+    const draw = () => drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
     draw();
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
     return () => {
       observer.disconnect();
     };
-  }, [graph, homologs, layoutMode, layoutRevision, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks]);
+  }, [graph, homologs, layoutMode, layoutRevision, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks]);
 
   function switchLayoutMode(mode: GfaLayoutMode) {
     if (mode === layoutMode) {
@@ -1381,38 +1438,28 @@ export function GfaGraphPanel({
     setCurationAssistantView("evidence");
   }
 
-  function proposeEdit(proposal: GfaEditProposal) {
-    setPickingInsertTarget(false);
-    setPendingEditProposal(proposal);
-  }
-
-  function confirmEditProposal() {
-    const proposal = pendingEditProposal;
-    if (!proposal) {
-      return;
+  function openContextMenu(event: React.MouseEvent<HTMLCanvasElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const point = graphPointFromPointer(
+      event.currentTarget,
+      event.clientX,
+      event.clientY,
+      viewRef.current,
+    );
+    const node = nodeAtPoint(nodesRef.current, point.x, point.y);
+    const selectionIntent = gfaContextMenuSelectionIntent(node, selectedIdsRef.current);
+    if (selectionIntent) {
+      onSelectOccurrences(selectionIntent);
     }
-    if (proposal.kind === "reverse") {
-      onEditAssembly({ type: "reverseAssemblySelection" });
-    } else if (proposal.kind === "insert") {
-      onEditAssembly({
-        type: "moveAssemblySelectionBefore",
-        targetBlockId: proposal.targetBlockId,
-        targetObjectId: proposal.targetObjectId,
-      });
-    } else if (proposal.kind === "delete") {
-      onEditAssembly({ type: "deleteAssemblySelection" });
-    } else if (proposal.kind === "create-block") {
-      onEditAssembly({ type: "createAssemblyBlockFromGfa", links: document.links });
-    } else {
-      onEditAssembly({ type: "dissolveAssemblyBlockSelection" });
-    }
-    setPendingEditProposal(null);
+    setContextMenu({ x: event.clientX, y: event.clientY });
   }
 
   function pointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
     if (event.button !== 0) {
       return;
     }
+    setContextMenu(null);
     event.preventDefault();
     const canvas = event.currentTarget;
     const point = graphPointFromPointer(canvas, event.clientX, event.clientY, viewRef.current);
@@ -1460,7 +1507,7 @@ export function GfaGraphPanel({
         currentY: point.y,
       };
       canvas.classList.add("gfa-selecting");
-      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
+      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
     }
     canvas.setPointerCapture(event.pointerId);
   }
@@ -1479,13 +1526,13 @@ export function GfaGraphPanel({
         selectionBoxRef.current.currentX = point.x;
         selectionBoxRef.current.currentY = point.y;
       }
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
       return;
     }
     if (interaction.kind === "pan") {
       viewRef.current.x = interaction.startViewX + deltaX;
       viewRef.current.y = interaction.startViewY + deltaY;
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
       return;
     }
     if (
@@ -1514,7 +1561,7 @@ export function GfaGraphPanel({
             updateNodeCenterFromPath(node);
           }
         }
-        drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+        drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
         return;
       }
       const startsById = new Map(interaction.draggedNodes.map((node) => [node.id, node]));
@@ -1529,7 +1576,7 @@ export function GfaGraphPanel({
           }));
         }
       }
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
     }
   }
 
@@ -1562,7 +1609,7 @@ export function GfaGraphPanel({
           onSelectOccurrences(chromosomeSelection);
           selectionBoxRef.current = null;
           event.currentTarget.classList.remove("gfa-selecting");
-          drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+          drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
           interactionRef.current = null;
           event.currentTarget.releasePointerCapture(event.pointerId);
           return;
@@ -1578,28 +1625,11 @@ export function GfaGraphPanel({
       }
       selectionBoxRef.current = null;
       event.currentTarget.classList.remove("gfa-selecting");
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
     } else if ((interaction.kind === "node" || interaction.kind === "reshape") && interaction.nodeId) {
       const node = nodesRef.current.find((candidate) => candidate.id === interaction.nodeId);
       const unitId = node ? gfaAssemblyUnitId(node) : null;
       if (!interaction.moved && unitId) {
-        if (pickingInsertTarget && node?.occurrenceId) {
-          const target = assemblyBlocksById.get(node.occurrenceId);
-          if (target && !selectedIdsRef.current.has(target.id)) {
-            proposeEdit({
-              kind: "insert",
-              title: `Insert before ${target.displayName?.trim() || target.sourceId}`,
-              detail: `Move ${selectedPlacedBlocks.length} selected utg${selectedPlacedBlocks.length === 1 ? "" : "s"} into ${target.objectId}. Existing GFA overlaps remain evidence until Create block is explicitly confirmed.`,
-              targetBlockId: target.id,
-              targetObjectId: target.objectId,
-            });
-          }
-          interactionRef.current = null;
-          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-            event.currentTarget.releasePointerCapture(event.pointerId);
-          }
-          return;
-        }
         onSelectOccurrences([unitId]);
         showEvidenceForNode(node!.id);
       }
@@ -1643,7 +1673,7 @@ export function GfaGraphPanel({
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-    drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+    drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
   }
 
   function zoom(event: React.WheelEvent<HTMLCanvasElement>) {
@@ -1659,7 +1689,7 @@ export function GfaGraphPanel({
     viewRef.current.scale = nextScale;
     viewRef.current.x = pointerX - graphX * nextScale;
     viewRef.current.y = pointerY - graphY * nextScale;
-    drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+    drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpGaps, visibleEndpointHiCLinks);
   }
 
   return (
@@ -1737,13 +1767,6 @@ export function GfaGraphPanel({
                 title="Show or hide all unitig links imported from the GFA"
                 onClick={() => setShowGfaLinks((visible) => !visible)}
               >GFA</button>
-              <button
-                type="button"
-                aria-label="Toggle AGP gap links"
-                aria-pressed={showAgpGaps}
-                title="Show or hide AGP gap and adjacency junction lines"
-                onClick={() => setShowAgpGaps((visible) => !visible)}
-              >AGP gaps</button>
             </div>
             <div
               className={`gfa-contact-layer-control${showHiCLinks ? " active" : ""}`}
@@ -1845,26 +1868,43 @@ export function GfaGraphPanel({
               onClick={toggleDisconnectedNodes}
             >Disconnected</button>
           </div>
-          <div className="gfa-toolbar-link-filters" role="group" aria-label="GFA link visibility">
+          <div className="gfa-toolbar-link-filters" role="group" aria-label="GFA and 3D contact link visibility">
             <span className="gfa-toolbar-section-label">Show links</span>
             <button
               type="button"
               className="gfa-link-toggle"
-              aria-label="Toggle links between homologous chromosomes"
+              aria-label="Toggle AGP gap links"
+              aria-pressed={showAgpGaps}
+              title="Show or hide AGP gap and adjacency junction lines"
+              onClick={() => setShowAgpGaps((visible) => !visible)}
+            >AGP gaps</button>
+            <button
+              type="button"
+              className="gfa-link-toggle"
+              aria-label="Toggle GFA and 3D contact links between homologous chromosomes"
               aria-pressed={showHomologLinks}
-              disabled={!showGfaLinks}
-              title="Show or hide GFA links between homologous chromosome members"
+              disabled={!showGfaLinks && !showHiCLinks}
+              title="Show or hide GFA and 3D contact links between homologous chromosome members"
               onClick={() => setShowHomologLinks((visible) => !visible)}
             >Homolog</button>
             <button
               type="button"
               className="gfa-link-toggle"
-              aria-label="Toggle links between non-homologous chromosomes"
+              aria-label="Toggle GFA and 3D contact links between non-homologous chromosomes"
               aria-pressed={showNonHomologLinks}
-              disabled={!showGfaLinks}
-              title="Show or hide GFA links between non-homologous chromosomes and unplaced unitigs"
+              disabled={!showGfaLinks && !showHiCLinks}
+              title="Show or hide GFA and 3D contact links between anchored chromosomes outside the same homolog group"
               onClick={() => setShowNonHomologLinks((visible) => !visible)}
             >Non-homolog</button>
+            <button
+              type="button"
+              className="gfa-link-toggle"
+              aria-label="Toggle GFA and 3D contact links between anchor and unanchor contigs"
+              aria-pressed={showAnchorUnanchorLinks}
+              disabled={!showGfaLinks && !showHiCLinks}
+              title="Show or hide GFA and 3D contact links with one anchored endpoint and one unanchored endpoint"
+              onClick={() => setShowAnchorUnanchorLinks((visible) => !visible)}
+            >Anchor–unanchor</button>
           </div>
           <div className="gfa-toolbar-legend" aria-label="GFA graph line legend">
             <span className="gfa-toolbar-section-label">Lines</span>
@@ -1876,95 +1916,30 @@ export function GfaGraphPanel({
           </div>
         </div> : null}
       </header>
-      {selectedPlacedBlocks.length > 0 ? (
-        <div className="gfa-edit-dock" aria-label="Selected GFA assembly operations">
-          <div className="gfa-edit-actions">
-            <span className="gfa-edit-selection-count">
-              <strong>{selectedPlacedBlocks.length}</strong> utg{selectedPlacedBlocks.length === 1 ? "" : "s"} selected
-            </span>
-            <button
-              type="button"
-              onClick={() => proposeEdit({
-                kind: "reverse",
-                title: selectedPlacedBlocks.length === 1 ? "Flip selected utg" : "Reverse selected block order and orientation",
-                detail: `Reverse ${selectedPlacedBlocks.length} selected utg${selectedPlacedBlocks.length === 1 ? "" : "s"}; source sequence is not modified.`,
-              })}
-            >Flip</button>
-            <button
-              type="button"
-              className={pickingInsertTarget ? "active" : undefined}
-              aria-pressed={pickingInsertTarget}
-              onClick={() => {
-                setPendingEditProposal(null);
-                setPickingInsertTarget((picking) => !picking);
-              }}
-            >Insert…</button>
-            <button
-              type="button"
-              disabled={!selectedBlockPlan.ok}
-              title={selectedBlockPlan.ok ? "Preview one overlap-aware block" : selectedBlockPlan.reason}
-              onClick={() => {
-                if (!selectedBlockPlan.ok) {
-                  return;
-                }
-                const trimmedBases = selectedBlockPlan.joins.reduce((sum, join) => sum + join.trimRightBases, 0);
-                const supportedJoins = selectedBlockPlan.joins.filter((join) => join.linkId).length;
-                proposeEdit({
-                  kind: "create-block",
-                  title: `Create one block from ${selectedBlockPlan.selectedBlockIds.length} utgs`,
-                  detail: `${supportedJoins}/${selectedBlockPlan.joins.length} junctions have uniquely oriented GFA L evidence; ${trimmedBases.toLocaleString()} overlapping bp will be trimmed once from right-hand source intervals.`,
-                });
-              }}
-            >Create block</button>
-            <button
-              type="button"
-              disabled={selectedCompositeBlockCount === 0}
-              title={selectedCompositeBlockCount === 0 ? "Select a composite block first" : "Preview splitting selected blocks into singleton utgs"}
-              onClick={() => proposeEdit({
-                kind: "dissolve-block",
-                title: `Dissolve ${selectedCompositeBlockCount} block${selectedCompositeBlockCount === 1 ? "" : "s"}`,
-                detail: "Restore any GFA-trimmed source interval and add explicit 100 bp unknown AGP gaps between the resulting singleton utgs.",
-              })}
-            >Dissolve block</button>
-            <button
-              type="button"
-              className="danger"
-              onClick={() => proposeEdit({
-                kind: "delete",
-                title: `Delete ${selectedPlacedBlocks.length} utg${selectedPlacedBlocks.length === 1 ? "" : "s"}`,
-                detail: "Remove these placements from the edited assembly. The original GFA and source sequence remain unchanged, and the operation can be undone from History.",
-              })}
-            >Delete</button>
-          </div>
-          {pickingInsertTarget ? (
-            <p className="gfa-edit-guidance">Click an unselected target utg to preview insertion immediately before it. Esc or Insert… cancels.</p>
-          ) : null}
-          {pendingEditProposal ? (
-            <div className="gfa-edit-preview" role="dialog" aria-label="GFA operation preview">
-              <span><strong>Preview · {pendingEditProposal.title}</strong><small>{pendingEditProposal.detail}</small></span>
-              <button type="button" onClick={() => setPendingEditProposal(null)}>Cancel</button>
-              <button
-                type="button"
-                className={pendingEditProposal.kind === "delete" ? "danger confirm" : "confirm"}
-                onClick={confirmEditProposal}
-              >Confirm</button>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
       <div className={`gfa-canvas-frame${curationAssistantOpen ? " with-curation-assistant" : ""}`}>
         <canvas
           ref={canvasRef}
           className={`gfa-graph-canvas${layoutMode === "bandage" && bandageInteractionMode === "reshape" ? " gfa-reshaping" : ""}`}
           aria-label={layoutMode === "bandage" && bandageInteractionMode === "reshape"
-            ? "Interactive Bandage graph in Reshape mode; drag a unitig locally to bend its block, Shift-drag to select multiple blocks, drag empty space to pan, and scroll to zoom"
-            : "Interactive GFA curation graph; drag a unitig to move its whole block, Shift-drag to select multiple blocks, drag empty space to pan, and scroll to zoom"}
+            ? "Interactive Bandage graph in Reshape mode; drag a unitig locally to bend its block, Shift-drag to select multiple blocks, right-click for assembly operations, drag empty space to pan, and scroll to zoom"
+            : "Interactive GFA curation graph; drag a unitig to move its whole block, Shift-drag to select multiple blocks, right-click for assembly operations, drag empty space to pan, and scroll to zoom"}
+          aria-haspopup="menu"
           onPointerDown={pointerDown}
           onPointerMove={pointerMove}
           onPointerUp={pointerUp}
           onPointerCancel={pointerCancel}
           onWheel={zoom}
+          onContextMenu={openContextMenu}
         />
+        {contextMenu ? (
+          <AssemblyContextMenu
+            position={contextMenu}
+            uiState={uiState}
+            onUiAction={onUiAction}
+            onClose={() => setContextMenu(null)}
+            fixed
+          />
+        ) : null}
         {curationAssistantOpen ? (
           <GfaCurationAssistant
             issues={curationIssues}
@@ -2672,6 +2647,7 @@ function drawCurrentGraph(
   showGfaLinks: boolean,
   showHomologLinks: boolean,
   showNonHomologLinks: boolean,
+  showAnchorUnanchorLinks: boolean,
   showAgpGaps: boolean,
   hiCLinks: ReadonlyArray<GfaEndpointHiCLink>,
   selectionBox: GfaSelectionBox | null = null,
@@ -2692,6 +2668,7 @@ function drawCurrentGraph(
     showGfaLinks,
     showHomologLinks,
     showNonHomologLinks,
+    showAnchorUnanchorLinks,
     showAgpGaps,
     hiCLinks,
     selectionBox,
@@ -2800,6 +2777,7 @@ function drawInteractiveGraph(
   showGfaLinks: boolean,
   showHomologLinks: boolean,
   showNonHomologLinks: boolean,
+  showAnchorUnanchorLinks: boolean,
   showAgpGaps: boolean,
   hiCLinks: ReadonlyArray<GfaEndpointHiCLink>,
   selectionBox: GfaSelectionBox | null,
@@ -2820,6 +2798,7 @@ function drawInteractiveGraph(
   context.translate(view.x, view.y);
   context.scale(view.scale, view.scale);
   const byId = new Map(nodes.map((node) => [node.id, node]));
+  const anchoredScaffoldIds = homologScaffoldIds(homologs);
   const agpGapPairs = new Set(
     graph.edges
       .filter((edge) => edge.kind === "agp-gap")
@@ -2833,16 +2812,20 @@ function drawInteractiveGraph(
   for (const edge of graph.edges) {
     const source = byId.get(edge.source);
     const target = byId.get(edge.target);
-    const scope = source && target && edge.kind === "gfa-link"
-      ? gfaLinkScope(source.groupId, target.groupId, homologs)
-      : "within-scaffold";
     const visible = edge.kind === "agp-gap"
       ? showAgpGaps
       : edge.kind !== "gfa-link" || (
         showGfaLinks
-        && (
-          scope === "within-scaffold"
-          || (scope === "homolog" ? showHomologLinks : showNonHomologLinks)
+        && source
+        && target
+        && gfaRelationLinkVisible(
+          source,
+          target,
+          homologs,
+          anchoredScaffoldIds,
+          showHomologLinks,
+          showNonHomologLinks,
+          showAnchorUnanchorLinks,
         )
       );
     if (source && target && visible) {
@@ -3034,6 +3017,7 @@ export function benchmarkGfaCanvasRender(
     view,
     new Set<string>(),
     homologs,
+    true,
     true,
     true,
     true,

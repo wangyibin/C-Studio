@@ -489,6 +489,10 @@ export function AppShell({
         addDataMenuRef.current?.querySelector<HTMLElement>("summary")?.focus();
         return;
       }
+      if (intent === "toggle-resolution-lock") {
+        onUiAction({ type: "toggleContactResolutionLock" });
+        return;
+      }
 
       const { showChromosomeBoxes, showBlockBoxes, showContigBoxes } = uiState.assembly;
       if (showChromosomeBoxes || showBlockBoxes || showContigBoxes) {
@@ -892,6 +896,7 @@ export function AppShell({
                     <div><dt>Delete gap / join</dt><dd>{shortcuts.deleteGap}</dd></div>
                     <div><dt>Delete contig</dt><dd>{shortcuts.deleteContig}</dd></div>
                     <div><dt>Switch resolution</dt><dd>{shortcuts.resolutionWheel}</dd></div>
+                    <div><dt>Lock resolution</dt><dd>{shortcuts.resolutionLock}</dd></div>
                     <div><dt>Pan diagonally</dt><dd>{shortcuts.diagonalWheel}</dd></div>
                     <div><dt>Deselect / cancel</dt><dd>Esc</dd></div>
                     <div><dt>Toggle annotations</dt><dd>F2</dd></div>
@@ -1037,11 +1042,8 @@ export function AppShell({
                   type: "selectAssemblyContigs",
                   ids,
                 })}
-                onSelectExactOccurrences={(ids) => onUiAction({
-                  type: "selectAssemblyOccurrences",
-                  ids,
-                })}
-                onEditAssembly={(action) => onUiAction(action)}
+                uiState={uiState}
+                onUiAction={onUiAction}
               />
             </>
           ) : null}

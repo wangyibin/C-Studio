@@ -223,6 +223,28 @@ export function contactResolutionWheelIntent({
     : resolutionOptions[nextIndex] ?? null;
 }
 
+export function lockedContactResolutionWheelZoomIntent(
+  deltaX: number,
+  deltaY: number,
+  clientX: number,
+  clientY: number,
+  bounds: Pick<DOMRect, "left" | "top" | "width" | "height">,
+  totalSpanMb: number,
+): UiAction | null {
+  const wheelDelta = Math.abs(deltaY) >= Math.abs(deltaX) ? deltaY : deltaX;
+  if (!Number.isFinite(wheelDelta) || wheelDelta === 0) return null;
+  const focusRatioX = bounds.width > 0 ? clamp01((clientX - bounds.left) / bounds.width) : 0.5;
+  const focusRatioY = bounds.height > 0 ? clamp01((clientY - bounds.top) / bounds.height) : 0.5;
+  return {
+    type: "zoomContactViewport",
+    direction: wheelDelta < 0 ? "in" : "out",
+    focusRatioX,
+    focusRatioY,
+    scaleFactor: Math.min(2, Math.max(0.5, Math.exp(-wheelDelta * 0.002))),
+    totalSpanMb,
+  };
+}
+
 export type AssemblyShiftClickIntent =
   | { type: "clear-selection" }
   | { type: "select-contig"; id: string; additive: boolean }
@@ -800,6 +822,20 @@ export function ContactMapViewport({
           return;
         }
         const latestUiState = latestUiStateRef.current;
+        if (latestUiState.contact.resolutionLocked) {
+          const bounds = canvasFrameRef.current?.getBoundingClientRect()
+            ?? stage!.getBoundingClientRect();
+          const zoomAction = lockedContactResolutionWheelZoomIntent(
+            event.deltaX,
+            event.deltaY,
+            event.clientX,
+            event.clientY,
+            bounds,
+            totalSpanMb,
+          );
+          if (zoomAction) onUiAction(zoomAction);
+          return;
+        }
         const viewportResolutionOptions = availableContactResolutions(
           latestUiState.contact,
           totalSpanMb,

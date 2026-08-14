@@ -2631,7 +2631,7 @@ export function App() {
       setPafImported(Boolean(importedDataset.paf_path));
       setGfaDocument(parseGfaText(gfaText, "hifi.asm.bp.p_utg.noseq.gfa"));
       dispatchUi({ type: "setAssemblyBlocks", blocks: importedDataset.agp_layout.blocks });
-      dispatchUi({ type: "setOverviewMode", mode: "gfa" });
+      dispatchUi({ type: "setOverviewMode", mode: "overview" });
       dispatchUi({
         type: "fitContactViewport",
         totalSpanMb: importedDataset.agp_layout.totalSpan / 1_000_000,
@@ -2659,7 +2659,7 @@ export function App() {
       setPafImported(true);
       setGfaDocument(example.gfaDocument);
       dispatchUi({ type: "setAssemblyBlocks", blocks: example.dataset.agp_layout.blocks });
-      dispatchUi({ type: "setOverviewMode", mode: "gfa" });
+      dispatchUi({ type: "setOverviewMode", mode: "overview" });
       dispatchUi({
         type: "fitContactViewport",
         totalSpanMb: example.dataset.agp_layout.totalSpan / 1_000_000,
@@ -2713,7 +2713,7 @@ export function App() {
         throw new Error("no S records found");
       }
       setGfaDocument(document);
-      dispatchUi({ type: "setOverviewMode", mode: "gfa" });
+      dispatchUi({ type: "setOverviewMode", mode: "overview" });
       setStatusMessage(
         `GFA imported: ${file.name} (${document.summary.segmentCount.toLocaleString()} segments)`,
       );
@@ -2795,14 +2795,11 @@ export function App() {
         dispatchUi({ type: "fitContactViewport", totalSpanMb: agpLayout.totalSpan / 1_000_000 });
       }
       setGfaDocument(gfaDocument);
-      if (gfaDocument) {
-        dispatchUi({ type: "setOverviewMode", mode: "gfa" });
-      }
+      dispatchUi({ type: "setOverviewMode", mode: "overview" });
       if (project.paf) {
         setPafPath(project.paf.path);
         setPafText("");
         setPafImported(true);
-        if (!gfaDocument) dispatchUi({ type: "setOverviewMode", mode: "synteny" });
       } else {
         setPafPath(null);
         setPafText("");
@@ -2853,7 +2850,7 @@ export function App() {
       setPafText("");
       setPafImported(true);
       setStatusMessage(`PAF imported: ${selected.name}`);
-      dispatchUi({ type: "setOverviewMode", mode: "synteny" });
+      dispatchUi({ type: "setOverviewMode", mode: "overview" });
       dispatchUi({
         type: "appendLog",
         message: `PAF imported natively: ${selected.name} (${selected.size_bytes.toLocaleString()} bytes)`,
@@ -2873,7 +2870,7 @@ export function App() {
     setStatusMessage(
       `PAF imported: ${file.name} (${summary.alignmentCount.toLocaleString()} alignments)`,
     );
-    dispatchUi({ type: "setOverviewMode", mode: "synteny" });
+    dispatchUi({ type: "setOverviewMode", mode: "overview" });
     dispatchUi({
       type: "appendLog",
       message: `PAF imported: ${file.name}; ${summary.alignmentCount.toLocaleString()} alignments, ${summary.ignoredLines.toLocaleString()} ignored`,
@@ -3399,7 +3396,7 @@ export async function loadBrowserExampleBundle(
   return {
     dataset: buildDatasetSummary({
       agpPath: "examples/groups.agp",
-      mcoolPath: "examples/input.1k.cool",
+      mcoolPath: "examples/input.1k_allres.mcool",
       coolPath: "",
       pafPath: "examples/mono.hifi.asm.bp.p_utg.paf",
       agpLines: summary.lineCount,
@@ -3407,10 +3404,22 @@ export async function loadBrowserExampleBundle(
       agpComponents: summary.componentCount,
       agpGaps: summary.gapCount,
       maxObjectSpan: summary.maxObjectSpan,
-      mcoolSizeBytes: 18_713_472,
+      mcoolSizeBytes: 69_849_053,
       coveragePath: "examples/hifi.asm.bp.p_utg.noseq.depth",
       agpLayout: parseAgpLayout(agpText),
-      availableResolutions: [1_000],
+      availableResolutions: [
+        2_500_000,
+        2_000_000,
+        1_000_000,
+        500_000,
+        250_000,
+        100_000,
+        50_000,
+        25_000,
+        10_000,
+        5_000,
+        1_000,
+      ],
     }),
     coverageRecords: parseBedGraphText(coverageText),
     pafText,

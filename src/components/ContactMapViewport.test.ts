@@ -10,6 +10,7 @@ import {
   ContactMapViewport,
   contactCanvasBackingSizeFromBounds,
   contactResolutionWheelIntent,
+  lockedContactResolutionWheelZoomIntent,
   contactViewportForAxisNavigator,
   contactViewportSizePxFromBounds,
   contactTileOverscanDirectionForViewports,
@@ -111,6 +112,32 @@ describe("contactResolutionWheelIntent", () => {
       currentResolution: "10 kb",
       resolutionOptions,
     })).toBeNull();
+  });
+});
+
+describe("lockedContactResolutionWheelZoomIntent", () => {
+  it("turns a modified wheel into pointer-anchored viewport zoom without a resolution action", () => {
+    expect(lockedContactResolutionWheelZoomIntent(
+      0,
+      -100,
+      300,
+      75,
+      { left: 100, top: 25, width: 400, height: 200 },
+      500,
+    )).toEqual({
+      type: "zoomContactViewport",
+      direction: "in",
+      focusRatioX: 0.5,
+      focusRatioY: 0.25,
+      scaleFactor: Math.exp(0.2),
+      totalSpanMb: 500,
+    });
+  });
+
+  it("ignores a zero wheel gesture", () => {
+    expect(lockedContactResolutionWheelZoomIntent(
+      0, 0, 0, 0, { left: 0, top: 0, width: 100, height: 100 }, 500,
+    )).toBeNull();
   });
 });
 

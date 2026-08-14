@@ -2,6 +2,7 @@ export type JuiceboxShortcutIntent =
   | "save"
   | "undo"
   | "redo"
+  | "toggle-resolution-lock"
   | "toggle-annotations"
   | "toggle-inspector"
   | "open-file-menu";
@@ -57,6 +58,8 @@ export function juiceboxShortcutIntent({
   }
 
   switch (key.toUpperCase()) {
+    case "L":
+      return "toggle-resolution-lock";
     case "F2":
       return "toggle-annotations";
     case "F9":

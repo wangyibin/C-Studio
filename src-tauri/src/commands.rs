@@ -1304,7 +1304,7 @@ pub fn load_example_dataset() -> Result<ExampleDatasetSummary, String> {
     let agp_path = root.join("examples/groups.agp");
     let coverage_path = root.join("examples/hifi.asm.bp.p_utg.noseq.depth");
     let paf_path = root.join("examples/mono.hifi.asm.bp.p_utg.paf");
-    let contact_path = root.join("examples/input.1k.cool");
+    let contact_path = root.join("examples/input.1k_allres.mcool");
     let agp_text = fs::read_to_string(&agp_path).map_err(|error| error.to_string())?;
     let agp_summary =
         cstudio_core::agp::AgpSummary::parse(&agp_text).map_err(|error| error.to_string())?;
@@ -1316,7 +1316,7 @@ pub fn load_example_dataset() -> Result<ExampleDatasetSummary, String> {
     let contact_name = contact_path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("input.1k.cool");
+        .unwrap_or("input.1k_allres.mcool");
 
     Ok(ExampleDatasetSummary {
         agp_path: "examples/groups.agp".to_string(),
@@ -3876,6 +3876,19 @@ fn imported_text_file(path: &Path) -> Result<ImportedProjectTextFile, String> {
     })
 }
 
+fn sort_project_contact_candidates(candidates: &mut [PathBuf]) {
+    candidates.sort_by_key(|path| {
+        (
+            if has_plain_suffix(path, &["mcool"]) {
+                0
+            } else {
+                1
+            },
+            lowercase_data_suffix(path),
+        )
+    });
+}
+
 fn scan_project_directory(directory: &Path) -> Result<ImportedProjectDirectory, String> {
     if !directory.is_dir() {
         return Err("selected project path is not a directory".to_string());
@@ -3906,6 +3919,7 @@ fn scan_project_directory(directory: &Path) -> Result<ImportedProjectDirectory, 
             contact.push(path);
         }
     }
+    sort_project_contact_candidates(&mut contact);
 
     let mut ignored_candidates = Vec::new();
     for candidates in [&agp, &gfa, &paf, &coverage, &contact] {
@@ -4442,6 +4456,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fs;
     use std::io::{BufRead, Write};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -4456,12 +4471,12 @@ mod tests {
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
         build_synteny_view, contact_overview_aggregate_cell_bound, get_app_status,
         open_text_reader, persistent_lod_cache_key, scan_project_directory,
-        write_existing_agp_path, BedGraphRecordRequest, ContactMapBinRequest,
-        ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
-        ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
-        ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
-        CoverageViewFromBedGraphRequest, CoverageViewRequest, PafRecordRequest, SyntenyViewRequest,
-        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
+        sort_project_contact_candidates, write_existing_agp_path, BedGraphRecordRequest,
+        ContactMapBinRequest, ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest,
+        ContactMapTileKeyRequest, ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest,
+        ContactMapViewRequest, ContactMapViewportRequest, ContactNormalizationRequest,
+        ContactTileRequestPurpose, CoverageViewFromBedGraphRequest, CoverageViewRequest,
+        PafRecordRequest, SyntenyViewRequest, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
 
     #[test]
@@ -4498,6 +4513,23 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_contact_candidates_prefer_mcool_then_sort_by_name() {
+        let mut candidates = [
+            PathBuf::from("a.cool"),
+            PathBuf::from("z.mcool"),
+            PathBuf::from("z.cool"),
+            PathBuf::from("b.mcool"),
+        ];
+
+        sort_project_contact_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates.map(|path| path.to_string_lossy().to_string()),
+            ["b.mcool", "z.mcool", "a.cool", "z.cool"],
+        );
     }
 
     fn test_layout_block(id: &str, visual_start: u64) -> ContactMapLayoutBlockRequest {
@@ -5846,10 +5878,10 @@ mod tests {
         let summary = super::load_example_dataset().expect("example dataset should load");
         let gfa_text = super::load_example_gfa_text().expect("example GFA should load");
 
-        assert_eq!(summary.agp_lines, 1_182);
-        assert_eq!(summary.agp_objects, 186);
-        assert_eq!(summary.agp_components, 797);
-        assert_eq!(summary.agp_gaps, 385);
+        assert_eq!(summary.agp_lines, 1_177);
+        assert_eq!(summary.agp_objects, 192);
+        assert_eq!(summary.agp_components, 798);
+        assert_eq!(summary.agp_gaps, 379);
         assert_eq!(summary.max_object_span, 31_529_557);
         assert!(summary.mcool_size_bytes > 1_000_000);
         let coverage_path = summary
@@ -5863,9 +5895,20 @@ mod tests {
         assert!(std::path::Path::new(paf_path).is_absolute());
         assert!(std::path::Path::new(coverage_path).is_file());
         assert!(std::path::Path::new(paf_path).is_file());
-        assert!(summary.cool_path.ends_with("examples/input.1k.cool"));
-        assert!(!summary.available_resolutions.is_empty());
-        assert_eq!(summary.agp_layout.blocks.len(), 797);
+        assert!(summary
+            .cool_path
+            .ends_with("examples/input.1k_allres.mcool"));
+        assert!(summary
+            .mcool_path
+            .ends_with("examples/input.1k_allres.mcool"));
+        assert_eq!(
+            summary.available_resolutions,
+            vec![
+                2_500_000, 2_000_000, 1_000_000, 500_000, 250_000, 100_000, 50_000, 25_000, 10_000,
+                5_000, 1_000,
+            ],
+        );
+        assert_eq!(summary.agp_layout.blocks.len(), 798);
         assert!(summary.agp_layout.total_span > summary.max_object_span);
         assert_eq!(summary.agp_layout.blocks[0].object_id, "Chr01g1");
         assert_eq!(summary.agp_layout.blocks[0].component_type, "W");

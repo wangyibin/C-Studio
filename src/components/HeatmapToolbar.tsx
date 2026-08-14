@@ -191,11 +191,12 @@ export function HeatmapToolbar({
           className={`heatmap-toolbar-icon-button${uiState.contact.resolutionLocked ? " active" : ""}`}
           type="button"
           aria-label={uiState.contact.resolutionLocked ? "Unlock resolution" : "Lock resolution"}
+          aria-keyshortcuts="L"
           aria-pressed={uiState.contact.resolutionLocked}
           title={
             uiState.contact.resolutionLocked
-              ? `Resolution locked at ${uiState.contact.resolution}`
-              : "Lock resolution during zoom"
+              ? `Resolution locked at ${uiState.contact.resolution} (L)`
+              : "Lock resolution during zoom (L)"
           }
           onClick={() => onUiAction({ type: "toggleContactResolutionLock" })}
         >

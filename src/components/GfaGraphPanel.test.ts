@@ -10,12 +10,14 @@ import {
   gfaAssemblyUnitId,
   gfaAssemblyUnitIdsInSelection,
   gfaChromosomeLabelSelection,
+  gfaContextMenuSelectionIntent,
   gfaNodeMatchesAssemblySelection,
   gfaAutomaticBandagePaths,
   gfaBandagePathContainsPoint,
   gfaBandagePathPort,
   gfaBandageFocalNodeIds,
   gfaEndpointHiCRequestBatchSize,
+  gfaEndpointHiCLinksForRelationVisibility,
   gfaInitialBandagePathPoints,
   gfaPreviewPlacements,
   gfaReshapeBandageBlockPaths,
@@ -66,6 +68,67 @@ describe("GFA endpoint contact loading", () => {
   it("uses 32-pair batches when the desktop batch loader is connected", () => {
     expect(gfaEndpointHiCRequestBatchSize(true)).toBe(32);
     expect(gfaEndpointHiCRequestBatchSize(false)).toBe(1);
+  });
+
+  it("separates anchor-unanchor contacts from non-homolog anchor contacts", () => {
+    const homologs = classifyGfaScaffolds(["Chr01g1", "Chr01g2", "Chr02g1"]);
+    const nodes = new Map([
+      ["same-a", { groupId: "Chr01g1", kind: "placed" as const }],
+      ["same-b", { groupId: "Chr01g1", kind: "placed" as const }],
+      ["homolog", { groupId: "Chr01g2", kind: "placed" as const }],
+      ["non-homolog", { groupId: "Chr02g1", kind: "placed" as const }],
+      ["unanchor-a", { groupId: "Unplaced", kind: "placed" as const }],
+      ["unanchor-b", { groupId: "Unplaced", kind: "unplaced" as const }],
+    ]);
+    const links = [
+      { source: "same-a", target: "same-b", relation: "within" },
+      { source: "same-a", target: "homolog", relation: "homolog" },
+      { source: "same-a", target: "non-homolog", relation: "non-homolog" },
+      { source: "same-a", target: "unanchor-a", relation: "anchor-unanchor" },
+      { source: "unanchor-a", target: "unanchor-b", relation: "within-unanchor" },
+      { source: "same-a", target: "missing", relation: "missing" },
+    ];
+    const visibleRelations = (
+      showHomolog: boolean,
+      showNonHomolog: boolean,
+      showAnchorUnanchor: boolean,
+    ) => (
+      gfaEndpointHiCLinksForRelationVisibility(
+        links,
+        nodes,
+        homologs,
+        showHomolog,
+        showNonHomolog,
+        showAnchorUnanchor,
+      ).map((link) => link.relation)
+    );
+
+    expect(visibleRelations(true, true, true)).toEqual([
+      "within",
+      "homolog",
+      "non-homolog",
+      "anchor-unanchor",
+      "within-unanchor",
+    ]);
+    expect(visibleRelations(false, true, true)).toEqual([
+      "within",
+      "non-homolog",
+      "anchor-unanchor",
+      "within-unanchor",
+    ]);
+    expect(visibleRelations(true, false, true)).toEqual([
+      "within",
+      "homolog",
+      "anchor-unanchor",
+      "within-unanchor",
+    ]);
+    expect(visibleRelations(true, true, false)).toEqual([
+      "within",
+      "homolog",
+      "non-homolog",
+      "within-unanchor",
+    ]);
+    expect(visibleRelations(false, false, false)).toEqual(["within", "within-unanchor"]);
   });
 });
 
@@ -287,6 +350,23 @@ describe("GFA Shift-drag selection", () => {
     expect(gfaNodeMatchesAssemblySelection(node, new Set(["placed-a"]))).toBe(true);
     expect(gfaNodeMatchesAssemblySelection(node, new Set(["block-a"]))).toBe(true);
     expect(gfaNodeMatchesAssemblySelection(node, new Set(["placed-b"]))).toBe(false);
+  });
+
+  it("focuses an unselected assembly node before opening the shared context menu", () => {
+    const node = {
+      id: "placed-a",
+      occurrenceId: "placed-a",
+      assemblyBlockId: "block-a",
+    };
+
+    expect(gfaContextMenuSelectionIntent(node, new Set(["placed-b"]))).toEqual(["block-a"]);
+    expect(gfaContextMenuSelectionIntent(node, new Set(["placed-a"]))).toBeNull();
+    expect(gfaContextMenuSelectionIntent(node, new Set(["block-a"]))).toBeNull();
+    expect(gfaContextMenuSelectionIntent({
+      id: "gfa-only",
+      occurrenceId: null,
+      assemblyBlockId: null,
+    }, new Set())).toBeNull();
   });
 
   it("selects every assembly unit intersecting a box in either drag direction", () => {

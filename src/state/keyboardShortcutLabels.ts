@@ -13,6 +13,7 @@ export interface KeyboardShortcutLabels {
   deleteGap: string;
   deleteContig: string;
   resolutionWheel: string;
+  resolutionLock: string;
   diagonalWheel: string;
 }
 
@@ -41,6 +42,7 @@ export function keyboardShortcutLabels(
       deleteGap: "⌘J",
       deleteContig: "⇧⌫",
       resolutionWheel: "⌘+Scroll",
+      resolutionLock: "L",
       diagonalWheel: "⇧⌘+Scroll",
     };
   }
@@ -58,6 +60,7 @@ export function keyboardShortcutLabels(
     deleteGap: "Ctrl+J",
     deleteContig: "Shift+Del",
     resolutionWheel: "Ctrl+Scroll",
+    resolutionLock: "L",
     diagonalWheel: "Ctrl+Shift+Scroll",
   };
 }
