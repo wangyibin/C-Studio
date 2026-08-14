@@ -13,8 +13,15 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 cstudio-core = { path = "../crates/cstudio-core" }
+flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
 
 [dev-dependencies]
 serde_json = "1"
+
+# C-Studio's development window is also used for real multi-gigabase datasets.
+# Keep debug assertions and symbols, but optimize the per-contact projection
+# loop so `tauri dev` does not turn a seconds-scale release scan into minutes.
+[profile.dev]
+opt-level = 2

@@ -13,6 +13,7 @@ export interface KeyboardShortcutLabels {
   deleteGap: string;
   deleteContig: string;
   resolutionWheel: string;
+  diagonalWheel: string;
 }
 
 export function detectDesktopShortcutPlatform(
@@ -40,6 +41,7 @@ export function keyboardShortcutLabels(
       deleteGap: "⌘J",
       deleteContig: "⇧⌫",
       resolutionWheel: "⌘+Scroll",
+      diagonalWheel: "⇧⌘+Scroll",
     };
   }
 
@@ -56,5 +58,6 @@ export function keyboardShortcutLabels(
     deleteGap: "Ctrl+J",
     deleteContig: "Shift+Del",
     resolutionWheel: "Ctrl+Scroll",
+    diagonalWheel: "Ctrl+Shift+Scroll",
   };
 }

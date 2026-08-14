@@ -33,6 +33,19 @@ describe("adjacent contact resolution prefetch", () => {
     expect(coarse).toEqual(["coarse-1", "coarse-2", "coarse-3"]);
     expect(fine).toEqual(["fine-1", "fine-2"]);
   });
+
+  it("caps total background batches while preserving neighbor fairness", () => {
+    const coarse = ["coarse-1", "coarse-2", "coarse-3"];
+    const fine = ["fine-1", "fine-2", "fine-3"];
+
+    expect(interleaveContactPrefetchBatches([coarse, fine], 4)).toEqual([
+      "coarse-1",
+      "fine-1",
+      "coarse-2",
+      "fine-2",
+    ]);
+    expect(interleaveContactPrefetchBatches([coarse, fine], 0)).toEqual([]);
+  });
 });
 
 describe("contact idle task scheduling", () => {

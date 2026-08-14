@@ -19,6 +19,7 @@ describe("keyboard shortcut labels", () => {
       reverse: "⇧⌘R",
       deleteContig: "⇧⌫",
       resolutionWheel: "⌘+Scroll",
+      diagonalWheel: "⇧⌘+Scroll",
     });
     expect(keyboardShortcutLabels("windows")).toMatchObject({
       save: "Ctrl+S",
@@ -26,6 +27,7 @@ describe("keyboard shortcut labels", () => {
       reverse: "Ctrl+Shift+R",
       deleteContig: "Shift+Del",
       resolutionWheel: "Ctrl+Scroll",
+      diagonalWheel: "Ctrl+Shift+Scroll",
     });
   });
 });

@@ -32,8 +32,15 @@ export function adjacentContactResolutions(
  */
 export function interleaveContactPrefetchBatches<T>(
   queues: readonly (readonly T[])[],
+  maximumBatches = Number.POSITIVE_INFINITY,
 ): T[] {
   const interleaved: T[] = [];
+  const safeMaximumBatches = Number.isFinite(maximumBatches)
+    ? Math.max(0, Math.floor(maximumBatches))
+    : Number.POSITIVE_INFINITY;
+  if (safeMaximumBatches === 0) {
+    return interleaved;
+  }
   const maximumLength = queues.reduce(
     (maximum, queue) => Math.max(maximum, queue.length),
     0,
@@ -43,6 +50,9 @@ export function interleaveContactPrefetchBatches<T>(
       const value = queue[index];
       if (value !== undefined) {
         interleaved.push(value);
+        if (interleaved.length >= safeMaximumBatches) {
+          return interleaved;
+        }
       }
     }
   }

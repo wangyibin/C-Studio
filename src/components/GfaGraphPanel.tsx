@@ -1,6 +1,8 @@
 import { ChevronDown, Maximize2, RotateCcw, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ContactMapView } from "../App";
 import type { ContactMapLayoutBlock } from "../state/importers";
+import { planGfaBlockCreation } from "../state/assemblyEditing";
 import {
   defaultAssemblyScaffoldColor,
   homologScaffoldColor,
@@ -12,6 +14,7 @@ import {
   type GfaEvidenceDocument,
   type GfaGraphEdge,
   type GfaGraphNode,
+  type GfaLinkEvidence,
   type GfaSegmentSide,
 } from "../state/gfa";
 import {
@@ -22,9 +25,39 @@ import {
   gfaLinkScope,
   layoutGfaNodesBandage,
   layoutGfaNodesForCuration,
+  layoutGfaNodesGuided,
   type GfaLayoutMode,
   type GfaHomologClassification,
 } from "../state/gfaHomologLayout";
+import {
+  buildLengthNormalizedGfaHiCLinks,
+  gfaHiCContactMapUsesLayout,
+  maximumGfaHiCLinks,
+} from "../state/gfaHiCLinks";
+import {
+  buildGfaCurationIssues,
+  type GfaCurationIssue,
+  type GfaCurationPlacementEvidence,
+} from "../state/gfaCurationEvidence";
+import {
+  physicalSideForDisplayedEndpoint,
+  type GfaDisplayedEndpoint,
+  type GfaEndpointHiCBatchLoader,
+  type GfaEndpointHiCLoadResult,
+  type GfaEndpointHiCLoader,
+} from "../state/gfaEndpointHiC";
+import {
+  buildRankedGfaEndpointHiCLinks,
+  defaultGfaEndpointHiCLinkLimit,
+  gfaEndpointHiCOverviewPartnerLimit,
+  gfaEndpointHiCPairCacheKey,
+  maximumGfaEndpointHiCLinkLimit,
+  normalizeGfaEndpointHiCLinkLimit,
+  selectGfaEndpointHiCCandidates,
+  type GfaEndpointHiCCandidate,
+  type GfaEndpointHiCLink,
+  type GfaEndpointHiCResultEntry,
+} from "../state/gfaEndpointHiCLinks";
 
 interface GfaPreviewCardProps {
   document: GfaEvidenceDocument;
@@ -38,6 +71,9 @@ interface GfaPreviewCardProps {
 interface GfaGraphPanelProps {
   document: GfaEvidenceDocument;
   assemblyBlocks: ContactMapLayoutBlock[];
+  contactMap: ContactMapView | null;
+  onLoadEndpointHiC?: GfaEndpointHiCLoader;
+  onLoadEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
   selectedAssemblyBlockIds: string[];
   homologPattern: string;
   visibleScaffoldIds: ReadonlySet<string>;
@@ -45,7 +81,16 @@ interface GfaGraphPanelProps {
   onRestoreHeatmap?: () => void;
   onClose: () => void;
   onSelectOccurrences: (ids: string[]) => void;
+  onSelectExactOccurrences?: (ids: string[]) => void;
+  onEditAssembly: (action: GfaAssemblyEditAction) => void;
 }
+
+export type GfaAssemblyEditAction =
+  | { type: "reverseAssemblySelection" }
+  | { type: "moveAssemblySelectionBefore"; targetBlockId: string | null; targetObjectId?: string }
+  | { type: "deleteAssemblySelection" }
+  | { type: "createAssemblyBlockFromGfa"; links: GfaLinkEvidence[] }
+  | { type: "dissolveAssemblyBlockSelection" };
 
 interface LayoutNode extends GfaGraphNode {
   x: number;
@@ -56,9 +101,64 @@ interface LayoutNode extends GfaGraphNode {
   height: number;
   scaffoldColor: string;
   homologColumn: string | null;
+  guidedFocal: boolean;
   manuallyPlaced: boolean;
   layoutMode: GfaLayoutMode;
+  pathPoints: GfaPathPoint[];
 }
+
+export interface GfaPathPoint {
+  x: number;
+  y: number;
+}
+
+export interface GfaBandagePathSnapshot {
+  id: string;
+  width: number;
+  pathPoints: GfaPathPoint[];
+}
+
+type BandageInteractionMode = "move" | "reshape";
+type CurationAssistantView = "queue" | "evidence";
+type GfaEditProposal =
+  | { kind: "reverse"; title: string; detail: string }
+  | { kind: "insert"; title: string; detail: string; targetBlockId: string; targetObjectId: string }
+  | { kind: "delete"; title: string; detail: string }
+  | { kind: "create-block"; title: string; detail: string }
+  | { kind: "dissolve-block"; title: string; detail: string };
+
+interface SelectedEndpointHiCPair {
+  key: string;
+  sourceBlockId: string;
+  targetBlockId: string;
+}
+
+interface EndpointHiCRequestState {
+  key: string;
+  loading: boolean;
+  result: GfaEndpointHiCLoadResult | null;
+}
+
+interface EndpointHiCCandidateRequest {
+  candidate: GfaEndpointHiCCandidate;
+  cacheKey: string;
+  sourceBlockId: string;
+  targetBlockId: string;
+}
+
+interface EndpointHiCOverlayRequestState {
+  key: string;
+  loading: boolean;
+  requestedCount: number;
+  completedCount: number;
+  entries: GfaEndpointHiCResultEntry[];
+}
+
+type EndpointHiCDisplayState =
+  | { status: "not-applicable" }
+  | { status: "ineligible"; reason: string }
+  | { status: "loading" }
+  | { status: "result"; result: GfaEndpointHiCLoadResult };
 
 interface ViewTransform {
   x: number;
@@ -68,9 +168,16 @@ interface ViewTransform {
 
 interface GraphInteraction {
   pointerId: number;
-  kind: "node" | "pan" | "selection";
+  kind: "node" | "pan" | "selection" | "reshape";
   nodeId?: string;
-  draggedNodes?: Array<{ id: string; x: number; y: number }>;
+  draggedNodes?: Array<{
+    id: string;
+    x: number;
+    y: number;
+    width: number;
+    pathPoints: GfaPathPoint[];
+  }>;
+  grabbedPointIndex?: number;
   startGraphX?: number;
   startGraphY?: number;
   startClientX: number;
@@ -89,6 +196,30 @@ interface GfaSelectionBox {
 
 const defaultView: ViewTransform = { x: 24, y: 24, scale: 0.72 };
 const graphNodeLimit = 1_200;
+export const defaultGfaReviewOpen = false;
+
+export function gfaEndpointHiCRequestBatchSize(batchLoaderConnected: boolean) {
+  return batchLoaderConnected ? 32 : 1;
+}
+
+function waitForGfaInteractionIdle(isInteracting: () => boolean) {
+  return new Promise<void>((resolve) => {
+    const waitForFrame = () => {
+      window.requestAnimationFrame(() => {
+        if (isInteracting()) {
+          window.setTimeout(waitForFrame, 50);
+        } else {
+          resolve();
+        }
+      });
+    };
+    if (isInteracting()) {
+      window.setTimeout(waitForFrame, 50);
+    } else {
+      waitForFrame();
+    }
+  });
+}
 
 /**
  * Resolve the rigid editing unit for a pointer drag. Assembly block ids are
@@ -110,11 +241,210 @@ export function gfaRigidBlockNodeIds(
     .map((node) => node.id);
 }
 
+/** Build the straight polyline used as a Bandage node before manual reshaping. */
+export function gfaInitialBandagePathPoints(
+  x: number,
+  y: number,
+  width: number,
+): GfaPathPoint[] {
+  const pointCount = clamp(Math.ceil(width / 72) + 1, 3, 7);
+  return Array.from({ length: pointCount }, (_, index) => ({
+    x: x - width / 2 + width * index / (pointCount - 1),
+    y,
+  }));
+}
+
+interface GfaAutomaticBandageNode {
+  id: string;
+  groupId: string;
+  assemblyBlockId?: string | null;
+  order: number;
+}
+
+interface GfaAutomaticBandageEdge {
+  source: string;
+  target: string;
+  kind: "agp-joined" | "agp-gap" | "gfa-link";
+}
+
+/**
+ * Route each rigid AGP block as one smooth Bandage polyline after the topology
+ * solve. External GFA neighbours pull the nearest part of a block towards
+ * their lane; AGP order, node x positions, and the block's member order remain
+ * unchanged. This is a one-shot deterministic route, not a live spring.
+ */
+export function gfaAutomaticBandagePaths(
+  nodes: ReadonlyArray<GfaAutomaticBandageNode>,
+  edges: ReadonlyArray<GfaAutomaticBandageEdge>,
+  positions: ReadonlyMap<string, GfaPathPoint>,
+  widths: ReadonlyMap<string, number>,
+) {
+  const blocksByKey = new Map<string, GfaAutomaticBandageNode[]>();
+  const blockKeyByNodeId = new Map<string, string>();
+  for (const node of nodes) {
+    const key = automaticBandageBlockKey(node);
+    const members = blocksByKey.get(key) ?? [];
+    members.push(node);
+    blocksByKey.set(key, members);
+    blockKeyByNodeId.set(node.id, key);
+  }
+  for (const members of blocksByKey.values()) {
+    members.sort((left, right) => left.order - right.order || left.id.localeCompare(right.id));
+  }
+  const geometryByKey = new Map<string, {
+    left: number;
+    right: number;
+    centerY: number;
+    samples: Array<{ x: number; bend: number }>;
+  }>();
+  for (const [key, members] of blocksByKey) {
+    const placed = members.flatMap((member) => {
+      const position = positions.get(member.id);
+      return position ? [{ member, position }] : [];
+    });
+    if (placed.length === 0) {
+      continue;
+    }
+    geometryByKey.set(key, {
+      left: Math.min(...placed.map(({ member, position }) => (
+        position.x - (widths.get(member.id) ?? 18) / 2
+      ))),
+      right: Math.max(...placed.map(({ member, position }) => (
+        position.x + (widths.get(member.id) ?? 18) / 2
+      ))),
+      centerY: placed.reduce((sum, { position }) => sum + position.y, 0) / placed.length,
+      samples: [],
+    });
+  }
+  function addPullSample(nodeId: string, otherNodeId: string) {
+    const key = blockKeyByNodeId.get(nodeId);
+    const otherKey = blockKeyByNodeId.get(otherNodeId);
+    const position = positions.get(nodeId);
+    const geometry = key ? geometryByKey.get(key) : undefined;
+    const otherGeometry = otherKey ? geometryByKey.get(otherKey) : undefined;
+    if (!key || !otherKey || key === otherKey || !position || !geometry || !otherGeometry) {
+      return;
+    }
+    const maximumBend = clamp((geometry.right - geometry.left) * 0.16, 16, 52);
+    geometry.samples.push({
+      x: position.x,
+      bend: clamp((otherGeometry.centerY - geometry.centerY) * 0.24, -maximumBend, maximumBend),
+    });
+  }
+  for (const edge of edges) {
+    if (edge.kind !== "gfa-link") {
+      continue;
+    }
+    addPullSample(edge.source, edge.target);
+    addPullSample(edge.target, edge.source);
+  }
+
+  const output = new Map<string, GfaPathPoint[]>();
+  for (const [key, members] of blocksByKey) {
+    const geometry = geometryByKey.get(key);
+    if (!geometry) {
+      continue;
+    }
+    const span = Math.max(1, geometry.right - geometry.left);
+    const influenceRadius = clamp(span * 0.24, 48, 150);
+    for (const member of members) {
+      const position = positions.get(member.id);
+      const width = widths.get(member.id) ?? 18;
+      if (!position) {
+        continue;
+      }
+      const points = gfaInitialBandagePathPoints(position.x, position.y, width);
+      output.set(member.id, points.map((point) => {
+        let weightedBend = 0;
+        let totalWeight = 0;
+        for (const sample of geometry.samples) {
+          const distance = (point.x - sample.x) / influenceRadius;
+          const weight = Math.exp(-(distance * distance) * 2.2);
+          weightedBend += sample.bend * weight;
+          totalWeight += weight;
+        }
+        return {
+          x: point.x,
+          y: point.y + weightedBend / Math.max(1, totalWeight),
+        };
+      }));
+    }
+  }
+  return output;
+}
+
+/**
+ * Deform a local part of one rigid AGP block. The grabbed control point moves
+ * most; neighbouring points across adjacent unitigs receive a smooth falloff.
+ * The displacement is capped so Reshape remains a curation aid rather than an
+ * unconstrained graph-layout force.
+ */
+export function gfaReshapeBandageBlockPaths(
+  nodes: ReadonlyArray<GfaBandagePathSnapshot>,
+  grabbedNodeId: string,
+  grabbedPointIndex: number,
+  delta: GfaPathPoint,
+) {
+  const flattened = nodes.flatMap((node) => (
+    node.pathPoints.map((point, pointIndex) => ({ node, point, pointIndex }))
+  ));
+  const grabbedGlobalIndex = flattened.findIndex((entry) => (
+    entry.node.id === grabbedNodeId && entry.pointIndex === grabbedPointIndex
+  ));
+  const grabbedNode = nodes.find((node) => node.id === grabbedNodeId);
+  if (grabbedGlobalIndex < 0 || !grabbedNode) {
+    return new Map(nodes.map((node) => [node.id, node.pathPoints.map(copyPathPoint)]));
+  }
+  const maximumX = clamp(grabbedNode.width * 0.18, 18, 48);
+  const maximumY = clamp(grabbedNode.width * 0.65, 42, 140);
+  const limitedDelta = {
+    x: clamp(delta.x, -maximumX, maximumX),
+    y: clamp(delta.y, -maximumY, maximumY),
+  };
+  const output = new Map<string, GfaPathPoint[]>();
+  let globalIndex = 0;
+  for (const node of nodes) {
+    output.set(node.id, node.pathPoints.map((point) => {
+      const distance = Math.abs(globalIndex - grabbedGlobalIndex);
+      const weight = Math.exp(-(distance * distance) / 7.5);
+      globalIndex += 1;
+      return {
+        x: point.x + limitedDelta.x * weight,
+        y: point.y + limitedDelta.y * weight,
+      };
+    }));
+  }
+  return output;
+}
+
+/** Resolve a GFA segment side to the current endpoint of a bent Bandage node. */
+export function gfaBandagePathPort(
+  pathPoints: ReadonlyArray<GfaPathPoint>,
+  orientation: GfaGraphNode["orientation"],
+  side: GfaSegmentSide,
+) {
+  const visualSide = orientation === "-"
+    ? side === "start" ? "end" : "start"
+    : side;
+  const point = visualSide === "start" ? pathPoints[0] : pathPoints[pathPoints.length - 1];
+  return point ? copyPathPoint(point) : null;
+}
+
 /** GFA editing is block-based even when a node is an individually selectable source segment. */
 export function gfaAssemblyUnitId(
   node: Pick<GfaGraphNode, "occurrenceId" | "assemblyBlockId">,
 ) {
   return node.assemblyBlockId || node.occurrenceId;
+}
+
+/** Match heatmap selection whether it arrives as an occurrence or rigid block id. */
+export function gfaNodeMatchesAssemblySelection(
+  node: Pick<GfaGraphNode, "id" | "occurrenceId" | "assemblyBlockId">,
+  selectedIds: ReadonlySet<string>,
+) {
+  return selectedIds.has(node.id)
+    || Boolean(node.occurrenceId && selectedIds.has(node.occurrenceId))
+    || Boolean(node.assemblyBlockId && selectedIds.has(node.assemblyBlockId));
 }
 
 /** Return assembly units whose node rectangles intersect a graph-space box. */
@@ -126,6 +456,7 @@ export function gfaAssemblyUnitIdsInSelection(
     y: number;
     width: number;
     height: number;
+    pathPoints?: ReadonlyArray<GfaPathPoint>;
   }>,
   start: { x: number; y: number },
   end: { x: number; y: number },
@@ -140,15 +471,66 @@ export function gfaAssemblyUnitIdsInSelection(
     if (!unitId) {
       continue;
     }
-    const nodeLeft = node.x - node.width / 2;
-    const nodeRight = node.x + node.width / 2;
-    const nodeTop = node.y - node.height / 2;
-    const nodeBottom = node.y + node.height / 2;
-    if (nodeRight >= left && nodeLeft <= right && nodeBottom >= top && nodeTop <= bottom) {
+    const bounds = visualBoundsForNodeData(node);
+    if (bounds.right >= left && bounds.left <= right && bounds.bottom >= top && bounds.top <= bottom) {
       ids.add(unitId);
     }
   }
   return [...ids];
+}
+
+interface GfaChromosomeRowNode {
+  groupId: string;
+  anchorY: number;
+  occurrenceId: string | null;
+  assemblyBlockId: string | null;
+}
+
+function gfaChromosomeRows(
+  nodes: ReadonlyArray<GfaChromosomeRowNode>,
+  chromosomeScaffolds: ReadonlySet<string>,
+) {
+  const rows = new Map<string, GfaChromosomeRowNode[]>();
+  for (const node of nodes) {
+    if (!chromosomeScaffolds.has(node.groupId)) {
+      continue;
+    }
+    const values = rows.get(node.groupId) ?? [];
+    values.push(node);
+    rows.set(node.groupId, values);
+  }
+  return rows;
+}
+
+/** Resolve a Shift-click in the chromosome-label gutter to all assembly units on that row. */
+export function gfaChromosomeLabelSelection(
+  nodes: ReadonlyArray<GfaChromosomeRowNode>,
+  chromosomeScaffolds: ReadonlySet<string>,
+  point: { x: number; y: number },
+  displayScale: number,
+) {
+  const safeScale = Math.max(0.01, displayScale);
+  const fontSize = Math.max(11, 8 / safeScale);
+  const verticalPadding = Math.max(5, 4 / safeScale);
+  for (const [label, values] of gfaChromosomeRows(nodes, chromosomeScaffolds)) {
+    const rowY = values.reduce((sum, node) => sum + node.anchorY, 0) / values.length;
+    const estimatedTextWidth = Math.max(32, label.length * fontSize * 0.68);
+    if (
+      point.x >= 150 - estimatedTextWidth - 8 / safeScale
+      && point.x <= 150 + 8 / safeScale
+      && Math.abs(point.y - rowY) <= fontSize / 2 + verticalPadding
+    ) {
+      const ids = new Set<string>();
+      for (const node of values) {
+        const id = gfaAssemblyUnitId(node);
+        if (id) {
+          ids.add(id);
+        }
+      }
+      return [...ids];
+    }
+  }
+  return null;
 }
 
 /** Expand the Bandage contig window to complete AGP blocks at its boundaries. */
@@ -175,25 +557,36 @@ export function gfaBandageFocalNodeIds(
 }
 
 /**
- * AGP junctions describe adjacency in the edited chromosome layout, not GFA
- * segment sides. Always connect the two node faces that point at one another;
- * component orientation only changes the arrow shape inside those positions.
+ * AGP junctions describe directed adjacency in the edited chromosome layout.
+ * The source is always attached to its displayed AGP end and the target to its
+ * displayed AGP start. Manual placement must never make the junction swap ends.
  */
 export function gfaAgpJunctionPoints(
   source: { x: number; y: number; width: number },
   target: { x: number; y: number; width: number },
 ) {
-  const sourceIsLeft = source.x <= target.x;
   return {
     source: {
-      x: source.x + (sourceIsLeft ? source.width / 2 : -source.width / 2),
+      x: source.x + source.width / 2,
       y: source.y,
     },
     target: {
-      x: target.x + (sourceIsLeft ? -target.width / 2 : target.width / 2),
+      x: target.x - target.width / 2,
       y: target.y,
     },
   };
+}
+
+/** Lock a bent Bandage AGP junction to the ordered path ends, never the nearest pair. */
+export function gfaAgpBandageJunctionPoints(
+  sourcePath: ReadonlyArray<GfaPathPoint>,
+  targetPath: ReadonlyArray<GfaPathPoint>,
+) {
+  const source = sourcePath[sourcePath.length - 1];
+  const target = targetPath[0];
+  return source && target
+    ? { source: copyPathPoint(source), target: copyPathPoint(target) }
+    : null;
 }
 
 export function GfaPreviewCard({
@@ -277,6 +670,9 @@ export function GfaPreviewCard({
 export function GfaGraphPanel({
   document,
   assemblyBlocks,
+  contactMap,
+  onLoadEndpointHiC,
+  onLoadEndpointHiCBatch,
   selectedAssemblyBlockIds,
   homologPattern,
   visibleScaffoldIds,
@@ -284,6 +680,8 @@ export function GfaGraphPanel({
   onRestoreHeatmap,
   onClose,
   onSelectOccurrences,
+  onSelectExactOccurrences = onSelectOccurrences,
+  onEditAssembly,
 }: GfaGraphPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const nodesRef = useRef<LayoutNode[]>([]);
@@ -292,13 +690,128 @@ export function GfaGraphPanel({
   const interactionRef = useRef<GraphInteraction | null>(null);
   const selectionBoxRef = useRef<GfaSelectionBox | null>(null);
   const fitViewPendingRef = useRef(true);
+  const guidedGraphKeyRef = useRef("");
+  const bandagePathStateRef = useRef(new Map<string, GfaPathPoint[]>());
   const [layoutRevision, setLayoutRevision] = useState(0);
   const [layoutMode, setLayoutMode] = useState<GfaLayoutMode>("curation");
+  const [bandageInteractionMode, setBandageInteractionMode] = useState<BandageInteractionMode>("move");
   const [showGfaOnlyNodes, setShowGfaOnlyNodes] = useState(false);
   const [showDisconnectedNodes, setShowDisconnectedNodes] = useState(false);
+  const [showGfaLinks, setShowGfaLinks] = useState(true);
+  const [showAgpGaps, setShowAgpGaps] = useState(true);
+  const [showHiCLinks, setShowHiCLinks] = useState(false);
+  const [hiCLinkLimit, setHiCLinkLimit] = useState(defaultGfaEndpointHiCLinkLimit);
   const [showHomologLinks, setShowHomologLinks] = useState(true);
   const [showNonHomologLinks, setShowNonHomologLinks] = useState(true);
   const [toolbarDetailsOpen, setToolbarDetailsOpen] = useState(false);
+  const [pendingEditProposal, setPendingEditProposal] = useState<GfaEditProposal | null>(null);
+  const [pickingInsertTarget, setPickingInsertTarget] = useState(false);
+  const [curationAssistantOpen, setCurationAssistantOpen] = useState(defaultGfaReviewOpen);
+  const [curationAssistantView, setCurationAssistantView] = useState<CurationAssistantView>("queue");
+  const [selectedCurationIssueId, setSelectedCurationIssueId] = useState<string | null>(null);
+  const endpointHiCCacheRef = useRef(new Map<string, GfaEndpointHiCLoadResult>());
+  const endpointHiCInFlightRef = useRef(new Map<string, Promise<GfaEndpointHiCLoadResult>>());
+  const endpointHiCCacheGenerationRef = useRef(0);
+  const [endpointHiCRequest, setEndpointHiCRequest] = useState<EndpointHiCRequestState>({
+    key: "",
+    loading: false,
+    result: null,
+  });
+  useEffect(() => {
+    if (!pickingInsertTarget && !pendingEditProposal) {
+      return;
+    }
+    const cancelPendingEdit = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      setPickingInsertTarget(false);
+      setPendingEditProposal(null);
+    };
+    window.addEventListener("keydown", cancelPendingEdit);
+    return () => window.removeEventListener("keydown", cancelPendingEdit);
+  }, [pendingEditProposal, pickingInsertTarget]);
+  const [endpointHiCOverlayRequest, setEndpointHiCOverlayRequest] = useState<EndpointHiCOverlayRequestState>({
+    key: "",
+    loading: false,
+    requestedCount: 0,
+    completedCount: 0,
+    entries: [],
+  });
+  const loadEndpointHiCBatchCached = useCallback((requests: ReadonlyArray<{
+    cacheKey: string;
+    sourceBlockId: string;
+    targetBlockId: string;
+  }>): Promise<GfaEndpointHiCLoadResult[]> => {
+    const promises = new Map<string, Promise<GfaEndpointHiCLoadResult>>();
+    const missing = requests.filter((request) => {
+      const cached = endpointHiCCacheRef.current.get(request.cacheKey);
+      if (cached) {
+        promises.set(request.cacheKey, Promise.resolve(cached));
+        return false;
+      }
+      const inFlight = endpointHiCInFlightRef.current.get(request.cacheKey);
+      if (inFlight) {
+        promises.set(request.cacheKey, inFlight);
+        return false;
+      }
+      return true;
+    });
+    if (missing.length > 0) {
+      const generation = endpointHiCCacheGenerationRef.current;
+      const batch = onLoadEndpointHiCBatch
+        ? onLoadEndpointHiCBatch(missing.map(({ sourceBlockId, targetBlockId }) => ({
+          sourceBlockId,
+          targetBlockId,
+        })))
+        : onLoadEndpointHiC
+          ? Promise.all(missing.map(({ sourceBlockId, targetBlockId }) => (
+            onLoadEndpointHiC(sourceBlockId, targetBlockId)
+          )))
+          : Promise.resolve(missing.map((): GfaEndpointHiCLoadResult => ({
+            status: "unavailable",
+            reason: "Endpoint 3D contact querying is not connected in this view.",
+          })));
+      const safeBatch = batch.catch((error: unknown) => missing.map((): GfaEndpointHiCLoadResult => ({
+        status: "error",
+        reason: error instanceof Error ? error.message : String(error),
+      })));
+      missing.forEach((request, index) => {
+        let flight!: Promise<GfaEndpointHiCLoadResult>;
+        flight = safeBatch
+          .then((results) => results[index] ?? ({
+            status: "error",
+            reason: "Endpoint 3D contact batch omitted a result.",
+          }))
+          .then((result) => {
+            if (generation === endpointHiCCacheGenerationRef.current) {
+              endpointHiCCacheRef.current.set(request.cacheKey, result);
+            }
+            return result;
+          })
+          .finally(() => {
+            if (
+              generation === endpointHiCCacheGenerationRef.current
+              && endpointHiCInFlightRef.current.get(request.cacheKey) === flight
+            ) {
+              endpointHiCInFlightRef.current.delete(request.cacheKey);
+            }
+          });
+        endpointHiCInFlightRef.current.set(request.cacheKey, flight);
+        promises.set(request.cacheKey, flight);
+      });
+    }
+    return Promise.all(requests.map((request) => promises.get(request.cacheKey)!));
+  }, [onLoadEndpointHiC, onLoadEndpointHiCBatch]);
+  const loadEndpointHiCCached = useCallback((
+    cacheKey: string,
+    sourceBlockId: string,
+    targetBlockId: string,
+  ): Promise<GfaEndpointHiCLoadResult> => loadEndpointHiCBatchCached([{
+    cacheKey,
+    sourceBlockId,
+    targetBlockId,
+  }]).then((results) => results[0]!), [loadEndpointHiCBatchCached]);
   const visibleScaffoldKey = [...visibleScaffoldIds].sort().join("\u0000");
   const visibleContigKey = [...visibleContigIds].sort().join("\u0000");
   const graph = useMemo(
@@ -320,73 +833,493 @@ export function GfaGraphPanel({
     ),
     [graph, homologs, showDisconnectedNodes, visibleScaffoldKey],
   );
-  const visibleBandageGraphWithGfaOnlyNodes = useMemo(
-    () => graphForVisibleContigs(graph, visibleContigIds),
+  const guidedFocalNodeIds = useMemo(
+    () => gfaBandageFocalNodeIds(graph.nodes, visibleContigIds),
     [graph, visibleContigKey],
-  );
-  const visibleConnectedBandageGraphWithGfaOnlyNodes = useMemo(
-    () => graphForChromosomeConnectionVisibility(
-      visibleBandageGraphWithGfaOnlyNodes,
-      graph,
-      homologs,
-      showDisconnectedNodes,
-    ),
-    [graph, homologs, showDisconnectedNodes, visibleBandageGraphWithGfaOnlyNodes],
   );
   const visibleGraph = useMemo(
     () => graphForGfaOnlyNodeVisibility(visibleGraphWithGfaOnlyNodes, showGfaOnlyNodes),
     [showGfaOnlyNodes, visibleGraphWithGfaOnlyNodes],
   );
+  const visibleGuidedGraph = useMemo(
+    () => graphForGuidedNodeVisibility(
+      graph,
+      visibleContigIds,
+      homologs,
+      showGfaOnlyNodes,
+      showDisconnectedNodes,
+    ),
+    [graph, homologs, showDisconnectedNodes, showGfaOnlyNodes, visibleContigKey],
+  );
   const visibleBandageGraph = useMemo(
     () => graphForGfaOnlyNodeVisibility(
-      visibleConnectedBandageGraphWithGfaOnlyNodes,
+      visibleGraphWithGfaOnlyNodes,
       showGfaOnlyNodes,
     ),
-    [showGfaOnlyNodes, visibleConnectedBandageGraphWithGfaOnlyNodes],
+    [showGfaOnlyNodes, visibleGraphWithGfaOnlyNodes],
   );
+  const activeGraph = layoutMode === "curation"
+    ? visibleGraph
+    : layoutMode === "guided" ? visibleGuidedGraph : visibleBandageGraph;
+  const guidedGraphKey = visibleGuidedGraph.nodes.map((node) => node.id).join("\u0000");
+  const hiCContactMapReady = Boolean(
+    contactMap && gfaHiCContactMapUsesLayout(contactMap, assemblyBlocks),
+  );
+  const hiCLinks = useMemo(
+    () => contactMap && gfaHiCContactMapUsesLayout(contactMap, assemblyBlocks)
+      ? buildLengthNormalizedGfaHiCLinks(
+        contactMap,
+        assemblyBlocks,
+        layoutMode === "guided" ? activeGraph.nodes : graph.nodes,
+        maximumGfaHiCLinks,
+        layoutMode === "guided"
+          ? undefined
+          : gfaEndpointHiCOverviewPartnerLimit(hiCLinkLimit),
+      )
+      : [],
+    [activeGraph.nodes, assemblyBlocks, contactMap, graph.nodes, hiCLinkLimit, layoutMode],
+  );
+  const activeNodesById = useMemo(
+    () => new Map(activeGraph.nodes.map((node) => [node.id, node])),
+    [activeGraph],
+  );
+  const visibleOverviewHiCLinks = useMemo(
+    () => hiCLinks.filter((link) => (
+      activeNodesById.has(link.source) && activeNodesById.has(link.target)
+    )),
+    [activeNodesById, hiCLinks],
+  );
+  const guidedCrossFocusHiCLinkIds = useMemo(() => {
+    if (layoutMode !== "guided" || selectedAssemblyBlockIds.length === 0) {
+      return new Set<string>();
+    }
+    const selectedIds = new Set(selectedAssemblyBlockIds);
+    return new Set(visibleOverviewHiCLinks.flatMap((link) => (
+      selectedIds.has(link.source) !== selectedIds.has(link.target) ? [link.id] : []
+    )));
+  }, [layoutMode, selectedAssemblyBlockIds, visibleOverviewHiCLinks]);
+  const endpointHiCCandidates = useMemo(
+    () => showHiCLinks && hiCContactMapReady && onLoadEndpointHiC
+      ? selectGfaEndpointHiCCandidates(
+        visibleOverviewHiCLinks,
+        hiCLinkLimit,
+        guidedCrossFocusHiCLinkIds,
+      )
+      : [],
+    [
+      guidedCrossFocusHiCLinkIds,
+      hiCContactMapReady,
+      hiCLinkLimit,
+      onLoadEndpointHiC,
+      showHiCLinks,
+      visibleOverviewHiCLinks,
+    ],
+  );
+  const assemblyBlocksById = useMemo(
+    () => new Map(assemblyBlocks.map((block) => [block.id, block])),
+    [assemblyBlocks],
+  );
+  const selectedPlacedBlocks = useMemo(() => {
+    const ids = new Set(selectedAssemblyBlockIds);
+    return assemblyBlocks.filter((block) => ids.has(block.id));
+  }, [assemblyBlocks, selectedAssemblyBlockIds]);
+  const selectedBlockPlan = useMemo(() => planGfaBlockCreation(
+    assemblyBlocks,
+    selectedAssemblyBlockIds.length > 0
+      ? { kind: "contigs", ids: selectedAssemblyBlockIds, exact: true }
+      : null,
+    document.links,
+  ), [assemblyBlocks, document.links, selectedAssemblyBlockIds]);
+  const selectedCompositeBlockCount = useMemo(() => new Set(
+    selectedPlacedBlocks.flatMap((block) => block.assemblyBlockId ? [block.assemblyBlockId] : []),
+  ).size, [selectedPlacedBlocks]);
+  const editSelectionKey = [...selectedAssemblyBlockIds].sort().join("\u0000");
+  const previousEditSelectionKeyRef = useRef(editSelectionKey);
+  useEffect(() => {
+    if (previousEditSelectionKeyRef.current === editSelectionKey) {
+      return;
+    }
+    previousEditSelectionKeyRef.current = editSelectionKey;
+    setPendingEditProposal(null);
+    setPickingInsertTarget(false);
+  }, [editSelectionKey]);
+  const endpointHiCCandidateRequests = useMemo<EndpointHiCCandidateRequest[]>(
+    () => endpointHiCCandidates.flatMap((candidate) => {
+      const sourceBlock = assemblyBlocksById.get(candidate.link.source);
+      const targetBlock = assemblyBlocksById.get(candidate.link.target);
+      if (!sourceBlock || !targetBlock) {
+        return [];
+      }
+      return [{
+        candidate,
+        sourceBlockId: sourceBlock.id,
+        targetBlockId: targetBlock.id,
+        cacheKey: gfaEndpointHiCPairCacheKey(
+          sourceBlock,
+          targetBlock,
+          contactMap?.layoutScope,
+          contactMap?.normalization,
+        ),
+      }];
+    }),
+    [
+      assemblyBlocksById,
+      contactMap?.layoutScope,
+      contactMap?.normalization,
+      endpointHiCCandidates,
+    ],
+  );
+  const endpointHiCOverlayKey = useMemo(
+    () => endpointHiCCandidateRequests.length > 0
+      ? [
+        hiCLinkLimit,
+        ...endpointHiCCandidateRequests.map((request) => (
+          `${request.cacheKey}\u0002${request.candidate.link.id}\u0002${request.candidate.overviewRank}`
+        )),
+      ].join("\u0001")
+      : "",
+    [endpointHiCCandidateRequests, hiCLinkLimit],
+  );
+  const visibleEndpointHiCLinks = useMemo(
+    () => showHiCLinks && endpointHiCOverlayRequest.key === endpointHiCOverlayKey
+      ? buildRankedGfaEndpointHiCLinks(
+        endpointHiCOverlayRequest.entries,
+        assemblyBlocks,
+        hiCLinkLimit,
+      )
+      : [],
+    [
+      assemblyBlocks,
+      endpointHiCOverlayKey,
+      endpointHiCOverlayRequest.entries,
+      endpointHiCOverlayRequest.key,
+      hiCLinkLimit,
+      showHiCLinks,
+    ],
+  );
+  const curationIssues = useMemo(
+    () => buildGfaCurationIssues({
+      document,
+      graph: activeGraph,
+      assemblyBlocks,
+      hiCLinks,
+    }),
+    [activeGraph, assemblyBlocks, document, hiCLinks],
+  );
+  const selectedCurationIssue = curationIssues.find(
+    (issue) => issue.id === selectedCurationIssueId,
+  ) ?? null;
+  const selectedEndpointHiCPair = useMemo<SelectedEndpointHiCPair | null>(() => {
+    const placed = selectedCurationIssue?.placements.filter(
+      (placement) => placement.kind === "placed",
+    ) ?? [];
+    if (placed.length !== 2) {
+      return null;
+    }
+    const sourceBlock = assemblyBlocks.find((block) => block.id === placed[0].nodeId);
+    const targetBlock = assemblyBlocks.find((block) => block.id === placed[1].nodeId);
+    if (!sourceBlock || !targetBlock) {
+      return null;
+    }
+    return {
+      sourceBlockId: sourceBlock.id,
+      targetBlockId: targetBlock.id,
+      key: gfaEndpointHiCPairCacheKey(
+        sourceBlock,
+        targetBlock,
+        contactMap?.layoutScope,
+        contactMap?.normalization,
+      ),
+    };
+  }, [assemblyBlocks, contactMap?.layoutScope, contactMap?.normalization, selectedCurationIssue]);
+  const endpointHiCDisplayState: EndpointHiCDisplayState = (() => {
+    if (!selectedCurationIssue || selectedCurationIssue.placements.length === 0) {
+      return { status: "not-applicable" };
+    }
+    if (!onLoadEndpointHiC) {
+      return {
+        status: "ineligible",
+        reason: "Endpoint 3D contact querying is not connected in this view.",
+      };
+    }
+    if (!selectedEndpointHiCPair) {
+      const placedCount = selectedCurationIssue.placements.filter(
+        (placement) => placement.kind === "placed",
+      ).length;
+      return {
+        status: "ineligible",
+        reason: placedCount === 2
+          ? "The selected AGP occurrences are no longer available for endpoint comparison."
+          : "Endpoint contacts require two specific unitig occurrences placed in the current AGP.",
+      };
+    }
+    if (
+      endpointHiCRequest.key === selectedEndpointHiCPair.key
+      && endpointHiCRequest.result
+    ) {
+      return { status: "result", result: endpointHiCRequest.result };
+    }
+    return { status: "loading" };
+  })();
+  const visibleGraphRelationCount = activeGraph.edges.filter((edge) => {
+    if (edge.kind !== "gfa-link") {
+      return true;
+    }
+    if (!showGfaLinks) {
+      return false;
+    }
+    const source = activeNodesById.get(edge.source);
+    const target = activeNodesById.get(edge.target);
+    if (!source || !target) {
+      return false;
+    }
+    const scope = gfaLinkScope(source.groupId, target.groupId, homologs);
+    return scope === "within-scaffold"
+      || (scope === "homolog" ? showHomologLinks : showNonHomologLinks);
+  }).length + visibleEndpointHiCLinks.length;
 
   useEffect(() => {
+    bandagePathStateRef.current.clear();
+    if (layoutMode === "bandage") {
+      nodesRef.current = [];
+      fitViewPendingRef.current = true;
+    }
+  }, [document]);
+
+  useEffect(() => {
+    setSelectedCurationIssueId((current) => (
+      current && curationIssues.some((issue) => issue.id === current)
+        ? current
+        : curationIssues[0]?.id ?? null
+    ));
+    if (curationIssues.length === 0) {
+      setCurationAssistantView("queue");
+    }
+  }, [curationIssues]);
+
+  useEffect(() => {
+    if (selectedAssemblyBlockIds.length === 0) {
+      return;
+    }
+    const selectedIds = new Set(selectedAssemblyBlockIds);
+    const matchingIssue = curationIssues.find((issue) => (
+      issue.focusAssemblyUnitIds.some((id) => selectedIds.has(id))
+    ));
+    if (matchingIssue) {
+      setSelectedCurationIssueId(matchingIssue.id);
+    }
+  }, [curationIssues, selectedAssemblyBlockIds]);
+
+  useEffect(() => {
+    endpointHiCCacheGenerationRef.current += 1;
+    endpointHiCCacheRef.current.clear();
+    endpointHiCInFlightRef.current.clear();
+    setEndpointHiCRequest({ key: "", loading: false, result: null });
+    setEndpointHiCOverlayRequest({
+      key: "",
+      loading: false,
+      requestedCount: 0,
+      completedCount: 0,
+      entries: [],
+    });
+  }, [onLoadEndpointHiC]);
+
+  useEffect(() => {
+    if (
+      !curationAssistantOpen
+      || curationAssistantView !== "evidence"
+      || !selectedEndpointHiCPair
+      || !onLoadEndpointHiC
+    ) {
+      return undefined;
+    }
+    const cached = endpointHiCCacheRef.current.get(selectedEndpointHiCPair.key);
+    if (cached) {
+      setEndpointHiCRequest({
+        key: selectedEndpointHiCPair.key,
+        loading: false,
+        result: cached,
+      });
+      return undefined;
+    }
+
+    let cancelled = false;
+    setEndpointHiCRequest({
+      key: selectedEndpointHiCPair.key,
+      loading: true,
+      result: null,
+    });
+    void loadEndpointHiCCached(
+      selectedEndpointHiCPair.key,
+      selectedEndpointHiCPair.sourceBlockId,
+      selectedEndpointHiCPair.targetBlockId,
+    ).then((result) => {
+      if (cancelled) {
+        return;
+      }
+      setEndpointHiCRequest({
+        key: selectedEndpointHiCPair.key,
+        loading: false,
+        result,
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    curationAssistantOpen,
+    curationAssistantView,
+    loadEndpointHiCCached,
+    onLoadEndpointHiC,
+    selectedEndpointHiCPair,
+  ]);
+
+  useEffect(() => {
+    if (!endpointHiCOverlayKey || endpointHiCCandidateRequests.length === 0) {
+      setEndpointHiCOverlayRequest((current) => current.key === ""
+        ? current
+        : {
+          key: "",
+          loading: false,
+          requestedCount: 0,
+          completedCount: 0,
+          entries: [],
+        });
+      return undefined;
+    }
+
+    let cancelled = false;
+    const cachedEntries = endpointHiCCandidateRequests.flatMap((request) => {
+      const result = endpointHiCCacheRef.current.get(request.cacheKey);
+      return result ? [{ candidate: request.candidate, result }] : [];
+    });
+    const missingRequests = endpointHiCCandidateRequests.filter(
+      (request) => !endpointHiCCacheRef.current.has(request.cacheKey),
+    );
+    setEndpointHiCOverlayRequest({
+      key: endpointHiCOverlayKey,
+      loading: missingRequests.length > 0,
+      requestedCount: endpointHiCCandidateRequests.length,
+      completedCount: cachedEntries.length,
+      entries: cachedEntries,
+    });
+    if (missingRequests.length === 0) {
+      return undefined;
+    }
+
+    const entriesById = new Map(cachedEntries.map((entry) => [
+      entry.candidate.link.id,
+      entry,
+    ]));
+    let cursor = 0;
+    let completedCount = cachedEntries.length;
+    const publish = () => {
+      if (cancelled) {
+        return;
+      }
+      setEndpointHiCOverlayRequest({
+        key: endpointHiCOverlayKey,
+        loading: completedCount < endpointHiCCandidateRequests.length,
+        requestedCount: endpointHiCCandidateRequests.length,
+        completedCount,
+        entries: [...entriesById.values()],
+      });
+    };
+    const batchSize = gfaEndpointHiCRequestBatchSize(Boolean(onLoadEndpointHiCBatch));
+    const runWorker = async () => {
+      while (!cancelled) {
+        const batch = missingRequests.slice(cursor, cursor + batchSize);
+        cursor += batch.length;
+        if (batch.length === 0) {
+          return;
+        }
+        const results = await loadEndpointHiCBatchCached(batch);
+        if (cancelled) {
+          return;
+        }
+        results.forEach((result, index) => {
+          const request = batch[index];
+          if (request) {
+            entriesById.set(request.candidate.link.id, { candidate: request.candidate, result });
+            completedCount += 1;
+          }
+        });
+        if (completedCount === endpointHiCCandidateRequests.length) {
+          publish();
+        }
+        if (!cancelled && completedCount < endpointHiCCandidateRequests.length) {
+          await waitForGfaInteractionIdle(() => interactionRef.current !== null);
+        }
+      }
+    };
+    const workerCount = 1;
+    for (let index = 0; index < workerCount; index += 1) {
+      void runWorker();
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    endpointHiCCandidateRequests,
+    endpointHiCOverlayKey,
+    loadEndpointHiCBatchCached,
+    onLoadEndpointHiCBatch,
+  ]);
+
+  useEffect(() => {
+    const guidedFocusChanged = layoutMode === "guided"
+      && guidedGraphKeyRef.current !== guidedGraphKey;
+    if (guidedFocusChanged) {
+      nodesRef.current = [];
+      fitViewPendingRef.current = true;
+    }
+    guidedGraphKeyRef.current = guidedGraphKey;
     const firstLayout = nodesRef.current.length === 0;
-    graphRef.current = layoutMode === "curation" ? visibleGraph : visibleBandageGraph;
+    graphRef.current = activeGraph;
     if (homologs.error && layoutMode === "curation") {
       return;
     }
     nodesRef.current = initializeLayoutNodes(
-      layoutMode === "curation" ? visibleGraph : visibleBandageGraph,
+      activeGraph,
       homologs,
       nodesRef.current,
       layoutMode,
       graph,
+      guidedFocalNodeIds,
+      bandagePathStateRef.current,
     );
     if (firstLayout) {
       fitViewPendingRef.current = true;
     }
-  }, [graph, homologs, layoutMode, layoutRevision, visibleGraph, visibleBandageGraph]);
+  }, [activeGraph, graph, guidedFocalNodeIds, guidedGraphKey, homologs, layoutMode, layoutRevision]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (canvas) {
-      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks, selectionBoxRef.current);
+      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
     }
-  }, [homologs, selectedAssemblyBlockIds, showHomologLinks, showNonHomologLinks]);
+  }, [homologs, selectedAssemblyBlockIds, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) {
       return;
     }
-    const draw = () => drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks, selectionBoxRef.current);
+    const draw = () => drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
     draw();
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
     return () => {
       observer.disconnect();
     };
-  }, [graph, homologs, layoutMode, layoutRevision, showHomologLinks, showNonHomologLinks]);
+  }, [graph, homologs, layoutMode, layoutRevision, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks]);
 
   function switchLayoutMode(mode: GfaLayoutMode) {
     if (mode === layoutMode) {
       return;
+    }
+    if (layoutMode === "bandage") {
+      rememberBandagePaths(bandagePathStateRef.current, nodesRef.current);
     }
     nodesRef.current = [];
     fitViewPendingRef.current = true;
@@ -397,6 +1330,19 @@ export function GfaGraphPanel({
     if (homologs.error && layoutMode === "curation") {
       return;
     }
+    if (layoutMode === "bandage") {
+      bandagePathStateRef.current.clear();
+    }
+    nodesRef.current = [];
+    fitViewPendingRef.current = true;
+    setLayoutRevision((revision) => revision + 1);
+  }
+
+  function autoLayoutBandage() {
+    if (layoutMode !== "bandage") {
+      return;
+    }
+    bandagePathStateRef.current.clear();
     nodesRef.current = [];
     fitViewPendingRef.current = true;
     setLayoutRevision((revision) => revision + 1);
@@ -414,6 +1360,55 @@ export function GfaGraphPanel({
     setShowDisconnectedNodes((visible) => !visible);
   }
 
+  function inspectCurationIssue(issue: GfaCurationIssue) {
+    setSelectedCurationIssueId(issue.id);
+    setCurationAssistantView("evidence");
+    if (issue.focusAssemblyUnitIds.length === 0) {
+      return;
+    }
+    onSelectOccurrences(issue.focusAssemblyUnitIds);
+    if (layoutMode !== "guided") {
+      switchLayoutMode("guided");
+    }
+  }
+
+  function showEvidenceForNode(nodeId: string) {
+    const issue = curationIssues.find((candidate) => candidate.nodeIds.includes(nodeId));
+    if (!issue) {
+      return;
+    }
+    setSelectedCurationIssueId(issue.id);
+    setCurationAssistantView("evidence");
+  }
+
+  function proposeEdit(proposal: GfaEditProposal) {
+    setPickingInsertTarget(false);
+    setPendingEditProposal(proposal);
+  }
+
+  function confirmEditProposal() {
+    const proposal = pendingEditProposal;
+    if (!proposal) {
+      return;
+    }
+    if (proposal.kind === "reverse") {
+      onEditAssembly({ type: "reverseAssemblySelection" });
+    } else if (proposal.kind === "insert") {
+      onEditAssembly({
+        type: "moveAssemblySelectionBefore",
+        targetBlockId: proposal.targetBlockId,
+        targetObjectId: proposal.targetObjectId,
+      });
+    } else if (proposal.kind === "delete") {
+      onEditAssembly({ type: "deleteAssemblySelection" });
+    } else if (proposal.kind === "create-block") {
+      onEditAssembly({ type: "createAssemblyBlockFromGfa", links: document.links });
+    } else {
+      onEditAssembly({ type: "dissolveAssemblyBlockSelection" });
+    }
+    setPendingEditProposal(null);
+  }
+
   function pointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
     if (event.button !== 0) {
       return;
@@ -425,14 +1420,29 @@ export function GfaGraphPanel({
     const rigidNodeIds = node
       ? new Set(gfaRigidBlockNodeIds(nodesRef.current, node.id))
       : new Set<string>();
+    const reshape = Boolean(
+      node
+      && !event.shiftKey
+      && layoutMode === "bandage"
+      && bandageInteractionMode === "reshape",
+    );
     interactionRef.current = {
       pointerId: event.pointerId,
-      kind: event.shiftKey ? "selection" : node ? "node" : "pan",
+      kind: event.shiftKey ? "selection" : node ? reshape ? "reshape" : "node" : "pan",
       nodeId: event.shiftKey ? undefined : node?.id,
       draggedNodes: node && !event.shiftKey
         ? nodesRef.current
           .filter((candidate) => rigidNodeIds.has(candidate.id))
-          .map((candidate) => ({ id: candidate.id, x: candidate.x, y: candidate.y }))
+          .map((candidate) => ({
+            id: candidate.id,
+            x: candidate.x,
+            y: candidate.y,
+            width: candidate.width,
+            pathPoints: candidate.pathPoints.map(copyPathPoint),
+          }))
+        : undefined,
+      grabbedPointIndex: reshape && node
+        ? closestBandageControlPointIndex(node.pathPoints, point)
         : undefined,
       startGraphX: node || event.shiftKey ? point.x : undefined,
       startGraphY: node || event.shiftKey ? point.y : undefined,
@@ -450,7 +1460,7 @@ export function GfaGraphPanel({
         currentY: point.y,
       };
       canvas.classList.add("gfa-selecting");
-      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks, selectionBoxRef.current);
+      drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
     }
     canvas.setPointerCapture(event.pointerId);
   }
@@ -469,13 +1479,13 @@ export function GfaGraphPanel({
         selectionBoxRef.current.currentX = point.x;
         selectionBoxRef.current.currentY = point.y;
       }
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks, selectionBoxRef.current);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks, selectionBoxRef.current);
       return;
     }
     if (interaction.kind === "pan") {
       viewRef.current.x = interaction.startViewX + deltaX;
       viewRef.current.y = interaction.startViewY + deltaY;
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
       return;
     }
     if (
@@ -486,15 +1496,40 @@ export function GfaGraphPanel({
       const point = graphPointFromPointer(event.currentTarget, event.clientX, event.clientY, viewRef.current);
       const graphDeltaX = point.x - interaction.startGraphX;
       const graphDeltaY = point.y - interaction.startGraphY;
+      if (
+        interaction.kind === "reshape"
+        && interaction.nodeId
+        && interaction.grabbedPointIndex !== undefined
+      ) {
+        const reshaped = gfaReshapeBandageBlockPaths(
+          interaction.draggedNodes,
+          interaction.nodeId,
+          interaction.grabbedPointIndex,
+          { x: graphDeltaX, y: graphDeltaY },
+        );
+        for (const node of nodesRef.current) {
+          const pathPoints = reshaped.get(node.id);
+          if (pathPoints) {
+            node.pathPoints = pathPoints;
+            updateNodeCenterFromPath(node);
+          }
+        }
+        drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+        return;
+      }
       const startsById = new Map(interaction.draggedNodes.map((node) => [node.id, node]));
       for (const node of nodesRef.current) {
         const start = startsById.get(node.id);
         if (start) {
           node.x = start.x + graphDeltaX;
           node.y = start.y + graphDeltaY;
+          node.pathPoints = start.pathPoints.map((pathPoint) => ({
+            x: pathPoint.x + graphDeltaX,
+            y: pathPoint.y + graphDeltaY,
+          }));
         }
       }
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks);
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
     }
   }
 
@@ -517,22 +1552,56 @@ export function GfaGraphPanel({
         ));
       } else {
         const point = graphPointFromPointer(event.currentTarget, event.clientX, event.clientY, viewRef.current);
+        const chromosomeSelection = gfaChromosomeLabelSelection(
+          nodesRef.current,
+          homologScaffoldIds(homologs),
+          point,
+          viewRef.current.scale,
+        );
+        if (chromosomeSelection) {
+          onSelectOccurrences(chromosomeSelection);
+          selectionBoxRef.current = null;
+          event.currentTarget.classList.remove("gfa-selecting");
+          drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+          interactionRef.current = null;
+          event.currentTarget.releasePointerCapture(event.pointerId);
+          return;
+        }
         const node = nodeAtPoint(nodesRef.current, point.x, point.y);
         const unitId = node ? gfaAssemblyUnitId(node) : null;
         if (unitId) {
           onSelectOccurrences([unitId]);
+          showEvidenceForNode(node!.id);
         } else {
           onSelectOccurrences([]);
         }
       }
       selectionBoxRef.current = null;
       event.currentTarget.classList.remove("gfa-selecting");
-      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks);
-    } else if (interaction.kind === "node" && interaction.nodeId) {
+      drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
+    } else if ((interaction.kind === "node" || interaction.kind === "reshape") && interaction.nodeId) {
       const node = nodesRef.current.find((candidate) => candidate.id === interaction.nodeId);
       const unitId = node ? gfaAssemblyUnitId(node) : null;
       if (!interaction.moved && unitId) {
+        if (pickingInsertTarget && node?.occurrenceId) {
+          const target = assemblyBlocksById.get(node.occurrenceId);
+          if (target && !selectedIdsRef.current.has(target.id)) {
+            proposeEdit({
+              kind: "insert",
+              title: `Insert before ${target.displayName?.trim() || target.sourceId}`,
+              detail: `Move ${selectedPlacedBlocks.length} selected utg${selectedPlacedBlocks.length === 1 ? "" : "s"} into ${target.objectId}. Existing GFA overlaps remain evidence until Create block is explicitly confirmed.`,
+              targetBlockId: target.id,
+              targetObjectId: target.objectId,
+            });
+          }
+          interactionRef.current = null;
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          return;
+        }
         onSelectOccurrences([unitId]);
+        showEvidenceForNode(node!.id);
       }
       if (interaction.moved) {
         const draggedIds = new Set(interaction.draggedNodes?.map((dragged) => dragged.id));
@@ -540,6 +1609,9 @@ export function GfaGraphPanel({
           if (draggedIds.has(candidate.id)) {
             candidate.manuallyPlaced = true;
           }
+        }
+        if (layoutMode === "bandage") {
+          rememberBandagePaths(bandagePathStateRef.current, nodesRef.current, draggedIds);
         }
       }
     }
@@ -554,13 +1626,14 @@ export function GfaGraphPanel({
     if (!interaction || interaction.pointerId !== event.pointerId) {
       return;
     }
-    if (interaction.kind === "node" && interaction.draggedNodes) {
+    if ((interaction.kind === "node" || interaction.kind === "reshape") && interaction.draggedNodes) {
       const startsById = new Map(interaction.draggedNodes.map((node) => [node.id, node]));
       for (const node of nodesRef.current) {
         const start = startsById.get(node.id);
         if (start) {
           node.x = start.x;
           node.y = start.y;
+          node.pathPoints = start.pathPoints.map(copyPathPoint);
         }
       }
     }
@@ -570,7 +1643,7 @@ export function GfaGraphPanel({
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-    drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks);
+    drawCurrentGraph(event.currentTarget, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
   }
 
   function zoom(event: React.WheelEvent<HTMLCanvasElement>) {
@@ -586,7 +1659,7 @@ export function GfaGraphPanel({
     viewRef.current.scale = nextScale;
     viewRef.current.x = pointerX - graphX * nextScale;
     viewRef.current.y = pointerY - graphY * nextScale;
-    drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showHomologLinks, showNonHomologLinks);
+    drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAgpGaps, visibleEndpointHiCLinks);
   }
 
   return (
@@ -596,7 +1669,14 @@ export function GfaGraphPanel({
           <span className="gfa-toolbar-title">
             <strong>GFA Assembly Graph</strong>
             <small>
-              {(layoutMode === "curation" ? visibleGraph.nodes.length : visibleBandageGraph.nodes.length).toLocaleString()} nodes · {(layoutMode === "curation" ? visibleGraph.edges.length : visibleBandageGraph.edges.length).toLocaleString()} visible relations
+              {activeGraph.nodes.length.toLocaleString()} nodes · {visibleGraphRelationCount.toLocaleString()} visible relations
+              {showHiCLinks && hiCContactMapReady
+                ? ` · ${visibleEndpointHiCLinks.length.toLocaleString()} 3D contact links · Top ${hiCLinkLimit.toLocaleString()}/end${
+                  endpointHiCOverlayRequest.key === endpointHiCOverlayKey && endpointHiCOverlayRequest.loading
+                    ? ` (${endpointHiCOverlayRequest.completedCount}/${endpointHiCOverlayRequest.requestedCount})`
+                    : ""
+                }`
+                : ""}
               {graph.ambiguousLinkCount ? ` · ${graph.ambiguousLinkCount.toLocaleString()} ambiguous links hidden` : ""}
             </small>
           </span>
@@ -611,12 +1691,111 @@ export function GfaGraphPanel({
               >Curation</button>
               <button
                 type="button"
+                aria-pressed={layoutMode === "guided"}
+                title="Keep the AGP backbone ordered and show one layer of GFA neighbors around the selected or heatmap-focus blocks"
+                onClick={() => switchLayoutMode("guided")}
+              >Guided</button>
+              <button
+                type="button"
                 aria-pressed={layoutMode === "bandage"}
                 title="Arrange blocks by graph topology while preserving AGP order inside each block"
                 onClick={() => switchLayoutMode("bandage")}
               >Bandage</button>
             </div>
+            {layoutMode === "bandage" ? <>
+              <span className="gfa-toolbar-divider" aria-hidden="true" />
+              <button
+                type="button"
+                className="gfa-link-toggle gfa-auto-layout-button"
+                aria-label="Run Bandage automatic layout"
+                title="Recompute the block-aware topology layout and automatic bends"
+                onClick={autoLayoutBandage}
+              >Auto layout</button>
+              <span className="gfa-toolbar-section-label">Edit</span>
+              <div className="gfa-layout-mode gfa-bandage-edit-mode" role="group" aria-label="Bandage interaction mode">
+                <button
+                  type="button"
+                  aria-pressed={bandageInteractionMode === "move"}
+                  title="Move the complete AGP block without changing its shape"
+                  onClick={() => setBandageInteractionMode("move")}
+                >Move</button>
+                <button
+                  type="button"
+                  aria-pressed={bandageInteractionMode === "reshape"}
+                  title="Bend a local part of the AGP block; GFA links follow its endpoints"
+                  onClick={() => setBandageInteractionMode("reshape")}
+                >Reshape</button>
+              </div>
+            </> : null}
             <span className="gfa-toolbar-divider" aria-hidden="true" />
+            <span className="gfa-toolbar-section-label">Layers</span>
+            <div className="gfa-layout-mode gfa-evidence-layers" role="group" aria-label="Graph evidence layers">
+              <button
+                type="button"
+                aria-label="Toggle GFA links"
+                aria-pressed={showGfaLinks}
+                title="Show or hide all unitig links imported from the GFA"
+                onClick={() => setShowGfaLinks((visible) => !visible)}
+              >GFA</button>
+              <button
+                type="button"
+                aria-label="Toggle AGP gap links"
+                aria-pressed={showAgpGaps}
+                title="Show or hide AGP gap and adjacency junction lines"
+                onClick={() => setShowAgpGaps((visible) => !visible)}
+              >AGP gaps</button>
+            </div>
+            <div
+              className={`gfa-contact-layer-control${showHiCLinks ? " active" : ""}`}
+              role="group"
+              aria-label="3D contact layer controls"
+            >
+              <button
+                type="button"
+                className="gfa-contact-layer-toggle"
+                aria-label="Toggle endpoint 3D contact links"
+                aria-pressed={showHiCLinks}
+                disabled={!hiCContactMapReady}
+                title={hiCContactMapReady
+                  ? "Show or hide endpoint-resolved 3D contact links from a Hi-C, Pore-C, or CiFi contact map; a link is drawn only when it ranks within Top X at both ends"
+                  : contactMap
+                    ? "The 3D contact overview is refreshing for the current assembly layout"
+                    : "Load a compatible Hi-C, Pore-C, or CiFi contact map to enable this layer"}
+                onClick={() => setShowHiCLinks((visible) => !visible)}
+              >3D Contacts</button>
+              <span className="gfa-contact-control-divider" aria-hidden="true" />
+              <label
+                className="gfa-contact-top-control"
+                title="Apply the same strict length-normalized Top X filter independently to L and R of every currently drawn, contact-mappable unitig"
+              >
+                <span>Top/end</span>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={maximumGfaEndpointHiCLinkLimit}
+                  step={1}
+                  value={hiCLinkLimit}
+                  disabled={!hiCContactMapReady}
+                  aria-label="3D contact links per contig endpoint"
+                  onChange={(event) => {
+                    const value = Number(event.currentTarget.value);
+                    if (Number.isFinite(value) && value > 0) {
+                      setHiCLinkLimit(normalizeGfaEndpointHiCLinkLimit(value));
+                    }
+                  }}
+                />
+              </label>
+            </div>
+            <span className="gfa-toolbar-divider" aria-hidden="true" />
+            <button
+              type="button"
+              className="gfa-link-toggle gfa-review-toggle"
+              aria-label="Toggle GFA review queue and evidence card"
+              aria-pressed={curationAssistantOpen}
+              title="Show or hide read-only GFA and 3D contact review candidates"
+              onClick={() => setCurationAssistantOpen((open) => !open)}
+            >Review {curationIssues.length.toLocaleString()}</button>
             <button
               type="button"
               className="gfa-toolbar-details-toggle"
@@ -673,6 +1852,7 @@ export function GfaGraphPanel({
               className="gfa-link-toggle"
               aria-label="Toggle links between homologous chromosomes"
               aria-pressed={showHomologLinks}
+              disabled={!showGfaLinks}
               title="Show or hide GFA links between homologous chromosome members"
               onClick={() => setShowHomologLinks((visible) => !visible)}
             >Homolog</button>
@@ -681,6 +1861,7 @@ export function GfaGraphPanel({
               className="gfa-link-toggle"
               aria-label="Toggle links between non-homologous chromosomes"
               aria-pressed={showNonHomologLinks}
+              disabled={!showGfaLinks}
               title="Show or hide GFA links between non-homologous chromosomes and unplaced unitigs"
               onClick={() => setShowNonHomologLinks((visible) => !visible)}
             >Non-homolog</button>
@@ -691,23 +1872,492 @@ export function GfaGraphPanel({
             <span className="gfa-legend"><i className="gap" />AGP gap</span>
             <span className="gfa-legend"><i className="link" />GFA link</span>
             <span className="gfa-legend"><i className="gap-link" />GFA across gap</span>
+            <span className="gfa-legend"><i className="hic-link" />3D contacts</span>
           </div>
         </div> : null}
       </header>
-      <div className="gfa-canvas-frame">
+      {selectedPlacedBlocks.length > 0 ? (
+        <div className="gfa-edit-dock" aria-label="Selected GFA assembly operations">
+          <div className="gfa-edit-actions">
+            <span className="gfa-edit-selection-count">
+              <strong>{selectedPlacedBlocks.length}</strong> utg{selectedPlacedBlocks.length === 1 ? "" : "s"} selected
+            </span>
+            <button
+              type="button"
+              onClick={() => proposeEdit({
+                kind: "reverse",
+                title: selectedPlacedBlocks.length === 1 ? "Flip selected utg" : "Reverse selected block order and orientation",
+                detail: `Reverse ${selectedPlacedBlocks.length} selected utg${selectedPlacedBlocks.length === 1 ? "" : "s"}; source sequence is not modified.`,
+              })}
+            >Flip</button>
+            <button
+              type="button"
+              className={pickingInsertTarget ? "active" : undefined}
+              aria-pressed={pickingInsertTarget}
+              onClick={() => {
+                setPendingEditProposal(null);
+                setPickingInsertTarget((picking) => !picking);
+              }}
+            >Insert…</button>
+            <button
+              type="button"
+              disabled={!selectedBlockPlan.ok}
+              title={selectedBlockPlan.ok ? "Preview one overlap-aware block" : selectedBlockPlan.reason}
+              onClick={() => {
+                if (!selectedBlockPlan.ok) {
+                  return;
+                }
+                const trimmedBases = selectedBlockPlan.joins.reduce((sum, join) => sum + join.trimRightBases, 0);
+                const supportedJoins = selectedBlockPlan.joins.filter((join) => join.linkId).length;
+                proposeEdit({
+                  kind: "create-block",
+                  title: `Create one block from ${selectedBlockPlan.selectedBlockIds.length} utgs`,
+                  detail: `${supportedJoins}/${selectedBlockPlan.joins.length} junctions have uniquely oriented GFA L evidence; ${trimmedBases.toLocaleString()} overlapping bp will be trimmed once from right-hand source intervals.`,
+                });
+              }}
+            >Create block</button>
+            <button
+              type="button"
+              disabled={selectedCompositeBlockCount === 0}
+              title={selectedCompositeBlockCount === 0 ? "Select a composite block first" : "Preview splitting selected blocks into singleton utgs"}
+              onClick={() => proposeEdit({
+                kind: "dissolve-block",
+                title: `Dissolve ${selectedCompositeBlockCount} block${selectedCompositeBlockCount === 1 ? "" : "s"}`,
+                detail: "Restore any GFA-trimmed source interval and add explicit 100 bp unknown AGP gaps between the resulting singleton utgs.",
+              })}
+            >Dissolve block</button>
+            <button
+              type="button"
+              className="danger"
+              onClick={() => proposeEdit({
+                kind: "delete",
+                title: `Delete ${selectedPlacedBlocks.length} utg${selectedPlacedBlocks.length === 1 ? "" : "s"}`,
+                detail: "Remove these placements from the edited assembly. The original GFA and source sequence remain unchanged, and the operation can be undone from History.",
+              })}
+            >Delete</button>
+          </div>
+          {pickingInsertTarget ? (
+            <p className="gfa-edit-guidance">Click an unselected target utg to preview insertion immediately before it. Esc or Insert… cancels.</p>
+          ) : null}
+          {pendingEditProposal ? (
+            <div className="gfa-edit-preview" role="dialog" aria-label="GFA operation preview">
+              <span><strong>Preview · {pendingEditProposal.title}</strong><small>{pendingEditProposal.detail}</small></span>
+              <button type="button" onClick={() => setPendingEditProposal(null)}>Cancel</button>
+              <button
+                type="button"
+                className={pendingEditProposal.kind === "delete" ? "danger confirm" : "confirm"}
+                onClick={confirmEditProposal}
+              >Confirm</button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      <div className={`gfa-canvas-frame${curationAssistantOpen ? " with-curation-assistant" : ""}`}>
         <canvas
           ref={canvasRef}
-          className="gfa-graph-canvas"
-          aria-label="Interactive GFA curation graph; drag a unitig to move its whole block, Shift-drag to select multiple blocks, drag empty space to pan, and scroll to zoom"
+          className={`gfa-graph-canvas${layoutMode === "bandage" && bandageInteractionMode === "reshape" ? " gfa-reshaping" : ""}`}
+          aria-label={layoutMode === "bandage" && bandageInteractionMode === "reshape"
+            ? "Interactive Bandage graph in Reshape mode; drag a unitig locally to bend its block, Shift-drag to select multiple blocks, drag empty space to pan, and scroll to zoom"
+            : "Interactive GFA curation graph; drag a unitig to move its whole block, Shift-drag to select multiple blocks, drag empty space to pan, and scroll to zoom"}
           onPointerDown={pointerDown}
           onPointerMove={pointerMove}
           onPointerUp={pointerUp}
           onPointerCancel={pointerCancel}
           onWheel={zoom}
         />
+        {curationAssistantOpen ? (
+          <GfaCurationAssistant
+            issues={curationIssues}
+            selectedIssue={selectedCurationIssue}
+            view={curationAssistantView}
+            hiCAvailable={hiCContactMapReady}
+            endpointHiC={endpointHiCDisplayState}
+            onShowQueue={() => setCurationAssistantView("queue")}
+            onInspectIssue={inspectCurationIssue}
+          />
+        ) : null}
       </div>
     </section>
   );
+}
+
+function GfaCurationAssistant({
+  issues,
+  selectedIssue,
+  view,
+  hiCAvailable,
+  endpointHiC,
+  onShowQueue,
+  onInspectIssue,
+}: {
+  issues: GfaCurationIssue[];
+  selectedIssue: GfaCurationIssue | null;
+  view: CurationAssistantView;
+  hiCAvailable: boolean;
+  endpointHiC: EndpointHiCDisplayState;
+  onShowQueue: () => void;
+  onInspectIssue: (issue: GfaCurationIssue) => void;
+}) {
+  const priorityCounts = issues.reduce(
+    (counts, issue) => ({ ...counts, [issue.priority]: counts[issue.priority] + 1 }),
+    { high: 0, medium: 0, info: 0 },
+  );
+
+  return (
+    <aside className="gfa-curation-assistant" aria-label="GFA review queue and evidence">
+      <header className="gfa-curation-assistant-header">
+        {view === "evidence" ? (
+          <button type="button" className="gfa-evidence-back" onClick={onShowQueue}>
+            ← Queue
+          </button>
+        ) : (
+          <span>
+            <strong>Review queue</strong>
+            <small>{issues.length.toLocaleString()} candidates</small>
+          </span>
+        )}
+        <em>Read-only</em>
+      </header>
+      {view === "queue" ? (
+        <div className="gfa-review-queue-view">
+          <div className="gfa-review-summary" aria-label="Review candidate counts">
+            <span className="high"><strong>{priorityCounts.high}</strong> high</span>
+            <span className="medium"><strong>{priorityCounts.medium}</strong> review</span>
+            <span className="info"><strong>{priorityCounts.info}</strong> context</span>
+          </div>
+          {!hiCAvailable ? (
+            <p className="gfa-review-notice">3D contact triage is unavailable until the current assembly overview is ready.</p>
+          ) : null}
+          {issues.length > 0 ? (
+            <ol className="gfa-review-list">
+              {issues.map((issue) => (
+                <li key={issue.id}>
+                  <button
+                    type="button"
+                    className={`gfa-review-item priority-${issue.priority}`}
+                    aria-label={`Inspect ${issue.title}`}
+                    onClick={() => onInspectIssue(issue)}
+                  >
+                    <span className="gfa-review-item-heading">
+                      <i aria-hidden="true" />
+                      <strong>{issue.title}</strong>
+                      <b aria-hidden="true">›</b>
+                    </span>
+                    <small>{issueKindLabel(issue.kind)}</small>
+                    <p>{issue.summary}</p>
+                  </button>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <div className="gfa-review-empty">
+              <strong>No review candidates</strong>
+              <p>No endpoint conflict, gap bridge, strong non-adjacent 3D contact pair, or copy ambiguity was found in the current graph scope.</p>
+            </div>
+          )}
+        </div>
+      ) : selectedIssue ? (
+        <GfaEvidenceCard
+          issue={selectedIssue}
+          endpointHiC={endpointHiC}
+          onFocus={() => onInspectIssue(selectedIssue)}
+        />
+      ) : (
+        <div className="gfa-review-empty">
+          <strong>No evidence selected</strong>
+          <button type="button" onClick={onShowQueue}>Return to queue</button>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function GfaEvidenceCard({
+  issue,
+  endpointHiC,
+  onFocus,
+}: {
+  issue: GfaCurationIssue;
+  endpointHiC: EndpointHiCDisplayState;
+  onFocus: () => void;
+}) {
+  return (
+    <article className="gfa-evidence-card" aria-label={`Evidence for ${issue.title}`}>
+      <div className="gfa-evidence-title-row">
+        <span className={`gfa-priority-badge priority-${issue.priority}`}>
+          {issuePriorityLabel(issue.priority)}
+        </span>
+        <span>{issueKindLabel(issue.kind)}</span>
+      </div>
+      <h3>{issue.title}</h3>
+      <p className="gfa-evidence-summary">{issue.summary}</p>
+      {issue.focusAssemblyUnitIds.length > 0 ? (
+        <button type="button" className="gfa-evidence-focus" onClick={onFocus}>
+          Focus in Guided
+        </button>
+      ) : null}
+
+      {issue.placements.length > 0 ? (
+        <section>
+          <h4>Placements</h4>
+          <div className="gfa-evidence-placement-list">
+            {issue.placements.map((placement) => (
+              <dl key={placement.nodeId}>
+                <div><dt>Unitig</dt><dd>{placement.segmentName}</dd></div>
+                <div><dt>AGP</dt><dd>{placement.kind === "placed" ? placement.groupId : "Not placed"}</dd></div>
+                <div><dt>Orientation</dt><dd>{placement.orientation}</dd></div>
+                <div><dt>Length</dt><dd>{formatEvidenceBasePairs(placement.length)}</dd></div>
+                <div><dt>Read depth</dt><dd>{placement.readDepth ?? "Not provided"}</dd></div>
+              </dl>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {issue.agp ? (
+        <section>
+          <h4>Current AGP</h4>
+          <dl className="gfa-evidence-facts">
+            <div><dt>Relationship</dt><dd>{agpRelationshipLabel(issue.agp.relationship)}</dd></div>
+            {issue.agp.gapLength !== null ? (
+              <div><dt>Gap</dt><dd>{formatEvidenceBasePairs(issue.agp.gapLength)}</dd></div>
+            ) : null}
+          </dl>
+        </section>
+      ) : null}
+
+      {issue.gfa ? (
+        <section>
+          <h4>GFA link</h4>
+          <dl className="gfa-evidence-facts">
+            <div>
+              <dt>Ends</dt>
+              <dd>{gfaLinkEndsLabel(issue)}</dd>
+            </div>
+            <div><dt>Overlap</dt><dd>{issue.gfa.overlap ?? "Not provided"}</dd></div>
+            <div><dt>Pair links</dt><dd>{issue.gfa.pairLinkCount.toLocaleString()}</dd></div>
+          </dl>
+        </section>
+      ) : null}
+
+      {issue.hic ? (
+        <section>
+          <h4>3D contact overview</h4>
+          <dl className="gfa-evidence-facts">
+            <div><dt>Raw apportioned</dt><dd>{formatEvidenceNumber(issue.hic.rawCount)}</dd></div>
+            <div><dt>Length-normalized</dt><dd>{formatEvidenceNumber(issue.hic.normalizedCountPerMb2)} contacts/Mb²</dd></div>
+            <div><dt>Rank</dt><dd>Top {Math.max(1, Math.round((1 - issue.hic.percentile) * 100))}%</dd></div>
+          </dl>
+        </section>
+      ) : null}
+
+      {endpointHiC.status !== "not-applicable" ? (
+        <GfaEndpointHiCEvidenceSection issue={issue} state={endpointHiC} />
+      ) : null}
+
+      <section className="gfa-evidence-interpretation">
+        <h4>What it supports</h4>
+        <p>{issue.interpretation}</p>
+      </section>
+      <section className="gfa-evidence-limits">
+        <h4>Limits</h4>
+        <ul>
+          {issue.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
+        </ul>
+      </section>
+    </article>
+  );
+}
+
+function GfaEndpointHiCEvidenceSection({
+  issue,
+  state,
+}: {
+  issue: GfaCurationIssue;
+  state: Exclude<EndpointHiCDisplayState, { status: "not-applicable" }>;
+}) {
+  if (state.status === "loading") {
+    return (
+      <section className="gfa-endpoint-hic" aria-busy="true">
+        <h4>Endpoint contacts</h4>
+        <p className="gfa-endpoint-status">Loading four terminal-window combinations…</p>
+      </section>
+    );
+  }
+  if (state.status === "ineligible") {
+    return (
+      <section className="gfa-endpoint-hic">
+        <h4>Endpoint contacts</h4>
+        <p className="gfa-endpoint-status">{state.reason}</p>
+      </section>
+    );
+  }
+  if (state.result.status !== "ready") {
+    return (
+      <section className={`gfa-endpoint-hic status-${state.result.status}`}>
+        <h4>Endpoint contacts</h4>
+        <p className="gfa-endpoint-status">{state.result.reason}</p>
+        {state.result.resolution ? (
+          <small>Attempted resolution: {formatEvidenceBasePairs(state.result.resolution)}/bin</small>
+        ) : null}
+      </section>
+    );
+  }
+
+  const { evidence } = state.result;
+  const source = issue.placements.find(
+    (placement) => placement.nodeId === evidence.sourceBlockId,
+  );
+  const target = issue.placements.find(
+    (placement) => placement.nodeId === evidence.targetBlockId,
+  );
+  if (!source || !target) {
+    return (
+      <section className="gfa-endpoint-hic status-unavailable">
+        <h4>Endpoint contacts</h4>
+        <p className="gfa-endpoint-status">The endpoint result no longer matches this evidence pair.</p>
+      </section>
+    );
+  }
+
+  const signalUnit = evidence.normalization === "raw"
+    ? "contacts/Mb²"
+    : `${endpointNormalizationLabel(evidence.normalization)} signal/Mb²`;
+  const best = evidence.bestQuadrant;
+  const endpoints: GfaDisplayedEndpoint[] = ["left", "right"];
+  return (
+    <section className="gfa-endpoint-hic">
+      <h4>Endpoint contacts</h4>
+      <p className="gfa-endpoint-intro">
+        Displayed terminal windows for <strong>{source.segmentName}</strong> × <strong>{target.segmentName}</strong>.
+      </p>
+      <table className="gfa-endpoint-matrix">
+        <caption>Length-normalized signal for each displayed endpoint pair</caption>
+        <thead>
+          <tr>
+            <th scope="col">Source ↓ / target →</th>
+            {endpoints.map((endpoint) => (
+              <th scope="col" key={endpoint}>
+                {endpointHeader(target, endpoint)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {endpoints.map((sourceEndpoint) => (
+            <tr key={sourceEndpoint}>
+              <th scope="row">{endpointHeader(source, sourceEndpoint)}</th>
+              {endpoints.map((targetEndpoint) => {
+                const quadrant = evidence.quadrants.find((candidate) => (
+                  candidate.sourceEndpoint === sourceEndpoint
+                  && candidate.targetEndpoint === targetEndpoint
+                ));
+                const isBest = best?.sourceEndpoint === sourceEndpoint
+                  && best.targetEndpoint === targetEndpoint;
+                return (
+                  <td key={targetEndpoint} className={isBest ? "is-best" : undefined}>
+                    <strong>{formatEvidenceNumber(quadrant?.normalizedCountPerMb2 ?? 0)}</strong>
+                    <small>{signalUnit}</small>
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <dl className="gfa-evidence-facts gfa-endpoint-facts">
+        <div><dt>Resolution</dt><dd>{formatEvidenceBasePairs(evidence.resolution)}/bin</dd></div>
+        <div>
+          <dt>Windows</dt>
+          <dd>{formatEvidenceBasePairs(evidence.sourceWindowBp)} × {formatEvidenceBasePairs(evidence.targetWindowBp)}</dd>
+        </div>
+        <div><dt>Matrix</dt><dd>{endpointNormalizationLabel(evidence.normalization)}</dd></div>
+        <div>
+          <dt>Strongest pair</dt>
+          <dd>{best ? `${endpointHeader(source, best.sourceEndpoint)} ↔ ${endpointHeader(target, best.targetEndpoint)}` : "No nonzero endpoint signal"}</dd>
+        </div>
+        <div>
+          <dt>Contrast</dt>
+          <dd>{evidence.contrastToNext === null ? "No nonzero runner-up" : `${formatEvidenceNumber(evidence.contrastToNext)}× vs next`}</dd>
+        </div>
+      </dl>
+      {!evidence.complete ? (
+        <p className="gfa-endpoint-warning">
+          Partial result: {evidence.missingTileCount.toLocaleString()} requested tile(s) were missing.
+        </p>
+      ) : null}
+      <p className="gfa-endpoint-caveat">
+        This identifies where contact signal is concentrated; it remains evidence for review, not an automatic flip or move.
+      </p>
+    </section>
+  );
+}
+
+function endpointHeader(
+  placement: GfaCurationPlacementEvidence,
+  endpoint: GfaDisplayedEndpoint,
+) {
+  const physicalSide = physicalSideForDisplayedEndpoint(placement.orientation, endpoint);
+  return `${endpoint === "left" ? "L" : "R"} (${physicalSide ?? "physical ?"})`;
+}
+
+function endpointNormalizationLabel(
+  normalization: "raw" | "ice" | "kr" | "vc" | "vc_sqrt",
+) {
+  switch (normalization) {
+    case "raw": return "Raw";
+    case "ice": return "ICE balanced";
+    case "kr": return "KR balanced";
+    case "vc": return "VC";
+    case "vc_sqrt": return "VC sqrt";
+  }
+}
+
+function issueKindLabel(kind: GfaCurationIssue["kind"]) {
+  switch (kind) {
+    case "orientation-conflict": return "Endpoint conflict";
+    case "gap-bridge": return "Gap bridge";
+    case "off-backbone": return "Non-adjacent evidence";
+    case "unplaced-neighbor": return "Unplaced neighbor";
+    case "copy-ambiguity": return "Copy ambiguity";
+  }
+}
+
+function issuePriorityLabel(priority: GfaCurationIssue["priority"]) {
+  return priority === "high" ? "High" : priority === "medium" ? "Review" : "Context";
+}
+
+function agpRelationshipLabel(relationship: NonNullable<GfaCurationIssue["agp"]>["relationship"]) {
+  switch (relationship) {
+    case "adjacent": return "Adjacent placements";
+    case "same-scaffold-nonadjacent": return "Same chromosome, non-adjacent";
+    case "cross-scaffold": return "Different chromosomes";
+    case "unplaced": return "One unitig is not placed";
+  }
+}
+
+function gfaLinkEndsLabel(issue: GfaCurationIssue) {
+  if (!issue.gfa) {
+    return "Not available";
+  }
+  const source = issue.placements.find((placement) => placement.nodeId === issue.gfa!.sourceNodeId);
+  const target = issue.placements.find((placement) => placement.nodeId === issue.gfa!.targetNodeId);
+  return `${source?.segmentName ?? issue.gfa.sourceNodeId}:${issue.gfa.sourceSide ?? "?"} ↔ ${target?.segmentName ?? issue.gfa.targetNodeId}:${issue.gfa.targetSide ?? "?"}`;
+}
+
+function formatEvidenceNumber(value: number) {
+  return value.toLocaleString(undefined, { maximumFractionDigits: value >= 100 ? 1 : 2 });
+}
+
+function formatEvidenceBasePairs(value: number) {
+  if (value >= 1_000_000) {
+    return `${formatEvidenceNumber(value / 1_000_000)} Mb`;
+  }
+  if (value >= 1_000) {
+    return `${formatEvidenceNumber(value / 1_000)} kb`;
+  }
+  return `${value.toLocaleString()} bp`;
 }
 
 export function graphForVisibleHomologScaffolds(
@@ -870,6 +2520,47 @@ export function graphForChromosomeConnectionVisibility(
   };
 }
 
+/**
+ * Apply both node-visibility switches to Guided's local contig window.
+ * Disconnected components must be selected from the complete graph before the
+ * Non-AGP filter runs; otherwise the one-hop Guided crop makes the toggle a
+ * no-op. The focused chromosome window is always retained.
+ */
+export function graphForGuidedNodeVisibility(
+  graph: GfaAssemblyGraph,
+  visibleContigIds: ReadonlySet<string>,
+  homologs: GfaHomologClassification,
+  showGfaOnlyNodes: boolean,
+  showDisconnectedNodes: boolean,
+) {
+  const focused = graphForVisibleContigs(graph, visibleContigIds);
+  let candidate = focused;
+  if (showDisconnectedNodes) {
+    const chromosomeConnected = graphForChromosomeConnectionVisibility(
+      graph,
+      graph,
+      homologs,
+      false,
+    );
+    const connectedIds = new Set(chromosomeConnected.nodes.map((node) => node.id));
+    const selectedIds = new Set(focused.nodes.map((node) => node.id));
+    for (const node of graph.nodes) {
+      if (!connectedIds.has(node.id)) {
+        selectedIds.add(node.id);
+      }
+    }
+    candidate = inducedGfaGraph(graph, selectedIds);
+  } else {
+    candidate = graphForChromosomeConnectionVisibility(
+      focused,
+      graph,
+      homologs,
+      false,
+    );
+  }
+  return graphForGfaOnlyNodeVisibility(candidate, showGfaOnlyNodes);
+}
+
 function homologScaffoldIds(homologs: GfaHomologClassification) {
   return new Set(
     homologs.columns.flatMap((column) => column.scaffolds.map((scaffold) => scaffold.id)),
@@ -911,6 +2602,21 @@ function graphForVisibleContigs(
   };
 }
 
+function inducedGfaGraph(
+  graph: GfaAssemblyGraph,
+  nodeIds: ReadonlySet<string>,
+): GfaAssemblyGraph {
+  const nodes = graph.nodes.filter((node) => nodeIds.has(node.id));
+  return {
+    ...graph,
+    nodes,
+    edges: graph.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)),
+    groupOrder: graph.groupOrder.filter((groupId) => (
+      nodes.some((node) => node.groupId === groupId)
+    )),
+  };
+}
+
 function fitViewToNodes(
   canvas: HTMLCanvasElement,
   nodes: LayoutNode[],
@@ -928,13 +2634,14 @@ function fitViewToNodes(
     ? nodes.filter((node) => node.homologColumn !== null)
     : [];
   const fitNodes = chromosomeNodes.length > 0 ? chromosomeNodes : nodes;
-  const nodeMinX = Math.min(...fitNodes.map((node) => node.x - node.width / 2)) - 28;
+  const fitBounds = fitNodes.map(visualNodeBounds);
+  const nodeMinX = Math.min(...fitBounds.map((bounds) => bounds.left)) - 28;
   // Curation rows have right-aligned chromosome labels at x=150. Include
   // their full text gutter in automatic framing instead of clipping "Chr".
   const minX = chromosomeNodes.length > 0 ? Math.min(-220, nodeMinX) : nodeMinX;
-  const maxX = Math.max(...fitNodes.map((node) => node.x + node.width / 2)) + 28;
-  const minY = Math.min(...fitNodes.map((node) => node.y - node.height / 2)) - 28;
-  const maxY = Math.max(...fitNodes.map((node) => node.y + node.height / 2)) + 72;
+  const maxX = Math.max(...fitBounds.map((bounds) => bounds.right)) + 28;
+  const minY = Math.min(...fitBounds.map((bounds) => bounds.top)) - 28;
+  const maxY = Math.max(...fitBounds.map((bounds) => bounds.bottom)) + 72;
   // In the shallow bottom panel, fitting every chromosome and unanchored
   // component would collapse the curation rows. Fit chromosome width first;
   // the user can pan vertically across chromosome groups and rightward into
@@ -962,8 +2669,11 @@ function drawCurrentGraph(
   selectedIds: ReadonlySet<string>,
   fitPending: { current: boolean },
   homologs: GfaHomologClassification,
+  showGfaLinks: boolean,
   showHomologLinks: boolean,
   showNonHomologLinks: boolean,
+  showAgpGaps: boolean,
+  hiCLinks: ReadonlyArray<GfaEndpointHiCLink>,
   selectionBox: GfaSelectionBox | null = null,
 ) {
   if (!graph) {
@@ -972,7 +2682,20 @@ function drawCurrentGraph(
   if (fitPending.current && fitViewToNodes(canvas, nodes, view, layoutModeFromNodes(nodes))) {
     fitPending.current = false;
   }
-  drawInteractiveGraph(canvas, nodes, graph, view, selectedIds, homologs, showHomologLinks, showNonHomologLinks, selectionBox);
+  drawInteractiveGraph(
+    canvas,
+    nodes,
+    graph,
+    view,
+    selectedIds,
+    homologs,
+    showGfaLinks,
+    showHomologLinks,
+    showNonHomologLinks,
+    showAgpGaps,
+    hiCLinks,
+    selectionBox,
+  );
 }
 
 function initializeLayoutNodes(
@@ -981,6 +2704,8 @@ function initializeLayoutNodes(
   previous: LayoutNode[],
   layoutMode: GfaLayoutMode,
   evidenceGraph: GfaAssemblyGraph = graph,
+  guidedFocalNodeIds: ReadonlySet<string> = new Set<string>(),
+  savedBandagePaths: ReadonlyMap<string, GfaPathPoint[]> = new Map<string, GfaPathPoint[]>(),
 ) {
   const previousById = new Map(previous.map((node) => [node.id, node]));
   const homologByScaffold = new Map(
@@ -996,19 +2721,24 @@ function initializeLayoutNodes(
   );
   const positions = layoutMode === "bandage"
     ? layoutGfaNodesBandage(graph.nodes, graph.edges)
-    : layoutGfaNodesForCuration(
+    : layoutMode === "guided"
+      ? layoutGfaNodesGuided(graph.nodes, graph.edges, guidedFocalNodeIds)
+      : layoutGfaNodesForCuration(
       graph.nodes,
       graph.edges,
       homologs,
       evidenceGraph.nodes,
       evidenceGraph.edges,
     );
-  const bandageWidths = layoutMode === "bandage"
+  const bandageWidths = layoutMode !== "curation"
     ? gfaBandageNodeWidths(graph.nodes)
     : new Map<string, number>();
   const curationWidths = layoutMode === "curation"
     ? gfaCurationNodeWidths(graph.nodes)
     : new Map<string, number>();
+  const automaticBandagePaths = layoutMode === "bandage"
+    ? gfaAutomaticBandagePaths(graph.nodes, graph.edges, positions, bandageWidths)
+    : new Map<string, GfaPathPoint[]>();
 
   const output: LayoutNode[] = [];
   for (const node of graph.nodes) {
@@ -1016,15 +2746,31 @@ function initializeLayoutNodes(
       const targetX = position.x;
       const targetY = position.y;
       const existing = previousById.get(node.id);
+      const width = layoutMode !== "curation"
+        ? bandageWidths.get(node.id) ?? 18
+        : curationWidths.get(node.id) ?? 12;
+      const storedPath = layoutMode === "bandage"
+        ? existing?.pathPoints.length
+          ? existing.pathPoints
+          : savedBandagePaths.get(node.id)
+        : undefined;
+      const pathPoints = layoutMode === "bandage"
+        ? storedPath?.map(copyPathPoint)
+          ?? automaticBandagePaths.get(node.id)?.map(copyPathPoint)
+          ?? gfaInitialBandagePathPoints(targetX, targetY, width)
+        : [];
+      const pathCenter = bandagePathCenter(pathPoints);
       output.push({
         ...node,
-        x: existing?.manuallyPlaced ? existing.x : targetX,
-        y: existing?.manuallyPlaced ? existing.y : targetY,
+        x: layoutMode === "bandage"
+          ? pathCenter.x
+          : existing?.manuallyPlaced ? existing.x : targetX,
+        y: layoutMode === "bandage"
+          ? pathCenter.y
+          : existing?.manuallyPlaced ? existing.y : targetY,
         anchorX: targetX,
         anchorY: targetY,
-        width: layoutMode === "bandage"
-          ? bandageWidths.get(node.id) ?? 18
-          : curationWidths.get(node.id) ?? 12,
+        width,
         height: 14,
         scaffoldColor: homologByScaffold.has(node.groupId)
           ? homologScaffoldColor(
@@ -1033,8 +2779,12 @@ function initializeLayoutNodes(
           )
           : unplacedAssemblyColor,
         homologColumn: homologByScaffold.get(node.groupId) ?? null,
-        manuallyPlaced: existing?.manuallyPlaced ?? false,
+        guidedFocal: layoutMode !== "guided" || guidedFocalNodeIds.has(node.id),
+        manuallyPlaced: layoutMode === "bandage"
+          ? Boolean(existing?.manuallyPlaced || savedBandagePaths.has(node.id))
+          : existing?.manuallyPlaced ?? false,
         layoutMode,
+        pathPoints,
       });
   }
   return output;
@@ -1047,8 +2797,11 @@ function drawInteractiveGraph(
   view: ViewTransform,
   selectedIds: ReadonlySet<string>,
   homologs: GfaHomologClassification,
+  showGfaLinks: boolean,
   showHomologLinks: boolean,
   showNonHomologLinks: boolean,
+  showAgpGaps: boolean,
+  hiCLinks: ReadonlyArray<GfaEndpointHiCLink>,
   selectionBox: GfaSelectionBox | null,
 ) {
   resizeCanvas(canvas);
@@ -1076,14 +2829,22 @@ function drawInteractiveGraph(
   if (layoutModeFromNodes(nodes) === "curation") {
     drawChromosomeRowLabels(context, nodes, view.scale, homologs);
   }
+  drawEndpointHiCLinks(context, byId, hiCLinks, view.scale);
   for (const edge of graph.edges) {
     const source = byId.get(edge.source);
     const target = byId.get(edge.target);
     const scope = source && target && edge.kind === "gfa-link"
       ? gfaLinkScope(source.groupId, target.groupId, homologs)
       : "within-scaffold";
-    const visible = scope === "within-scaffold"
-      || (scope === "homolog" ? showHomologLinks : showNonHomologLinks);
+    const visible = edge.kind === "agp-gap"
+      ? showAgpGaps
+      : edge.kind !== "gfa-link" || (
+        showGfaLinks
+        && (
+          scope === "within-scaffold"
+          || (scope === "homolog" ? showHomologLinks : showNonHomologLinks)
+        )
+      );
     if (source && target && visible) {
       drawGraphEdge(
         context,
@@ -1107,7 +2868,7 @@ function drawInteractiveGraph(
     drawGraphNode(
       context,
       node,
-      selectedIds.has(node.id)
+      gfaNodeMatchesAssemblySelection(node, selectedIds)
         || Boolean(gfaAssemblyUnitId(node) && previewUnitIds.has(gfaAssemblyUnitId(node)!)),
       view.scale,
     );
@@ -1129,6 +2890,192 @@ function drawInteractiveGraph(
   context.restore();
 }
 
+export interface GfaCanvasBenchmarkOptions {
+  nodeCount?: number;
+  edgeCount?: number;
+  contactLinkCount?: number;
+  iterations?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface GfaCanvasBenchmarkResult {
+  nodeCount: number;
+  edgeCount: number;
+  contactLinkCount: number;
+  iterations: number;
+  meanMs: number;
+  p50Ms: number;
+  p95Ms: number;
+  maxMs: number;
+}
+
+/**
+ * Browser-only diagnostic that benchmarks the actual interactive GFA Canvas
+ * renderer with deterministic synthetic geometry. It is exported so a local
+ * Playwright run can capture repeatable before/after timings without adding a
+ * hidden production UI or substituting a mock drawing implementation.
+ */
+export function benchmarkGfaCanvasRender(
+  options: GfaCanvasBenchmarkOptions = {},
+): GfaCanvasBenchmarkResult {
+  if (typeof document === "undefined") {
+    throw new Error("The GFA Canvas benchmark requires a browser document.");
+  }
+  const nodeCount = benchmarkPositiveInteger(options.nodeCount, 701);
+  const edgeCount = benchmarkPositiveInteger(options.edgeCount, 870);
+  const contactLinkCount = benchmarkPositiveInteger(options.contactLinkCount, 700);
+  const iterations = benchmarkPositiveInteger(options.iterations, 40);
+  const width = benchmarkPositiveInteger(options.width, 1_200);
+  const height = benchmarkPositiveInteger(options.height, 700);
+  const rowCount = Math.max(1, Math.min(12, Math.ceil(nodeCount / 100)));
+  const groupIds = Array.from({ length: rowCount }, (_, index) => `Chr01g${index + 1}`);
+  const homologs = classifyGfaScaffolds(groupIds);
+  const columns = Math.ceil(nodeCount / rowCount);
+  const nodes: LayoutNode[] = Array.from({ length: nodeCount }, (_, index) => {
+    const row = index % rowCount;
+    const column = Math.floor(index / rowCount);
+    const id = `benchmark-utg-${index}`;
+    const x = 168 + column * Math.max(7, 900 / Math.max(1, columns));
+    const y = 52 + row * Math.max(38, 590 / Math.max(1, rowCount - 1));
+    const scaffoldColor = homologScaffoldColor(0, row);
+    return {
+      id,
+      occurrenceId: id,
+      segmentName: id,
+      groupId: groupIds[row],
+      assemblyBlockId: `benchmark-block-${row}-${Math.floor(column / 8)}`,
+      kind: "placed",
+      orientation: index % 5 === 0 ? "-" : "+",
+      length: 1_000_000,
+      order: index,
+      readDepth: null,
+      x,
+      y,
+      anchorX: x,
+      anchorY: y,
+      width: 12,
+      height: 14,
+      scaffoldColor,
+      homologColumn: "Chr01",
+      guidedFocal: true,
+      manuallyPlaced: false,
+      layoutMode: "curation",
+      pathPoints: [],
+    };
+  });
+  const graphEdges: GfaGraphEdge[] = [];
+  for (let index = 0; index < Math.min(edgeCount, Math.max(0, nodeCount - 1)); index += 1) {
+    graphEdges.push({
+      id: `benchmark-agp-${index}`,
+      source: nodes[index].id,
+      target: nodes[index + 1].id,
+      kind: index % 11 === 0 ? "agp-gap" : "agp-joined",
+    });
+  }
+  for (let index = graphEdges.length; index < edgeCount; index += 1) {
+    const sourceIndex = index % nodeCount;
+    const targetIndex = (sourceIndex + 17 + index % 31) % nodeCount;
+    graphEdges.push({
+      id: `benchmark-gfa-${index}`,
+      source: nodes[sourceIndex].id,
+      target: nodes[targetIndex].id,
+      kind: "gfa-link",
+      sourceSide: index % 2 === 0 ? "start" : "end",
+      targetSide: index % 3 === 0 ? "end" : "start",
+    });
+  }
+  const contactLinks: GfaEndpointHiCLink[] = Array.from(
+    { length: contactLinkCount },
+    (_, index) => {
+      const sourceIndex = index % nodeCount;
+      const targetIndex = (sourceIndex + 29 + index % 47) % nodeCount;
+      return {
+        id: `benchmark-contact-${index}`,
+        source: nodes[sourceIndex].id,
+        target: nodes[targetIndex].id,
+        sourceEndpoint: index % 2 === 0 ? "left" : "right",
+        targetEndpoint: index % 3 === 0 ? "right" : "left",
+        sourceSide: index % 2 === 0 ? "start" : "end",
+        targetSide: index % 3 === 0 ? "end" : "start",
+        rawCount: contactLinkCount - index,
+        normalizedCountPerMb2: contactLinkCount - index,
+        overviewNormalizedCountPerMb2: contactLinkCount - index,
+        contrastToNext: null,
+        resolution: 10_000,
+        overviewRank: index + 1,
+        sourceEndpointRank: 1,
+        targetEndpointRank: 1,
+        lineWidth: 1.1 + 4.7 * Math.sqrt((contactLinkCount - index) / contactLinkCount),
+      };
+    },
+  );
+  const graph: GfaAssemblyGraph = {
+    nodes,
+    edges: graphEdges,
+    groupOrder: groupIds,
+    matchedSegmentCount: nodeCount,
+    unmatchedSegmentCount: 0,
+    ambiguousLinkCount: 0,
+    truncated: false,
+  };
+  const canvas = document.createElement("canvas");
+  canvas.style.position = "fixed";
+  canvas.style.left = "-10000px";
+  canvas.style.top = "0";
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  document.body.appendChild(canvas);
+  const view: ViewTransform = { x: 0, y: 0, scale: 1 };
+  const render = () => drawInteractiveGraph(
+    canvas,
+    nodes,
+    graph,
+    view,
+    new Set<string>(),
+    homologs,
+    true,
+    true,
+    true,
+    true,
+    contactLinks,
+    null,
+  );
+  try {
+    for (let index = 0; index < 5; index += 1) {
+      render();
+    }
+    const samples: number[] = [];
+    for (let index = 0; index < iterations; index += 1) {
+      const startedAt = performance.now();
+      render();
+      samples.push(performance.now() - startedAt);
+    }
+    samples.sort((left, right) => left - right);
+    const meanMs = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+    return {
+      nodeCount,
+      edgeCount,
+      contactLinkCount,
+      iterations,
+      meanMs: roundBenchmarkMilliseconds(meanMs),
+      p50Ms: roundBenchmarkMilliseconds(samples[Math.floor(samples.length * 0.5)]),
+      p95Ms: roundBenchmarkMilliseconds(samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.95))]),
+      maxMs: roundBenchmarkMilliseconds(samples[samples.length - 1]),
+    };
+  } finally {
+    canvas.remove();
+  }
+}
+
+function benchmarkPositiveInteger(value: number | undefined, fallback: number) {
+  return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function roundBenchmarkMilliseconds(value: number) {
+  return Math.round(value * 1_000) / 1_000;
+}
+
 function drawChromosomeRowLabels(
   context: CanvasRenderingContext2D,
   nodes: LayoutNode[],
@@ -1136,15 +3083,7 @@ function drawChromosomeRowLabels(
   homologs: GfaHomologClassification,
 ) {
   const chromosomeScaffolds = homologScaffoldIds(homologs);
-  const rows = new Map<string, LayoutNode[]>();
-  for (const node of nodes) {
-    if (!chromosomeScaffolds.has(node.groupId)) {
-      continue;
-    }
-    const values = rows.get(node.groupId) ?? [];
-    values.push(node);
-    rows.set(node.groupId, values);
-  }
+  const rows = gfaChromosomeRows(nodes, chromosomeScaffolds);
   context.save();
   context.fillStyle = "#334155";
   context.font = `650 ${Math.max(11, 8 / displayScale)}px Inter, system-ui, sans-serif`;
@@ -1166,6 +3105,88 @@ function drawChromosomeRowLabels(
   context.restore();
 }
 
+interface EndpointHiCPathGeometry {
+  source: GfaPathPoint;
+  target: GfaPathPoint;
+  control: GfaPathPoint;
+  radius: number;
+}
+
+/**
+ * Batch endpoint-contact curves into a small set of width buckets and fill all
+ * endpoint dots in one path. The previous renderer issued one stroke and two
+ * fills per link, which made overlay cost scale with thousands of Canvas state
+ * transitions while the overlay was progressively loading.
+ */
+function drawEndpointHiCLinks(
+  context: CanvasRenderingContext2D,
+  nodesById: ReadonlyMap<string, LayoutNode>,
+  links: ReadonlyArray<GfaEndpointHiCLink>,
+  displayScale: number,
+) {
+  if (links.length === 0) {
+    return;
+  }
+  const safeScale = Math.max(0.01, displayScale);
+  const pathsByWidth = new Map<number, EndpointHiCPathGeometry[]>();
+  for (const link of links) {
+    const source = nodesById.get(link.source);
+    const target = nodesById.get(link.target);
+    if (!source || !target) {
+      continue;
+    }
+    const sourcePoint = nodePort(source, link.sourceSide);
+    const targetPoint = nodePort(target, link.targetSide);
+    const widthBucket = Math.max(1, Math.round(link.lineWidth * 2) / 2);
+    const geometries = pathsByWidth.get(widthBucket) ?? [];
+    geometries.push({
+      source: sourcePoint,
+      target: targetPoint,
+      control: gfaBandageControlPoint(
+        sourcePoint,
+        targetPoint,
+        deterministicSign(link.id),
+        0.18,
+        16,
+        92,
+      ),
+      radius: Math.max(1.8, Math.min(3.4, link.lineWidth * 0.58)) / safeScale,
+    });
+    pathsByWidth.set(widthBucket, geometries);
+  }
+
+  context.save();
+  context.strokeStyle = "rgba(124, 58, 237, 0.46)";
+  context.lineCap = "round";
+  for (const [widthBucket, geometries] of pathsByWidth) {
+    context.beginPath();
+    for (const geometry of geometries) {
+      context.moveTo(geometry.source.x, geometry.source.y);
+      context.quadraticCurveTo(
+        geometry.control.x,
+        geometry.control.y,
+        geometry.target.x,
+        geometry.target.y,
+      );
+    }
+    context.lineWidth = widthBucket / safeScale;
+    context.stroke();
+  }
+
+  context.beginPath();
+  for (const geometries of pathsByWidth.values()) {
+    for (const geometry of geometries) {
+      for (const point of [geometry.source, geometry.target]) {
+        context.moveTo(point.x + geometry.radius, point.y);
+        context.arc(point.x, point.y, geometry.radius, 0, Math.PI * 2);
+      }
+    }
+  }
+  context.fillStyle = "rgba(109, 40, 217, 0.82)";
+  context.fill();
+  context.restore();
+}
+
 function drawGraphEdge(
   context: CanvasRenderingContext2D,
   source: LayoutNode,
@@ -1180,7 +3201,7 @@ function drawGraphEdge(
       source: nodePort(source, edge.sourceSide ?? "end"),
       target: nodePort(target, edge.targetSide ?? "start"),
     }
-    : gfaAgpJunctionPoints(source, target);
+    : layoutAgpJunctionPoints(source, target);
   const sourcePoint = junction.source;
   const targetPoint = junction.target;
   context.save();
@@ -1226,6 +3247,10 @@ function drawGraphNode(
   selected: boolean,
   displayScale: number,
 ) {
+  if (node.layoutMode === "bandage" && node.pathPoints.length >= 2) {
+    drawBandagePathNode(context, node, selected, displayScale);
+    return;
+  }
   context.save();
   context.translate(node.x, node.y);
   if (node.orientation === "-") {
@@ -1240,7 +3265,9 @@ function drawGraphNode(
   context.lineTo(halfWidth - 7, halfHeight);
   context.lineTo(-halfWidth, halfHeight);
   context.closePath();
-  context.globalAlpha = node.homologColumn === null ? 0.68 : 0.96;
+  context.globalAlpha = node.layoutMode === "guided" && !node.guidedFocal
+    ? 0.72
+    : node.homologColumn === null ? 0.68 : 0.96;
   context.fillStyle = node.scaffoldColor;
   context.fill();
   context.globalAlpha = 1;
@@ -1256,6 +3283,90 @@ function drawGraphNode(
     context.textAlign = "center";
     context.fillText(node.segmentName, node.x, node.y - node.height / 2 - 6);
   }
+}
+
+function drawBandagePathNode(
+  context: CanvasRenderingContext2D,
+  node: LayoutNode,
+  selected: boolean,
+  displayScale: number,
+) {
+  const outlineColor = selected ? "#f59e0b" : darkenScaffoldColor(node.scaffoldColor);
+  const outlineWidth = selected
+    ? Math.max(4, 2.5 / displayScale)
+    : Math.max(2, 1.2 / displayScale);
+  const alpha = node.homologColumn === null ? 0.68 : 0.96;
+  context.save();
+  context.globalAlpha = alpha;
+  context.lineCap = "butt";
+  context.lineJoin = "round";
+  traceSmoothBandagePath(context, node.pathPoints);
+  context.strokeStyle = outlineColor;
+  context.lineWidth = node.height + outlineWidth * 2;
+  context.stroke();
+  traceSmoothBandagePath(context, node.pathPoints);
+  context.strokeStyle = node.scaffoldColor;
+  context.lineWidth = node.height;
+  context.stroke();
+  drawBandageArrowHead(context, node, outlineColor, outlineWidth);
+  context.restore();
+  if (selected) {
+    const bounds = visualNodeBounds(node);
+    context.fillStyle = "#111827";
+    context.font = "600 10px Inter, system-ui, sans-serif";
+    context.textAlign = "center";
+    context.fillText(node.segmentName, (bounds.left + bounds.right) / 2, bounds.top - 6);
+  }
+}
+
+function traceSmoothBandagePath(
+  context: CanvasRenderingContext2D,
+  points: ReadonlyArray<GfaPathPoint>,
+) {
+  context.beginPath();
+  context.moveTo(points[0].x, points[0].y);
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const point = points[index];
+    const next = points[index + 1];
+    context.quadraticCurveTo(
+      point.x,
+      point.y,
+      (point.x + next.x) / 2,
+      (point.y + next.y) / 2,
+    );
+  }
+  const last = points[points.length - 1];
+  context.lineTo(last.x, last.y);
+}
+
+function drawBandageArrowHead(
+  context: CanvasRenderingContext2D,
+  node: LayoutNode,
+  outlineColor: string,
+  outlineWidth: number,
+) {
+  const points = node.pathPoints;
+  const arrowAtStart = node.orientation === "-";
+  const tip = arrowAtStart ? points[0] : points[points.length - 1];
+  const neighbour = arrowAtStart ? points[1] : points[points.length - 2];
+  const dx = tip.x - neighbour.x;
+  const dy = tip.y - neighbour.y;
+  const distance = Math.max(0.001, Math.hypot(dx, dy));
+  const ux = dx / distance;
+  const uy = dy / distance;
+  const arrowLength = clamp(node.width * 0.1, 7, 11);
+  const halfHeight = node.height / 2;
+  const base = { x: tip.x - ux * arrowLength, y: tip.y - uy * arrowLength };
+  context.beginPath();
+  context.moveTo(tip.x, tip.y);
+  context.lineTo(base.x - uy * halfHeight, base.y + ux * halfHeight);
+  context.lineTo(base.x + uy * halfHeight, base.y - ux * halfHeight);
+  context.closePath();
+  context.fillStyle = node.scaffoldColor;
+  context.fill();
+  context.strokeStyle = outlineColor;
+  context.lineWidth = outlineWidth;
+  context.stroke();
 }
 
 function drawGraphPreview(
@@ -1417,6 +3528,9 @@ export function gfaPreviewPlacements(
 }
 
 function nodePort(node: LayoutNode, side: GfaSegmentSide) {
+  if (node.layoutMode === "bandage" && node.pathPoints.length >= 2) {
+    return gfaBandagePathPort(node.pathPoints, node.orientation, side)!;
+  }
   const visualSide = node.orientation === "-"
     ? side === "start" ? "end" : "start"
     : side;
@@ -1424,6 +3538,19 @@ function nodePort(node: LayoutNode, side: GfaSegmentSide) {
     x: node.x + (visualSide === "start" ? -node.width / 2 : node.width / 2),
     y: node.y,
   };
+}
+
+function layoutAgpJunctionPoints(source: LayoutNode, target: LayoutNode) {
+  if (
+    source.layoutMode !== "bandage"
+    || target.layoutMode !== "bandage"
+    || source.pathPoints.length < 2
+    || target.pathPoints.length < 2
+  ) {
+    return gfaAgpJunctionPoints(source, target);
+  }
+  return gfaAgpBandageJunctionPoints(source.pathPoints, target.pathPoints)
+    ?? gfaAgpJunctionPoints(source, target);
 }
 
 function graphPointFromPointer(
@@ -1442,11 +3569,68 @@ function graphPointFromPointer(
 function nodeAtPoint(nodes: LayoutNode[], x: number, y: number) {
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const node = nodes[index];
-    if (Math.abs(x - node.x) <= node.width / 2 + 4 && Math.abs(y - node.y) <= node.height / 2 + 6) {
+    if (
+      node.layoutMode === "bandage"
+      && gfaBandagePathContainsPoint(node.pathPoints, { x, y }, node.height / 2 + 6)
+    ) {
+      return node;
+    }
+    if (
+      node.layoutMode !== "bandage"
+      && Math.abs(x - node.x) <= node.width / 2 + 4
+      && Math.abs(y - node.y) <= node.height / 2 + 6
+    ) {
       return node;
     }
   }
   return null;
+}
+
+export function gfaBandagePathContainsPoint(
+  pathPoints: ReadonlyArray<GfaPathPoint>,
+  point: GfaPathPoint,
+  radius: number,
+) {
+  for (let index = 1; index < pathPoints.length; index += 1) {
+    if (distanceToSegment(point, pathPoints[index - 1], pathPoints[index]) <= radius) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function closestBandageControlPointIndex(
+  pathPoints: ReadonlyArray<GfaPathPoint>,
+  point: GfaPathPoint,
+) {
+  let nearestIndex = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < pathPoints.length; index += 1) {
+    const distance = Math.hypot(point.x - pathPoints[index].x, point.y - pathPoints[index].y);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = index;
+    }
+  }
+  return nearestIndex;
+}
+
+function distanceToSegment(point: GfaPathPoint, start: GfaPathPoint, end: GfaPathPoint) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared <= Number.EPSILON) {
+    return Math.hypot(point.x - start.x, point.y - start.y);
+  }
+  const projection = clamp(
+    ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared,
+    0,
+    1,
+  );
+  return Math.hypot(
+    point.x - (start.x + projection * dx),
+    point.y - (start.y + projection * dy),
+  );
 }
 
 function resizeCanvas(canvas: HTMLCanvasElement) {
@@ -1492,6 +3676,76 @@ function unorderedNodePair(left: string, right: string) {
 
 function layoutModeFromNodes(nodes: LayoutNode[]): GfaLayoutMode {
   return nodes[0]?.layoutMode ?? "curation";
+}
+
+function copyPathPoint(point: GfaPathPoint): GfaPathPoint {
+  return { x: point.x, y: point.y };
+}
+
+function automaticBandageBlockKey(node: GfaAutomaticBandageNode) {
+  return node.assemblyBlockId
+    ? `block:${node.groupId}\0${node.assemblyBlockId}`
+    : `single:${node.id}`;
+}
+
+function bandagePathCenter(pathPoints: ReadonlyArray<GfaPathPoint>) {
+  if (pathPoints.length === 0) {
+    return { x: 0, y: 0 };
+  }
+  return {
+    x: pathPoints.reduce((sum, point) => sum + point.x, 0) / pathPoints.length,
+    y: pathPoints.reduce((sum, point) => sum + point.y, 0) / pathPoints.length,
+  };
+}
+
+function updateNodeCenterFromPath(node: LayoutNode) {
+  const center = bandagePathCenter(node.pathPoints);
+  node.x = center.x;
+  node.y = center.y;
+}
+
+function rememberBandagePaths(
+  state: Map<string, GfaPathPoint[]>,
+  nodes: ReadonlyArray<LayoutNode>,
+  nodeIds?: ReadonlySet<string>,
+) {
+  for (const node of nodes) {
+    if (
+      node.layoutMode === "bandage"
+      && node.pathPoints.length >= 2
+      && (!nodeIds || nodeIds.has(node.id))
+    ) {
+      state.set(node.id, node.pathPoints.map(copyPathPoint));
+    }
+  }
+}
+
+function visualNodeBounds(node: LayoutNode) {
+  return visualBoundsForNodeData(node);
+}
+
+function visualBoundsForNodeData(node: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pathPoints?: ReadonlyArray<GfaPathPoint>;
+}) {
+  const padding = node.height / 2;
+  if (node.pathPoints && node.pathPoints.length >= 2) {
+    return {
+      left: Math.min(...node.pathPoints.map((point) => point.x)) - padding,
+      right: Math.max(...node.pathPoints.map((point) => point.x)) + padding,
+      top: Math.min(...node.pathPoints.map((point) => point.y)) - padding,
+      bottom: Math.max(...node.pathPoints.map((point) => point.y)) + padding,
+    };
+  }
+  return {
+    left: node.x - node.width / 2,
+    right: node.x + node.width / 2,
+    top: node.y - node.height / 2,
+    bottom: node.y + node.height / 2,
+  };
 }
 
 function clamp(value: number, minimum: number, maximum: number) {

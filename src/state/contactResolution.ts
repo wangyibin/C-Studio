@@ -15,6 +15,8 @@ export const contactResolutionLevels: readonly ContactResolution[] = [
   "25 kb",
   "10 kb",
   "5 kb",
+  "2 kb",
+  "1 kb",
 ];
 
 export const maxContactPixelSize = 128;
@@ -25,6 +27,52 @@ export function contactResolutionToBasePairs(resolution: ContactResolution) {
   const value = Number(amount);
 
   return unit === "Mb" ? value * 1_000_000 : value * 1_000;
+}
+
+/** Keep the application's ordered pyramid aligned to the levels stored in a dataset. */
+export function contactResolutionLevelsForBasePairs(
+  availableBasePairs: readonly number[],
+): ContactResolution[] {
+  const storedBasePairs = new Set(
+    availableBasePairs.filter((resolution) => Number.isFinite(resolution) && resolution > 0),
+  );
+
+  return contactResolutionLevels.filter((resolution) => (
+    storedBasePairs.has(contactResolutionToBasePairs(resolution))
+  ));
+}
+
+/**
+ * Resolve stale UI state to the closest real dataset level. On equal distance,
+ * prefer the coarser level so reconciliation cannot unexpectedly multiply the
+ * number of visible bins.
+ */
+export function closestContactResolution(
+  requestedResolution: ContactResolution,
+  availableResolutions: readonly ContactResolution[],
+): ContactResolution | null {
+  if (availableResolutions.includes(requestedResolution)) {
+    return requestedResolution;
+  }
+  const requestedBasePairs = contactResolutionToBasePairs(requestedResolution);
+  let closest: ContactResolution | null = null;
+  let closestDistance = Infinity;
+  let closestBasePairs = 0;
+
+  for (const resolution of availableResolutions) {
+    const basePairs = contactResolutionToBasePairs(resolution);
+    const distance = Math.abs(Math.log(basePairs / requestedBasePairs));
+    if (
+      distance < closestDistance
+      || (Math.abs(distance - closestDistance) <= Number.EPSILON && basePairs > closestBasePairs)
+    ) {
+      closest = resolution;
+      closestDistance = distance;
+      closestBasePairs = basePairs;
+    }
+  }
+
+  return closest;
 }
 
 export function chooseContactResolutionForBpPerPixel(bpPerPixel: number): ContactResolution {

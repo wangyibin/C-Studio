@@ -31,7 +31,7 @@ export interface GfaCurationLayoutEdge {
 }
 
 export type GfaLinkScope = "within-scaffold" | "homolog" | "non-homolog";
-export type GfaLayoutMode = "curation" | "bandage";
+export type GfaLayoutMode = "curation" | "guided" | "bandage";
 
 const bandageMinimumNodeWidth = 18;
 const bandageMaximumNodeWidth = 360;
@@ -623,6 +623,234 @@ export function layoutGfaNodesBandage(
     }
     shelfX += width + 44;
     rowHeight = Math.max(rowHeight, height);
+  }
+
+  const nodePoints = new Map<string, GfaGraphPoint>();
+  for (const [unitIndex, unit] of units.entries()) {
+    let left = points[unitIndex].x - unit.width / 2;
+    for (const memberIndex of unit.memberIndices) {
+      const node = nodes[memberIndex];
+      const width = nodeWidths.get(node.id) ?? bandageMinimumNodeWidth;
+      nodePoints.set(node.id, { x: left + width / 2, y: points[unitIndex].y });
+      left += width + 4;
+    }
+  }
+  return nodePoints;
+}
+
+/**
+ * AGP-guided local topology layout. Focal assembly blocks form immutable,
+ * left-to-right scaffold backbones. One-hop GFA neighbors are placed in
+ * crossing-reduced lanes above and below the backbone they support. The solve
+ * is deterministic and never applies graph forces to the AGP order.
+ */
+export function layoutGfaNodesGuided(
+  nodes: GfaHomologLayoutNode[],
+  edges: GfaCurationLayoutEdge[],
+  focalNodeIds: ReadonlySet<string>,
+) {
+  if (nodes.length === 0) {
+    return new Map<string, GfaGraphPoint>();
+  }
+  const nodeWidths = gfaBandageNodeWidths(nodes);
+  const unitsByKey = new Map<string, {
+    id: string;
+    groupId: string;
+    memberIndices: number[];
+    width: number;
+    firstOrder: number;
+    focal: boolean;
+  }>();
+  for (const [index, node] of nodes.entries()) {
+    const key = rigidAssemblyBlockKey(node);
+    const unit = unitsByKey.get(key) ?? {
+      id: key,
+      groupId: node.groupId,
+      memberIndices: [],
+      width: 0,
+      firstOrder: node.order,
+      focal: false,
+    };
+    unit.memberIndices.push(index);
+    unit.firstOrder = Math.min(unit.firstOrder, node.order);
+    unit.focal ||= focalNodeIds.has(node.id);
+    unitsByKey.set(key, unit);
+  }
+  const units = [...unitsByKey.values()]
+    .sort((left, right) => left.firstOrder - right.firstOrder || naturalCompare(left.id, right.id));
+  for (const unit of units) {
+    unit.memberIndices.sort((left, right) => (
+      nodes[left].order - nodes[right].order || naturalCompare(nodes[left].id, nodes[right].id)
+    ));
+    unit.width = unit.memberIndices.reduce((total, index) => (
+      total + (nodeWidths.get(nodes[index].id) ?? bandageMinimumNodeWidth)
+    ), 0) + Math.max(0, unit.memberIndices.length - 1) * 4;
+  }
+
+  const unitIndexByNodeId = new Map<string, number>();
+  for (const [unitIndex, unit] of units.entries()) {
+    for (const memberIndex of unit.memberIndices) {
+      unitIndexByNodeId.set(nodes[memberIndex].id, unitIndex);
+    }
+  }
+  const focalUnitIds = new Set(
+    units.flatMap((unit, index) => unit.focal ? [index] : []),
+  );
+  // A missing focus can happen briefly while the heatmap viewport is between
+  // assemblies. Keep the result finite and useful instead of collapsing every
+  // node onto the origin.
+  if (focalUnitIds.size === 0) {
+    return layoutGfaNodesBandage(nodes, edges);
+  }
+
+  const focalRows = new Map<string, number[]>();
+  for (const unitIndex of focalUnitIds) {
+    const values = focalRows.get(units[unitIndex].groupId) ?? [];
+    values.push(unitIndex);
+    focalRows.set(units[unitIndex].groupId, values);
+  }
+  const orderedRows = [...focalRows.entries()]
+    .map(([groupId, unitIndices]) => ({
+      groupId,
+      unitIndices: unitIndices.sort((left, right) => (
+        units[left].firstOrder - units[right].firstOrder
+        || naturalCompare(units[left].id, units[right].id)
+      )),
+      firstOrder: Math.min(...unitIndices.map((index) => units[index].firstOrder)),
+    }))
+    .sort((left, right) => left.firstOrder - right.firstOrder || naturalCompare(left.groupId, right.groupId));
+
+  const points = units.map(() => ({ x: 0, y: 0 }));
+  const rowByFocalUnit = new Map<number, number>();
+  const provisionalRowY = orderedRows.map((_, index) => 120 + index * 220);
+  for (const [rowIndex, row] of orderedRows.entries()) {
+    let cursorX = 100;
+    for (const unitIndex of row.unitIndices) {
+      points[unitIndex] = {
+        x: cursorX + units[unitIndex].width / 2,
+        y: provisionalRowY[rowIndex],
+      };
+      cursorX += units[unitIndex].width + 28;
+      rowByFocalUnit.set(unitIndex, rowIndex);
+    }
+  }
+
+  const linkedFocalUnits = units.map(() => [] as number[]);
+  for (const edge of edges) {
+    if (edge.kind !== "gfa-link") {
+      continue;
+    }
+    const source = unitIndexByNodeId.get(edge.source);
+    const target = unitIndexByNodeId.get(edge.target);
+    if (source === undefined || target === undefined || source === target) {
+      continue;
+    }
+    if (!focalUnitIds.has(source) && focalUnitIds.has(target)) {
+      linkedFocalUnits[source].push(target);
+    }
+    if (!focalUnitIds.has(target) && focalUnitIds.has(source)) {
+      linkedFocalUnits[target].push(source);
+    }
+  }
+
+  interface GuidedNeighborPlacement {
+    unitIndex: number;
+    rowIndex: number;
+    anchorX: number;
+    side: -1 | 1;
+    lane: number;
+  }
+  const candidates = units.flatMap((unit, unitIndex) => {
+    if (unit.focal || linkedFocalUnits[unitIndex].length === 0) {
+      return [];
+    }
+    const links = linkedFocalUnits[unitIndex];
+    const rowCounts = new Map<number, number>();
+    for (const focalIndex of links) {
+      const rowIndex = rowByFocalUnit.get(focalIndex);
+      if (rowIndex !== undefined) {
+        rowCounts.set(rowIndex, (rowCounts.get(rowIndex) ?? 0) + 1);
+      }
+    }
+    const rowIndex = [...rowCounts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0] - right[0])[0]?.[0] ?? 0;
+    const sameRowLinks = links.filter((index) => rowByFocalUnit.get(index) === rowIndex);
+    const anchorLinks = sameRowLinks.length > 0 ? sameRowLinks : links;
+    return [{
+      unitIndex,
+      rowIndex,
+      anchorX: anchorLinks.reduce((sum, index) => sum + points[index].x, 0) / anchorLinks.length,
+    }];
+  }).sort((left, right) => (
+    left.rowIndex - right.rowIndex
+    || left.anchorX - right.anchorX
+    || naturalCompare(units[left.unitIndex].id, units[right.unitIndex].id)
+  ));
+
+  const laneRightEdges = new Map<string, number[]>();
+  const placements: GuidedNeighborPlacement[] = [];
+  for (const [rank, candidate] of candidates.entries()) {
+    const side: -1 | 1 = rank % 2 === 0 ? -1 : 1;
+    const laneKey = `${candidate.rowIndex}:${side}`;
+    const rightEdges = laneRightEdges.get(laneKey) ?? [];
+    const unit = units[candidate.unitIndex];
+    let lane = rightEdges.findIndex((rightEdge) => (
+      candidate.anchorX - unit.width / 2 >= rightEdge + 18
+    ));
+    if (lane < 0) {
+      lane = rightEdges.length;
+      rightEdges.push(Number.NEGATIVE_INFINITY);
+    }
+    const x = Math.max(
+      candidate.anchorX,
+      rightEdges[lane] + 18 + unit.width / 2,
+    );
+    rightEdges[lane] = x + unit.width / 2;
+    laneRightEdges.set(laneKey, rightEdges);
+    placements.push({ ...candidate, side, lane });
+    points[candidate.unitIndex].x = x;
+  }
+
+  const aboveLaneCounts = orderedRows.map((_, rowIndex) => (
+    laneRightEdges.get(`${rowIndex}:-1`)?.length ?? 0
+  ));
+  const belowLaneCounts = orderedRows.map((_, rowIndex) => (
+    laneRightEdges.get(`${rowIndex}:1`)?.length ?? 0
+  ));
+  const rowY: number[] = [];
+  for (let rowIndex = 0; rowIndex < orderedRows.length; rowIndex += 1) {
+    rowY[rowIndex] = rowIndex === 0
+      ? 80 + aboveLaneCounts[rowIndex] * 38
+      : rowY[rowIndex - 1]
+        + 96
+        + belowLaneCounts[rowIndex - 1] * 38
+        + aboveLaneCounts[rowIndex] * 38;
+    for (const unitIndex of orderedRows[rowIndex].unitIndices) {
+      points[unitIndex].y = rowY[rowIndex];
+    }
+  }
+  for (const placement of placements) {
+    points[placement.unitIndex].y = rowY[placement.rowIndex]
+      + placement.side * (50 + placement.lane * 38);
+  }
+
+  // The local graph normally contains only focal units and their one-hop
+  // neighbors. Any residual unit is packed to the right without affecting the
+  // backbone, which keeps transient/import edge cases deterministic.
+  const residual = units
+    .map((_, index) => index)
+    .filter((index) => !focalUnitIds.has(index) && linkedFocalUnits[index].length === 0);
+  let residualX = Math.max(
+    100,
+    ...[...focalUnitIds].map((index) => points[index].x + units[index].width / 2),
+  ) + 100;
+  const residualY = rowY.length > 0 ? rowY.reduce((sum, value) => sum + value, 0) / rowY.length : 100;
+  for (const unitIndex of residual) {
+    points[unitIndex] = {
+      x: residualX + units[unitIndex].width / 2,
+      y: residualY,
+    };
+    residualX += units[unitIndex].width + 28;
   }
 
   const nodePoints = new Map<string, GfaGraphPoint>();

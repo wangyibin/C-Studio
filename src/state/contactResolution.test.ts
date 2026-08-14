@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   chooseContactResolutionForBpPerPixel,
   chooseContactResolutionForSpan,
+  closestContactResolution,
+  contactResolutionLevelsForBasePairs,
   contactResolutionLevelsForViewport,
   contactResolutionToBasePairs,
   contactViewportSpanForResolution,
@@ -18,6 +20,29 @@ describe("contactResolutionToBasePairs", () => {
     expect(contactResolutionToBasePairs("250 kb")).toBe(250_000);
     expect(contactResolutionToBasePairs("25 kb")).toBe(25_000);
     expect(contactResolutionToBasePairs("5 kb")).toBe(5_000);
+    expect(contactResolutionToBasePairs("2 kb")).toBe(2_000);
+    expect(contactResolutionToBasePairs("1 kb")).toBe(1_000);
+  });
+
+  it("maps stored base-pair levels and rejects phantom UI levels", () => {
+    const stored = contactResolutionLevelsForBasePairs([
+      1_000,
+      2_000,
+      5_000,
+      10_000,
+      25_000,
+      50_000,
+      100_000,
+      250_000,
+      500_000,
+      1_000_000,
+      2_500_000,
+    ]);
+
+    expect(stored).toHaveLength(11);
+    expect(stored).not.toContain("2 Mb");
+    expect(stored.slice(-3)).toEqual(["5 kb", "2 kb", "1 kb"]);
+    expect(closestContactResolution("2 Mb", stored)).toBe("2.5 Mb");
   });
 });
 
@@ -32,6 +57,8 @@ describe("chooseContactResolutionForSpan", () => {
     expect(chooseContactResolutionForSpan(5)).toBe("25 kb");
     expect(chooseContactResolutionForSpan(2)).toBe("10 kb");
     expect(chooseContactResolutionForSpan(1)).toBe("5 kb");
+    expect(chooseContactResolutionForSpan(0.4)).toBe("2 kb");
+    expect(chooseContactResolutionForSpan(0.2)).toBe("1 kb");
   });
 
   it("uses the measured viewport instead of a fixed span bucket", () => {
@@ -56,6 +83,8 @@ describe("Juicebox contact viewport geometry", () => {
       "25 kb",
       "10 kb",
       "5 kb",
+      "2 kb",
+      "1 kb",
     ]);
   });
 

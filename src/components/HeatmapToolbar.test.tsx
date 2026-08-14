@@ -26,11 +26,13 @@ describe("HeatmapToolbar", () => {
     expect(markup).toContain('aria-label="Contact map resolution"');
     expect(markup).toContain('<span class="heatmap-resolution-heading">');
     expect(markup).toContain('<span class="heatmap-resolution-value" aria-live="polite">500 kb</span>');
-    expect(markup).toContain('class="heatmap-resolution-range" type="range" min="0" max="6"');
+    expect(markup).not.toContain('aria-label="Stored contact map resolution"');
+    expect(markup).not.toContain('<select class="heatmap-resolution-value"');
+    expect(markup).toContain('class="heatmap-resolution-range" type="range" min="0" max="8"');
     expect(markup).not.toContain("<small>Max</small>");
     expect(markup).not.toContain("<small>Min</small>");
     expect(markup).toContain('class="heatmap-resolution-indicator"');
-    expect(markup.match(/<span class="heatmap-resolution-tick(?: [^"]+)?"/g)).toHaveLength(7);
+    expect(markup.match(/<span class="heatmap-resolution-tick(?: [^"]+)?"/g)).toHaveLength(9);
     expect(markup.match(/<span class="heatmap-resolution-tick(?: [^"]+)?"[^>]*><i><\/i><small>/g)).toHaveLength(3);
     expect(markup).toContain('class="heatmap-resolution-tick first"');
     expect(markup).toContain('class="heatmap-resolution-tick last"');
@@ -67,22 +69,38 @@ describe("HeatmapToolbar", () => {
     expect(openingButton(markup, "Contig boxes")).toContain('aria-pressed="true"');
   });
 
-  it("shows only pyramid levels that actually exist in an mcool", () => {
+  it("shows every pyramid level that actually exists in an mcool", () => {
     const uiState = createInitialUiState("ready");
     const markup = renderToStaticMarkup(
       <HeatmapToolbar
         uiState={uiState}
         onUiAction={() => undefined}
         totalSpanMb={200}
-        preserveResolutionViewport
-        availableResolutionBasePairs={[2_500_000, 500_000, 100_000, 10_000, 1_000]}
+        useStoredResolutionOptions
+        availableResolutionBasePairs={[
+          2_500_000,
+          1_000_000,
+          500_000,
+          250_000,
+          100_000,
+          50_000,
+          25_000,
+          10_000,
+          5_000,
+          2_000,
+          1_000,
+        ]}
       />,
     );
 
     expect(markup).toContain('aria-valuetext="500 kb"');
-    expect(markup).toContain('type="range" min="0" max="1"');
+    expect(markup).toContain('type="range" min="0" max="10"');
+    expect(markup).toContain('<span class="heatmap-resolution-value" aria-live="polite">500 kb</span>');
+    expect(markup.match(/<span class="heatmap-resolution-tick(?: [^"]+)?"/g)).toHaveLength(11);
+    expect(markup).not.toContain('<select class="heatmap-resolution-value"');
+    expect(markup).toContain("2.5 Mb");
+    expect(markup).toContain("1 kb");
     expect(markup).not.toContain("2 Mb");
-    expect(markup).not.toContain("250 kb");
   });
 
   it("reflects imported display settings", () => {

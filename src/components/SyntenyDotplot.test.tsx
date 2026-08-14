@@ -6,10 +6,24 @@ import {
   buildDotplotLayout,
   dominantSyntenyTargetByChromosome,
   syntenyBlockIdsInSelection,
+  syntenyHorizontalWheelDelta,
   syntenyViewForAssemblyExtent,
   syntenyTargetLaneTopRatio,
   SyntenyDotplot,
 } from "./SyntenyDotplot";
+
+describe("syntenyHorizontalWheelDelta", () => {
+  it("maps mouse-wheel vertical motion and trackpad horizontal motion onto assembly X", () => {
+    expect(syntenyHorizontalWheelDelta(0, 24)).toBe(24);
+    expect(syntenyHorizontalWheelDelta(-36, 4)).toBe(-36);
+    expect(syntenyHorizontalWheelDelta(8, -20)).toBe(-20);
+  });
+
+  it("sanitizes invalid wheel samples", () => {
+    expect(syntenyHorizontalWheelDelta(Number.NaN, 12)).toBe(12);
+    expect(syntenyHorizontalWheelDelta(Number.NaN, Number.NaN)).toBe(0);
+  });
+});
 
 const syntenyView: SyntenyView = {
   viewport: { xStart: 0, xEnd: 2_000, yStart: 0, yEnd: 2_000 },
@@ -93,10 +107,10 @@ describe("SyntenyDotplot", () => {
     }).blocks[0];
 
     expect(positive?.left).toBe(53);
-    expect(positive?.angle).toBeLessThan(0);
+    expect(positive?.angle).toBeGreaterThan(0);
     expect(reverse?.left).toBe(53);
-    expect(reverse?.angle).toBeGreaterThan(0);
-    expect(reverse?.top).toBeLessThan(positive?.top ?? 0);
+    expect(reverse?.angle).toBeLessThan(0);
+    expect(reverse?.top).toBeGreaterThan(positive?.top ?? 0);
   });
 
   it("keeps segment endpoints aligned on a non-square canvas", () => {
@@ -112,7 +126,7 @@ describe("SyntenyDotplot", () => {
 
     expect(block?.left).toBe(53);
     expect(renderedDeltaXPercent).toBeCloseTo(22, 8);
-    expect(renderedDeltaYPercent).toBeCloseTo(-21.5, 8);
+    expect(renderedDeltaYPercent).toBeCloseTo(21.5, 8);
   });
 
   it("separates reference chromosomes into stable target lanes", () => {
@@ -136,9 +150,9 @@ describe("SyntenyDotplot", () => {
       ["target-1", 2_000],
       ["target-2", 4_000],
     ]);
-    expect(layout.targetLanes[0]?.top).toBeGreaterThan(layout.targetLanes[1]?.top ?? 0);
+    expect(layout.targetLanes[0]?.top).toBeLessThan(layout.targetLanes[1]?.top ?? 0);
     expect(layout.targetLanes[1]?.height).toBeGreaterThan(layout.targetLanes[0]?.height ?? 0);
-    expect(layout.blocks[0]?.top).toBeGreaterThan(layout.blocks[1]?.top ?? 0);
+    expect(layout.blocks[0]?.top).toBeLessThan(layout.blocks[1]?.top ?? 0);
   });
 
   it("deduplicates the synteny blocks intersected by a Shift-drag rectangle", () => {

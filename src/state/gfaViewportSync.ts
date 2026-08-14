@@ -67,6 +67,7 @@ export function gfaContigsForHeatmapViewport(
   blocks: ContactMapLayoutBlock[],
   viewport: ContactViewport,
   flankCount = 5,
+  selectedOccurrenceIds: ReadonlySet<string> = new Set<string>(),
 ) {
   const orderedByScaffold = new Map<string, ContactMapLayoutBlock[]>();
   for (const block of [...blocks].sort((left, right) => (
@@ -76,13 +77,17 @@ export function gfaContigsForHeatmapViewport(
     values.push(block);
     orderedByScaffold.set(block.objectId, values);
   }
-  const visible = blocks.filter((block) => (
-    overlaps(block.visualStart, block.visualEnd, viewport.xStart, viewport.xEnd)
-    || overlaps(block.visualStart, block.visualEnd, viewport.yStart, viewport.yEnd)
-  ));
+  const selected = blocks.filter((block) => selectedOccurrenceIds.has(block.id));
+  const viewportFocalBlocks = [
+    focusBlockForAxis(blocks, viewport.xStart, viewport.xEnd),
+    focusBlockForAxis(blocks, viewport.yStart, viewport.yEnd),
+  ].filter((block): block is ContactMapLayoutBlock => block !== null);
+  const focalBlocks = [...new Map(
+    [...selected, ...viewportFocalBlocks].map((block) => [block.id, block]),
+  ).values()];
   const output = new Set<string>();
   const safeFlankCount = Number.isFinite(flankCount) ? Math.max(0, Math.floor(flankCount)) : 0;
-  for (const block of visible) {
+  for (const block of focalBlocks) {
     const scaffoldBlocks = orderedByScaffold.get(block.objectId) ?? [];
     const index = scaffoldBlocks.findIndex((candidate) => candidate.id === block.id);
     if (index < 0) {

@@ -6,12 +6,15 @@ import {
   assemblyRenameValidationError,
   buildAssemblyEditModel,
   chromosomeEndInsertionTargets,
+  createAssemblyBlockFromGfa,
   contigIdsInScreenSelection,
   DEFAULT_INSERTED_GAP,
   deleteContigSelection,
   deleteGapsBetweenSelection,
+  dissolveAssemblyBlockSelection,
   groupAssemblyBlocksByChromosome,
   hasDeletableGap,
+  hasDissolvableAssemblyBlock,
   hasRemovableChromosomeBoundary,
   hitTestAssemblyLayout,
   insertionTargetAtScreenPoint,
@@ -21,6 +24,7 @@ import {
   addChromosomeBoundariesToSelection,
   moveSelectionBefore,
   moveSelectionToDebris,
+  planGfaBlockCreation,
   pointSelectsWholeChromosome,
   reverseSelection,
   removeChromosomeBoundariesFromSelection,
@@ -30,6 +34,7 @@ import {
   selectContigs,
   splitContigAtVisualPosition,
 } from "./assemblyEditing";
+import type { GfaLinkEvidence } from "./gfa";
 import { exportAgpText } from "./agpExport";
 import { parseAgpLayout, type ContactMapLayoutBlock } from "./importers";
 
@@ -65,6 +70,89 @@ const blocks: ContactMapLayoutBlock[] = [
     orientation: "+",
   },
 ];
+
+describe("GFA-aware block editing", () => {
+  const selected = { kind: "contigs" as const, ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"] };
+  const overlapLink: GfaLinkEvidence = {
+    id: "link-1",
+    from: { segmentName: "ctg1", orientation: "+", side: "end" },
+    to: { segmentName: "ctg2", orientation: "-", side: "end" },
+    overlap: "12M",
+  };
+
+  it("creates one block and trims an accepted GFA overlap once from the displayed right utg", () => {
+    const created = createAssemblyBlockFromGfa(blocks, selected, [overlapLink]);
+
+    expect(created.slice(0, 2).map((block) => block.assemblyBlockId)).toEqual([
+      "Chr01_block_1",
+      "Chr01_block_1",
+    ]);
+    expect(created[1]).toMatchObject({ sourceStart: 0, sourceEnd: 138 });
+    expect(created[1].gfaOverlapBefore).toMatchObject({
+      linkId: "link-1",
+      cigar: "12M",
+      trimmedBases: 12,
+      originalSourceStart: 0,
+      originalSourceEnd: 150,
+    });
+    expect(exportAgpText(created)).toContain("\tctg2\t1\t138\t-");
+  });
+
+  it("dissolves the generated block, restores trimmed source coordinates, and inserts an AGP gap", () => {
+    const created = createAssemblyBlockFromGfa(blocks, selected, [overlapLink]);
+    const dissolved = dissolveAssemblyBlockSelection(created, {
+      kind: "contigs",
+      ids: [created[0].assemblyBlockId!],
+    });
+
+    expect(dissolved.slice(0, 2).map((block) => block.assemblyBlockId)).toEqual([null, null]);
+    expect(dissolved[1]).toMatchObject({ sourceStart: 0, sourceEnd: 150 });
+    expect(dissolved[1].gapBefore).toEqual(DEFAULT_INSERTED_GAP);
+    expect(dissolved[1].gfaOverlapBefore).toBeUndefined();
+  });
+
+  it("enables dissolve only when the selection touches a composite block", () => {
+    const created = createAssemblyBlockFromGfa(blocks, selected, [overlapLink]);
+    expect(hasDissolvableAssemblyBlock(created, {
+      kind: "contigs",
+      ids: [created[0].assemblyBlockId!],
+    })).toBe(true);
+    expect(hasDissolvableAssemblyBlock(created, {
+      kind: "contigs",
+      ids: [created[0].id],
+      exact: true,
+    })).toBe(true);
+    expect(hasDissolvableAssemblyBlock(blocks, selected)).toBe(false);
+  });
+
+  it("does not record another create operation for utgs already in the same block", () => {
+    const created = createAssemblyBlockFromGfa(blocks, selected, [overlapLink]);
+    expect(planGfaBlockCreation(created, {
+      kind: "contigs",
+      ids: created.slice(0, 2).map((block) => block.id),
+      exact: true,
+    }, [overlapLink])).toEqual({
+      ok: false,
+      reason: "Selected utgs already belong to one block.",
+    });
+  });
+
+  it("blocks ambiguous, orientation-conflicting, and gapped overlaps", () => {
+    expect(planGfaBlockCreation(blocks, selected, [{ ...overlapLink, overlap: "10M2I" }]))
+      .toEqual({ ok: false, reason: "Overlap 10M2I is not a simple ungapped M/= CIGAR; review it before joining." });
+    expect(planGfaBlockCreation(blocks, selected, [{
+      ...overlapLink,
+      to: { ...overlapLink.to, side: "start" },
+    }])).toEqual({
+      ok: false,
+      reason: "GFA link orientation conflicts at ctg1 → ctg2.",
+    });
+    expect(planGfaBlockCreation(blocks, selected, [overlapLink, { ...overlapLink, id: "link-2" }])).toEqual({
+      ok: false,
+      reason: "Multiple GFA overlaps match ctg1 → ctg2.",
+    });
+  });
+});
 
 const structuredBlocks: ContactMapLayoutBlock[] = [
   {

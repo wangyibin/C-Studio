@@ -42,6 +42,14 @@ export interface ContactMapLayoutBlock {
   componentType?: string;
   assemblyBlockId?: string | null;
   gapBefore?: AgpGapMetadata;
+  /** Reversible source-interval trim applied when a GFA overlap is accepted into a block. */
+  gfaOverlapBefore?: {
+    linkId: string;
+    cigar: string;
+    trimmedBases: number;
+    originalSourceStart: number;
+    originalSourceEnd: number;
+  };
 }
 
 export interface AgpLayout {

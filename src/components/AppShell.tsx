@@ -5,6 +5,7 @@ import {
   Maximize2,
   PanelRight,
   Plus,
+  RefreshCcw,
   Redo2,
   Save,
   Trash2,
@@ -24,6 +25,10 @@ import {
 } from "../state/assemblyEditing";
 import type { CoverageView } from "../state/coverageView";
 import type { GfaEvidenceDocument } from "../state/gfa";
+import type {
+  GfaEndpointHiCBatchLoader,
+  GfaEndpointHiCLoader,
+} from "../state/gfaEndpointHiC";
 import { classifyGfaScaffolds } from "../state/gfaHomologLayout";
 import { buildCenteredContactViewport } from "../state/contactViewport";
 import {
@@ -67,6 +72,8 @@ interface AppShellProps {
   pafText: string;
   pafImported: boolean;
   gfaDocument: GfaEvidenceDocument | null;
+  onLoadGfaEndpointHiC?: GfaEndpointHiCLoader;
+  onLoadGfaEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
   gfaHomologPattern: string;
   onGfaHomologPatternChange: (pattern: string) => void;
   onPafTextChange: (value: string) => void;
@@ -87,9 +94,12 @@ interface AppShellProps {
   isAgpDirty: boolean;
   onAutoSaveEnabledChange: (enabled: boolean) => void;
   onLoadExample: () => void;
+  onLoadProject?: () => void;
+  onReloadAssembly: () => void;
   onClearAllData: () => void;
   status: AppStatus;
   statusMessage: string;
+  contactTilePerformanceLog?: string | null;
   contactPanPerformanceLog?: string | null;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
@@ -148,6 +158,8 @@ export function AppShell({
   pafText,
   pafImported,
   gfaDocument,
+  onLoadGfaEndpointHiC,
+  onLoadGfaEndpointHiCBatch,
   gfaHomologPattern,
   onGfaHomologPatternChange,
   onPafTextChange,
@@ -168,6 +180,8 @@ export function AppShell({
   isAgpDirty,
   onAutoSaveEnabledChange,
   onLoadExample,
+  onLoadProject = () => undefined,
+  onReloadAssembly,
   onClearAllData,
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
@@ -175,6 +189,7 @@ export function AppShell({
   onUiAction,
   status,
   statusMessage,
+  contactTilePerformanceLog,
   contactPanPerformanceLog,
   uiState,
 }: AppShellProps) {
@@ -196,6 +211,7 @@ export function AppShell({
   const [heatmapPanelOpen, setHeatmapPanelOpen] = useState(true);
   const [gfaPanelHeight, setGfaPanelHeight] = useState<number | null>(null);
   const [confirmingClearData, setConfirmingClearData] = useState(false);
+  const [confirmingReloadAssembly, setConfirmingReloadAssembly] = useState(false);
   const projectMenuRef = useRef<HTMLDetailsElement>(null);
   const addDataMenuRef = useRef<HTMLDetailsElement>(null);
   const appMenuRef = useRef<HTMLDetailsElement>(null);
@@ -206,6 +222,7 @@ export function AppShell({
   } | null>(null);
   const syntenySelectionAnchorRef = useRef<string | null>(null);
   const agpImported = Boolean(dataset?.agp_path || uiState.assembly.blocks.length > 0);
+  const sourceAssemblyAvailable = Boolean(dataset?.agp_layout.blocks.length);
   const contactImported = Boolean(dataset?.mcool_path || dataset?.cool_path || contactMap);
   const coverageImported = Boolean(dataset?.coverage_path || coverageView);
   const syntenyImported = Boolean(pafImported || pafText.trim() || syntenyView);
@@ -270,19 +287,25 @@ export function AppShell({
     [...new Set(activeAssemblyBlocks.map((block) => block.objectId))],
     gfaHomologPattern,
   );
-  const gfaVisibleScaffoldIds = gfaScaffoldsForHeatmapViewport(
+  // Curation/Bandage follow every chromosome touched by the heatmap viewport,
+  // expanding each hit to its whole homolog group as the minimum scope.
+  const gfaVisibleHomologScaffoldIds = gfaScaffoldsForHeatmapViewport(
     activeAssemblyBlocks,
     heatmapViewport,
     gfaHomologs,
   );
+  // The compact preview stays intentionally focused on one primary group.
   const gfaPreviewScaffoldIds = gfaPrimaryHomologScaffoldsForHeatmapViewport(
     activeAssemblyBlocks,
     heatmapViewport,
     gfaHomologs,
   );
-  const gfaVisibleContigIds = gfaContigsForHeatmapViewport(
+  // Guided narrows the focus to the AGP contig plus five neighbors per side.
+  const gfaGuidedContigIds = gfaContigsForHeatmapViewport(
     activeAssemblyBlocks,
     heatmapViewport,
+    5,
+    new Set(selectedAssemblyBlockIds),
   );
   const selectedContactNormalization = contactNormalizationForBackend(uiState.normalization);
   const displayedContactNormalization = contactMap?.normalization;
@@ -526,6 +549,7 @@ export function AppShell({
           menu.open = false;
           if (menu === addDataMenuRef.current) {
             setConfirmingClearData(false);
+            setConfirmingReloadAssembly(false);
           }
         }
       }
@@ -541,6 +565,7 @@ export function AppShell({
           menu.querySelector<HTMLElement>("summary")?.focus();
           if (menu === addDataMenuRef.current) {
             setConfirmingClearData(false);
+            setConfirmingReloadAssembly(false);
           }
         }
       }
@@ -557,6 +582,7 @@ export function AppShell({
   function runAddDataAction(action: () => void) {
     addDataMenuRef.current?.removeAttribute("open");
     setConfirmingClearData(false);
+    setConfirmingReloadAssembly(false);
     action();
   }
 
@@ -602,6 +628,7 @@ export function AppShell({
               onToggle={(event) => {
                 if (!event.currentTarget.open) {
                   setConfirmingClearData(false);
+                  setConfirmingReloadAssembly(false);
                 }
               }}
             >
@@ -615,10 +642,55 @@ export function AppShell({
                 <ChevronDown size={13} aria-hidden="true" />
               </summary>
               <div className="toolbar-popover add-data-popover" aria-label="Add data">
+                <button type="button" onClick={() => runAddDataAction(onLoadProject)}>
+                  <span>Load project folder…</span>
+                </button>
+                <span className="popover-divider" aria-hidden="true" />
                 <button type="button" onClick={() => runAddDataAction(() => agpInputRef.current?.click())}>
                   <span>Assembly (.agp)</span>
                   {agpImported ? <Check size={14} aria-label="Loaded" /> : null}
                 </button>
+                {confirmingReloadAssembly ? (
+                  <section
+                    className="add-data-clear-confirmation"
+                    role="alertdialog"
+                    aria-labelledby="reload-assembly-title"
+                    aria-describedby="reload-assembly-description"
+                  >
+                    <strong id="reload-assembly-title">Reload source assembly?</strong>
+                    <p id="reload-assembly-description">
+                      This restores the initially loaded source AGP and clears all assembly edits
+                      and edit history. Other loaded data stays in the workspace.
+                    </p>
+                    <div className="add-data-clear-actions">
+                      <button type="button" onClick={() => setConfirmingReloadAssembly(false)}>
+                        Cancel
+                      </button>
+                      <button
+                        className="add-data-clear-confirm"
+                        type="button"
+                        onClick={() => runAddDataAction(onReloadAssembly)}
+                      >
+                        Reload
+                      </button>
+                    </div>
+                  </section>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={!sourceAssemblyAvailable}
+                    title={sourceAssemblyAvailable
+                      ? "Discard all assembly edits and reload the source AGP"
+                      : "No source AGP loaded"}
+                    onClick={() => {
+                      setConfirmingClearData(false);
+                      setConfirmingReloadAssembly(true);
+                    }}
+                  >
+                    <span>Reload assembly…</span>
+                    <RefreshCcw size={14} aria-hidden="true" />
+                  </button>
+                )}
                 <button type="button" onClick={() => runAddDataAction(() => gfaInputRef.current?.click())}>
                   <span>Assembly graph (.gfa)</span>
                   {gfaImported ? <Check size={14} aria-label="Loaded" /> : null}
@@ -671,7 +743,10 @@ export function AppShell({
                     type="button"
                     disabled={!hasLoadedData}
                     title={hasLoadedData ? "Remove every loaded data source" : "No loaded data"}
-                    onClick={() => setConfirmingClearData(true)}
+                    onClick={() => {
+                      setConfirmingReloadAssembly(false);
+                      setConfirmingClearData(true);
+                    }}
                   >
                     <span>Clear all loaded data…</span>
                     <Trash2 size={14} aria-hidden="true" />
@@ -701,7 +776,7 @@ export function AppShell({
               ref={agpInputRef}
               className="file-input"
               type="file"
-              accept=".agp,.txt"
+              accept=".agp,.agp.gz,.txt,.txt.gz"
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) {
@@ -714,7 +789,7 @@ export function AppShell({
               ref={pafInputRef}
               className="file-input"
               type="file"
-              accept=".paf,.txt"
+              accept=".paf,.paf.gz,.txt,.txt.gz"
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) {
@@ -727,7 +802,7 @@ export function AppShell({
               ref={gfaInputRef}
               className="file-input"
               type="file"
-              accept=".gfa,.gfa1,.txt"
+              accept=".gfa,.gfa.gz,.gfa1,.gfa1.gz,.txt,.txt.gz"
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) {
@@ -740,7 +815,7 @@ export function AppShell({
               ref={coverageInputRef}
               className="file-input"
               type="file"
-              accept=".bedgraph,.bedGraph,.bg,.txt"
+              accept=".depth,.depth.gz,.bedgraph,.bedgraph.gz,.bedGraph,.bg,.bg.gz,.txt,.txt.gz"
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) {
@@ -817,6 +892,7 @@ export function AppShell({
                     <div><dt>Delete gap / join</dt><dd>{shortcuts.deleteGap}</dd></div>
                     <div><dt>Delete contig</dt><dd>{shortcuts.deleteContig}</dd></div>
                     <div><dt>Switch resolution</dt><dd>{shortcuts.resolutionWheel}</dd></div>
+                    <div><dt>Pan diagonally</dt><dd>{shortcuts.diagonalWheel}</dd></div>
                     <div><dt>Deselect / cancel</dt><dd>Esc</dd></div>
                     <div><dt>Toggle annotations</dt><dd>F2</dd></div>
                     <div><dt>Toggle inspector</dt><dd>F9</dd></div>
@@ -832,7 +908,7 @@ export function AppShell({
           uiState={uiState}
           onUiAction={onUiAction}
           totalSpanMb={totalSpanMb}
-          preserveResolutionViewport={contactIsMcool}
+          useStoredResolutionOptions={contactIsMcool}
           availableResolutionBasePairs={contactAvailableResolutions}
         />
       </header>
@@ -866,7 +942,7 @@ export function AppShell({
                   coverageView={coverageView}
                   uiState={uiState}
                   homologPattern={gfaHomologPattern}
-                  preserveResolutionViewport={contactIsMcool}
+                  useStoredResolutionOptions={contactIsMcool}
                   availableResolutionBasePairs={contactAvailableResolutions}
                   onClosePanel={closeHeatmapPanel}
                   onExpandPanel={expandHeatmapPanel}
@@ -941,10 +1017,13 @@ export function AppShell({
               <GfaGraphPanel
                 document={gfaDocument}
                 assemblyBlocks={activeAssemblyBlocks}
+                contactMap={overviewContactMap}
+                onLoadEndpointHiC={onLoadGfaEndpointHiC}
+                onLoadEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
                 selectedAssemblyBlockIds={selectedAssemblyBlockIds}
                 homologPattern={gfaHomologPattern}
-                visibleScaffoldIds={gfaVisibleScaffoldIds}
-                visibleContigIds={gfaVisibleContigIds}
+                visibleScaffoldIds={gfaVisibleHomologScaffoldIds}
+                visibleContigIds={gfaGuidedContigIds}
                 onRestoreHeatmap={!heatmapPanelOpen && !uiState.layout.syntenySplitOpen
                   ? () => setHeatmapPanelOpen(true)
                   : undefined}
@@ -958,6 +1037,11 @@ export function AppShell({
                   type: "selectAssemblyContigs",
                   ids,
                 })}
+                onSelectExactOccurrences={(ids) => onUiAction({
+                  type: "selectAssemblyOccurrences",
+                  ids,
+                })}
+                onEditAssembly={(action) => onUiAction(action)}
               />
             </>
           ) : null}
@@ -1017,6 +1101,9 @@ export function AppShell({
         <span>X: {uiState.contact.viewportCenterXMb.toFixed(2)} Mb</span>
         <span>Y: {uiState.contact.viewportCenterYMb.toFixed(2)} Mb</span>
         <strong>{statusMessage}</strong>
+        {contactTilePerformanceLog ? (
+          <output aria-label="Contact resolution performance">{contactTilePerformanceLog}</output>
+        ) : null}
         {contactPanPerformanceLog ? (
           <output aria-label="Contact pan performance">{contactPanPerformanceLog}</output>
         ) : null}

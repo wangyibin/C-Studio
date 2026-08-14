@@ -9,6 +9,7 @@ import {
   gfaLinkScope,
   layoutGfaNodesBandage,
   layoutGfaNodesForCuration,
+  layoutGfaNodesGuided,
   layoutGfaNodesByHomolog,
 } from "./gfaHomologLayout";
 
@@ -147,6 +148,50 @@ describe("GFA homologous chromosome grouping", () => {
       first.get("a")!.x - first.get("c")!.x,
       first.get("a")!.y - first.get("c")!.y,
     )).toBeLessThan(260);
+  });
+
+  it("keeps the Guided AGP backbone ordered and places one-hop neighbors in lanes", () => {
+    const nodes = [
+      { id: "a", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 1, length: 40_000 },
+      { id: "b", groupId: "Chr01g1", assemblyBlockId: "block-1", order: 2, length: 60_000 },
+      { id: "c", groupId: "Chr01g1", assemblyBlockId: "block-2", order: 3, length: 50_000 },
+      { id: "left-branch", groupId: "Unplaced", order: 4, length: 30_000 },
+      { id: "right-branch", groupId: "Unplaced", order: 5, length: 30_000 },
+    ];
+    const positions = layoutGfaNodesGuided(nodes, [
+      { source: "b", target: "c", kind: "agp-joined" },
+      { source: "a", target: "left-branch", kind: "gfa-link" },
+      { source: "c", target: "right-branch", kind: "gfa-link" },
+    ], new Set(["a", "b", "c"]));
+    const widths = gfaBandageNodeWidths(nodes);
+
+    expect(positions.get("a")!.y).toBe(positions.get("b")!.y);
+    expect(positions.get("b")!.y).toBe(positions.get("c")!.y);
+    expect(positions.get("a")!.x).toBeLessThan(positions.get("b")!.x);
+    expect(positions.get("b")!.x).toBeLessThan(positions.get("c")!.x);
+    expect(positions.get("b")!.x - positions.get("a")!.x).toBe(
+      widths.get("a")! / 2 + 4 + widths.get("b")! / 2,
+    );
+    expect(positions.get("left-branch")!.y).not.toBe(positions.get("a")!.y);
+    expect(positions.get("right-branch")!.y).not.toBe(positions.get("c")!.y);
+    expect(positions.get("left-branch")!.x).toBeLessThan(positions.get("right-branch")!.x);
+  });
+
+  it("separates Guided backbones from different scaffolds without changing either order", () => {
+    const nodes = [
+      { id: "a1", groupId: "Chr01g1", order: 1 },
+      { id: "a2", groupId: "Chr01g1", order: 2 },
+      { id: "b1", groupId: "Chr01g2", order: 3 },
+      { id: "b2", groupId: "Chr01g2", order: 4 },
+    ];
+    const focal = new Set(nodes.map((node) => node.id));
+    const first = layoutGfaNodesGuided(nodes, [], focal);
+    const second = layoutGfaNodesGuided(nodes, [], focal);
+
+    expect([...first]).toEqual([...second]);
+    expect(first.get("a1")!.x).toBeLessThan(first.get("a2")!.x);
+    expect(first.get("b1")!.x).toBeLessThan(first.get("b2")!.x);
+    expect(first.get("a1")!.y).not.toBe(first.get("b1")!.y);
   });
 
   it("does not combine equal block ids from different chromosomes", () => {

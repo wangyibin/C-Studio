@@ -6,6 +6,7 @@ import {
   contactOverviewRequestIsReady,
   overviewResolutionForSpan,
   shouldResumeContactBackgroundSchedulingAfterFailure,
+  wholeAssemblyOverviewFromCoveringMap,
   type ContactOverviewRequestReadiness,
 } from "./contactOverviewTiles";
 
@@ -99,5 +100,38 @@ describe("contact overview request readiness", () => {
   it("keeps the adjacent-to-overview chain alive after spatial prefetch fails", () => {
     expect(shouldResumeContactBackgroundSchedulingAfterFailure(true)).toBe(true);
     expect(shouldResumeContactBackgroundSchedulingAfterFailure(false)).toBe(false);
+  });
+});
+
+describe("contact overview reuse", () => {
+  it("crops a covering rectangular main LOD without copying its cells", () => {
+    const cells = [{ xBin: 1, yBin: 2, count: 3 }];
+    const map = {
+      resolution: 10_000,
+      normalization: "raw" as const,
+      viewport: {
+        xStart: 0,
+        xEnd: 14_000_000_000,
+        yStart: 0,
+        yEnd: 10_000_000_000,
+      },
+      cells,
+      visibleLayerComplete: true,
+    };
+
+    const overview = wholeAssemblyOverviewFromCoveringMap(map, 10_000_000_000);
+
+    expect(overview).not.toBeNull();
+    expect(overview?.viewport).toEqual({
+      xStart: 0,
+      xEnd: 10_000_000_000,
+      yStart: 0,
+      yEnd: 10_000_000_000,
+    });
+    expect(overview?.cells).toBe(cells);
+    expect(wholeAssemblyOverviewFromCoveringMap({
+      ...map,
+      viewport: { ...map.viewport, xStart: 1 },
+    }, 10_000_000_000)).toBeNull();
   });
 });

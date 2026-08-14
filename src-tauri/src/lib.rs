@@ -1,9 +1,19 @@
 mod commands;
 mod contact_lod_cache;
 
+use tauri::Manager;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            if let Ok(cache_root) = app.path().app_cache_dir() {
+                cstudio_core::cool::configure_persistent_normalization_cache(
+                    cache_root.join("normalization-v1"),
+                );
+            }
+            Ok(())
+        })
         .manage(commands::ContactCacheState::default())
         .manage(commands::ContactTileCacheState::default())
         .manage(commands::ContactTileRequestState::default())
@@ -18,6 +28,7 @@ pub fn run() {
             commands::select_contact_file,
             commands::select_coverage_file,
             commands::select_paf_file,
+            commands::select_project_directory,
             commands::save_agp_file,
             commands::overwrite_agp_file,
             commands::set_window_title,
@@ -27,7 +38,10 @@ pub fn run() {
             commands::register_contact_map_layout,
             commands::log_contact_tile_frontend_ipc,
             commands::log_contact_pan_frontend_performance,
+            commands::log_gfa_frontend_performance,
             commands::begin_contact_tile_generation,
+            commands::prewarm_contact_normalizations,
+            commands::cancel_contact_normalization_prewarm,
             commands::get_contact_map_tiles_from_cool,
             commands::get_contact_map_tiles_from_cool_binary_v1,
             commands::stream_contact_map_tiles_from_cool_binary_v1,

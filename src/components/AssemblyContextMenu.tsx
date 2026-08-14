@@ -7,6 +7,7 @@ import {
   assemblyRenameTarget,
   assemblyRenameValidationError,
   hasDeletableGap,
+  hasDissolvableAssemblyBlock,
   hasRemovableChromosomeBoundary,
   selectedBlockIds,
 } from "../state/assemblyEditing";
@@ -174,6 +175,10 @@ export function AssemblyContextMenu({
     uiState.assembly.blocks,
     uiState.assembly.selection,
   );
+  const canDissolveBlock = hasDissolvableAssemblyBlock(
+    uiState.assembly.blocks,
+    uiState.assembly.selection,
+  );
   const canRemoveChromosomeBoundary = hasRemovableChromosomeBoundary(
     uiState.assembly.blocks,
     uiState.assembly.selection,
@@ -338,6 +343,16 @@ export function AssemblyContextMenu({
       >
         <span>Delete contig…</span>
         <kbd>{shortcuts.deleteContig}</kbd>
+      </button>
+      <button
+        type="button"
+        disabled={!canDissolveBlock}
+        title={canDissolveBlock
+          ? "Split the selected composite block into singleton contigs"
+          : "Select a composite block first"}
+        onClick={() => run({ type: "dissolveAssemblyBlockSelection" })}
+      >
+        Dissolve block
       </button>
       <button
         type="button"

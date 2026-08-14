@@ -1,10 +1,12 @@
 import {
   addChromosomeBoundariesToSelection,
+  createAssemblyBlockFromGfa,
   assemblyUnitIdForContig,
   copySelection,
   copySelectionBefore,
   deleteContigSelection,
   deleteGapsBetweenSelection,
+  dissolveAssemblyBlockSelection,
   moveSelectionBefore,
   moveSelectionToDebris,
   removeChromosomeBoundariesFromSelection,
@@ -23,6 +25,7 @@ import {
   chooseContactResolutionForBpPerPixel,
   clampContactResolutionToViewport,
   contactResolutionToBasePairs,
+  contactResolutionLevelsForBasePairs,
   contactResolutionLevelsForViewport,
   contactResolutionLevels,
   contactWholeGenomeViewportSpanMb,
@@ -32,6 +35,7 @@ import {
 } from "./contactResolution";
 import { contactViewportAxisSpans } from "./contactViewport";
 import type { ContactMapLayoutBlock } from "./importers";
+import type { GfaLinkEvidence } from "./gfa";
 
 export type Tool = "select" | "split" | "move" | "flip" | "copy";
 export type EditMode = "normal" | "advanced";
@@ -46,11 +50,14 @@ export type ContactResolution =
   | "50 kb"
   | "25 kb"
   | "10 kb"
-  | "5 kb";
+  | "5 kb"
+  | "2 kb"
+  | "1 kb";
 
-// Manual pyramid changes keep the genomic viewport fixed. Bound the number of
-// matrix bins across the longer viewport axis so choosing a very fine level on
-// a whole-genome view cannot fan out into thousands of visible tile requests.
+// Automatic dataset reconciliation may preserve the genomic viewport. Bound
+// that compatibility path so resolving to a fine stored level cannot fan out
+// into thousands of visible tile requests. Manual controls instead use the
+// target level's default pixels-per-bin geometry.
 const maxManualContactBinsPerAxis = 6_144;
 export type ContactColormap = "Reds" | "Viridis" | "Magma" | "Inferno" | "Turbo";
 export type Normalization =
@@ -71,7 +78,9 @@ export type ContextOperationType =
   | "move"
   | "split_contig"
   | "delete_gap"
-  | "rename";
+  | "rename"
+  | "create_block"
+  | "dissolve_block";
 
 export interface LogEntry {
   time: string;
@@ -184,6 +193,7 @@ export type UiAction =
   | {
       type: "setContactResolution";
       resolution: ContactResolution;
+      /** Reserved for automatic dataset reconciliation; manual controls omit it. */
       preserveViewport?: boolean;
     }
   | { type: "toggleContactResolutionLock" }
@@ -244,6 +254,7 @@ export type UiAction =
   | { type: "selectAssemblyContig"; id: string; additive: boolean }
   | { type: "focusAssemblyContig"; id: string }
   | { type: "selectAssemblyContigs"; ids: string[] }
+  | { type: "selectAssemblyOccurrences"; ids: string[] }
   | { type: "selectAssemblyChromosome"; id: string }
   | { type: "focusAssemblyChromosome"; id: string }
   | { type: "clearAssemblySelection" }
@@ -255,6 +266,8 @@ export type UiAction =
     }
   | { type: "moveAssemblySelectionToDebris" }
   | { type: "deleteAssemblySelection" }
+  | { type: "createAssemblyBlockFromGfa"; links: GfaLinkEvidence[] }
+  | { type: "dissolveAssemblyBlockSelection" }
   | { type: "addAssemblyChromosomeBoundaries" }
   | { type: "removeAssemblyChromosomeBoundaries" }
   | { type: "copyAssemblySelection" }
@@ -352,14 +365,43 @@ export function availableContactResolutions(
     ),
     firstAvailableIndex,
   );
-  // Preserve the active level after a resize or a restored session even if it
-  // temporarily exceeds the manual-load budget. The next explicit choice is
-  // still clamped to the safe portion of the pyramid.
+  // Preserve the active level after a resize or restored session even if it
+  // temporarily exceeds this background-load budget. Imported-dataset
+  // controls enumerate stored levels separately; an explicit fine-level
+  // choice narrows the viewport instead of silently changing the resolution.
   const lastAvailableIndex = currentIndex >= firstAvailableIndex
     ? Math.max(lastSafeIndex, currentIndex)
     : lastSafeIndex;
 
   return [...contactResolutionLevels.slice(firstAvailableIndex, lastAvailableIndex + 1)];
+}
+
+export function availableContactResolutionsForDataset(
+  contact: UiState["contact"],
+  availableBasePairs: readonly number[],
+  totalSpanMb = contact.totalSpanMb,
+  preserveViewport = true,
+): ContactResolution[] {
+  const viewportResolutions = availableContactResolutions(
+    contact,
+    totalSpanMb,
+    preserveViewport,
+  );
+  if (availableBasePairs.length === 0) {
+    return viewportResolutions;
+  }
+  const storedResolutions = new Set(
+    contactResolutionLevelsForBasePairs(availableBasePairs),
+  );
+
+  return viewportResolutions.filter((resolution) => storedResolutions.has(resolution));
+}
+
+/** Every supported pyramid level physically stored in an imported dataset. */
+export function storedContactResolutionsForDataset(
+  availableBasePairs: readonly number[],
+): ContactResolution[] {
+  return [...contactResolutionLevelsForBasePairs(availableBasePairs)];
 }
 
 export function createInitialUiState(initialMessage: string): UiState {
@@ -658,9 +700,15 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         action.resolution,
         action.preserveViewport ?? false,
       );
+      const viewportNarrowed = nextState.contact.viewportSpanMb
+        < state.contact.viewportSpanMb - 0.000001;
       return withLog(
         nextState,
-        `Contact resolution set to ${nextState.contact.resolution}`,
+        `Contact resolution set to ${nextState.contact.resolution}${
+          viewportNarrowed
+            ? `; viewport narrowed to ${nextState.contact.viewportSpanMb} Mb`
+            : ""
+        }`,
       );
     }
     case "toggleContactResolutionLock": {
@@ -910,7 +958,7 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         fittedZoomMaximumViewportSpanMb,
         currentViewportSpanMb,
       );
-      const finestResolution = contactResolutionLevels[contactResolutionLevels.length - 1] ?? "5 kb";
+      const finestResolution = contactResolutionLevels[contactResolutionLevels.length - 1] ?? "1 kb";
       const floorResolution = state.contact.resolutionLocked
         ? state.contact.resolution
         : finestResolution;
@@ -1406,6 +1454,21 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           ))),
         },
       };
+    case "selectAssemblyOccurrences": {
+      const occurrenceIds = new Set(action.ids);
+      const ids = state.assembly.blocks
+        .filter((block) => occurrenceIds.has(block.id))
+        .map((block) => block.id);
+      return {
+        ...state,
+        assembly: {
+          ...state.assembly,
+          selection: ids.length > 0
+            ? { kind: "contigs", ids, exact: true }
+            : null,
+        },
+      };
+    }
     case "selectAssemblyChromosome":
       return {
         ...state,
@@ -1525,6 +1588,33 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         "delete_contig",
       );
     }
+    case "createAssemblyBlockFromGfa":
+      return withAssemblyHistory(
+        state,
+        {
+          blocks: createAssemblyBlockFromGfa(
+            state.assembly.blocks,
+            state.assembly.selection,
+            action.links,
+          ),
+          selection: null,
+        },
+        "GFA-aware block created",
+        "create_block",
+      );
+    case "dissolveAssemblyBlockSelection":
+      return withAssemblyHistory(
+        state,
+        {
+          blocks: dissolveAssemblyBlockSelection(
+            state.assembly.blocks,
+            state.assembly.selection,
+          ),
+          selection: null,
+        },
+        "Assembly block dissolved",
+        "dissolve_block",
+      );
     case "addAssemblyChromosomeBoundaries":
       return withAssemblyHistory(
         state,
@@ -1818,7 +1908,7 @@ function clamp(value: number, min: number, max: number) {
 
 function roundContactViewportMb(value: number) {
   // One millionth of a megabase is one base pair. Keeping this precision avoids
-  // cursor-anchor drift at the finest (5 kb) contact resolution.
+  // cursor-anchor drift at the finest (1 kb) contact resolution.
   return Number(value.toFixed(6));
 }
 
@@ -1890,25 +1980,22 @@ function setContactResolution(
     };
   }
 
-  const availableResolutions = availableContactResolutions(
-    state.contact,
+  const resolution = requestedResolution;
+  const maximumBudgetedViewportSpanMb = maximumManualContactViewportSpanMb(
+    resolution,
     totalSpanMb,
-    true,
+    state.contact.viewportWidthPx,
+    state.contact.viewportHeightPx,
   );
-  const requestedIndex = contactResolutionLevels.indexOf(requestedResolution);
-  const firstAvailable = availableResolutions[0] ?? state.contact.resolution;
-  const lastAvailable = availableResolutions[availableResolutions.length - 1] ?? firstAvailable;
-  const firstAvailableIndex = contactResolutionLevels.indexOf(firstAvailable);
-  const lastAvailableIndex = contactResolutionLevels.indexOf(lastAvailable);
-  const resolution = requestedIndex < firstAvailableIndex
-    ? firstAvailable
-    : requestedIndex > lastAvailableIndex
-      ? lastAvailable
-      : requestedResolution;
-  // Resolution selection changes the .mcool pyramid level, not the camera.
-  // Zoom actions remain responsible for changing viewportSpanMb.
+  // Keep the camera unchanged when possible. For a too-fine stored level,
+  // shrink the shorter-axis span just enough to keep the longer data axis
+  // within the bounded tile budget; center coordinates are retained below.
   const viewportSpanMb = roundContactViewportMb(
-    clamp(state.contact.viewportSpanMb, 0.000001, totalSpanMb),
+    clamp(
+      state.contact.viewportSpanMb,
+      0.000001,
+      maximumBudgetedViewportSpanMb,
+    ),
   );
   const { xSpanMb, ySpanMb } = contactViewportAxisSpansMb(
     viewportSpanMb,
@@ -1969,6 +2056,31 @@ function maximumContactViewportSpanMb(
     sanitizeContactTotalSpanMb(totalSpanMb),
     sanitizeContactViewportSizePx(viewportWidthPx),
     sanitizeContactViewportSizePx(viewportHeightPx),
+  );
+}
+
+function maximumManualContactViewportSpanMb(
+  resolution: ContactResolution,
+  totalSpanMb: number,
+  viewportWidthPx: number,
+  viewportHeightPx: number,
+) {
+  const safeTotalSpanMb = sanitizeContactTotalSpanMb(totalSpanMb);
+  const maximumDataAxisSpanMb = (
+    contactResolutionToBasePairs(resolution) * maxManualContactBinsPerAxis
+  ) / 1_000_000;
+  if (safeTotalSpanMb <= maximumDataAxisSpanMb) {
+    return safeTotalSpanMb;
+  }
+
+  const safeWidthPx = sanitizeContactViewportSizePx(viewportWidthPx);
+  const safeHeightPx = sanitizeContactViewportSizePx(viewportHeightPx);
+  const aspectScale = Math.max(safeWidthPx, safeHeightPx)
+    / Math.min(safeWidthPx, safeHeightPx);
+
+  return Math.max(
+    0.000001,
+    Math.min(safeTotalSpanMb, maximumDataAxisSpanMb / aspectScale),
   );
 }
 

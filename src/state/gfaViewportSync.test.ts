@@ -104,6 +104,35 @@ describe("GFA heatmap viewport synchronization", () => {
     )].sort()).toEqual(["a0", "b1"]);
   });
 
+  it("keeps whole-genome Guided focus local instead of returning every contig", () => {
+    const blocks = Array.from({ length: 30 }, (_, index) => (
+      block(`a${index}`, "Chr01g1", index * 10, index * 10 + 10)
+    ));
+
+    expect([...gfaContigsForHeatmapViewport(
+      blocks,
+      { xStart: 0, xEnd: 300, yStart: 0, yEnd: 300 },
+    )].sort()).toEqual([
+      "a10", "a11", "a12", "a13", "a14", "a15", "a16", "a17", "a18", "a19", "a20",
+    ]);
+  });
+
+  it("keeps selected occurrences while adding the refreshed heatmap focus", () => {
+    const blocks = Array.from({ length: 30 }, (_, index) => (
+      block(`a${index}`, "Chr01g1", index * 10, index * 10 + 10)
+    ));
+    const focused = gfaContigsForHeatmapViewport(
+      blocks,
+      { xStart: 140, xEnd: 170, yStart: 140, yEnd: 170 },
+      2,
+      new Set(["a2"]),
+    );
+
+    expect([...focused].sort()).toEqual([
+      "a0", "a1", "a13", "a14", "a15", "a16", "a17", "a2", "a3", "a4",
+    ]);
+  });
+
   it("focuses the compact preview on one homolog group at the X-axis center", () => {
     const blocks = [
       block("a", "Chr01g1", 0, 100),

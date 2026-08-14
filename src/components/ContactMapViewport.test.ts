@@ -5,6 +5,7 @@ import type { ExampleDatasetSummary } from "../App";
 import { createInitialUiState } from "../state/uiState";
 import {
   assemblyCutTargetAtScreenPoint,
+  assemblySelectionProjectionBands,
   assemblyShiftClickIntent,
   ContactMapViewport,
   contactCanvasBackingSizeFromBounds,
@@ -12,6 +13,7 @@ import {
   contactViewportForAxisNavigator,
   contactViewportSizePxFromBounds,
   contactTileOverscanDirectionForViewports,
+  contactWheelNavigationMode,
   contactWheelPanIntent,
   historyPreviewBoxes,
 } from "./ContactMapViewport";
@@ -27,6 +29,32 @@ const viewport = {
   yStart: 75_000_000,
   yEnd: 175_000_000,
 };
+
+describe("assemblySelectionProjectionBands", () => {
+  it("projects one selected interval into full-height and full-width alignment bands", () => {
+    expect(assemblySelectionProjectionBands(100, 200, {
+      xStart: 0,
+      xEnd: 400,
+      yStart: 50,
+      yEnd: 250,
+    })).toEqual({
+      vertical: { left: "25%", width: "25%" },
+      horizontal: { top: "25%", height: "50%" },
+    });
+  });
+
+  it("keeps the visible axis band when independent x/y viewports only overlap one axis", () => {
+    expect(assemblySelectionProjectionBands(100, 200, {
+      xStart: 0,
+      xEnd: 400,
+      yStart: 300,
+      yEnd: 500,
+    })).toEqual({
+      vertical: { left: "25%", width: "25%" },
+      horizontal: null,
+    });
+  });
+});
 
 describe("contactResolutionWheelIntent", () => {
   const resolutionOptions = ["1 Mb", "500 kb", "100 kb", "10 kb"] as const;
@@ -87,6 +115,24 @@ describe("contactResolutionWheelIntent", () => {
 });
 
 describe("contactWheelPanIntent", () => {
+  it("gives Command/Ctrl-Shift wheel priority over modified resolution changes", () => {
+    expect(contactWheelNavigationMode({
+      ctrlKey: false,
+      metaKey: true,
+      shiftKey: false,
+    })).toBe("resolution");
+    expect(contactWheelNavigationMode({
+      ctrlKey: false,
+      metaKey: true,
+      shiftKey: true,
+    })).toBe("pan");
+    expect(contactWheelNavigationMode({
+      ctrlKey: true,
+      metaKey: false,
+      shiftKey: true,
+    })).toBe("pan");
+  });
+
   it("maps trackpad movement independently across both genomic axes", () => {
     expect(contactWheelPanIntent({
       deltaX: 40,
@@ -139,6 +185,33 @@ describe("contactWheelPanIntent", () => {
       bounds,
       viewport,
     })).toEqual({ deltaXPx: 400, deltaYPx: -100, deltaXMb: 200, deltaYMb: -50 });
+  });
+
+  it("uses Command/Ctrl-Shift-wheel for 45-degree diagonal movement", () => {
+    expect(contactWheelPanIntent({
+      deltaX: 0,
+      deltaY: 25,
+      deltaMode: 0,
+      shiftKey: true,
+      diagonalKey: true,
+      bounds,
+      viewport,
+    })).toEqual({
+      deltaXPx: 25,
+      deltaYPx: 25,
+      deltaXMb: 12.5,
+      deltaYMb: 12.5,
+    });
+
+    expect(contactWheelPanIntent({
+      deltaX: -30,
+      deltaY: 8,
+      deltaMode: 0,
+      shiftKey: true,
+      diagonalKey: true,
+      bounds,
+      viewport,
+    })).toMatchObject({ deltaXPx: -30, deltaYPx: -30 });
   });
 
   it("ignores empty, invalid, or dimensionless wheel input", () => {
@@ -454,6 +527,11 @@ describe("assembly overlay hierarchy", () => {
       mcool_size_bytes: 0,
       agp_layout: { blocks: uiState.assembly.blocks, totalSpan: 400 },
     };
+    uiState.assembly.selection = {
+      kind: "contigs",
+      ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"],
+      exact: true,
+    };
 
     const markup = renderToStaticMarkup(
       createElement(ContactMapViewport, {
@@ -471,6 +549,11 @@ describe("assembly overlay hierarchy", () => {
     expect(markup).toContain('data-block-id="Chr01_block_1"');
     expect(markup).toContain('title="Chr01_block_1 · 2 contigs"');
     expect(markup).not.toContain('data-contig-id="Chr01:4:ctg3"');
+    expect(markup.match(/assembly-selection-axis-band vertical/g)).toHaveLength(1);
+    expect(markup.match(/assembly-selection-axis-band horizontal/g)).toHaveLength(1);
+    expect(markup).toMatch(
+      /class="assembly-selection-axis-band horizontal"[^>]*><\/span><div class="assembly-overlay-layer"/,
+    );
 
     uiState.assembly.showBlockBoxes = false;
     const contigOnlyMarkup = renderToStaticMarkup(

@@ -174,13 +174,31 @@ where
 pub struct ContactMapChunkProjector<'a> {
     query: &'a ContactMapQuery,
     block_index: LayoutBlockIndex<'a>,
+    last_x_source: Option<(&'a str, usize)>,
+    last_y_source: Option<(&'a str, usize)>,
+    indexed_source_slots: Vec<Option<Option<usize>>>,
     requested_tiles: Option<RequestedTileFilter>,
-    aggregate: HashMap<(u64, u64), f64>,
+    aggregate: ContactMapAggregate,
 }
 
 struct RequestedTileFilter {
     tile_size_bins: u64,
     tiles: HashSet<(u64, u64)>,
+}
+
+enum ContactMapAggregate {
+    Sparse(HashMap<(u64, u64), f64>),
+    Dense(DenseContactMapAggregate),
+}
+
+struct DenseContactMapAggregate {
+    x_start_bin: u64,
+    y_start_bin: u64,
+    x_bins: usize,
+    y_bins: usize,
+    counts: Vec<f64>,
+    occupied: Vec<bool>,
+    occupied_count: usize,
 }
 
 impl<'a> ContactMapChunkProjector<'a> {
@@ -189,8 +207,32 @@ impl<'a> ContactMapChunkProjector<'a> {
         Ok(Self {
             query,
             block_index: LayoutBlockIndex::new(&query.layout_blocks),
+            last_x_source: None,
+            last_y_source: None,
+            indexed_source_slots: Vec::new(),
             requested_tiles: None,
-            aggregate: HashMap::new(),
+            aggregate: ContactMapAggregate::Sparse(HashMap::new()),
+        })
+    }
+
+    /// Builds an exact dense aggregate whose allocation is bounded by the
+    /// caller before any source contacts are visited. This avoids hashing tens
+    /// of millions of contacts into a screen-sized overview grid.
+    pub fn new_for_bounded_view(
+        query: &'a ContactMapQuery,
+        max_cells: usize,
+    ) -> CStudioResult<Self> {
+        validate_query(query)?;
+        Ok(Self {
+            query,
+            block_index: LayoutBlockIndex::new(&query.layout_blocks),
+            last_x_source: None,
+            last_y_source: None,
+            indexed_source_slots: Vec::new(),
+            requested_tiles: None,
+            aggregate: ContactMapAggregate::Dense(DenseContactMapAggregate::new(
+                query, max_cells,
+            )?),
         })
     }
 
@@ -232,12 +274,89 @@ impl<'a> ContactMapChunkProjector<'a> {
         start2: u64,
         count: f64,
     ) {
-        let Some(x_blocks) = self.block_index.blocks(source1) else {
+        let Some(x_source) = Self::cached_source_slot(
+            &self.block_index,
+            &mut self.last_x_source,
+            source1,
+        ) else {
             return;
         };
-        let Some(y_blocks) = self.block_index.blocks(source2) else {
+        let Some(y_source) = Self::cached_source_slot(
+            &self.block_index,
+            &mut self.last_y_source,
+            source2,
+        ) else {
             return;
         };
+        self.push_contact_from_source_slots(x_source, start1, y_source, start2, count);
+    }
+
+    /// Projects a Cooler contact by its stable chromosome-table indexes. Each
+    /// source name is resolved against the layout once per scan instead of
+    /// hashing two strings for every pixel.
+    pub fn push_indexed_contact(
+        &mut self,
+        source1_index: usize,
+        source1: &str,
+        start1: u64,
+        source2_index: usize,
+        source2: &str,
+        start2: u64,
+        count: f64,
+    ) {
+        let Some(x_source) = self.indexed_source_slot(source1_index, source1) else {
+            return;
+        };
+        let Some(y_source) = self.indexed_source_slot(source2_index, source2) else {
+            return;
+        };
+        self.push_contact_from_source_slots(x_source, start1, y_source, start2, count);
+    }
+
+    fn indexed_source_slot(&mut self, source_index: usize, source_id: &str) -> Option<usize> {
+        if self.indexed_source_slots.len() <= source_index {
+            self.indexed_source_slots.resize(source_index + 1, None);
+        }
+        if let Some(slot) = self.indexed_source_slots[source_index] {
+            return slot;
+        }
+        let slot = self.block_index.source_slot(source_id);
+        self.indexed_source_slots[source_index] = Some(slot);
+        slot
+    }
+
+    fn push_contact_from_source_slots(
+        &mut self,
+        x_source: usize,
+        start1: u64,
+        y_source: usize,
+        start2: u64,
+        count: f64,
+    ) {
+        let x_blocks = self.block_index.blocks(x_source);
+        let y_blocks = self.block_index.blocks(y_source);
+
+        // Most assembly sources have exactly one current placement. Avoid two
+        // extra interval scans and the copy-share division on that dominant
+        // whole-genome path while preserving the general copied-placement path.
+        if x_blocks.len() == 1 && y_blocks.len() == 1 {
+            let Some(x) = x_blocks[0].visual_position(start1) else {
+                return;
+            };
+            let Some(y) = y_blocks[0].visual_position(start2) else {
+                return;
+            };
+            Self::push_visual_contact(
+                self.query,
+                self.requested_tiles.as_ref(),
+                &mut self.aggregate,
+                x,
+                y,
+                count,
+            );
+            return;
+        }
+
         let x_position_count = x_blocks
             .iter()
             .filter(|block| block.visual_position(start1).is_some())
@@ -266,33 +385,58 @@ impl<'a> ContactMapChunkProjector<'a> {
                 let Some(y) = y_block.visual_position(start2) else {
                     continue;
                 };
-                let (visual_x, visual_y) = if x <= y { (x, y) } else { (y, x) };
-                if !self.query.viewport.contains(visual_x, visual_y) {
-                    continue;
-                }
-                let x_bin = visual_x / self.query.target_resolution;
-                let y_bin = visual_y / self.query.target_resolution;
-                if let Some(filter) = &self.requested_tiles {
-                    let tile = (x_bin / filter.tile_size_bins, y_bin / filter.tile_size_bins);
-                    if !filter.tiles.contains(&tile) {
-                        continue;
-                    }
-                }
-                *self.aggregate.entry((x_bin, y_bin)).or_insert(0.0) += projected_count;
+                Self::push_visual_contact(
+                    self.query,
+                    self.requested_tiles.as_ref(),
+                    &mut self.aggregate,
+                    x,
+                    y,
+                    projected_count,
+                );
             }
         }
     }
 
+    fn cached_source_slot(
+        block_index: &LayoutBlockIndex<'a>,
+        cached: &mut Option<(&'a str, usize)>,
+        source_id: &str,
+    ) -> Option<usize> {
+        if let Some((cached_source, slot)) = *cached {
+            if cached_source == source_id {
+                return Some(slot);
+            }
+        }
+        let slot = block_index.source_slot(source_id)?;
+        *cached = Some((block_index.source_id(slot), slot));
+        Some(slot)
+    }
+
+    fn push_visual_contact(
+        query: &ContactMapQuery,
+        requested_tiles: Option<&RequestedTileFilter>,
+        aggregate: &mut ContactMapAggregate,
+        x: u64,
+        y: u64,
+        count: f64,
+    ) {
+        let (visual_x, visual_y) = if x <= y { (x, y) } else { (y, x) };
+        if !query.viewport.contains(visual_x, visual_y) {
+            return;
+        }
+        let x_bin = visual_x / query.target_resolution;
+        let y_bin = visual_y / query.target_resolution;
+        if let Some(filter) = requested_tiles {
+            let tile = (x_bin / filter.tile_size_bins, y_bin / filter.tile_size_bins);
+            if !filter.tiles.contains(&tile) {
+                return;
+            }
+        }
+        aggregate.add(x_bin, y_bin, count);
+    }
+
     pub fn take_view(&mut self) -> ContactMapView {
-        let mut cells: Vec<ContactMapCell> = std::mem::take(&mut self.aggregate)
-            .into_iter()
-            .map(|((x_bin, y_bin), count)| ContactMapCell {
-                x_bin,
-                y_bin,
-                count,
-            })
-            .collect();
-        cells.sort_by_key(|cell| (cell.x_bin, cell.y_bin));
+        let cells = self.aggregate.take_cells();
         ContactMapView {
             resolution: self.query.target_resolution,
             viewport: self.query.viewport,
@@ -302,6 +446,132 @@ impl<'a> ContactMapChunkProjector<'a> {
 
     pub fn pending_cell_count(&self) -> usize {
         self.aggregate.len()
+    }
+}
+
+impl ContactMapAggregate {
+    fn add(&mut self, x_bin: u64, y_bin: u64, count: f64) {
+        match self {
+            Self::Sparse(aggregate) => {
+                *aggregate.entry((x_bin, y_bin)).or_insert(0.0) += count;
+            }
+            Self::Dense(aggregate) => aggregate.add(x_bin, y_bin, count),
+        }
+    }
+
+    fn take_cells(&mut self) -> Vec<ContactMapCell> {
+        match self {
+            Self::Sparse(aggregate) => {
+                let mut cells: Vec<ContactMapCell> = std::mem::take(aggregate)
+                    .into_iter()
+                    .map(|((x_bin, y_bin), count)| ContactMapCell {
+                        x_bin,
+                        y_bin,
+                        count,
+                    })
+                    .collect();
+                cells.sort_by_key(|cell| (cell.x_bin, cell.y_bin));
+                cells
+            }
+            Self::Dense(aggregate) => aggregate.take_cells(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Sparse(aggregate) => aggregate.len(),
+            Self::Dense(aggregate) => aggregate.occupied_count,
+        }
+    }
+}
+
+impl DenseContactMapAggregate {
+    fn new(query: &ContactMapQuery, max_cells: usize) -> CStudioResult<Self> {
+        let resolution = query.target_resolution;
+        let x_start_bin = query.viewport.x_start / resolution;
+        let x_end_bin = query.viewport.x_end.div_ceil(resolution);
+        let y_start_bin = query.viewport.y_start / resolution;
+        let y_end_bin = query.viewport.y_end.div_ceil(resolution);
+        let x_bins = x_end_bin.saturating_sub(x_start_bin);
+        let y_bins = y_end_bin.saturating_sub(y_start_bin);
+        let cell_count = x_bins.checked_mul(y_bins).ok_or_else(|| {
+            CStudioError::InvalidContactMapQuery(
+                "bounded contact-map aggregate grid overflowed u64".to_string(),
+            )
+        })?;
+        if cell_count > u64::try_from(max_cells).unwrap_or(u64::MAX) {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                "contact-map aggregate requires {cell_count} cells, exceeding bound {max_cells}"
+            )));
+        }
+        let x_bins = usize::try_from(x_bins).map_err(|_| {
+            CStudioError::InvalidContactMapQuery(
+                "bounded contact-map X grid exceeds platform range".to_string(),
+            )
+        })?;
+        let y_bins = usize::try_from(y_bins).map_err(|_| {
+            CStudioError::InvalidContactMapQuery(
+                "bounded contact-map Y grid exceeds platform range".to_string(),
+            )
+        })?;
+        let cell_count = usize::try_from(cell_count).map_err(|_| {
+            CStudioError::InvalidContactMapQuery(
+                "bounded contact-map grid exceeds platform range".to_string(),
+            )
+        })?;
+        Ok(Self {
+            x_start_bin,
+            y_start_bin,
+            x_bins,
+            y_bins,
+            counts: vec![0.0; cell_count],
+            occupied: vec![false; cell_count],
+            occupied_count: 0,
+        })
+    }
+
+    fn add(&mut self, x_bin: u64, y_bin: u64, count: f64) {
+        let Some(local_x) = x_bin
+            .checked_sub(self.x_start_bin)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value < self.x_bins)
+        else {
+            return;
+        };
+        let Some(local_y) = y_bin
+            .checked_sub(self.y_start_bin)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value < self.y_bins)
+        else {
+            return;
+        };
+        let index = local_x * self.y_bins + local_y;
+        if !self.occupied[index] {
+            self.occupied[index] = true;
+            self.occupied_count += 1;
+        }
+        self.counts[index] += count;
+    }
+
+    fn take_cells(&mut self) -> Vec<ContactMapCell> {
+        let mut cells = Vec::with_capacity(self.occupied_count);
+        for local_x in 0..self.x_bins {
+            for local_y in 0..self.y_bins {
+                let index = local_x * self.y_bins + local_y;
+                if !self.occupied[index] {
+                    continue;
+                }
+                cells.push(ContactMapCell {
+                    x_bin: self.x_start_bin + local_x as u64,
+                    y_bin: self.y_start_bin + local_y as u64,
+                    count: self.counts[index],
+                });
+                self.counts[index] = 0.0;
+                self.occupied[index] = false;
+            }
+        }
+        self.occupied_count = 0;
+        cells
     }
 }
 
@@ -349,24 +619,49 @@ fn validate_query(query: &ContactMapQuery) -> CStudioResult<()> {
 }
 
 struct LayoutBlockIndex<'a> {
-    by_source: HashMap<&'a str, Vec<&'a LayoutBlock>>,
+    by_source: HashMap<&'a str, usize>,
+    sources: Vec<SourceLayoutBlocks<'a>>,
+}
+
+struct SourceLayoutBlocks<'a> {
+    source_id: &'a str,
+    blocks: Vec<&'a LayoutBlock>,
 }
 
 impl<'a> LayoutBlockIndex<'a> {
     fn new(blocks: &'a [LayoutBlock]) -> Self {
-        let mut by_source: HashMap<&'a str, Vec<&'a LayoutBlock>> = HashMap::new();
+        let mut by_source: HashMap<&'a str, usize> = HashMap::new();
+        let mut sources = Vec::<SourceLayoutBlocks<'a>>::new();
         for block in blocks {
-            by_source
-                .entry(block.source_id.as_str())
-                .or_default()
-                .push(block);
+            let source_id = block.source_id.as_str();
+            let slot = match by_source.get(source_id).copied() {
+                Some(slot) => slot,
+                None => {
+                    let slot = sources.len();
+                    sources.push(SourceLayoutBlocks {
+                        source_id,
+                        blocks: Vec::new(),
+                    });
+                    by_source.insert(source_id, slot);
+                    slot
+                }
+            };
+            sources[slot].blocks.push(block);
         }
 
-        Self { by_source }
+        Self { by_source, sources }
     }
 
-    fn blocks(&self, source_id: &str) -> Option<&[&'a LayoutBlock]> {
-        self.by_source.get(source_id).map(Vec::as_slice)
+    fn source_slot(&self, source_id: &str) -> Option<usize> {
+        self.by_source.get(source_id).copied()
+    }
+
+    fn source_id(&self, slot: usize) -> &'a str {
+        self.sources[slot].source_id
+    }
+
+    fn blocks(&self, slot: usize) -> &[&'a LayoutBlock] {
+        self.sources[slot].blocks.as_slice()
     }
 }
 
@@ -508,6 +803,58 @@ mod tests {
         for cell in expected.cells {
             assert_eq!(delta_counts[&(cell.x_bin, cell.y_bin)], cell.count);
         }
+    }
+
+    #[test]
+    fn bounded_dense_projector_matches_sparse_projection_and_resets_exactly() {
+        let query = ContactMapQuery {
+            base_resolution: 1_000,
+            target_resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 4_000,
+                y_start: 0,
+                y_end: 4_000,
+            },
+            layout_blocks: vec![
+                LayoutBlock {
+                    id: "copy-forward".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 0,
+                    source_end: 2_000,
+                    visual_start: 0,
+                    orientation: Orientation::Forward,
+                },
+                LayoutBlock {
+                    id: "copy-reverse".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 0,
+                    source_end: 2_000,
+                    visual_start: 2_000,
+                    orientation: Orientation::Reverse,
+                },
+            ],
+        };
+        let contacts = [
+            ("contig-a", 0, "contig-a", 1_000, 8.0),
+            ("contig-a", 1_000, "contig-a", 1_000, 4.0),
+        ];
+        let mut sparse = ContactMapChunkProjector::new(&query).expect("sparse projector");
+        let mut dense = ContactMapChunkProjector::new_for_bounded_view(&query, 16)
+            .expect("bounded dense projector");
+        for (source1, start1, source2, start2, count) in contacts {
+            sparse.push_contact(source1, start1, source2, start2, count);
+            dense.push_indexed_contact(0, source1, start1, 0, source2, start2, count);
+        }
+
+        assert_eq!(dense.pending_cell_count(), sparse.pending_cell_count());
+        assert_eq!(dense.take_view(), sparse.take_view());
+        assert!(dense.take_view().cells.is_empty());
+
+        let error = ContactMapChunkProjector::new_for_bounded_view(&query, 15)
+            .err()
+            .expect("undersized bound should fail before allocation");
+        assert!(error.to_string().contains("exceeding bound 15"));
     }
 
     #[test]

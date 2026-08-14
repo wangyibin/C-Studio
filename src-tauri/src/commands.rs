@@ -1,9 +1,10 @@
+use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
@@ -41,6 +42,13 @@ pub struct ContactTileRequestState {
 
 const MAX_CONTACT_LAYOUT_HANDLES: usize = 64;
 const UNKNOWN_CONTACT_LAYOUT_HANDLE_PREFIX: &str = "unknown contact map layout handle";
+// Overview aggregation must remain screen-sized even when the source matrix
+// contains tens of millions of pixels. The frontend currently requests about
+// 320 bins for the inspector and at most screen-scale bins for the main view;
+// one million target slots leaves headroom for rectangular desktop viewports
+// while preventing an accidental fine-resolution whole-genome request from
+// growing an unbounded sparse HashMap.
+const MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS: u64 = 1_048_576;
 
 #[derive(Debug)]
 struct ContactLayoutRegistry {
@@ -228,6 +236,24 @@ impl ContactTileRequestState {
         active_requests
             .get(&request_id)
             .is_none_or(|generation| *generation < latest_generation)
+    }
+
+    /// Normalization prewarming is lower priority than every contact-map
+    /// request. It may run only while it is the sole registered task in the
+    /// current generation; a foreground or tile-prefetch request makes its
+    /// cancellation closure true at the next normalization checkpoint.
+    fn is_normalization_prewarm_cancelled(&self, request_id: u64) -> bool {
+        let Ok(active_requests) = self.active_requests.lock() else {
+            return true;
+        };
+        let latest_generation = self.latest_generation.load(Ordering::SeqCst);
+        let Some(generation) = active_requests.get(&request_id) else {
+            return true;
+        };
+        *generation < latest_generation
+            || active_requests
+                .keys()
+                .any(|active_request_id| *active_request_id != request_id)
     }
 
     fn finish(&self, request_id: u64) {
@@ -562,7 +588,10 @@ impl ContactNormalizationRequest {
         match self {
             Self::Raw => "raw",
             Self::Ice => "ice",
-            Self::Kr => "kr",
+            // Cache namespace changes whenever runtime KR semantics change.
+            // `kr_assembly_v1` invalidates tiles produced by the earlier
+            // per-source-cis fallback while leaving raw/ICE/VC caches intact.
+            Self::Kr => "kr_assembly_v1",
             Self::Vc => "vc",
             Self::VcSqrt => "vc_sqrt",
         }
@@ -577,6 +606,7 @@ pub enum ContactTileRequestPurpose {
     SpatialPrefetch,
     AdjacentPrefetch,
     Overview,
+    EndpointEvidence,
 }
 
 impl ContactTileRequestPurpose {
@@ -586,6 +616,7 @@ impl ContactTileRequestPurpose {
             Self::SpatialPrefetch => "spatial_prefetch",
             Self::AdjacentPrefetch => "adjacent_prefetch",
             Self::Overview => "overview",
+            Self::EndpointEvidence => "endpoint_evidence",
         }
     }
 }
@@ -685,6 +716,26 @@ pub struct ImportedContactFile {
     pub name: String,
     pub size_bytes: u64,
     pub available_resolutions: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedProjectTextFile {
+    pub path: String,
+    pub name: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedProjectDirectory {
+    pub directory: String,
+    pub agp: Option<ImportedProjectTextFile>,
+    pub gfa: Option<ImportedProjectTextFile>,
+    pub paf: Option<ImportedContactFile>,
+    pub coverage: Option<ImportedContactFile>,
+    pub contact: Option<ImportedContactFile>,
+    pub ignored_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -868,6 +919,29 @@ fn resolve_contact_tile_request(
 pub struct BeginContactTileGenerationRequest {
     pub generation: u64,
     pub retained_request_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrewarmContactNormalizationsRequest {
+    pub request_id: u64,
+    pub generation: u64,
+    pub cool_path: String,
+    pub resolutions: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelContactNormalizationPrewarmRequest {
+    pub request_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrewarmContactNormalizationsResponse {
+    pub prepared: usize,
+    pub failed: usize,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1297,6 +1371,14 @@ pub fn select_paf_file() -> Result<Option<ImportedContactFile>, String> {
 }
 
 #[tauri::command]
+pub fn select_project_directory() -> Result<Option<ImportedProjectDirectory>, String> {
+    let Some(path) = choose_project_directory_path()? else {
+        return Ok(None);
+    };
+    scan_project_directory(&path).map(Some)
+}
+
+#[tauri::command]
 pub fn save_agp_file(default_filename: String, contents: String) -> Result<Option<String>, String> {
     let Some(path) = choose_agp_save_path(&default_filename)? else {
         return Ok(None);
@@ -1619,6 +1701,38 @@ fn contact_overview_response_from_lod_payload(
     }
 }
 
+fn contact_overview_aggregate_cell_bound(
+    request: &ContactMapOverviewFromCoolRequest,
+) -> Result<usize, String> {
+    let resolution = request.target_resolution;
+    if resolution == 0 {
+        return Err("overview targetResolution must be positive".to_string());
+    }
+    if request.viewport.x_start >= request.viewport.x_end
+        || request.viewport.y_start >= request.viewport.y_end
+    {
+        return Err("overview viewport start must be less than viewport end".to_string());
+    }
+
+    let x_start_bin = request.viewport.x_start / resolution;
+    let x_end_bin = request.viewport.x_end.div_ceil(resolution);
+    let y_start_bin = request.viewport.y_start / resolution;
+    let y_end_bin = request.viewport.y_end.div_ceil(resolution);
+    let x_bins = x_end_bin.saturating_sub(x_start_bin);
+    let y_bins = y_end_bin.saturating_sub(y_start_bin);
+    let cell_bound = x_bins
+        .checked_mul(y_bins)
+        .ok_or_else(|| "overview target grid cell bound overflowed u64".to_string())?;
+    if cell_bound > MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS {
+        return Err(format!(
+            "overview target grid could contain {cell_bound} cells, exceeding bounded aggregate limit {MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS}; request a coarser targetResolution"
+        ));
+    }
+
+    usize::try_from(cell_bound)
+        .map_err(|_| "overview target grid exceeds this platform's index range".to_string())
+}
+
 fn build_contact_map_overview_from_cool_inner(
     request: ContactMapOverviewFromCoolRequest,
     layout_blocks: Arc<Vec<ContactMapLayoutBlockRequest>>,
@@ -1633,6 +1747,7 @@ fn build_contact_map_overview_from_cool_inner(
             "overview targetResolution must be a positive multiple of sourceResolution".to_string(),
         );
     }
+    let aggregate_cell_bound = contact_overview_aggregate_cell_bound(&request)?;
 
     let query = contact_map_query_from_parts(
         request.source_resolution,
@@ -1646,22 +1761,46 @@ fn build_contact_map_overview_from_cool_inner(
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mcool"));
-    let contacts =
-        cstudio_core::cool::read_cool_contacts_for_source_ranges_at_resolution_with_normalization_cancellable(
-            &request.cool_path,
-            &source_ranges,
-            is_mcool.then_some(request.source_resolution),
-            request.normalization.into(),
-            should_cancel,
-        )
-        .map_err(|error| error.to_string())?;
-    let view = cstudio_core::contact_map::build_contact_map_view_from_contacts_cancellable(
+    let mut projector = cstudio_core::contact_map::ContactMapChunkProjector::new_for_bounded_view(
         &query,
-        contacts,
+        aggregate_cell_bound,
+    )
+    .map_err(|error| error.to_string())?;
+    let visited_contacts = cstudio_core::cool::visit_cool_contact_chunks_indexed_for_source_ranges_at_resolution_with_normalization_cancellable(
+        &request.cool_path,
+        &source_ranges,
+        is_mcool.then_some(request.source_resolution),
+        request.normalization.into(),
         should_cancel,
+        |source1_index, source1, start1, source2_index, source2, start2, count| {
+            projector.push_indexed_contact(
+                source1_index,
+                source1,
+                start1,
+                source2_index,
+                source2,
+                start2,
+                count,
+            );
+            Ok(())
+        },
+        || Ok(()),
     )
     .map_err(|error| error.to_string())?;
     ensure_contact_tile_request_active(should_cancel)?;
+    let view = projector.take_view();
+    debug_assert!(view.cells.len() <= aggregate_cell_bound);
+    if contact_tile_perf_logging_enabled() {
+        eprintln!(
+            "CSTUDIO_PERF event=contact_overview_chunk_aggregate status=ok source_resolution={} \
+             target_resolution={} visited_contacts={} aggregate_cell_bound={} response_cells={}",
+            request.source_resolution,
+            request.target_resolution,
+            visited_contacts,
+            aggregate_cell_bound,
+            view.cells.len(),
+        );
+    }
     let cells = view
         .cells
         .into_iter()
@@ -1708,11 +1847,115 @@ pub fn log_contact_pan_frontend_performance(request: ContactPanFrontendPerforman
 }
 
 #[tauri::command]
+pub fn log_gfa_frontend_performance(line: String) {
+    if line.len() <= 1_024 && line.starts_with("CSTUDIO_PERF event=gfa_") {
+        eprintln!("{line}");
+    }
+}
+
+#[tauri::command]
 pub fn begin_contact_tile_generation(
     request: BeginContactTileGenerationRequest,
     request_state: tauri::State<'_, ContactTileRequestState>,
 ) -> Result<Vec<u64>, String> {
     request_state.retain_and_begin_generation(request.generation, &request.retained_request_ids)
+}
+
+#[tauri::command]
+pub async fn prewarm_contact_normalizations(
+    request: PrewarmContactNormalizationsRequest,
+    request_state: tauri::State<'_, ContactTileRequestState>,
+) -> Result<PrewarmContactNormalizationsResponse, String> {
+    let mut resolutions = request.resolutions;
+    resolutions.retain(|resolution| *resolution > 0);
+    let mut seen_resolutions = BTreeSet::new();
+    resolutions.retain(|resolution| seen_resolutions.insert(*resolution));
+    if resolutions.is_empty() {
+        return Err("normalization prewarm requires at least one resolution".to_string());
+    }
+
+    request_state.register_current_generation(request.request_id, request.generation)?;
+    let task_request_state = request_state.inner().clone();
+    let request_id = request.request_id;
+    let generation = request.generation;
+    let cool_path = request.cool_path;
+    let _request_guard = ContactTileRequestGuard {
+        state: request_state.inner().clone(),
+        request_id,
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let should_cancel = || {
+            task_request_state.is_normalization_prewarm_cancelled(request_id)
+        };
+        let normalizations = [
+            cstudio_core::contact_normalization::ContactNormalization::Kr,
+            cstudio_core::contact_normalization::ContactNormalization::Ice,
+            cstudio_core::contact_normalization::ContactNormalization::Vc,
+            cstudio_core::contact_normalization::ContactNormalization::VcSqrt,
+        ];
+        let mut prepared = 0_usize;
+        let mut failed = 0_usize;
+        let mut cancelled = false;
+
+        'resolutions: for resolution in resolutions {
+            for normalization in normalizations {
+                match cstudio_core::cool::prewarm_contact_normalization_at_resolution_cancellable(
+                    &cool_path,
+                    Some(resolution),
+                    normalization,
+                    &should_cancel,
+                ) {
+                    Ok(()) => prepared = prepared.saturating_add(1),
+                    Err(cstudio_core::CStudioError::RequestCancelled) => {
+                        cancelled = true;
+                        break 'resolutions;
+                    }
+                    Err(error) => {
+                        failed = failed.saturating_add(1);
+                        if contact_tile_perf_logging_enabled() {
+                            eprintln!(
+                                "CSTUDIO_PERF event=normalization_prewarm status=method_error request_id={} generation={} resolution={} normalization={} error={:?}",
+                                request_id,
+                                generation,
+                                resolution,
+                                normalization.as_str(),
+                                error,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if contact_tile_perf_logging_enabled() {
+            eprintln!(
+                "CSTUDIO_PERF event=normalization_prewarm status={} request_id={} generation={} prepared={} failed={} elapsed_ms={}",
+                if cancelled { "cancelled" } else { "complete" },
+                request_id,
+                generation,
+                prepared,
+                failed,
+                started.elapsed().as_millis(),
+            );
+        }
+        PrewarmContactNormalizationsResponse {
+            prepared,
+            failed,
+            cancelled,
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_contact_normalization_prewarm(
+    request: CancelContactNormalizationPrewarmRequest,
+    request_state: tauri::State<'_, ContactTileRequestState>,
+) {
+    request_state.finish(request.request_id);
 }
 
 #[tauri::command]
@@ -1945,7 +2188,10 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
         eprintln!(
             "CSTUDIO_PERF event=contact_tile_delta_stream status=ok scenario={} request_id={} \
              generation={} target_resolution={} requested_tiles={} emitted_chunks={} \
-             response_cells={} response_bytes={} visited_contacts={} first_emit_us={} command_us={}",
+             response_cells={} response_bytes={} indexed_visitor={} emit_cell_threshold={} \
+             hdf5_chunks={} scanned_pixels={} visited_contacts={} prepare_us={} \
+             hdf5_read_us={} scan_project_us={} finish_chunk_us={} encode_send_us={} \
+             first_emit_us={} command_us={}",
             purpose.scenario_key(),
             request_id,
             generation,
@@ -1954,7 +2200,16 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
             stats.emitted_chunks,
             stats.response_cells,
             stats.response_bytes,
+            stats.indexed_visitor,
+            stats.emit_cell_threshold,
+            stats.visit_timings.hdf5_chunks,
+            stats.visit_timings.scanned_pixels,
             stats.visited_contacts,
+            stats.visit_timings.prepare.as_micros(),
+            stats.visit_timings.hdf5_read.as_micros(),
+            stats.visit_timings.scan_project.as_micros(),
+            stats.visit_timings.finish_chunk.as_micros(),
+            stats.encode_send.as_micros(),
             stats.first_emit_us.unwrap_or(0),
             command_started.elapsed().as_micros(),
         );
@@ -1969,6 +2224,24 @@ struct ContactTileDeltaStreamStats {
     response_bytes: usize,
     visited_contacts: usize,
     first_emit_us: Option<u128>,
+    indexed_visitor: bool,
+    emit_cell_threshold: usize,
+    visit_timings: cstudio_core::cool::CoolContactVisitTimings,
+    encode_send: Duration,
+}
+
+const DEFAULT_CONTACT_TILE_DELTA_EMIT_CELL_THRESHOLD: usize = 32_768;
+
+fn contact_tile_delta_indexed_visitor_enabled() -> bool {
+    std::env::var("CSTUDIO_CONTACT_DELTA_INDEXED").as_deref() != Ok("0")
+}
+
+fn contact_tile_delta_emit_cell_threshold() -> usize {
+    std::env::var("CSTUDIO_CONTACT_DELTA_EMIT_CELLS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=1_048_576).contains(value))
+        .unwrap_or(DEFAULT_CONTACT_TILE_DELTA_EMIT_CELL_THRESHOLD)
 }
 
 fn compute_contact_tile_deltas_single_scan<F>(
@@ -2038,7 +2311,8 @@ where
     );
     let stats = RefCell::new(ContactTileDeltaStreamStats::default());
     let stream_started = Instant::now();
-    const DELTA_EMIT_CELL_THRESHOLD: usize = 32_768;
+    let indexed_visitor = contact_tile_delta_indexed_visitor_enabled();
+    let emit_cell_threshold = contact_tile_delta_emit_cell_threshold();
     let mut flush_projected_delta = || -> cstudio_core::CStudioResult<()> {
         let view = projector.borrow_mut().take_view();
         if view.cells.is_empty() {
@@ -2056,8 +2330,10 @@ where
             return Ok(());
         }
         let response_cells = tiles.iter().map(|tile| tile.cells.len()).sum::<usize>();
+        let emit_started = Instant::now();
         let response_bytes =
             emit_chunk(&tiles).map_err(cstudio_core::CStudioError::InvalidContactMapQuery)?;
+        let encode_send = emit_started.elapsed();
         let mut current = stats.borrow_mut();
         if current.first_emit_us.is_none() {
             current.first_emit_us = Some(stream_started.elapsed().as_micros());
@@ -2065,28 +2341,60 @@ where
         current.emitted_chunks = current.emitted_chunks.saturating_add(1);
         current.response_cells = current.response_cells.saturating_add(response_cells);
         current.response_bytes = current.response_bytes.saturating_add(response_bytes);
+        current.encode_send += encode_send;
         Ok(())
     };
 
-    let visited_contacts = cstudio_core::cool::visit_cool_contact_chunks_for_source_ranges_at_resolution_with_normalization_cancellable(
-        &request.cool_path,
-        &source_ranges,
-        Some(request.target_resolution),
-        request.normalization.into(),
-        should_cancel,
-        |source1, start1, source2, start2, count| {
-            projector
-                .borrow_mut()
-                .push_contact(source1, start1, source2, start2, count);
-            Ok(())
-        },
-        || {
-            if projector.borrow().pending_cell_count() < DELTA_EMIT_CELL_THRESHOLD {
-                return Ok(());
-            }
-            flush_projected_delta()
-        },
-    )
+    let mut visit_timings = cstudio_core::cool::CoolContactVisitTimings::default();
+    let visited_contacts = if indexed_visitor {
+        cstudio_core::cool::visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
+            &request.cool_path,
+            &source_ranges,
+            Some(request.target_resolution),
+            request.normalization.into(),
+            should_cancel,
+            &mut visit_timings,
+            |source1_index, source1, start1, source2_index, source2, start2, count| {
+                projector.borrow_mut().push_indexed_contact(
+                    source1_index,
+                    source1,
+                    start1,
+                    source2_index,
+                    source2,
+                    start2,
+                    count,
+                );
+                Ok(())
+            },
+            || {
+                if projector.borrow().pending_cell_count() < emit_cell_threshold {
+                    return Ok(());
+                }
+                flush_projected_delta()
+            },
+        )
+    } else {
+        cstudio_core::cool::visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
+            &request.cool_path,
+            &source_ranges,
+            Some(request.target_resolution),
+            request.normalization.into(),
+            should_cancel,
+            &mut visit_timings,
+            |source1, start1, source2, start2, count| {
+                projector
+                    .borrow_mut()
+                    .push_contact(source1, start1, source2, start2, count);
+                Ok(())
+            },
+            || {
+                if projector.borrow().pending_cell_count() < emit_cell_threshold {
+                    return Ok(());
+                }
+                flush_projected_delta()
+            },
+        )
+    }
     .map_err(|error| error.to_string())?;
 
     ensure_contact_tile_request_active(should_cancel)?;
@@ -2094,10 +2402,16 @@ where
     drop(flush_projected_delta);
     // An empty CST1 response is the explicit end-of-stream marker. Requested
     // empty tiles are materialized by the frontend accumulator at this point.
+    let final_emit_started = Instant::now();
     let final_bytes = emit_chunk(&[])?;
+    let final_encode_send = final_emit_started.elapsed();
     let mut stats = stats.into_inner();
     stats.response_bytes = stats.response_bytes.saturating_add(final_bytes);
+    stats.encode_send += final_encode_send;
     stats.visited_contacts = visited_contacts;
+    stats.indexed_visitor = indexed_visitor;
+    stats.emit_cell_threshold = emit_cell_threshold;
+    stats.visit_timings = visit_timings;
     Ok(stats)
 }
 
@@ -3212,10 +3526,9 @@ fn build_coverage_view_from_bedgraph_with_cache(
         return coverage_response_from_view(view);
     }
 
-    let file = fs::File::open(&request.bedgraph_path).map_err(|error| error.to_string())?;
     let mut records = Vec::new();
 
-    for line in BufReader::new(file).lines() {
+    for line in open_text_reader(Path::new(&request.bedgraph_path))?.lines() {
         let line = line.map_err(|error| error.to_string())?;
         if let Some(record) = cstudio_core::coverage::BedGraphRecord::parse_line(&line)
             .map_err(|error| error.to_string())?
@@ -3508,14 +3821,146 @@ fn contact_file_from_path(path: &Path) -> Result<ImportedContactFile, String> {
     })
 }
 
-fn coverage_file_from_path(path: &Path) -> Result<ImportedContactFile, String> {
-    let extension = path
-        .extension()
+fn lowercase_data_suffix(path: &Path) -> String {
+    path.file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "bedgraph" | "bg" | "txt") {
-        return Err("selected file must end with .bedgraph, .bg, or .txt".to_string());
+        .to_ascii_lowercase()
+}
+
+fn has_data_suffix(path: &Path, suffixes: &[&str]) -> bool {
+    let name = lowercase_data_suffix(path);
+    suffixes.iter().any(|suffix| {
+        name.ends_with(&format!(".{suffix}")) || name.ends_with(&format!(".{suffix}.gz"))
+    })
+}
+
+fn has_plain_suffix(path: &Path, suffixes: &[&str]) -> bool {
+    let name = lowercase_data_suffix(path);
+    suffixes
+        .iter()
+        .any(|suffix| name.ends_with(&format!(".{suffix}")))
+}
+
+fn open_text_reader(path: &Path) -> Result<Box<dyn BufRead>, String> {
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("gz"))
+    {
+        Ok(Box::new(BufReader::new(MultiGzDecoder::new(file))))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+fn read_text_file(path: &Path) -> Result<String, String> {
+    let mut reader = open_text_reader(path)?;
+    let mut text = String::new();
+    reader
+        .read_to_string(&mut text)
+        .map_err(|error| error.to_string())?;
+    Ok(text)
+}
+
+fn imported_text_file(path: &Path) -> Result<ImportedProjectTextFile, String> {
+    Ok(ImportedProjectTextFile {
+        path: path.to_string_lossy().to_string(),
+        name: path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("data")
+            .to_string(),
+        text: read_text_file(path)?,
+    })
+}
+
+fn scan_project_directory(directory: &Path) -> Result<ImportedProjectDirectory, String> {
+    if !directory.is_dir() {
+        return Err("selected project path is not a directory".to_string());
+    }
+    let mut files = fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    files.sort_by_key(|path| lowercase_data_suffix(path));
+
+    let mut agp = Vec::new();
+    let mut gfa = Vec::new();
+    let mut paf = Vec::new();
+    let mut coverage = Vec::new();
+    let mut contact = Vec::new();
+    for path in files {
+        if has_data_suffix(&path, &["agp"]) {
+            agp.push(path);
+        } else if has_data_suffix(&path, &["gfa", "gfa1"]) {
+            gfa.push(path);
+        } else if has_data_suffix(&path, &["paf"]) {
+            paf.push(path);
+        } else if has_data_suffix(&path, &["depth", "bedgraph", "bg"]) {
+            coverage.push(path);
+        } else if has_plain_suffix(&path, &["cool", "mcool"]) {
+            contact.push(path);
+        }
+    }
+
+    let mut ignored_candidates = Vec::new();
+    for candidates in [&agp, &gfa, &paf, &coverage, &contact] {
+        ignored_candidates.extend(
+            candidates
+                .iter()
+                .skip(1)
+                .map(|path| path.to_string_lossy().to_string()),
+        );
+    }
+    let selected_agp = agp
+        .first()
+        .map(|path| imported_text_file(path))
+        .transpose()?;
+    let selected_gfa = gfa
+        .first()
+        .map(|path| imported_text_file(path))
+        .transpose()?;
+    let selected_paf = paf
+        .first()
+        .map(|path| paf_file_from_path(path))
+        .transpose()?;
+    let selected_coverage = coverage
+        .first()
+        .map(|path| coverage_file_from_path(path))
+        .transpose()?;
+    let selected_contact = contact
+        .first()
+        .map(|path| contact_file_from_path(path))
+        .transpose()?;
+    if selected_agp.is_none()
+        && selected_gfa.is_none()
+        && selected_paf.is_none()
+        && selected_coverage.is_none()
+        && selected_contact.is_none()
+    {
+        return Err("no supported project files found (.agp, .gfa, .paf, .depth/.bedgraph/.bg, .cool/.mcool, optionally .gz)".to_string());
+    }
+    Ok(ImportedProjectDirectory {
+        directory: directory.to_string_lossy().to_string(),
+        agp: selected_agp,
+        gfa: selected_gfa,
+        paf: selected_paf,
+        coverage: selected_coverage,
+        contact: selected_contact,
+        ignored_candidates,
+    })
+}
+
+fn coverage_file_from_path(path: &Path) -> Result<ImportedContactFile, String> {
+    if !has_data_suffix(path, &["depth", "bedgraph", "bg", "txt"]) {
+        return Err(
+            "selected file must end with .depth, .bedgraph, .bg, .txt, or their .gz form"
+                .to_string(),
+        );
     }
 
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
@@ -3532,13 +3977,8 @@ fn coverage_file_from_path(path: &Path) -> Result<ImportedContactFile, String> {
 }
 
 fn paf_file_from_path(path: &Path) -> Result<ImportedContactFile, String> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "paf" | "txt") {
-        return Err("selected file must end with .paf or .txt".to_string());
+    if !has_data_suffix(path, &["paf", "txt"]) {
+        return Err("selected file must end with .paf, .txt, or their .gz form".to_string());
     }
 
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
@@ -3558,7 +3998,12 @@ fn paf_file_from_path(path: &Path) -> Result<ImportedContactFile, String> {
 fn choose_contact_file_path() -> Result<Option<PathBuf>, String> {
     use std::process::Command;
 
-    let script = r#"set selectedFile to choose file with prompt "Select a .cool or .mcool contact map" of type {"cool", "mcool", "public.data"}
+    // AppleScript's `of type` expects registered macOS type identifiers, not
+    // filename extensions. `.cool` and `.mcool` normally have no registered
+    // UTI, so filtering here disables valid files in the native picker. Keep
+    // the picker unfiltered and enforce the extensions in
+    // `contact_file_from_path` instead.
+    let script = r#"set selectedFile to choose file with prompt "Select a .cool or .mcool contact map"
 POSIX path of selectedFile"#;
     let output = Command::new("osascript")
         .arg("-e")
@@ -3641,6 +4086,32 @@ POSIX path of selectedFile"#;
 
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+}
+
+#[cfg(target_os = "macos")]
+fn choose_project_directory_path() -> Result<Option<PathBuf>, String> {
+    use std::process::Command;
+    let script = r#"set selectedFolder to choose folder with prompt "Select a C-Studio project folder"
+POSIX path of selectedFolder"#;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("-128") {
+            return Ok(None);
+        }
+        return Err(stderr.trim().to_string());
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn choose_project_directory_path() -> Result<Option<PathBuf>, String> {
+    Err("native project directory picker is only implemented for macOS".to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3780,10 +4251,9 @@ fn build_synteny_view_from_paf_with_cache(
         return synteny_response_from_view(view);
     }
 
-    let file = fs::File::open(&request.paf_path).map_err(|error| error.to_string())?;
     let mut records = Vec::new();
 
-    for line in BufReader::new(file).lines() {
+    for line in open_text_reader(Path::new(&request.paf_path))?.lines() {
         let line = line.map_err(|error| error.to_string())?;
         if let Some(record) = cstudio_core::synteny::PafRecord::parse_line(&line)
             .map_err(|error| error.to_string())?
@@ -3967,9 +4437,11 @@ fn project_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use flate2::{write::GzEncoder, Compression};
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fs;
+    use std::io::{BufRead, Write};
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -3982,13 +4454,51 @@ mod tests {
 
     use super::{
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
-        build_synteny_view, get_app_status, persistent_lod_cache_key, write_existing_agp_path,
-        BedGraphRecordRequest, ContactMapBinRequest, ContactMapLayoutBlockRequest,
-        ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
+        build_synteny_view, contact_overview_aggregate_cell_bound, get_app_status,
+        open_text_reader, persistent_lod_cache_key, scan_project_directory,
+        write_existing_agp_path, BedGraphRecordRequest, ContactMapBinRequest,
+        ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
         ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
         ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
         CoverageViewFromBedGraphRequest, CoverageViewRequest, PafRecordRequest, SyntenyViewRequest,
+        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
+
+    #[test]
+    fn scans_project_directory_and_reads_gzip_text_inputs() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "c-studio-project-scan-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("z.agp"), "chr1\t1\t10\t1\tW\tctg1\t1\t10\t+\n").unwrap();
+        fs::write(root.join("a.agp"), "chr1\t1\t20\t1\tW\tctg1\t1\t20\t+\n").unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"S\tctg1\tACGT\n").unwrap();
+        fs::write(root.join("graph.gfa.gz"), encoder.finish().unwrap()).unwrap();
+        fs::write(root.join("reads.paf.gz"), b"").unwrap();
+        fs::write(root.join("track.depth.gz"), b"").unwrap();
+
+        let project = scan_project_directory(&root).unwrap();
+        assert_eq!(project.agp.as_ref().unwrap().name, "a.agp");
+        assert_eq!(project.gfa.as_ref().unwrap().text, "S\tctg1\tACGT\n");
+        assert_eq!(project.paf.as_ref().unwrap().name, "reads.paf.gz");
+        assert_eq!(project.coverage.as_ref().unwrap().name, "track.depth.gz");
+        assert_eq!(project.ignored_candidates.len(), 1);
+        assert_eq!(
+            open_text_reader(&root.join("graph.gfa.gz"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn test_layout_block(id: &str, visual_start: u64) -> ContactMapLayoutBlockRequest {
         ContactMapLayoutBlockRequest {
@@ -3999,6 +4509,59 @@ mod tests {
             visual_start,
             orientation: "+".to_string(),
         }
+    }
+
+    #[test]
+    fn bounds_overview_aggregation_by_target_grid_before_reading_cool() {
+        let request = ContactMapOverviewFromCoolRequest {
+            request_id: 1,
+            generation: 1,
+            cool_path: "/tmp/input.cool".to_string(),
+            source_resolution: 1_000,
+            target_resolution: 1_000,
+            normalization: ContactNormalizationRequest::Raw,
+            viewport: ContactMapViewportRequest {
+                x_start: 0,
+                x_end: 320_000,
+                y_start: 0,
+                y_end: 320_000,
+            },
+            layout_handle: None,
+            layout_blocks: Vec::new(),
+        };
+
+        assert_eq!(
+            contact_overview_aggregate_cell_bound(&request).unwrap(),
+            320 * 320,
+        );
+
+        let exact_limit = ContactMapOverviewFromCoolRequest {
+            viewport: ContactMapViewportRequest {
+                x_start: 0,
+                x_end: 1_024_000,
+                y_start: 0,
+                y_end: 1_024_000,
+            },
+            ..request.clone()
+        };
+        assert_eq!(
+            contact_overview_aggregate_cell_bound(&exact_limit).unwrap(),
+            MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS as usize,
+        );
+
+        let oversized = ContactMapOverviewFromCoolRequest {
+            viewport: ContactMapViewportRequest {
+                x_start: 0,
+                x_end: 1_025_000,
+                y_start: 0,
+                y_end: 1_025_000,
+            },
+            ..request
+        };
+        let error = contact_overview_aggregate_cell_bound(&oversized)
+            .expect_err("oversized overview target grid should be rejected before I/O");
+        assert!(error.contains("exceeding bounded aggregate limit"));
+        assert!(error.contains("coarser targetResolution"));
     }
 
     fn test_contact_tile_request(
@@ -4626,6 +5189,10 @@ mod tests {
             assert_eq!(parsed, expected);
         }
         assert!(serde_json::from_str::<ContactNormalizationRequest>("\"unknown\"").is_err());
+        assert_eq!(
+            ContactNormalizationRequest::Kr.cache_key(),
+            "kr_assembly_v1"
+        );
     }
 
     #[test]
@@ -4777,6 +5344,10 @@ mod tests {
                 ContactTileRequestPurpose::AdjacentPrefetch,
             ),
             ("overview", ContactTileRequestPurpose::Overview),
+            (
+                "endpoint_evidence",
+                ContactTileRequestPurpose::EndpointEvidence,
+            ),
         ] {
             let parsed: ContactTileRequestPurpose =
                 serde_json::from_str(format!("\"{wire_value}\"").as_str())
@@ -4864,6 +5435,7 @@ mod tests {
             (71, ContactTileRequestPurpose::SpatialPrefetch),
             (72, ContactTileRequestPurpose::AdjacentPrefetch),
             (73, ContactTileRequestPurpose::Overview),
+            (76, ContactTileRequestPurpose::EndpointEvidence),
         ] {
             state
                 .register_for_purpose(request_id, 7, purpose)
@@ -4888,6 +5460,31 @@ mod tests {
         assert!(state.is_cancelled(71));
         assert!(state.is_cancelled(72));
         assert!(state.is_cancelled(73));
+        assert!(state.is_cancelled(76));
+    }
+
+    #[test]
+    fn normalization_prewarm_yields_to_any_other_contact_request() {
+        let state = super::ContactTileRequestState::default();
+        state
+            .retain_and_begin_generation(7, &[])
+            .expect("visible generation begins");
+        state
+            .register_current_generation(80, 7)
+            .expect("prewarm joins current generation");
+        assert!(!state.is_normalization_prewarm_cancelled(80));
+
+        state
+            .register_for_purpose(81, 7, ContactTileRequestPurpose::Overview)
+            .expect("foreground-related work joins current generation");
+        assert!(state.is_normalization_prewarm_cancelled(80));
+
+        state.finish(81);
+        assert!(!state.is_normalization_prewarm_cancelled(80));
+        state
+            .retain_and_begin_generation(8, &[])
+            .expect("new interaction advances generation");
+        assert!(state.is_normalization_prewarm_cancelled(80));
     }
 
     #[test]
@@ -5342,6 +5939,10 @@ mod tests {
             .last()
             .expect("example contact resolution");
         let total_span = summary.agp_layout.total_span;
+        let target_resolution = total_span
+            .div_ceil(320)
+            .div_ceil(source_resolution)
+            .saturating_mul(source_resolution);
         let layout_blocks = Arc::new(
             summary
                 .agp_layout
@@ -5363,7 +5964,7 @@ mod tests {
                 generation: 1,
                 cool_path: summary.cool_path,
                 source_resolution,
-                target_resolution: source_resolution * 10,
+                target_resolution,
                 normalization: ContactNormalizationRequest::Raw,
                 viewport: ContactMapViewportRequest {
                     x_start: 0,
@@ -5380,9 +5981,10 @@ mod tests {
         .expect("dedicated overview should render");
 
         assert_eq!(response.source_resolution, source_resolution);
-        assert_eq!(response.resolution, source_resolution * 10);
+        assert_eq!(response.resolution, target_resolution);
         assert_eq!(response.viewport.x_end, total_span);
         assert!(!response.cells.is_empty());
+        assert!(response.cells.len() <= 320 * 320);
     }
 
     fn local_invalidation_layout(
@@ -5909,8 +6511,9 @@ mod tests {
     #[ignore = "run explicitly against the local POJ benchmark dataset"]
     fn poj_whole_genome_lod_vs_tiles_release_benchmark() {
         assert!(
-            !cfg!(debug_assertions),
-            "POJ contact-map timings are only meaningful with --release"
+            !cfg!(debug_assertions)
+                || std::env::var("CSTUDIO_POJ_ALLOW_DEV_BENCH").as_deref() == Ok("1"),
+            "POJ contact-map timings require --release unless CSTUDIO_POJ_ALLOW_DEV_BENCH=1 is set for an explicitly optimized dev profile"
         );
 
         let scenario = std::env::var("CSTUDIO_POJ_BENCH_SCENARIO")
@@ -5934,14 +6537,14 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| benchmark_root.join("groups.final.agp"));
         let cool_path = match scenario.as_str() {
-            "overview_mcool" | "tiles_mcool" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
+            "overview_mcool" | "tiles_mcool" | "delta_mcool_visible" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| benchmark_root.join("input.q1.1k_allres.mcool")),
             "overview_cool" | "overview_cool_cache" | "tiles_cool" | "delta_cool" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| benchmark_root.join("input.q1.1k.cool")),
             other => panic!(
-                "unknown CSTUDIO_POJ_BENCH_SCENARIO={other}; expected overview_mcool, overview_cool, overview_cool_cache, tiles_mcool, delta_cool, or tiles_cool"
+                "unknown CSTUDIO_POJ_BENCH_SCENARIO={other}; expected overview_mcool, overview_cool, overview_cool_cache, tiles_mcool, delta_mcool_visible, delta_cool, or tiles_cool"
             ),
         };
 
@@ -5969,7 +6572,10 @@ mod tests {
             y_start: 0,
             y_end: total_span,
         };
-        let source_resolution = if scenario.ends_with("mcool") {
+        let source_resolution = if matches!(
+            scenario.as_str(),
+            "overview_mcool" | "tiles_mcool" | "delta_mcool_visible"
+        ) {
             2_500_000
         } else {
             1_000
@@ -6088,26 +6694,67 @@ mod tests {
         }
 
         let tile_size_bins = 256_u64;
-        let target_resolution = 2_500_000_u64;
-        let axis_tiles = total_span.div_ceil(target_resolution.saturating_mul(tile_size_bins));
-        let center = axis_tiles as f64 / 2.0;
-        let mut tiles = (0..axis_tiles)
-            .flat_map(|tile_y| {
-                (0..=tile_y).map(move |tile_x| ContactMapTileKeyRequest { tile_x, tile_y })
-            })
-            .collect::<Vec<_>>();
-        tiles.sort_by(|left, right| {
-            let distance = |tile: &ContactMapTileKeyRequest| {
-                let x = tile.tile_x as f64 + 0.5 - center;
-                let y = tile.tile_y as f64 + 0.5 - center;
-                x * x + y * y
-            };
-            distance(left)
-                .total_cmp(&distance(right))
-                .then_with(|| left.tile_y.cmp(&right.tile_y))
-                .then_with(|| left.tile_x.cmp(&right.tile_x))
-        });
-        assert_eq!(tiles.len() as u64, axis_tiles * (axis_tiles + 1) / 2);
+        let target_resolution = if scenario == "delta_mcool_visible" {
+            std::env::var("CSTUDIO_POJ_BENCH_TARGET_RESOLUTION")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(25_000)
+                .max(1)
+        } else {
+            2_500_000
+        };
+        let mut tiles = if scenario == "delta_mcool_visible" {
+            let viewport = std::env::var("CSTUDIO_POJ_BENCH_VIEWPORT")
+                .unwrap_or_else(|_| "5316000000,5401000000,4882000000,4963000000".to_string())
+                .split(',')
+                .map(|value| value.parse::<u64>().expect("POJ viewport coordinate"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                viewport.len(),
+                4,
+                "POJ viewport requires x_start,x_end,y_start,y_end"
+            );
+            let tile_span = target_resolution.saturating_mul(tile_size_bins);
+            let x_start = viewport[0] / tile_span;
+            let x_end = viewport[1].saturating_sub(1) / tile_span;
+            let y_start = viewport[2] / tile_span;
+            let y_end = viewport[3].saturating_sub(1) / tile_span;
+            let mut visible = BTreeSet::new();
+            for tile_y in y_start..=y_end {
+                for tile_x in x_start..=x_end {
+                    visible.insert(if tile_x <= tile_y {
+                        (tile_x, tile_y)
+                    } else {
+                        (tile_y, tile_x)
+                    });
+                }
+            }
+            visible
+                .into_iter()
+                .map(|(tile_x, tile_y)| ContactMapTileKeyRequest { tile_x, tile_y })
+                .collect::<Vec<_>>()
+        } else {
+            let axis_tiles = total_span.div_ceil(target_resolution.saturating_mul(tile_size_bins));
+            let center = axis_tiles as f64 / 2.0;
+            let mut whole_genome = (0..axis_tiles)
+                .flat_map(|tile_y| {
+                    (0..=tile_y).map(move |tile_x| ContactMapTileKeyRequest { tile_x, tile_y })
+                })
+                .collect::<Vec<_>>();
+            whole_genome.sort_by(|left, right| {
+                let distance = |tile: &ContactMapTileKeyRequest| {
+                    let x = tile.tile_x as f64 + 0.5 - center;
+                    let y = tile.tile_y as f64 + 0.5 - center;
+                    x * x + y * y
+                };
+                distance(left)
+                    .total_cmp(&distance(right))
+                    .then_with(|| left.tile_y.cmp(&right.tile_y))
+                    .then_with(|| left.tile_x.cmp(&right.tile_x))
+            });
+            assert_eq!(whole_genome.len() as u64, axis_tiles * (axis_tiles + 1) / 2);
+            whole_genome
+        };
         if let Some(tile_limit) = std::env::var("CSTUDIO_POJ_BENCH_TILE_LIMIT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -6115,7 +6762,7 @@ mod tests {
             tiles.truncate(tile_limit.max(1));
         }
 
-        if scenario == "delta_cool" {
+        if scenario == "delta_cool" || scenario == "delta_mcool_visible" {
             for sample in 0..sample_count {
                 let request = super::ResolvedContactMapTilesFromCoolRequest {
                     request: ContactMapTilesFromCoolRequest {
@@ -6157,7 +6804,7 @@ mod tests {
                 .expect("POJ single-scan deltas should render");
                 let final_count = aggregate.values().copied().sum::<f64>();
                 println!(
-                    "CSTUDIO_POJ_BENCH result scenario={} sample={} total_us={} requested_tiles={} emitted_chunks={} first_emit_us={} response_delta_cells={} final_cells={} final_count={} response_bytes={} visited_contacts={}",
+                    "CSTUDIO_POJ_BENCH result scenario={} sample={} total_us={} requested_tiles={} emitted_chunks={} first_emit_us={} response_delta_cells={} final_cells={} final_count={} response_bytes={} indexed_visitor={} emit_cell_threshold={} hdf5_chunks={} scanned_pixels={} visited_contacts={} prepare_us={} hdf5_read_us={} scan_project_us={} finish_chunk_us={} encode_send_us={}",
                     scenario,
                     sample + 1,
                     started.elapsed().as_micros(),
@@ -6168,7 +6815,16 @@ mod tests {
                     aggregate.len(),
                     final_count,
                     stats.response_bytes,
+                    stats.indexed_visitor,
+                    stats.emit_cell_threshold,
+                    stats.visit_timings.hdf5_chunks,
+                    stats.visit_timings.scanned_pixels,
                     stats.visited_contacts,
+                    stats.visit_timings.prepare.as_micros(),
+                    stats.visit_timings.hdf5_read.as_micros(),
+                    stats.visit_timings.scan_project.as_micros(),
+                    stats.visit_timings.finish_chunk.as_micros(),
+                    stats.encode_send.as_micros(),
                 );
             }
             return;

@@ -41,6 +41,14 @@ import {
   type ContactViewport,
 } from "../state/contactViewport";
 import { contactTileViewportSignature } from "../state/contactTiles";
+import {
+  contactWheelNavigationMode,
+  contactWheelPanIntent,
+} from "../state/contactWheel";
+export {
+  contactWheelNavigationMode,
+  contactWheelPanIntent,
+} from "../state/contactWheel";
 import type { CoverageView } from "../state/coverageView";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import { defaultGfaHomologPattern } from "../state/gfaHomologLayout";
@@ -48,6 +56,7 @@ import { isEditableShortcutTarget } from "../state/juiceboxShortcuts";
 import {
   availableContactResolutions,
   contactNormalizationForBackend,
+  storedContactResolutionsForDataset,
   type ContactResolution,
   type OperationRecord,
   type UiAction,
@@ -77,7 +86,7 @@ interface ContactMapViewportProps {
   uiState: UiState;
   homologPattern?: string;
   onUiAction: (action: UiAction) => void;
-  preserveResolutionViewport?: boolean;
+  useStoredResolutionOptions?: boolean;
   availableResolutionBasePairs?: number[];
   onClosePanel?: () => void;
   onExpandPanel?: () => void;
@@ -141,11 +150,40 @@ interface AssemblyCutTargetInput {
   viewportYEnd: number;
 }
 
+export interface AssemblySelectionProjectionBands {
+  vertical: { left: string; width: string } | null;
+  horizontal: { top: string; height: string } | null;
+}
+
+/** Project one selected assembly interval across both contact-map axes. */
+export function assemblySelectionProjectionBands(
+  visualStart: number,
+  visualEnd: number,
+  viewport: ContactViewport,
+): AssemblySelectionProjectionBands {
+  const project = (start: number, end: number, viewportStart: number, viewportEnd: number) => {
+    const span = Math.max(1, viewportEnd - viewportStart);
+    const clippedStart = Math.max(start, viewportStart);
+    const clippedEnd = Math.min(end, viewportEnd);
+    if (clippedStart >= clippedEnd) {
+      return null;
+    }
+    return {
+      offset: `${((clippedStart - viewportStart) / span) * 100}%`,
+      size: `${((clippedEnd - clippedStart) / span) * 100}%`,
+    };
+  };
+
+  const x = project(visualStart, visualEnd, viewport.xStart, viewport.xEnd);
+  const y = project(visualStart, visualEnd, viewport.yStart, viewport.yEnd);
+  return {
+    vertical: x ? { left: x.offset, width: x.size } : null,
+    horizontal: y ? { top: y.offset, height: y.size } : null,
+  };
+}
+
 const maxBufferedContactCells = 360_000;
 const shiftSelectionClassName = "shift-selection-active";
-const wheelLinePixels = 16;
-const wheelDeltaLineMode = 1;
-const wheelDeltaPageMode = 2;
 const resolutionWheelCooldownMs = 140;
 
 interface ContactResolutionWheelInput {
@@ -183,25 +221,6 @@ export function contactResolutionWheelIntent({
   return resolutionOptions[nextIndex] === currentResolution
     ? null
     : resolutionOptions[nextIndex] ?? null;
-}
-
-interface ContactWheelPanInput {
-  deltaX: number;
-  deltaY: number;
-  deltaMode: number;
-  shiftKey: boolean;
-  bounds: {
-    width: number;
-    height: number;
-  };
-  viewport: ContactViewport;
-}
-
-export interface ContactWheelPanIntent {
-  deltaXPx: number;
-  deltaYPx: number;
-  deltaXMb: number;
-  deltaYMb: number;
 }
 
 export type AssemblyShiftClickIntent =
@@ -271,64 +290,6 @@ export function contactViewportForAxisNavigator({
     viewportWidthPx,
     viewportHeightPx,
   });
-}
-
-export function contactWheelPanIntent({
-  deltaX,
-  deltaY,
-  deltaMode,
-  shiftKey,
-  bounds,
-  viewport,
-}: ContactWheelPanInput): ContactWheelPanIntent | null {
-  if (
-    !Number.isFinite(bounds.width)
-    || !Number.isFinite(bounds.height)
-    || bounds.width <= 0
-    || bounds.height <= 0
-  ) {
-    return null;
-  }
-
-  const rawDeltaX = Number.isFinite(deltaX) ? deltaX : 0;
-  const rawDeltaY = Number.isFinite(deltaY) ? deltaY : 0;
-  const mappedDeltaX = shiftKey
-    ? (rawDeltaX !== 0 ? rawDeltaX : rawDeltaY)
-    : rawDeltaX;
-  const mappedDeltaY = shiftKey ? 0 : rawDeltaY;
-  const deltaScaleX = deltaMode === wheelDeltaLineMode
-    ? wheelLinePixels
-    : deltaMode === wheelDeltaPageMode
-      ? bounds.width
-      : 1;
-  const deltaScaleY = deltaMode === wheelDeltaLineMode
-    ? wheelLinePixels
-    : deltaMode === wheelDeltaPageMode
-      ? bounds.height
-      : 1;
-  const deltaXPx = mappedDeltaX * deltaScaleX;
-  const deltaYPx = mappedDeltaY * deltaScaleY;
-  if (deltaXPx === 0 && deltaYPx === 0) {
-    return null;
-  }
-
-  const viewportWidthMb = (viewport.xEnd - viewport.xStart) / 1_000_000;
-  const viewportHeightMb = (viewport.yEnd - viewport.yStart) / 1_000_000;
-  if (
-    !Number.isFinite(viewportWidthMb)
-    || !Number.isFinite(viewportHeightMb)
-    || viewportWidthMb <= 0
-    || viewportHeightMb <= 0
-  ) {
-    return null;
-  }
-
-  return {
-    deltaXPx,
-    deltaYPx,
-    deltaXMb: (deltaXPx / bounds.width) * viewportWidthMb,
-    deltaYMb: (deltaYPx / bounds.height) * viewportHeightMb,
-  };
 }
 
 export function contactTileOverscanDirectionForViewports(
@@ -434,7 +395,7 @@ export function ContactMapViewport({
   onContactTileLayerPaintComplete,
   onUiAction,
   onContactViewportPreview,
-  preserveResolutionViewport = false,
+  useStoredResolutionOptions = false,
   availableResolutionBasePairs = [],
   onClosePanel,
   onExpandPanel,
@@ -448,6 +409,8 @@ export function ContactMapViewport({
   const contactTileTransformRef = useRef<HTMLDivElement>(null);
   const contactTilePanRendererRef = useRef<ContactTileGpuRenderer | null>(null);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
+  const assemblySelectionVerticalBandRef = useRef<HTMLSpanElement>(null);
+  const assemblySelectionHorizontalBandRef = useRef<HTMLSpanElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const latestContactMapRef = useRef<ContactMapView | null>(null);
   const latestDisplayContactMapRef = useRef<ContactMapView | null>(null);
@@ -828,7 +791,9 @@ export function ContactMapViewport({
 
     function handleWheelPan(event: WheelEvent) {
       const sourceContactMap = latestContactMapRef.current;
-      if (event.ctrlKey || event.metaKey) {
+      const diagonalWheelPan = event.shiftKey && (event.ctrlKey || event.metaKey);
+      const navigationMode = contactWheelNavigationMode(event);
+      if (navigationMode === "resolution") {
         event.preventDefault();
         event.stopPropagation();
         if (!sourceContactMap) {
@@ -838,13 +803,11 @@ export function ContactMapViewport({
         const viewportResolutionOptions = availableContactResolutions(
           latestUiState.contact,
           totalSpanMb,
-          preserveResolutionViewport,
+          false,
         );
-        const resolutionOptions = preserveResolutionViewport
+        const resolutionOptions = useStoredResolutionOptions
           && availableResolutionBasePairs.length > 0
-          ? viewportResolutionOptions.filter((resolution) => (
-              availableResolutionBasePairs.includes(contactResolutionToBasePairs(resolution))
-            ))
+          ? storedContactResolutionsForDataset(availableResolutionBasePairs)
           : viewportResolutionOptions;
         const nextResolution = contactResolutionWheelIntent({
           deltaX: event.deltaX,
@@ -862,7 +825,6 @@ export function ContactMapViewport({
         onUiAction({
           type: "setContactResolution",
           resolution: nextResolution,
-          preserveViewport: preserveResolutionViewport,
         });
         return;
       }
@@ -887,6 +849,7 @@ export function ContactMapViewport({
         deltaY: event.deltaY,
         deltaMode: event.deltaMode,
         shiftKey: event.shiftKey,
+        diagonalKey: diagonalWheelPan,
         bounds,
         viewport: currentViewport,
       });
@@ -926,7 +889,7 @@ export function ContactMapViewport({
   }, [
     availableResolutionBasePairs,
     onUiAction,
-    preserveResolutionViewport,
+    useStoredResolutionOptions,
     totalSpanMb,
   ]);
 
@@ -1160,6 +1123,12 @@ export function ContactMapViewport({
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = transform;
     }
+    if (assemblySelectionVerticalBandRef.current) {
+      assemblySelectionVerticalBandRef.current.style.transform = `translateX(${offsetX}px)`;
+    }
+    if (assemblySelectionHorizontalBandRef.current) {
+      assemblySelectionHorizontalBandRef.current.style.transform = `translateY(${offsetY}px)`;
+    }
   }
 
   function schedulePanTransform(
@@ -1205,6 +1174,12 @@ export function ContactMapViewport({
     contactTilePanRendererRef.current?.resetPanOffset();
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = "";
+    }
+    if (assemblySelectionVerticalBandRef.current) {
+      assemblySelectionVerticalBandRef.current.style.transform = "";
+    }
+    if (assemblySelectionHorizontalBandRef.current) {
+      assemblySelectionHorizontalBandRef.current.style.transform = "";
     }
   }
 
@@ -1660,6 +1635,8 @@ export function ContactMapViewport({
           </div>
           <AssemblyOverlay
             overlayLayerRef={assemblyOverlayLayerRef}
+            selectionVerticalBandRef={assemblySelectionVerticalBandRef}
+            selectionHorizontalBandRef={assemblySelectionHorizontalBandRef}
             model={assemblyModel}
             viewportXStart={displayViewport.xStart}
             viewportXEnd={displayViewport.xEnd}
@@ -1849,6 +1826,8 @@ function HistoryOperationPreview({
 
 interface AssemblyOverlayProps {
   overlayLayerRef: React.RefObject<HTMLDivElement>;
+  selectionVerticalBandRef: React.RefObject<HTMLSpanElement>;
+  selectionHorizontalBandRef: React.RefObject<HTMLSpanElement>;
   model: AssemblyEditModel;
   viewportXStart: number;
   viewportXEnd: number;
@@ -1875,6 +1854,8 @@ interface AssemblyOverlayProps {
 
 function AssemblyOverlay({
   overlayLayerRef,
+  selectionVerticalBandRef,
+  selectionHorizontalBandRef,
   model,
   viewportXStart,
   viewportXEnd,
@@ -1917,6 +1898,20 @@ function AssemblyOverlay({
       .map((block) => block.id),
   );
   const selectedBlocks = model.assemblyBlocks.filter((block) => selectedUnitIds.has(block.id));
+  const selectedInterval = selectedBlocks.length > 0
+    ? {
+        start: Math.min(...selectedBlocks.map((block) => block.visualStart)),
+        end: Math.max(...selectedBlocks.map((block) => block.visualEnd)),
+      }
+    : null;
+  const selectionProjectionBands = selectedInterval
+    ? assemblySelectionProjectionBands(selectedInterval.start, selectedInterval.end, {
+        xStart: viewportXStart,
+        xEnd: viewportXEnd,
+        yStart: viewportYStart,
+        yEnd: viewportYEnd,
+      })
+    : null;
   const selectedIndexes = model.assemblyBlocks
     .map((block, index) => (selectedUnitIds.has(block.id) ? index : -1))
     .filter((index) => index >= 0);
@@ -1926,10 +1921,10 @@ function AssemblyOverlay({
       block.contigIds.map((contigId) => [contigId, block] as const)
     )),
   );
-  const selectedGroupBox = selectedBlocks.length > 0
+  const selectedGroupBox = selectedInterval
     ? intervalBox(
-        Math.min(...selectedBlocks.map((block) => block.visualStart)),
-        Math.max(...selectedBlocks.map((block) => block.visualEnd)),
+        selectedInterval.start,
+        selectedInterval.end,
         viewportXStart,
         viewportXEnd,
         viewportXSpan,
@@ -2001,6 +1996,22 @@ function AssemblyOverlay({
       onPointerCancel={onPointerCancel}
       onPointerLeave={onPointerLeave}
     >
+      {selectionProjectionBands?.vertical ? (
+        <span
+          ref={selectionVerticalBandRef}
+          aria-hidden="true"
+          className="assembly-selection-axis-band vertical"
+          style={selectionProjectionBands.vertical}
+        />
+      ) : null}
+      {selectionProjectionBands?.horizontal ? (
+        <span
+          ref={selectionHorizontalBandRef}
+          aria-hidden="true"
+          className="assembly-selection-axis-band horizontal"
+          style={selectionProjectionBands.horizontal}
+        />
+      ) : null}
       {selectionBox ? (
         <span
           className="assembly-selection-box"

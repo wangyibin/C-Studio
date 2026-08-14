@@ -1,3 +1,4 @@
+import type { ContactMapView } from "../App";
 import type { ContactViewport } from "./contactViewport";
 
 export const overviewTargetBins = 320;
@@ -16,6 +17,44 @@ export interface ContactOverviewRequestReadiness {
   paintedGeneration: number | null;
   completeLayerGeneration: number | null;
   documentHidden: boolean;
+}
+
+/**
+ * Reuse an already complete screen-scale layer as the inspector overview when
+ * it covers the assembly. The square viewport prevents a rectangular main
+ * canvas from inflating the overview's coordinate span and, crucially, avoids
+ * a second full scan of a single-resolution `.cool` file.
+ */
+export function wholeAssemblyOverviewFromCoveringMap(
+  map: ContactMapView,
+  totalSpanBp: number,
+): ContactMapView | null {
+  const span = Math.max(1, Math.round(totalSpanBp));
+  if (
+    map.viewport.xStart > 0
+    || map.viewport.yStart > 0
+    || map.viewport.xEnd < span
+    || map.viewport.yEnd < span
+  ) {
+    return null;
+  }
+  if (
+    map.viewport.xStart === 0
+    && map.viewport.xEnd === span
+    && map.viewport.yStart === 0
+    && map.viewport.yEnd === span
+  ) {
+    return map;
+  }
+  return {
+    ...map,
+    viewport: {
+      xStart: 0,
+      xEnd: span,
+      yStart: 0,
+      yEnd: span,
+    },
+  };
 }
 
 type ContactOverviewGenerationReadiness = Omit<

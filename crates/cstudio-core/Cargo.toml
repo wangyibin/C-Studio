@@ -11,3 +11,5 @@ path = "src/lib.rs"
 
 [dependencies]
 hdf5 = "0.8"
+libc = "0.2"
+rayon = "1.12"

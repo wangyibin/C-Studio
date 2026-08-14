@@ -1,4 +1,5 @@
 import type { ContactMapLayoutBlock } from "./importers";
+import type { GfaLinkEvidence, GfaSegmentSide } from "./gfa";
 
 export interface AssemblyChromosome {
   id: string;
@@ -590,6 +591,225 @@ export function deleteContigSelection(
   return recomputeVisualCoordinates(
     structured ? rebuildAssemblyBlockMembership(bounded) : bounded,
   );
+}
+
+export interface GfaBlockJoinPlan {
+  leftBlockId: string;
+  rightBlockId: string;
+  linkId: string | null;
+  overlap: string | null;
+  trimRightBases: number;
+}
+
+export type GfaBlockCreationPlan =
+  | { ok: true; selectedBlockIds: string[]; joins: GfaBlockJoinPlan[] }
+  | { ok: false; reason: string };
+
+/**
+ * Validate the exact, current AGP neighbours that a user wants to turn into
+ * one logical block. A positive overlap is accepted only from one uniquely
+ * oriented GFA L record with a simple ungapped M/= CIGAR; indel and clipped
+ * CIGARs remain review-only.
+ */
+export function planGfaBlockCreation(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+  links: ReadonlyArray<GfaLinkEvidence>,
+): GfaBlockCreationPlan {
+  const selectedIds = new Set(selectedBlockIds(blocks, selection));
+  const selected = blocks.filter((block) => selectedIds.has(block.id));
+  if (selected.length < 2) {
+    return { ok: false, reason: "Select at least two adjacent utgs." };
+  }
+  const firstIndex = blocks.findIndex((block) => block.id === selected[0].id);
+  const contiguous = selected.every((block, index) => blocks[firstIndex + index]?.id === block.id);
+  if (!contiguous || selected.some((block) => block.objectId !== selected[0].objectId)) {
+    return { ok: false, reason: "Selected utgs must be consecutive on one chromosome." };
+  }
+  const existingBlockId = selected[0].assemblyBlockId;
+  if (existingBlockId && selected.every((block) => block.assemblyBlockId === existingBlockId)) {
+    return { ok: false, reason: "Selected utgs already belong to one block." };
+  }
+
+  const joins: GfaBlockJoinPlan[] = [];
+  for (let index = 1; index < selected.length; index += 1) {
+    const left = selected[index - 1];
+    const right = selected[index];
+    const leftSide = displayedAssemblySide(left, "right");
+    const rightSide = displayedAssemblySide(right, "left");
+    const betweenSources = links.filter((link) => (
+      (link.from.segmentName === left.sourceId && link.to.segmentName === right.sourceId)
+      || (link.from.segmentName === right.sourceId && link.to.segmentName === left.sourceId)
+    ));
+    const matches = betweenSources.filter((link) => gfaLinkMatchesBoundary(
+      link,
+      left.sourceId,
+      leftSide,
+      right.sourceId,
+      rightSide,
+    ));
+    if (matches.length > 1) {
+      return { ok: false, reason: `Multiple GFA overlaps match ${left.sourceId} → ${right.sourceId}.` };
+    }
+    if (matches.length === 0 && betweenSources.length > 0) {
+      return { ok: false, reason: `GFA link orientation conflicts at ${left.sourceId} → ${right.sourceId}.` };
+    }
+    const link = matches[0] ?? null;
+    const trimRightBases = link ? exactGfaOverlapLength(link.overlap) : 0;
+    if (link && trimRightBases === null) {
+      return { ok: false, reason: `Overlap ${link.overlap} is not a simple ungapped M/= CIGAR; review it before joining.` };
+    }
+    if ((trimRightBases ?? 0) > 0 && !isKnownAssemblyOrientation(right.orientation)) {
+      return { ok: false, reason: `Orientation ${right.orientation} cannot safely resolve the overlap on ${right.sourceId}.` };
+    }
+    if ((trimRightBases ?? 0) >= right.sourceEnd - right.sourceStart) {
+      return { ok: false, reason: `Overlap is not shorter than ${right.sourceId}.` };
+    }
+    joins.push({
+      leftBlockId: left.id,
+      rightBlockId: right.id,
+      linkId: link?.id ?? null,
+      overlap: link?.overlap ?? null,
+      trimRightBases: trimRightBases ?? 0,
+    });
+  }
+  return { ok: true, selectedBlockIds: selected.map((block) => block.id), joins };
+}
+
+/** Apply one validated GFA-aware block creation without modifying the source FASTA. */
+export function createAssemblyBlockFromGfa(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+  links: ReadonlyArray<GfaLinkEvidence>,
+): ContactMapLayoutBlock[] {
+  const plan = planGfaBlockCreation(blocks, selection, links);
+  if (!plan.ok) {
+    return blocks;
+  }
+  const selectedIds = new Set(plan.selectedBlockIds);
+  const joinByRightId = new Map(plan.joins.map((join) => [join.rightBlockId, join]));
+  const edited = blocks.map((block) => {
+    const join = joinByRightId.get(block.id);
+    if (!selectedIds.has(block.id)) {
+      return block;
+    }
+    let next = { ...block };
+    if (join) {
+      next.gapBefore = undefined;
+      if (join.trimRightBases > 0 && join.linkId && join.overlap) {
+        next.gfaOverlapBefore = {
+          linkId: join.linkId,
+          cigar: join.overlap,
+          trimmedBases: join.trimRightBases,
+          originalSourceStart: block.sourceStart,
+          originalSourceEnd: block.sourceEnd,
+        };
+        if (block.orientation === "-") {
+          next.sourceEnd -= join.trimRightBases;
+        } else {
+          next.sourceStart += join.trimRightBases;
+        }
+      }
+    }
+    return next;
+  });
+  return recomputeVisualCoordinates(rebuildAssemblyBlockMembership(edited));
+}
+
+/** Split selected composite blocks into singleton logical units and undo their GFA overlap trims. */
+export function dissolveAssemblyBlockSelection(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+): ContactMapLayoutBlock[] {
+  const selectedIds = new Set(selectedBlockIds(blocks, selection));
+  const selectedCompositeIds = new Set(
+    blocks
+      .filter((block) => selectedIds.has(block.id) && block.assemblyBlockId)
+      .map((block) => block.assemblyBlockId!),
+  );
+  if (selectedCompositeIds.size === 0) {
+    return blocks;
+  }
+  let changed = false;
+  const firstIndexByCompositeId = new Map<string, number>();
+  blocks.forEach((block, index) => {
+    if (block.assemblyBlockId && !firstIndexByCompositeId.has(block.assemblyBlockId)) {
+      firstIndexByCompositeId.set(block.assemblyBlockId, index);
+    }
+  });
+  const edited = blocks.map((block, index) => {
+    if (!block.assemblyBlockId || !selectedCompositeIds.has(block.assemblyBlockId)) {
+      return block;
+    }
+    changed = true;
+    const overlap = block.gfaOverlapBefore;
+    return {
+      ...block,
+      assemblyBlockId: null,
+      gapBefore: index === firstIndexByCompositeId.get(block.assemblyBlockId)
+        ? block.gapBefore
+        : { ...DEFAULT_INSERTED_GAP },
+      sourceStart: overlap?.originalSourceStart ?? block.sourceStart,
+      sourceEnd: overlap?.originalSourceEnd ?? block.sourceEnd,
+      gfaOverlapBefore: undefined,
+    };
+  });
+  return changed ? recomputeVisualCoordinates(rebuildAssemblyBlockMembership(edited)) : blocks;
+}
+
+/** True when the current selection touches at least one composite assembly block. */
+export function hasDissolvableAssemblyBlock(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+) {
+  const selectedIds = new Set(selectedBlockIds(blocks, selection));
+  return blocks.some((block) => selectedIds.has(block.id) && Boolean(block.assemblyBlockId));
+}
+
+function displayedAssemblySide(
+  block: ContactMapLayoutBlock,
+  displayed: "left" | "right",
+): GfaSegmentSide {
+  if (block.orientation === "-") {
+    return displayed === "left" ? "end" : "start";
+  }
+  return displayed === "left" ? "start" : "end";
+}
+
+function gfaLinkMatchesBoundary(
+  link: GfaLinkEvidence,
+  leftName: string,
+  leftSide: GfaSegmentSide,
+  rightName: string,
+  rightSide: GfaSegmentSide,
+) {
+  return (
+    link.from.segmentName === leftName
+    && link.from.side === leftSide
+    && link.to.segmentName === rightName
+    && link.to.side === rightSide
+  ) || (
+    link.to.segmentName === leftName
+    && link.to.side === leftSide
+    && link.from.segmentName === rightName
+    && link.from.side === rightSide
+  );
+}
+
+function exactGfaOverlapLength(cigar: string): number | null {
+  if (cigar === "*") {
+    return null;
+  }
+  const operations = [...cigar.matchAll(/(\d+)([M=])/g)];
+  if (operations.length === 0 || operations.map((match) => match[0]).join("") !== cigar) {
+    return null;
+  }
+  const length = operations.reduce((sum, match) => sum + Number(match[1]), 0);
+  return Number.isSafeInteger(length) ? length : null;
+}
+
+function isKnownAssemblyOrientation(orientation: ContactMapLayoutBlock["orientation"]) {
+  return orientation === "+" || orientation === "-";
 }
 
 export function addChromosomeBoundariesToSelection(

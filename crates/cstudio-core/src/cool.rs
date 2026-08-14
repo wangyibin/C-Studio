@@ -1,8 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
     fs,
+    hash::{Hash, Hasher},
+    io::{Read, Write},
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     sync::{Arc, Condvar, Mutex, OnceLock},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use hdf5::{
@@ -23,7 +27,11 @@ use crate::{
 
 const MAX_COOL_INDEX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COOL_NORMALIZATION_CACHE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_RUNTIME_NORMALIZATION_MATRIX_BYTES: usize = 512 * 1024 * 1024;
+const PERSISTENT_NORMALIZATION_MAGIC: [u8; 4] = *b"CSN1";
+const PERSISTENT_NORMALIZATION_VERSION: u16 = 1;
+const RUNTIME_NORMALIZATION_MEMORY_NUMERATOR: usize = 4;
+const RUNTIME_NORMALIZATION_MEMORY_DENOMINATOR: usize = 5;
+const FALLBACK_RUNTIME_NORMALIZATION_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const MAX_COOL_READER_CACHE_ENTRIES: usize = 8;
 const MAX_ADAPTIVE_CHILD_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const ADAPTIVE_TARGET_RESOLUTION: u64 = 2_500_000;
@@ -32,12 +40,143 @@ const ADAPTIVE_RESOLUTION_CHAIN: [u64; 5] = [2_500_000, 500_000, 100_000, 10_000
 // holds bin2 and count arrays. At the widest supported element types this caps
 // their combined raw payload near 8 MiB while keeping HDF5 call overhead low.
 const MAX_COOL_PIXEL_READ_CHUNK: usize = 500_000;
-// Delta streaming drains projection state after every chunk. A smaller bound
-// keeps the transient sparse HashMap comfortably below whole-view tile memory.
+// Streaming consumers can project or drain state after every chunk. A smaller
+// bound keeps raw HDF5 payloads and transient projection state independent of
+// the total number of source pixels.
 const MAX_COOL_STREAM_PIXEL_READ_CHUNK: usize = 100_000;
 // Reading a small unselected gap is cheaper than issuing another three HDF5
 // hyperslab calls. Bridged pixels are still rejected by SelectedBinIndex.
 const MAX_COOL_PIXEL_BATCH_GAP: usize = 16_384;
+static PERSISTENT_NORMALIZATION_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static NEXT_NORMALIZATION_CACHE_TEMP: AtomicU64 = AtomicU64::new(1);
+
+fn runtime_normalization_memory_budget_bytes(available_bytes: usize) -> usize {
+    ((available_bytes as u128) * (RUNTIME_NORMALIZATION_MEMORY_NUMERATOR as u128)
+        / (RUNTIME_NORMALIZATION_MEMORY_DENOMINATOR as u128))
+        .min(usize::MAX as u128) as usize
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn available_system_memory_bytes() -> Option<usize> {
+    static HOST_PORT: OnceLock<libc::mach_port_t> = OnceLock::new();
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+
+    let host = *HOST_PORT.get_or_init(|| unsafe { libc::mach_host_self() });
+    let mut statistics = std::mem::MaybeUninit::<libc::vm_statistics64_data_t>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let status = unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            statistics.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    if status != libc::KERN_SUCCESS {
+        return None;
+    }
+    let statistics = unsafe { statistics.assume_init() };
+    // Inactive and speculative pages are reclaimable by the kernel. Excluding
+    // active, wired, and compressed pages keeps this below physical memory and
+    // reflects pressure at the moment a normalization allocation is attempted.
+    let available_pages = u64::from(statistics.free_count)
+        .saturating_add(u64::from(statistics.inactive_count))
+        .saturating_add(u64::from(statistics.speculative_count));
+    usize::try_from(available_pages.saturating_mul(page_size as u64)).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn available_system_memory_bytes() -> Option<usize> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    parse_linux_available_memory_bytes(&meminfo)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_available_memory_bytes(meminfo: &str) -> Option<usize> {
+    let kibibytes = meminfo.lines().find_map(|line| {
+        let value = line.strip_prefix("MemAvailable:")?.trim();
+        value.split_whitespace().next()?.parse::<usize>().ok()
+    })?;
+    kibibytes.checked_mul(1024)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn available_system_memory_bytes() -> Option<usize> {
+    None
+}
+
+fn ensure_runtime_normalization_memory_budget(
+    estimated_bytes: usize,
+    allocation_scope: &str,
+) -> CStudioResult<()> {
+    ensure_runtime_normalization_memory_budget_with_available(
+        estimated_bytes,
+        allocation_scope,
+        available_system_memory_bytes(),
+    )
+}
+
+fn ensure_runtime_normalization_memory_budget_with_available(
+    estimated_bytes: usize,
+    allocation_scope: &str,
+    available_bytes: Option<usize>,
+) -> CStudioResult<()> {
+    let (budget_bytes, availability) = match available_bytes {
+        Some(available_bytes) => (
+            runtime_normalization_memory_budget_bytes(available_bytes),
+            format!(
+                "{} MiB currently available; the 80% budget is {} MiB",
+                available_bytes / (1024 * 1024),
+                runtime_normalization_memory_budget_bytes(available_bytes) / (1024 * 1024),
+            ),
+        ),
+        None => (
+            FALLBACK_RUNTIME_NORMALIZATION_MEMORY_BYTES,
+            format!(
+                "available memory could not be determined; the fallback budget is {} MiB",
+                FALLBACK_RUNTIME_NORMALIZATION_MEMORY_BYTES / (1024 * 1024),
+            ),
+        ),
+    };
+    if estimated_bytes > budget_bytes {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool runtime normalization estimates about {} MiB {allocation_scope}, but {availability}; add a precomputed bins normalization vector or free memory",
+            estimated_bytes / (1024 * 1024),
+        )));
+    }
+    Ok(())
+}
+
+fn estimated_runtime_normalization_peak_bytes(
+    pixel_count: usize,
+    bin_count: usize,
+    normalization: ContactNormalization,
+) -> usize {
+    // SparseContactMatrix construction peaks at 32 bytes per pixel while u64
+    // HDF5 indexes are compacted to u32. KR later owns the compact sparse matrix
+    // plus a duplicated symmetric CSR and BNEWT work vectors, so account for its
+    // higher live peak rather than protecting only the input read.
+    let (bytes_per_pixel, bytes_per_bin) = match normalization {
+        ContactNormalization::Kr => (40_usize, 160_usize),
+        ContactNormalization::Ice => (32, 64),
+        ContactNormalization::Vc | ContactNormalization::VcSqrt => (32, 32),
+        ContactNormalization::Raw => (0, 0),
+    };
+    pixel_count
+        .saturating_mul(bytes_per_pixel)
+        .saturating_add(bin_count.saturating_mul(bytes_per_bin))
+}
+
+/// Configure the optional on-disk normalization-vector cache. The directory is
+/// process-global because the in-memory Cooler reader and normalization caches
+/// are process-global too. Calling this more than once keeps the first path.
+pub fn configure_persistent_normalization_cache(directory: PathBuf) {
+    let _ = PERSISTENT_NORMALIZATION_CACHE_DIR.set(directory);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CoolIndexCacheKey {
@@ -153,6 +292,22 @@ pub struct AdaptiveContactMapResult {
     pub stats: AdaptiveCoolStats,
 }
 
+/// Coarse-grained timings for one bounded Cooler contact visit. Timers are
+/// sampled once per HDF5 chunk rather than once per contact so diagnostics do
+/// not materially perturb the hot projection loop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CoolContactVisitTimings {
+    pub prepare: Duration,
+    pub hdf5_read: Duration,
+    /// Includes selected-bin filtering, coordinate lookup, and the caller's
+    /// projection callback. Those operations share one per-pixel loop and
+    /// cannot be separated without changing the production data path.
+    pub scan_project: Duration,
+    pub finish_chunk: Duration,
+    pub hdf5_chunks: usize,
+    pub scanned_pixels: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdaptiveEndpointDecision {
     Drop,
@@ -253,6 +408,31 @@ pub fn list_contact_resolutions(path: &str) -> CStudioResult<Vec<u64>> {
             )
         })?;
     Ok(vec![resolution])
+}
+
+/// Resolve and cache one normalization vector without reading or projecting
+/// any contact tiles. This is used by the desktop app's low-priority idle
+/// prewarmer; foreground readers reuse the same single-flight and LRU entries.
+pub fn prewarm_contact_normalization_at_resolution_cancellable(
+    path: &str,
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<()> {
+    ensure_not_cancelled(should_cancel)?;
+    if normalization == ContactNormalization::Raw {
+        return Ok(());
+    }
+    let reader = cached_cool_reader(path, resolution, should_cancel)?;
+    cached_normalization_weights(
+        reader.as_ref(),
+        path,
+        resolution,
+        &reader.index,
+        normalization,
+        should_cancel,
+    )?;
+    ensure_not_cancelled(should_cancel)
 }
 
 impl CoolUnsignedDataset {
@@ -483,7 +663,8 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
         normalization,
         should_cancel,
         MAX_COOL_PIXEL_READ_CHUNK,
-        |source1, start1, source2, start2, count| {
+        None,
+        |_, source1, start1, _, source2, start2, count| {
             contacts.push(ContactBin {
                 source1: source1.to_string(),
                 start1,
@@ -510,7 +691,7 @@ pub fn visit_cool_contact_chunks_for_source_ranges_at_resolution_with_normalizat
     resolution: Option<u64>,
     normalization: ContactNormalization,
     should_cancel: &dyn Fn() -> bool,
-    visit: Visit,
+    mut visit: Visit,
     finish_chunk: Finish,
 ) -> CStudioResult<usize>
 where
@@ -524,6 +705,106 @@ where
         normalization,
         should_cancel,
         MAX_COOL_STREAM_PIXEL_READ_CHUNK,
+        None,
+        |_, source1, start1, _, source2, start2, count| {
+            visit(source1, start1, source2, start2, count)
+        },
+        finish_chunk,
+    )
+}
+
+/// Indexed variant of the bounded Cooler visitor. Chromosome indexes are
+/// stable for one cached Cooler reader, allowing projection callers to resolve
+/// layout sources once per chromosome instead of hashing names per pixel.
+pub fn visit_cool_contact_chunks_indexed_for_source_ranges_at_resolution_with_normalization_cancellable<
+    Visit,
+    Finish,
+>(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+    visit: Visit,
+    finish_chunk: Finish,
+) -> CStudioResult<usize>
+where
+    Visit: FnMut(usize, &str, u64, usize, &str, u64, f64) -> CStudioResult<()>,
+    Finish: FnMut() -> CStudioResult<()>,
+{
+    visit_cool_contact_chunks_with_limit(
+        path,
+        source_ranges,
+        resolution,
+        normalization,
+        should_cancel,
+        MAX_COOL_STREAM_PIXEL_READ_CHUNK,
+        None,
+        visit,
+        finish_chunk,
+    )
+}
+
+/// Profiled form of the string-source visitor. Kept for an exact A/B control
+/// against the indexed production path.
+pub fn visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable<
+    Visit,
+    Finish,
+>(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+    timings: &mut CoolContactVisitTimings,
+    mut visit: Visit,
+    finish_chunk: Finish,
+) -> CStudioResult<usize>
+where
+    Visit: FnMut(&str, u64, &str, u64, f64) -> CStudioResult<()>,
+    Finish: FnMut() -> CStudioResult<()>,
+{
+    visit_cool_contact_chunks_with_limit(
+        path,
+        source_ranges,
+        resolution,
+        normalization,
+        should_cancel,
+        MAX_COOL_STREAM_PIXEL_READ_CHUNK,
+        Some(timings),
+        |_, source1, start1, _, source2, start2, count| {
+            visit(source1, start1, source2, start2, count)
+        },
+        finish_chunk,
+    )
+}
+
+/// Profiled form of the indexed visitor used by the visible-tile delta stream.
+pub fn visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable<
+    Visit,
+    Finish,
+>(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+    timings: &mut CoolContactVisitTimings,
+    visit: Visit,
+    finish_chunk: Finish,
+) -> CStudioResult<usize>
+where
+    Visit: FnMut(usize, &str, u64, usize, &str, u64, f64) -> CStudioResult<()>,
+    Finish: FnMut() -> CStudioResult<()>,
+{
+    visit_cool_contact_chunks_with_limit(
+        path,
+        source_ranges,
+        resolution,
+        normalization,
+        should_cancel,
+        MAX_COOL_STREAM_PIXEL_READ_CHUNK,
+        Some(timings),
         visit,
         finish_chunk,
     )
@@ -565,19 +846,20 @@ fn visit_cool_contact_chunks_with_limit<Visit, Finish>(
     normalization: ContactNormalization,
     should_cancel: &dyn Fn() -> bool,
     pixel_read_chunk: usize,
+    mut timings: Option<&mut CoolContactVisitTimings>,
     mut visit: Visit,
     mut finish_chunk: Finish,
 ) -> CStudioResult<usize>
 where
-    Visit: FnMut(&str, u64, &str, u64, f64) -> CStudioResult<()>,
+    Visit: FnMut(usize, &str, u64, usize, &str, u64, f64) -> CStudioResult<()>,
     Finish: FnMut() -> CStudioResult<()>,
 {
+    let prepare_started = Instant::now();
     ensure_not_cancelled(should_cancel)?;
     let reader = cached_cool_reader(path, resolution, should_cancel)?;
-    let file = &reader.file;
     let index = &reader.index;
     let normalization_weights = cached_normalization_weights(
-        &file,
+        reader.as_ref(),
         path,
         resolution,
         &index,
@@ -595,20 +877,30 @@ where
         should_cancel,
     )?;
     let pixel_ranges = batch_nearby_pixel_ranges(&pixel_ranges, MAX_COOL_PIXEL_BATCH_GAP);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.prepare += prepare_started.elapsed();
+    }
 
     for (pixel_start, pixel_end) in pixel_ranges {
         for chunk_start in (pixel_start..pixel_end).step_by(pixel_read_chunk) {
             ensure_not_cancelled(should_cancel)?;
             let chunk_end = chunk_start.saturating_add(pixel_read_chunk).min(pixel_end);
+            let read_started = Instant::now();
             let pixel_bin2 = reader.pixel_bin2.read_slice(chunk_start, chunk_end)?;
             ensure_not_cancelled(should_cancel)?;
             let pixel_counts = reader.pixel_counts.read_slice(chunk_start, chunk_end)?;
+            if let Some(timings) = timings.as_deref_mut() {
+                timings.hdf5_read += read_started.elapsed();
+                timings.hdf5_chunks = timings.hdf5_chunks.saturating_add(1);
+                timings.scanned_pixels = timings.scanned_pixels.saturating_add(pixel_bin2.len());
+            }
             if pixel_bin2.len() != pixel_counts.len() {
                 return Err(CStudioError::InvalidContactMapQuery(
                     ".cool pixels/bin2_id and count have different lengths".to_string(),
                 ));
             }
             let mut bin1_index = bin1_for_pixel_offset(&index.bin1_offsets, chunk_start)?;
+            let scan_project_started = Instant::now();
 
             for (pixel_index, (bin2, count)) in pixel_bin2
                 .into_iter()
@@ -650,16 +942,25 @@ where
                 let (source2_index, start2) = bin_source_and_start(&index, bin2, "bin2_id")?;
 
                 visit(
+                    source1_index,
                     &index.chrom_names[source1_index],
                     start1,
+                    source2_index,
                     &index.chrom_names[source2_index],
                     start2,
                     count,
                 )?;
                 visited_contacts = visited_contacts.saturating_add(1);
             }
+            if let Some(timings) = timings.as_deref_mut() {
+                timings.scan_project += scan_project_started.elapsed();
+            }
             ensure_not_cancelled(should_cancel)?;
+            let finish_started = Instant::now();
             finish_chunk()?;
+            if let Some(timings) = timings.as_deref_mut() {
+                timings.finish_chunk += finish_started.elapsed();
+            }
         }
     }
 
@@ -1849,7 +2150,7 @@ fn cool_index_cache_key(path: &str, resolution: Option<u64>) -> CoolIndexCacheKe
 }
 
 fn cached_normalization_weights(
-    file: &File,
+    reader: &CoolReader,
     path: &str,
     resolution: Option<u64>,
     index: &CoolIndex,
@@ -1865,33 +2166,400 @@ fn cached_normalization_weights(
         file: cool_index_cache_key(path, resolution),
         normalization,
     };
-    cached_normalization_vector(key, should_cancel, || {
-        // Preserve precomputed vectors exactly when present. Raw coolers without
-        // them fall back to one global calculation for the resolved matrix level.
-        let values = if let Some(values) = read_stored_normalization_weights(
-            file,
-            &index.prefix,
-            index.bin_starts.len(),
+    loop {
+        let result = cached_normalization_vector(key.clone(), should_cancel, || {
+            // Preserve precomputed vectors exactly when present. Raw coolers without
+            // them fall back to a runtime calculation for the resolved matrix level.
+            let values = if let Some(values) = read_stored_normalization_weights(
+                &reader.file,
+                &index.prefix,
+                index.bin_starts.len(),
+                normalization,
+                should_cancel,
+            )? {
+                values
+            } else if let Some(values) = load_persistent_normalization_vector(
+                path,
+                resolution,
+                normalization,
+                index.bin_starts.len(),
+            ) {
+                if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
+                    eprintln!(
+                        "CSTUDIO_PERF event=runtime_normalization status=cache_hit normalization={} scope=disk bins={}",
+                        normalization.as_str(),
+                        values.len(),
+                    );
+                }
+                values
+            } else {
+                let values = compute_runtime_normalization_weights(
+                    reader,
+                    index,
+                    normalization,
+                    should_cancel,
+                )?;
+                store_persistent_normalization_vector(path, resolution, normalization, &values);
+                values
+            };
+            ensure_not_cancelled(should_cancel)?;
+            if values.len() != index.bin_starts.len() {
+                return Err(CStudioError::InvalidContactMapQuery(format!(
+                    ".cool {} normalization has {} weights for {} bins",
+                    normalization.as_str(),
+                    values.len(),
+                    index.bin_starts.len(),
+                )));
+            }
+            Ok(values)
+        });
+
+        match result {
+            // A foreground request can arrive while an idle prewarmer owns the
+            // single-flight. If that low-priority leader yields, the still-live
+            // foreground waiter must take over instead of surfacing a transient
+            // cancellation to the UI.
+            Err(CStudioError::RequestCancelled) if !should_cancel() => continue,
+            result => return result.map(Some),
+        }
+    }
+}
+
+fn persistent_normalization_cache_path(
+    path: &str,
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+) -> Option<PathBuf> {
+    if normalization != ContactNormalization::Kr {
+        return None;
+    }
+    let root = PERSISTENT_NORMALIZATION_CACHE_DIR.get()?;
+    let source = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let metadata = fs::metadata(&source).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    let mut hasher = DefaultHasher::new();
+    "cstudio-runtime-kr-assembly-csr-v1".hash(&mut hasher);
+    source.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified_nanos.hash(&mut hasher);
+    resolution.hash(&mut hasher);
+    normalization.hash(&mut hasher);
+    Some(root.join(format!("{:016x}.csnorm", hasher.finish())))
+}
+
+fn load_persistent_normalization_vector(
+    path: &str,
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    expected_len: usize,
+) -> Option<Vec<f64>> {
+    let cache_path = persistent_normalization_cache_path(path, resolution, normalization)?;
+    let mut file = fs::File::open(&cache_path).ok()?;
+    let mut header = [0_u8; 16];
+    if file.read_exact(&mut header).is_err()
+        || header[..4] != PERSISTENT_NORMALIZATION_MAGIC
+        || u16::from_le_bytes([header[4], header[5]]) != PERSISTENT_NORMALIZATION_VERSION
+    {
+        let _ = fs::remove_file(cache_path);
+        return None;
+    }
+    let stored_len = u64::from_le_bytes(header[8..16].try_into().ok()?);
+    if stored_len != expected_len as u64 {
+        let _ = fs::remove_file(cache_path);
+        return None;
+    }
+    let expected_bytes = expected_len.checked_mul(std::mem::size_of::<f64>())?;
+    let mut bytes = vec![0_u8; expected_bytes];
+    if file.read_exact(&mut bytes).is_err() {
+        let _ = fs::remove_file(cache_path);
+        return None;
+    }
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).ok()? != 0 {
+        let _ = fs::remove_file(cache_path);
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(8)
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("eight-byte chunk")))
+            .collect(),
+    )
+}
+
+fn store_persistent_normalization_vector(
+    path: &str,
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    weights: &[f64],
+) {
+    let Some(cache_path) = persistent_normalization_cache_path(path, resolution, normalization)
+    else {
+        return;
+    };
+    let Some(root) = cache_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(root).is_err() {
+        return;
+    }
+    let temp_id = NEXT_NORMALIZATION_CACHE_TEMP.fetch_add(1, AtomicOrdering::Relaxed);
+    let temp_path = root.join(format!(
+        ".{}.{}-{temp_id}.tmp",
+        cache_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("normalization"),
+        std::process::id(),
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(&PERSISTENT_NORMALIZATION_MAGIC)?;
+        file.write_all(&PERSISTENT_NORMALIZATION_VERSION.to_le_bytes())?;
+        file.write_all(&0_u16.to_le_bytes())?;
+        file.write_all(&(weights.len() as u64).to_le_bytes())?;
+        for weight in weights {
+            file.write_all(&weight.to_le_bytes())?;
+        }
+        file.sync_all()?;
+        fs::rename(&temp_path, &cache_path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn compute_runtime_normalization_weights(
+    reader: &CoolReader,
+    index: &CoolIndex,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Vec<f64>> {
+    match normalization {
+        // Juicebox Assembly Tools builds its review map on one synthetic
+        // `assembly` chromosome. Match that curation scope by balancing every
+        // source bin and every cis/inter contact together. The resulting vector
+        // remains attached to immutable source bins and can therefore be reused
+        // while AGP placements are moved, flipped, joined, or split.
+        ContactNormalization::Kr => {
+            let matrix =
+                read_normalization_matrix(&reader.file, index, normalization, should_cancel)?;
+            let weights = compute_normalization_weights(&matrix, normalization, should_cancel)?;
+            if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
+                let valid_bins = weights
+                    .iter()
+                    .filter(|weight| weight.is_finite() && **weight > 0.0)
+                    .count();
+                eprintln!(
+                    "CSTUDIO_PERF event=runtime_normalization status=complete normalization=kr scope=assembly valid_bins={} invalid_bins={} bins={}",
+                    valid_bins,
+                    weights.len().saturating_sub(valid_bins),
+                    weights.len(),
+                );
+            }
+            Ok(weights)
+        }
+        // Coverage normalizations retain their chromosome-cis definition.
+        ContactNormalization::Vc | ContactNormalization::VcSqrt => {
+            compute_cis_normalization_weights_by_chromosome(
+                reader,
+                index,
+                normalization,
+                should_cancel,
+            )
+        }
+        // The `weight` fallback deliberately remains Cooler-style genome-wide
+        // ICE. It is a different normalization family from Juicebox KR.
+        ContactNormalization::Ice => {
+            let matrix =
+                read_normalization_matrix(&reader.file, index, normalization, should_cancel)?;
+            compute_normalization_weights(&matrix, normalization, should_cancel)
+        }
+        ContactNormalization::Raw => Ok(vec![1.0; index.bin_starts.len()]),
+    }
+}
+
+fn compute_cis_normalization_weights_by_chromosome(
+    reader: &CoolReader,
+    index: &CoolIndex,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Vec<f64>> {
+    let mut combined = vec![f64::NAN; index.bin_starts.len()];
+    let mut completed_chromosomes = 0_usize;
+    let mut failed_chromosomes = 0_usize;
+
+    for chrom_index in 0..index.chrom_names.len() {
+        ensure_not_cancelled(should_cancel)?;
+        let bin_start = *index.chrom_offsets.get(chrom_index).ok_or_else(|| {
+            CStudioError::InvalidContactMapQuery(format!(
+                ".cool indexes/chrom_offset is missing chromosome {chrom_index}",
+            ))
+        })?;
+        let bin_end = *index.chrom_offsets.get(chrom_index + 1).ok_or_else(|| {
+            CStudioError::InvalidContactMapQuery(format!(
+                ".cool indexes/chrom_offset is missing chromosome end {}",
+                chrom_index + 1,
+            ))
+        })?;
+        if bin_start >= bin_end {
+            continue;
+        }
+
+        let matrix = read_chromosome_cis_normalization_matrix(
+            reader,
+            index,
+            bin_start,
+            bin_end,
             normalization,
             should_cancel,
-        )? {
-            values
-        } else {
-            let matrix = read_normalization_matrix(file, index, should_cancel)?;
-            compute_normalization_weights(&matrix, normalization, should_cancel)?
-        };
-        ensure_not_cancelled(should_cancel)?;
-        if values.len() != index.bin_starts.len() {
-            return Err(CStudioError::InvalidContactMapQuery(format!(
-                ".cool {} normalization has {} weights for {} bins",
-                normalization.as_str(),
-                values.len(),
-                index.bin_starts.len(),
-            )));
+        )?;
+        match compute_normalization_weights(&matrix, normalization, should_cancel) {
+            Ok(weights) => {
+                if weights.len() != bin_end - bin_start {
+                    return Err(CStudioError::InvalidContactMapQuery(format!(
+                        ".cool {} normalization returned {} weights for chromosome {} with {} bins",
+                        normalization.as_str(),
+                        weights.len(),
+                        index.chrom_names[chrom_index],
+                        bin_end - bin_start,
+                    )));
+                }
+                combined[bin_start..bin_end].copy_from_slice(&weights);
+                completed_chromosomes += 1;
+            }
+            Err(CStudioError::RequestCancelled) => return Err(CStudioError::RequestCancelled),
+            Err(error) => {
+                // Juicebox treats a failed chromosome normalization as an
+                // unavailable vector for that chromosome. Keep its bins NaN so
+                // one sparse source cannot suppress valid vectors elsewhere.
+                failed_chromosomes += 1;
+                if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
+                    eprintln!(
+                        "CSTUDIO_PERF event=runtime_normalization_chromosome status=failed normalization={} chromosome={} bins={} error={}",
+                        normalization.as_str(),
+                        index.chrom_names[chrom_index],
+                        bin_end - bin_start,
+                        error,
+                    );
+                }
+            }
         }
-        Ok(values)
-    })
-    .map(Some)
+    }
+
+    if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
+        eprintln!(
+            "CSTUDIO_PERF event=runtime_normalization status=complete normalization={} chromosomes={} failed_chromosomes={} bins={}",
+            normalization.as_str(),
+            completed_chromosomes,
+            failed_chromosomes,
+            combined.len(),
+        );
+    }
+    Ok(combined)
+}
+
+fn read_chromosome_cis_normalization_matrix(
+    reader: &CoolReader,
+    index: &CoolIndex,
+    bin_start: usize,
+    bin_end: usize,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<SparseContactMatrix> {
+    let bin_count = bin_end.checked_sub(bin_start).ok_or_else(|| {
+        CStudioError::InvalidContactMapQuery(".cool chromosome bin range is reversed".to_string())
+    })?;
+    let pixel_start: usize = (*index.bin1_offsets.get(bin_start).ok_or_else(|| {
+        CStudioError::InvalidContactMapQuery(format!(
+            ".cool indexes/bin1_offset is missing bin {bin_start}",
+        ))
+    })?)
+    .try_into()
+    .map_err(|_| {
+        CStudioError::InvalidContactMapQuery(
+            ".cool chromosome pixel start exceeds this platform's index range".to_string(),
+        )
+    })?;
+    let pixel_end: usize = (*index.bin1_offsets.get(bin_end).ok_or_else(|| {
+        CStudioError::InvalidContactMapQuery(format!(
+            ".cool indexes/bin1_offset is missing bin {bin_end}",
+        ))
+    })?)
+    .try_into()
+    .map_err(|_| {
+        CStudioError::InvalidContactMapQuery(
+            ".cool chromosome pixel end exceeds this platform's index range".to_string(),
+        )
+    })?;
+
+    let pixel_count = pixel_end.saturating_sub(pixel_start);
+    let estimated_bytes =
+        estimated_runtime_normalization_peak_bytes(pixel_count, bin_count, normalization);
+    ensure_runtime_normalization_memory_budget(
+        estimated_bytes,
+        &format!("for one chromosome with {bin_count} bins and {pixel_count} pixels"),
+    )?;
+
+    let mut local_bin1 = Vec::new();
+    let mut local_bin2 = Vec::new();
+    let mut counts = Vec::new();
+    for chunk_start in (pixel_start..pixel_end).step_by(MAX_COOL_PIXEL_READ_CHUNK) {
+        ensure_not_cancelled(should_cancel)?;
+        let chunk_end = chunk_start
+            .saturating_add(MAX_COOL_PIXEL_READ_CHUNK)
+            .min(pixel_end);
+        let pixel_bin2 = reader.pixel_bin2.read_slice(chunk_start, chunk_end)?;
+        let pixel_counts = reader.pixel_counts.read_slice(chunk_start, chunk_end)?;
+        if pixel_bin2.len() != pixel_counts.len() {
+            return Err(CStudioError::InvalidContactMapQuery(
+                ".cool pixels/bin2_id and count have different lengths".to_string(),
+            ));
+        }
+        let mut bin1_index = bin1_for_pixel_offset(&index.bin1_offsets, chunk_start)?;
+        for (pixel_index, (bin2, count)) in pixel_bin2.into_iter().zip(pixel_counts).enumerate() {
+            if pixel_index % 16_384 == 0 {
+                ensure_not_cancelled(should_cancel)?;
+            }
+            let pixel_offset =
+                u64::try_from(chunk_start.saturating_add(pixel_index)).map_err(|_| {
+                    CStudioError::InvalidContactMapQuery(
+                        ".cool pixel offset exceeds u64".to_string(),
+                    )
+                })?;
+            while index
+                .bin1_offsets
+                .get(bin1_index + 1)
+                .is_some_and(|next_offset| *next_offset <= pixel_offset)
+            {
+                bin1_index += 1;
+            }
+            let bin2: usize = bin2.try_into().map_err(|_| {
+                CStudioError::InvalidContactMapQuery(
+                    ".cool bin2 index exceeds this platform's index range".to_string(),
+                )
+            })?;
+            if bin1_index < bin_start
+                || bin1_index >= bin_end
+                || bin2 < bin_start
+                || bin2 >= bin_end
+            {
+                continue;
+            }
+            local_bin1.push((bin1_index - bin_start) as u64);
+            local_bin2.push((bin2 - bin_start) as u64);
+            counts.push(count);
+        }
+    }
+
+    SparseContactMatrix::new(bin_count, local_bin1, local_bin2, counts)
 }
 
 fn cached_normalization_vector<F>(
@@ -2071,6 +2739,7 @@ fn stored_normalization_column(
 fn read_normalization_matrix(
     file: &File,
     index: &CoolIndex,
+    normalization: ContactNormalization,
     should_cancel: &dyn Fn() -> bool,
 ) -> CStudioResult<SparseContactMatrix> {
     let pixel_count: usize = index
@@ -2084,17 +2753,18 @@ fn read_normalization_matrix(
                 ".cool normalization pixel count exceeds this platform's index range".to_string(),
             )
         })?;
-    let estimated_bytes = pixel_count.saturating_mul(
-        2 * std::mem::size_of::<u64>()
-            + std::mem::size_of::<f64>()
-            + 2 * std::mem::size_of::<u32>(),
+    let estimated_bytes = estimated_runtime_normalization_peak_bytes(
+        pixel_count,
+        index.bin_starts.len(),
+        normalization,
     );
-    if estimated_bytes > MAX_RUNTIME_NORMALIZATION_MATRIX_BYTES {
-        return Err(CStudioError::InvalidContactMapQuery(format!(
-            ".cool runtime normalization needs about {} MiB for {pixel_count} pixels; add a precomputed bins normalization vector",
-            estimated_bytes / (1024 * 1024),
-        )));
-    }
+    ensure_runtime_normalization_memory_budget(
+        estimated_bytes,
+        &format!(
+            "for {} bins and {pixel_count} pixels",
+            index.bin_starts.len()
+        ),
+    )?;
     let mut bin1 = Vec::with_capacity(pixel_count);
     let mut bin2 = Vec::with_capacity(pixel_count);
     let mut counts = Vec::with_capacity(pixel_count);
@@ -2397,6 +3067,7 @@ fn cool_error(error: hdf5::Error) -> CStudioError {
 mod tests {
     use std::{
         collections::HashMap,
+        fs,
         path::PathBuf,
         sync::{
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -2410,15 +3081,19 @@ mod tests {
 
     use super::{
         batch_nearby_pixel_ranges, bin1_for_pixel_offset, cached_cool_reader,
-        cached_normalization_vector, list_contact_resolutions, normalized_contact_count,
-        pixel_ranges_for_selected_bin_ranges, read_cool_contacts_for_source_ranges_at_resolution,
+        cached_normalization_vector, cool_index_cache_key, list_contact_resolutions,
+        normalized_contact_count, pixel_ranges_for_selected_bin_ranges,
+        read_cool_contacts_for_source_ranges_at_resolution,
         read_cool_contacts_for_source_ranges_at_resolution_cancellable,
         read_cool_contacts_for_sources,
         read_cool_contacts_for_sources_at_resolution_with_normalization, resolve_chrom_offsets,
-        validate_bin1_offsets,
+        runtime_normalization_memory_budget_bytes, validate_bin1_offsets,
         visit_cool_contact_chunks_for_source_ranges_at_resolution_with_normalization_cancellable,
-        CoolIndex, CoolIndexCacheKey, CoolNormalizationCacheKey, SelectedBinIndex,
-        SourceRangeIndex,
+        visit_cool_contact_chunks_indexed_for_source_ranges_at_resolution_with_normalization_cancellable,
+        visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
+        visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
+        CoolContactVisitTimings, CoolIndex, CoolIndexCacheKey, CoolNormalizationCacheKey,
+        SelectedBinIndex, SourceRangeIndex,
     };
     use crate::{
         agp::Orientation,
@@ -2429,6 +3104,34 @@ mod tests {
     use crate::{contact_normalization::ContactNormalization, CStudioError, CStudioResult};
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn runtime_normalization_budget_is_eighty_percent_of_available_memory() {
+        assert_eq!(runtime_normalization_memory_budget_bytes(1_000), 800);
+        assert_eq!(runtime_normalization_memory_budget_bytes(9), 7);
+
+        super::ensure_runtime_normalization_memory_budget_with_available(
+            800,
+            "for a test matrix",
+            Some(1_000),
+        )
+        .expect("an estimate at the 80% boundary is allowed");
+        let error = super::ensure_runtime_normalization_memory_budget_with_available(
+            801,
+            "for a test matrix",
+            Some(1_000),
+        )
+        .expect_err("an estimate above the 80% boundary is rejected");
+        assert!(error.to_string().contains("80% budget"));
+    }
+
+    #[test]
+    fn runtime_normalization_can_observe_current_available_memory() {
+        let available = super::available_system_memory_bytes()
+            .expect("this supported desktop should report available memory");
+        assert!(available > 0);
+        assert!(runtime_normalization_memory_budget_bytes(available) <= available);
+    }
 
     fn test_normalization_cache_key() -> CoolNormalizationCacheKey {
         let id = NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
@@ -2458,6 +3161,21 @@ mod tests {
 
         fn with_chrom_offsets(chrom_offsets: &[u64]) -> Self {
             Self::create_with_chrom_offsets(None, None, Some(chrom_offsets))
+        }
+
+        fn with_two_chromosomes_and_strong_inter_contacts() -> Self {
+            Self::create_custom(
+                &["chr1", "chr2"],
+                &[2_000, 2_000],
+                &[0, 0, 1, 1],
+                &[0, 1_000, 0, 1_000],
+                &[1_000, 2_000, 1_000, 2_000],
+                &[0, 3, 5, 7, 8],
+                &[0, 0, 0, 1, 1, 2, 2, 3],
+                &[0, 1, 2, 1, 3, 2, 3, 3],
+                &[12.0, 6.0, 1_000.0, 3.0, 1_000.0, 4.0, 2.0, 1.0],
+                &[0, 2, 4],
+            )
         }
 
         fn create(weight: Option<&[f64]>, divisive: Option<&[f64]>) -> Self {
@@ -2536,6 +3254,65 @@ mod tests {
                         .expect("write divisive weights");
                 }
             }
+            drop(file);
+            Self { path }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn create_custom(
+            chrom_names: &[&str],
+            chrom_lengths: &[u64],
+            bin_chrom: &[i32],
+            bin_starts: &[u64],
+            bin_ends: &[u64],
+            bin1_offsets: &[u64],
+            pixel_bin1: &[u64],
+            pixel_bin2: &[u64],
+            pixel_counts: &[f64],
+            chrom_offsets: &[u64],
+        ) -> Self {
+            let id = NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cstudio-normalization-custom-{}-{id}.cool",
+                std::process::id(),
+            ));
+            let file = File::create(&path).expect("create custom test .cool file");
+            for group in ["chroms", "bins", "indexes", "pixels"] {
+                file.create_group(group).expect("create Cooler group");
+            }
+            let names = chrom_names
+                .iter()
+                .map(|name| FixedAscii::<11>::from_ascii(name).expect("ASCII chromosome"))
+                .collect::<Vec<_>>();
+            file.new_dataset_builder()
+                .with_data(&names)
+                .create("chroms/name")
+                .expect("write chromosome names");
+            file.new_dataset_builder()
+                .with_data(chrom_lengths)
+                .create("chroms/length")
+                .expect("write chromosome lengths");
+            for (path, values) in [
+                ("bins/start", bin_starts),
+                ("bins/end", bin_ends),
+                ("indexes/bin1_offset", bin1_offsets),
+                ("indexes/chrom_offset", chrom_offsets),
+                ("pixels/bin1_id", pixel_bin1),
+                ("pixels/bin2_id", pixel_bin2),
+            ] {
+                file.new_dataset_builder()
+                    .with_data(values)
+                    .create(path)
+                    .expect("write unsigned Cooler dataset");
+            }
+            file.new_dataset_builder()
+                .with_data(bin_chrom)
+                .create("bins/chrom")
+                .expect("write bin chromosomes");
+            file.new_dataset_builder()
+                .with_data(pixel_counts)
+                .create("pixels/count")
+                .expect("write pixel counts");
             drop(file);
             Self { path }
         }
@@ -2735,6 +3512,109 @@ mod tests {
         assert_eq!(observed, expected_tuples);
         assert_eq!(visited, expected.len());
         assert_eq!(finished_chunks, 1);
+
+        let mut indexed = Vec::new();
+        let indexed_visited = visit_cool_contact_chunks_indexed_for_source_ranges_at_resolution_with_normalization_cancellable(
+            file.path(),
+            &ranges,
+            None,
+            ContactNormalization::Raw,
+            &|| false,
+            |source1_index, source1, start1, source2_index, source2, start2, count| {
+                indexed.push((
+                    source1_index,
+                    source1.to_string(),
+                    start1,
+                    source2_index,
+                    source2.to_string(),
+                    start2,
+                    count,
+                ));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .expect("indexed chunk visitor should work");
+        assert_eq!(indexed_visited, expected.len());
+        assert!(indexed
+            .iter()
+            .all(|contact| contact.0 == 0 && contact.3 == 0));
+        assert_eq!(
+            indexed
+                .into_iter()
+                .map(|(_, source1, start1, _, source2, start2, count)| {
+                    (source1, start1, source2, start2, count)
+                })
+                .collect::<Vec<_>>(),
+            expected_tuples,
+        );
+
+        let mut profiled_control = Vec::new();
+        let mut control_timings = CoolContactVisitTimings::default();
+        let profiled_control_visited = visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
+            file.path(),
+            &ranges,
+            None,
+            ContactNormalization::Raw,
+            &|| false,
+            &mut control_timings,
+            |source1, start1, source2, start2, count| {
+                profiled_control.push((
+                    source1.to_string(),
+                    start1,
+                    source2.to_string(),
+                    start2,
+                    count,
+                ));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .expect("profiled string visitor should work");
+        assert_eq!(profiled_control_visited, expected.len());
+        assert_eq!(profiled_control, expected_tuples);
+        assert_eq!(control_timings.hdf5_chunks, 1);
+        assert!(control_timings.scanned_pixels >= expected.len());
+
+        let mut profiled_indexed = Vec::new();
+        let mut indexed_timings = CoolContactVisitTimings::default();
+        let profiled_indexed_visited = visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
+            file.path(),
+            &ranges,
+            None,
+            ContactNormalization::Raw,
+            &|| false,
+            &mut indexed_timings,
+            |source1_index, source1, start1, source2_index, source2, start2, count| {
+                profiled_indexed.push((
+                    source1_index,
+                    source1.to_string(),
+                    start1,
+                    source2_index,
+                    source2.to_string(),
+                    start2,
+                    count,
+                ));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .expect("profiled indexed visitor should work");
+        assert_eq!(profiled_indexed_visited, expected.len());
+        assert_eq!(indexed_timings.hdf5_chunks, 1);
+        assert_eq!(
+            indexed_timings.scanned_pixels,
+            control_timings.scanned_pixels
+        );
+        assert_eq!(
+            profiled_indexed
+                .into_iter()
+                .map(|(_, source1, start1, _, source2, start2, count)| {
+                    (source1, start1, source2, start2, count)
+                })
+                .collect::<Vec<_>>(),
+            expected_tuples,
+        );
     }
 
     #[test]
@@ -3046,7 +3926,7 @@ mod tests {
     }
 
     #[test]
-    fn computes_a_global_vector_when_the_requested_column_is_missing() {
+    fn computes_a_runtime_vector_when_the_requested_column_is_missing() {
         let file = TestCoolFile::without_weights();
         let contacts = read_cool_contacts_for_sources_at_resolution_with_normalization(
             file.path(),
@@ -3061,6 +3941,63 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(counts, vec![6.75, 6.75, 6.75]);
+    }
+
+    #[test]
+    fn runtime_coverage_normalizations_use_each_chromosome_cis_matrix() {
+        let reference = TestCoolFile::without_weights();
+        let multi = TestCoolFile::with_two_chromosomes_and_strong_inter_contacts();
+
+        for normalization in [ContactNormalization::Vc, ContactNormalization::VcSqrt] {
+            let counts_for = |file: &TestCoolFile| {
+                read_cool_contacts_for_sources_at_resolution_with_normalization(
+                    file.path(),
+                    &["chr1".to_string()],
+                    None,
+                    normalization,
+                )
+                .expect("runtime chromosome normalization")
+                .into_iter()
+                .map(|contact| contact.count)
+                .collect::<Vec<_>>()
+            };
+            let expected = counts_for(&reference);
+            let observed = counts_for(&multi);
+            assert_eq!(observed.len(), expected.len());
+            for (observed, expected) in observed.into_iter().zip(expected) {
+                let tolerance = 1e-10 * expected.abs().max(1.0);
+                assert!(
+                    (observed - expected).abs() <= tolerance,
+                    "{normalization:?}: observed {observed}, expected {expected}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_kr_uses_the_whole_assembly_matrix() {
+        let reference = TestCoolFile::without_weights();
+        let multi = TestCoolFile::with_two_chromosomes_and_strong_inter_contacts();
+        let counts_for = |file: &TestCoolFile| {
+            read_cool_contacts_for_sources_at_resolution_with_normalization(
+                file.path(),
+                &["chr1".to_string()],
+                None,
+                ContactNormalization::Kr,
+            )
+            .expect("whole-assembly KR normalization")
+            .into_iter()
+            .map(|contact| contact.count)
+            .collect::<Vec<_>>()
+        };
+
+        let cis_only = counts_for(&reference);
+        let with_inter_contacts = counts_for(&multi);
+        assert_eq!(with_inter_contacts.len(), cis_only.len());
+        assert!(with_inter_contacts
+            .iter()
+            .zip(cis_only)
+            .any(|(whole_assembly, cis)| (whole_assembly - cis).abs() > 1e-6));
     }
 
     #[test]
@@ -3120,6 +4057,51 @@ mod tests {
 
         assert_eq!(second.as_slice(), &[3.0, 4.0]);
         assert!(Arc::ptr_eq(&second, &cached));
+    }
+
+    #[test]
+    fn persistent_kr_vector_round_trips_and_rejects_corruption() {
+        let file = TestCoolFile::without_weights();
+        let cache_root = std::env::temp_dir().join(format!(
+            "cstudio-normalization-cache-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        let cache_path =
+            super::persistent_normalization_cache_path(file.path(), None, ContactNormalization::Kr);
+        if cache_path.is_none() {
+            super::configure_persistent_normalization_cache(cache_root.clone());
+        }
+        let cache_path =
+            super::persistent_normalization_cache_path(file.path(), None, ContactNormalization::Kr)
+                .expect("persistent normalization path");
+        let weights = vec![1.0, f64::NAN];
+        super::store_persistent_normalization_vector(
+            file.path(),
+            None,
+            ContactNormalization::Kr,
+            &weights,
+        );
+        let loaded = super::load_persistent_normalization_vector(
+            file.path(),
+            None,
+            ContactNormalization::Kr,
+            weights.len(),
+        )
+        .expect("persisted KR vector");
+        assert_eq!(loaded[0].to_bits(), weights[0].to_bits());
+        assert_eq!(loaded[1].to_bits(), weights[1].to_bits());
+
+        fs::write(&cache_path, b"broken").expect("corrupt persistent vector");
+        assert!(super::load_persistent_normalization_vector(
+            file.path(),
+            None,
+            ContactNormalization::Kr,
+            weights.len(),
+        )
+        .is_none());
+        assert!(!cache_path.exists());
+        let _ = fs::remove_dir_all(cache_root);
     }
 
     #[test]
@@ -3184,6 +4166,62 @@ mod tests {
             leader_result.expect("leader result").as_slice(),
             &[5.0, 6.0]
         );
+    }
+
+    #[test]
+    fn foreground_normalization_retries_after_idle_leader_yields() {
+        let file = TestCoolFile::with_weights(&[2.0, 4.0], &[2.0, 4.0]);
+        let key = CoolNormalizationCacheKey {
+            file: cool_index_cache_key(file.path(), None),
+            normalization: ContactNormalization::Kr,
+        };
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let leader_gate = Arc::clone(&gate);
+        let (leader_started_tx, leader_started_rx) = mpsc::channel();
+        let leader = thread::spawn(move || {
+            cached_normalization_vector(key, &|| false, || -> CStudioResult<Vec<f64>> {
+                leader_started_tx.send(()).expect("signal idle leader");
+                let (released, ready) = &*leader_gate;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*released {
+                    released = ready
+                        .wait(released)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                Err(CStudioError::RequestCancelled)
+            })
+        });
+        leader_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("idle leader should own the flight");
+
+        let path = file.path().to_string();
+        let foreground = thread::spawn(move || {
+            read_cool_contacts_for_sources_at_resolution_with_normalization(
+                &path,
+                &["chr1".to_string()],
+                None,
+                ContactNormalization::Kr,
+            )
+        });
+        thread::sleep(Duration::from_millis(50));
+        let (released, ready) = &*gate;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        ready.notify_all();
+
+        assert_eq!(
+            leader.join().expect("idle leader thread"),
+            Err(CStudioError::RequestCancelled),
+        );
+        let contacts = foreground
+            .join()
+            .expect("foreground thread")
+            .expect("foreground should replace the cancelled idle flight");
+        assert!(!contacts.is_empty());
     }
 
     #[test]

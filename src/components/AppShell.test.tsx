@@ -52,6 +52,7 @@ function renderShell(
       isAgpDirty={project.isAgpDirty ?? false}
       onAutoSaveEnabledChange={() => undefined}
       onLoadExample={() => undefined}
+      onReloadAssembly={() => undefined}
       onClearAllData={() => undefined}
       status={{
         engine: "c-studio-core",
@@ -83,6 +84,8 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain("Synteny alignments (.paf)");
     expect(markup).toContain("Coverage track");
     expect(markup).toContain("Load example project");
+    expect(markup).toContain("Reload assembly…");
+    expect(markup).toContain('title="No source AGP loaded"');
     expect(markup).toContain("Clear all loaded data…");
     expect(markup).toContain('title="No loaded data"');
     expect(markup).toContain('aria-keyshortcuts="F10"');
@@ -101,6 +104,7 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).not.toContain(`<dt>Rename</dt><dd>${otherRenameLabel}</dd>`);
     expect(markup).toContain("Delete gap / join");
     expect(markup).toContain(`<dt>Delete contig</dt><dd>${shortcuts.deleteContig}</dd>`);
+    expect(markup).toContain(`<dt>Pan diagonally</dt><dd>${shortcuts.diagonalWheel}</dd>`);
   });
 
   it("marks an invalid global homolog regex in the top toolbar", () => {
@@ -151,7 +155,19 @@ describe("AppShell confirmed workspace", () => {
       agp_gaps: 0,
       max_object_span: 100,
       mcool_size_bytes: 0,
-      agp_layout: { blocks: [], totalSpan: 0 },
+      agp_layout: {
+        blocks: [{
+          id: "Chr01:1:ctg1",
+          objectId: "Chr01",
+          sourceId: "ctg1",
+          sourceStart: 0,
+          sourceEnd: 100,
+          visualStart: 0,
+          visualEnd: 100,
+          orientation: "+",
+        }],
+        totalSpan: 100,
+      },
     };
     const markup = renderShell(false, null, "None (Raw)", {
       dataset,
@@ -166,6 +182,8 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).not.toContain("Save As once to enable auto-save");
     expect(markup).toContain('title="Remove every loaded data source"');
     expect(markup).not.toContain('title="No loaded data"');
+    expect(markup).toContain('title="Discard all assembly edits and reload the source AGP"');
+    expect(markup).not.toContain('title="No source AGP loaded"');
   });
 
   it("allows the inspector to collapse without changing the heatmap workspace", () => {

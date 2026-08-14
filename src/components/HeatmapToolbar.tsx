@@ -9,21 +9,24 @@ import {
   Unlock,
 } from "lucide-react";
 import type { UiAction, UiState } from "../state/uiState";
-import { availableContactResolutions, normalizations } from "../state/uiState";
-import { contactResolutionToBasePairs } from "../state/contactResolution";
+import {
+  availableContactResolutions,
+  normalizations,
+  storedContactResolutionsForDataset,
+} from "../state/uiState";
 import { resolveContactJumpInputs } from "../state/contactJump";
 
 export interface HeatmapToolbarProps {
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   totalSpanMb: number;
-  preserveResolutionViewport?: boolean;
+  useStoredResolutionOptions?: boolean;
   availableResolutionBasePairs?: number[];
 }
 
 export function HeatmapToolbar({
   onUiAction,
-  preserveResolutionViewport = false,
+  useStoredResolutionOptions = false,
   availableResolutionBasePairs = [],
   totalSpanMb,
   uiState,
@@ -34,15 +37,14 @@ export function HeatmapToolbar({
   const viewportResolutionOptions = availableContactResolutions(
     uiState.contact,
     safeTotalSpanMb,
-    preserveResolutionViewport,
+    false,
   );
-  const resolutionOptions = preserveResolutionViewport && availableResolutionBasePairs.length > 0
-    ? viewportResolutionOptions.filter((resolution) => (
-        availableResolutionBasePairs.includes(contactResolutionToBasePairs(resolution))
-      ))
+  const resolutionOptions = useStoredResolutionOptions && availableResolutionBasePairs.length > 0
+    ? storedContactResolutionsForDataset(availableResolutionBasePairs)
     : viewportResolutionOptions;
   const resolutionIndex = resolutionOptions.indexOf(uiState.contact.resolution);
   const safeResolutionIndex = Math.max(0, resolutionIndex);
+  const resolutionSignature = resolutionOptions.join("|");
   const colorScaleMin = uiState.contact.colorScale.min;
   const colorScaleMax = uiState.contact.colorScale.max;
   const [draftResolutionIndex, setDraftResolutionIndex] = useState(safeResolutionIndex);
@@ -58,7 +60,7 @@ export function HeatmapToolbar({
 
   useEffect(() => {
     setDraftResolutionIndex(safeResolutionIndex);
-  }, [resolutionOptions.length, safeResolutionIndex]);
+  }, [resolutionSignature, safeResolutionIndex]);
 
   useEffect(() => {
     setDraftMin(String(colorScaleMin));
@@ -75,7 +77,6 @@ export function HeatmapToolbar({
       onUiAction({
         type: "setContactResolution",
         resolution,
-        preserveViewport: preserveResolutionViewport,
       });
     }
   }

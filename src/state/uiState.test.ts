@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   availableContactResolutions,
+  availableContactResolutionsForDataset,
   contactNormalizationForBackend,
   contactNormalizationLabel,
   contactResolutions,
@@ -8,6 +9,7 @@ import {
   normalizations,
   overviewRatioToViewportCenterMb,
   reduceUiState,
+  storedContactResolutionsForDataset,
 } from "./uiState";
 import type { ContactMapLayoutBlock } from "./importers";
 import { selectedBlockIds } from "./assemblyEditing";
@@ -286,6 +288,8 @@ describe("reduceUiState", () => {
       "25 kb",
       "10 kb",
       "5 kb",
+      "2 kb",
+      "1 kb",
     ]);
 
     state = reduceUiState(state, { type: "adjustContactResolution", direction: "increase" });
@@ -366,7 +370,7 @@ describe("reduceUiState", () => {
     expect(state.contact.viewportCenterYMb).toBe(0.000175);
     expect(state.contact.viewportCenterMb).toBe(0.000175);
     expect(state.contact.viewportSpanMb).toBeLessThan(200);
-    expect(state.contact.resolution).toBe("5 kb");
+    expect(state.contact.resolution).toBe("1 kb");
     expect(state.contact.colorScale.auto).toBe(true);
     expect(state.logEntries[state.logEntries.length - 1]?.message).toBe(
       "Focused contig ctg2 at Chr01",
@@ -470,7 +474,26 @@ describe("reduceUiState", () => {
     expect(state.contact.viewportCenterYMb).toBe(98.42);
   });
 
-  it("limits mcool manual levels that would exceed the visible tile budget", () => {
+  it("makes a manual stored-resolution change follow the target level geometry", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 536,
+      totalSpanMb: 200,
+    });
+
+    state = reduceUiState(state, {
+      type: "setContactResolution",
+      resolution: "250 kb",
+    });
+
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSpanMb).toBe(134);
+    expect(state.contact.viewportCenterXMb).toBe(98.42);
+    expect(state.contact.viewportCenterYMb).toBe(98.42);
+  });
+
+  it("separates stored mcool levels from levels safe for the current viewport", () => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, {
       type: "setContactViewportMetrics",
@@ -482,6 +505,49 @@ describe("reduceUiState", () => {
       "2.5 Mb",
       "2 Mb",
     ]);
+    expect(availableContactResolutionsForDataset(
+      state.contact,
+      [
+        1_000,
+        2_000,
+        5_000,
+        10_000,
+        25_000,
+        50_000,
+        100_000,
+        250_000,
+        500_000,
+        1_000_000,
+        2_500_000,
+      ],
+      10_327,
+      true,
+    )).toEqual(["2.5 Mb"]);
+    expect(storedContactResolutionsForDataset([
+      1_000,
+      2_000,
+      5_000,
+      10_000,
+      25_000,
+      50_000,
+      100_000,
+      250_000,
+      500_000,
+      1_000_000,
+      2_500_000,
+    ])).toEqual([
+      "2.5 Mb",
+      "1 Mb",
+      "500 kb",
+      "250 kb",
+      "100 kb",
+      "50 kb",
+      "25 kb",
+      "10 kb",
+      "5 kb",
+      "2 kb",
+      "1 kb",
+    ]);
 
     state = reduceUiState(state, {
       type: "setContactResolution",
@@ -489,8 +555,35 @@ describe("reduceUiState", () => {
       preserveViewport: true,
     });
 
-    expect(state.contact.resolution).toBe("2 Mb");
-    expect(state.contact.viewportSpanMb).toBe(10_327);
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSpanMb).toBe(1_536);
+    expect(state.contact.viewportCenterXMb).toBe(5_163.5);
+    expect(state.contact.viewportCenterYMb).toBe(5_163.5);
+    expect(state.logEntries[state.logEntries.length - 1]?.message).toBe(
+      "Contact resolution set to 250 kb; viewport narrowed to 1536 Mb",
+    );
+  });
+
+  it("bounds the longer contact-map axis after selecting a stored fine level", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setContactViewportMetrics",
+      viewportSizePx: 600,
+      viewportWidthPx: 1_200,
+      viewportHeightPx: 600,
+      totalSpanMb: 10_327,
+    });
+
+    state = reduceUiState(state, {
+      type: "setContactResolution",
+      resolution: "1 kb",
+      preserveViewport: true,
+    });
+
+    expect(state.contact.resolution).toBe("1 kb");
+    expect(state.contact.viewportSpanMb).toBe(3.072);
+    expect(state.contact.viewportCenterXMb).toBe(5_163.5);
+    expect(state.contact.viewportCenterYMb).toBe(5_163.5);
   });
 
   it("clamps resolutions coarser than the fitted whole-map level", () => {
@@ -748,6 +841,8 @@ describe("reduceUiState", () => {
       "25 kb",
       "10 kb",
       "5 kb",
+      "2 kb",
+      "1 kb",
     ]);
 
     state = reduceUiState(state, { type: "setContactResolution", resolution: "2 Mb" });
@@ -1449,6 +1544,45 @@ describe("reduceUiState", () => {
     ]);
     expect(state.assembly.selection).toBeNull();
     expect(state.logEntries[state.logEntries.length - 1]?.message).toBe("Selection reversed");
+  });
+
+  it("creates and dissolves a GFA-overlap-aware block through reversible history", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContigs",
+      ids: ["Chr01:1:ctg1", "Chr01:2:ctg2"],
+    });
+    state = reduceUiState(state, {
+      type: "createAssemblyBlockFromGfa",
+      links: [{
+        id: "link-ctg1-ctg2",
+        from: { segmentName: "ctg1", orientation: "+", side: "end" },
+        to: { segmentName: "ctg2", orientation: "-", side: "end" },
+        overlap: "12M",
+      }],
+    });
+
+    expect(state.assembly.blocks.slice(0, 2).map((block) => block.assemblyBlockId)).toEqual([
+      "Chr01_block_1",
+      "Chr01_block_1",
+    ]);
+    expect(state.assembly.blocks[1]).toMatchObject({ sourceStart: 0, sourceEnd: 138 });
+    expect(state.operationHistory[state.operationHistory.length - 1]?.type).toBe("create_block");
+
+    state = reduceUiState(state, {
+      type: "selectAssemblyContigs",
+      ids: ["Chr01_block_1"],
+    });
+    state = reduceUiState(state, { type: "dissolveAssemblyBlockSelection" });
+
+    expect(state.assembly.blocks.slice(0, 2).map((block) => block.assemblyBlockId)).toEqual([null, null]);
+    expect(state.assembly.blocks[1]).toMatchObject({ sourceStart: 0, sourceEnd: 150 });
+    expect(state.assembly.blocks[1]?.gapBefore?.length).toBe(100);
+    expect(state.operationHistory[state.operationHistory.length - 1]?.type).toBe("dissolve_block");
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks[1]).toMatchObject({ sourceStart: 0, sourceEnd: 138 });
   });
 
   it("moves selected contigs before a target block from the reducer", () => {

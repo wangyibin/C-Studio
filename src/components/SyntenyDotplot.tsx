@@ -5,6 +5,7 @@ import {
   useState,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
 import {
   assemblyContigDisplayName,
@@ -19,8 +20,13 @@ import {
   horizontalViewportDragDeltaMb,
   horizontalViewportFocusRatio,
 } from "../state/contactViewport";
+import { contactWheelPanIntent } from "../state/contactWheel";
 import type { ContactMapLayoutBlock } from "../state/importers";
-import type { SyntenyBlockView, SyntenyView } from "../state/syntenyView";
+import {
+  buildSyntenyViewport,
+  type SyntenyBlockView,
+  type SyntenyView,
+} from "../state/syntenyView";
 import type { UiAction, UiState } from "../state/uiState";
 import {
   AssemblyContextMenu,
@@ -98,7 +104,15 @@ export interface SyntenySelectionCandidate {
   bottom: number;
 }
 
+/** Dotplot has one continuous assembly axis; map either wheel axis onto X. */
+export function syntenyHorizontalWheelDelta(deltaX: number, deltaY: number): number {
+  const safeDeltaX = Number.isFinite(deltaX) ? deltaX : 0;
+  const safeDeltaY = Number.isFinite(deltaY) ? deltaY : 0;
+  return Math.abs(safeDeltaX) >= Math.abs(safeDeltaY) ? safeDeltaX : safeDeltaY;
+}
+
 const syntenyDragThresholdPx = 4;
+const syntenyWheelZoomCooldownMs = 140;
 const syntenyPlotLeftPercent = 9;
 const syntenyPlotRightPercent = 97;
 const syntenyPlotTopPercent = 7;
@@ -119,13 +133,38 @@ export function SyntenyDotplot({
 }: SyntenyDotplotProps) {
   const isInteractive = interactionMode === "interactive";
   const canvasRef = useRef<HTMLDivElement>(null);
+  const wheelZoomReadyAtRef = useRef(0);
   const [canvasAspectRatio, setCanvasAspectRatio] = useState(1);
   const [canvasWidthPx, setCanvasWidthPx] = useState(
     fallbackAssemblyBoundaryViewportWidthPx,
   );
+  const synchronizedSyntenyView = useMemo(() => {
+    if (!syntenyView || !uiState) {
+      return syntenyView;
+    }
+    const assemblyTotalSpanBp = assemblyBlocks.reduce(
+      (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
+      0,
+    );
+    const resolvedTotalSpanBp = Math.max(
+      1,
+      (totalSpanMb ?? uiState.contact.totalSpanMb) * 1_000_000,
+      assemblyTotalSpanBp,
+    );
+    return {
+      ...syntenyView,
+      viewport: buildSyntenyViewport({
+        centerXMb: uiState.contact.viewportCenterXMb,
+        totalSpanBp: resolvedTotalSpanBp,
+        windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
+        viewportWidthPx: uiState.contact.viewportWidthPx,
+        viewportHeightPx: uiState.contact.viewportHeightPx,
+      }),
+    };
+  }, [assemblyBlocks, syntenyView, totalSpanMb, uiState]);
   const displaySyntenyView = useMemo(
-    () => syntenyViewForAssemblyExtent(syntenyView, assemblyBlocks),
-    [assemblyBlocks, syntenyView],
+    () => syntenyViewForAssemblyExtent(synchronizedSyntenyView, assemblyBlocks),
+    [assemblyBlocks, synchronizedSyntenyView],
   );
   const layout = useMemo(
     () => buildDotplotLayout(displaySyntenyView, canvasAspectRatio),
@@ -446,6 +485,65 @@ export function SyntenyDotplot({
     });
   }
 
+  function handleSyntenyWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    if (!isInteractive || !onUiAction || !syntenyView) {
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const assemblyTotalSpanMb = assemblyBlocks.reduce(
+      (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
+      0,
+    ) / 1_000_000;
+    const resolvedTotalSpanMb = Math.max(
+      0.000001,
+      totalSpanMb ?? (assemblyTotalSpanMb || uiState?.contact.totalSpanMb || 0),
+    );
+
+    if (event.ctrlKey || event.metaKey) {
+      const wheelDelta = Math.abs(event.deltaY) >= Math.abs(event.deltaX)
+        ? event.deltaY
+        : event.deltaX;
+      if (!Number.isFinite(wheelDelta) || wheelDelta === 0) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const now = performance.now();
+      if (now < wheelZoomReadyAtRef.current) {
+        return;
+      }
+      wheelZoomReadyAtRef.current = now + syntenyWheelZoomCooldownMs;
+      onUiAction({
+        type: "zoomContactViewport",
+        direction: wheelDelta < 0 ? "in" : "out",
+        focusRatioX: horizontalViewportFocusRatio(event.clientX, bounds.left, bounds.width),
+        snapToResolution: true,
+        totalSpanMb: resolvedTotalSpanMb,
+      });
+      return;
+    }
+
+    const horizontalDelta = syntenyHorizontalWheelDelta(event.deltaX, event.deltaY);
+    const intent = contactWheelPanIntent({
+      deltaX: horizontalDelta,
+      deltaY: 0,
+      deltaMode: event.deltaMode,
+      shiftKey: false,
+      bounds,
+      viewport: syntenyView.viewport,
+    });
+    if (!intent) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    onUiAction({
+      type: "panContactViewport",
+      deltaXMb: intent.deltaXMb,
+      deltaYMb: 0,
+    });
+  }
+
   function startSyntenyPointer(event: ReactPointerEvent<HTMLDivElement>) {
     if (!isInteractive) {
       startPanDrag(event);
@@ -500,9 +598,10 @@ export function SyntenyDotplot({
           panDrag?.moved ? "synteny-panning" : ""
         }`}
         aria-label={isInteractive
-          ? "Interactive synteny dotplot; drag horizontally to pan the shared assembly X region, double-click zooms in at the pointer, click replaces selection, Shift-drag selects multiple contigs, and Command or Control-click toggles individual contigs"
+          ? "Interactive synteny dotplot; vertical or horizontal wheel movement pans the shared assembly X axis, Command or Control-wheel zooms at the pointer, drag horizontally pans, double-click zooms in, click replaces selection, Shift-drag selects multiple contigs, and Command or Control-click toggles individual contigs"
           : "Synteny preview; drag horizontally to pan the shared assembly X region and double-click to open the interactive synteny view"}
         onDoubleClick={zoomSyntenyAtPointer}
+        onWheel={handleSyntenyWheel}
         onClick={() => {
           if (!suppressClickRef.current) {
             setContextMenu(null);
@@ -715,12 +814,12 @@ export function buildDotplotLayout(
     1,
     targetOrder.reduce((total, id) => total + (targetLengths.get(id) ?? 1), 0),
   );
-  let laneBottom = plotBottom;
+  let laneTop = plotTop;
   const targetLanes = targetOrder.map((id) => {
     const targetLength = targetLengths.get(id) ?? 1;
     const height = (targetLength / totalTargetLength) * plotHeight;
-    const top = laneBottom - height;
-    laneBottom = top;
+    const top = laneTop;
+    laneTop += height;
     return { id, top, height, targetLength };
   });
   const lanesById = new Map(targetLanes.map((lane) => [lane.id, lane]));
@@ -753,9 +852,9 @@ export function buildDotplotLayout(
     const x2 = plotLeft
       + ((visibleEnd - syntenyView.viewport.xStart) / viewportWidth) * plotWidth;
     const y1 = lane.top
-      + (1 - clamp(targetAtVisibleStart, 0, lane.targetLength) / lane.targetLength) * lane.height;
+      + (clamp(targetAtVisibleStart, 0, lane.targetLength) / lane.targetLength) * lane.height;
     const y2 = lane.top
-      + (1 - clamp(targetAtVisibleEnd, 0, lane.targetLength) / lane.targetLength) * lane.height;
+      + (clamp(targetAtVisibleEnd, 0, lane.targetLength) / lane.targetLength) * lane.height;
     const deltaX = x2 - x1;
     const deltaY = y2 - y1;
     // CSS percentage widths resolve against the canvas width, while percentage
