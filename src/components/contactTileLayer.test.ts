@@ -527,6 +527,54 @@ describe("contactTileCanvasBox", () => {
     expect(source).toMatchObject({ key: "2:5:source", transpose: false });
   });
 
+  it.each([1_000, 5_000])(
+    "covers every visible 4 by 4 screen tile at %s bp without rectangular holes",
+    (resolution) => {
+      const tileSizeBins = 256;
+      const axisTiles = 4;
+      const tileSpan = resolution * tileSizeBins;
+      const canonicalTiles = [];
+      for (let tileY = 0; tileY < axisTiles; tileY += 1) {
+        for (let tileX = 0; tileX <= tileY; tileX += 1) {
+          canonicalTiles.push({
+            tileX,
+            tileY,
+            cells: [{
+              xBin: tileX * tileSizeBins,
+              yBin: tileY * tileSizeBins,
+              count: 1,
+            }],
+          });
+        }
+      }
+
+      const descriptors = contactTileCanvasDescriptorsForViewport(
+        canonicalTiles,
+        resolution,
+        tileSizeBins,
+        {
+          xStart: 0,
+          xEnd: axisTiles * tileSpan,
+          yStart: 0,
+          yEnd: axisTiles * tileSpan,
+        },
+        { x: 0, y: 0 },
+      );
+      const covered = new Set(descriptors.map(({ tile, transpose }) => (
+        transpose
+          ? `${tile.tileY}:${tile.tileX}`
+          : `${tile.tileX}:${tile.tileY}`
+      )));
+
+      expect(descriptors).toHaveLength(axisTiles * axisTiles);
+      expect(covered).toEqual(new Set(
+        Array.from({ length: axisTiles * axisTiles }, (_, index) => (
+          `${index % axisTiles}:${Math.floor(index / axisTiles)}`
+        )),
+      ));
+    },
+  );
+
   it("renders one cached source tile plus its symmetric mirror without rebuilding a global canvas", () => {
     const markup = renderToStaticMarkup(
       createElement(ContactTileLayer, {

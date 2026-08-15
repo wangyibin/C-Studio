@@ -327,25 +327,6 @@ export function AssemblyContextMenu({
       </button>
       <button
         type="button"
-        disabled={!hasSelection}
-        aria-keyshortcuts="Control+Shift+D Meta+Shift+D"
-        onClick={() => run({ type: "moveAssemblySelectionToDebris" })}
-      >
-        <span>Move to debris</span>
-        <kbd>{shortcuts.moveToDebris}</kbd>
-      </button>
-      <button
-        type="button"
-        className="context-menu-danger"
-        disabled={!canDeleteContigs}
-        aria-keyshortcuts="Shift+Delete Shift+Backspace"
-        onClick={() => setConfirmingDelete(true)}
-      >
-        <span>Delete contig…</span>
-        <kbd>{shortcuts.deleteContig}</kbd>
-      </button>
-      <button
-        type="button"
         disabled={!canDissolveBlock}
         title={canDissolveBlock
           ? "Split the selected composite block into singleton contigs"
@@ -377,6 +358,25 @@ export function AssemblyContextMenu({
       >
         <span>Delete gap / join blocks</span>
         <kbd>{shortcuts.deleteGap}</kbd>
+      </button>
+      <button
+        type="button"
+        disabled={!hasSelection}
+        aria-keyshortcuts="Control+Shift+D Meta+Shift+D"
+        onClick={() => run({ type: "moveAssemblySelectionToDebris" })}
+      >
+        <span>Move to debris</span>
+        <kbd>{shortcuts.moveToDebris}</kbd>
+      </button>
+      <button
+        type="button"
+        className="context-menu-danger"
+        disabled={!canDeleteContigs}
+        aria-keyshortcuts="Shift+Delete Shift+Backspace"
+        onClick={() => setConfirmingDelete(true)}
+      >
+        <span>Delete contig…</span>
+        <kbd>{shortcuts.deleteContig}</kbd>
       </button>
       <button
         type="button"

@@ -24,6 +24,7 @@ import {
   addChromosomeBoundariesToSelection,
   moveSelectionBefore,
   moveSelectionToDebris,
+  planUnplacedGfaPlacement,
   planGfaBlockCreation,
   pointSelectsWholeChromosome,
   reverseSelection,
@@ -242,6 +243,98 @@ const structuredBlocks: ContactMapLayoutBlock[] = [
     assemblyBlockId: null,
   },
 ];
+
+describe("unplaced GFA placement", () => {
+  it("inserts one absent GFA segment at an assembly-unit boundary with explicit gaps", () => {
+    const plan = planUnplacedGfaPlacement(structuredBlocks, {
+      segmentName: "utg-unplaced",
+      length: 120,
+      targetObjectId: "Chr01",
+      targetBlockId: "Chr01:4:ctgC",
+      orientation: "-",
+    });
+
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.blocks[plan.insertedIndex]).toMatchObject({
+      id: plan.insertedBlockId,
+      objectId: "Chr01",
+      sourceId: "utg-unplaced",
+      sourceStart: 0,
+      sourceEnd: 120,
+      orientation: "-",
+      componentType: "W",
+      assemblyBlockId: null,
+      gapBefore: DEFAULT_INSERTED_GAP,
+    });
+    expect(plan.gapBefore).toEqual(DEFAULT_INSERTED_GAP);
+    expect(plan.gapAfter).toEqual(structuredBlocks[2]?.gapBefore);
+    expect(exportAgpText(plan.blocks)).toContain(
+      "Chr01\t251\t370\t4\tW\tutg-unplaced\t1\t120\t-",
+    );
+  });
+
+  it("creates only a right gap at chromosome start and only a left gap at its end", () => {
+    const atStart = planUnplacedGfaPlacement(structuredBlocks, {
+      segmentName: "utg-start",
+      length: 50,
+      targetObjectId: "Chr01",
+      targetBlockId: "Chr01_block_1",
+      orientation: "+",
+    });
+    expect(atStart.ok).toBe(true);
+    if (!atStart.ok) return;
+    expect(atStart.gapBefore).toBeUndefined();
+    expect(atStart.gapAfter).toEqual(DEFAULT_INSERTED_GAP);
+    expect(atStart.blocks[atStart.insertedIndex]).toMatchObject({ visualStart: 0, visualEnd: 50 });
+
+    const atEnd = planUnplacedGfaPlacement(structuredBlocks, {
+      segmentName: "utg-end",
+      length: 75,
+      targetObjectId: "Chr01",
+      targetBlockId: null,
+      orientation: "+",
+    });
+    expect(atEnd.ok).toBe(true);
+    if (!atEnd.ok) return;
+    expect(atEnd.gapBefore).toEqual(DEFAULT_INSERTED_GAP);
+    expect(atEnd.gapAfter).toBeUndefined();
+    expect(atEnd.blocks[atEnd.insertedIndex + 1]?.objectId).toBe("Chr02");
+  });
+
+  it("rejects unknown lengths, repeated placements, and stale cross-chromosome targets", () => {
+    expect(planUnplacedGfaPlacement(structuredBlocks, {
+      segmentName: "utg-unknown",
+      length: 0,
+      targetObjectId: "Chr01",
+      targetBlockId: null,
+      orientation: "+",
+    })).toEqual({
+      ok: false,
+      reason: "The GFA segment needs a known positive integer length.",
+    });
+    expect(planUnplacedGfaPlacement(structuredBlocks, {
+      segmentName: "ctgA",
+      length: 100,
+      targetObjectId: "Chr01",
+      targetBlockId: null,
+      orientation: "+",
+    })).toEqual({
+      ok: false,
+      reason: "ctgA is already placed in the current AGP.",
+    });
+    expect(planUnplacedGfaPlacement(structuredBlocks, {
+      segmentName: "utg-stale",
+      length: 100,
+      targetObjectId: "Chr01",
+      targetBlockId: "Chr02:1:ctgF",
+      orientation: "+",
+    })).toEqual({
+      ok: false,
+      reason: "The insertion point is not on the selected chromosome.",
+    });
+  });
+});
 
 describe("assemblyEditing", () => {
   it("renames a chromosome without changing its contig data ids", () => {

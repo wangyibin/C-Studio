@@ -71,6 +71,7 @@ describe("HeatmapToolbar", () => {
 
   it("shows every pyramid level that actually exists in an mcool", () => {
     const uiState = createInitialUiState("ready");
+    uiState.contact.resolution = "2 Mb";
     const markup = renderToStaticMarkup(
       <HeatmapToolbar
         uiState={uiState}
@@ -79,6 +80,7 @@ describe("HeatmapToolbar", () => {
         useStoredResolutionOptions
         availableResolutionBasePairs={[
           2_500_000,
+          2_000_000,
           1_000_000,
           500_000,
           250_000,
@@ -87,20 +89,40 @@ describe("HeatmapToolbar", () => {
           25_000,
           10_000,
           5_000,
-          2_000,
           1_000,
         ]}
       />,
     );
 
-    expect(markup).toContain('aria-valuetext="500 kb"');
+    expect(markup).toContain('aria-valuetext="2 Mb"');
     expect(markup).toContain('type="range" min="0" max="10"');
-    expect(markup).toContain('<span class="heatmap-resolution-value" aria-live="polite">500 kb</span>');
+    expect(markup).toContain('<span class="heatmap-resolution-value" aria-live="polite">2 Mb</span>');
     expect(markup.match(/<span class="heatmap-resolution-tick(?: [^"]+)?"/g)).toHaveLength(11);
     expect(markup).not.toContain('<select class="heatmap-resolution-value"');
     expect(markup).toContain("2.5 Mb");
     expect(markup).toContain("1 kb");
+    expect(markup).not.toContain("2 kb");
+  });
+
+  it("does not expose generic levels while mcool metadata is unavailable", () => {
+    const uiState = createInitialUiState("ready");
+    const markup = renderToStaticMarkup(
+      <HeatmapToolbar
+        uiState={uiState}
+        onUiAction={() => undefined}
+        totalSpanMb={10_000}
+        useStoredResolutionOptions
+        availableResolutionBasePairs={[]}
+      />,
+    );
+
+    expect(markup).toContain(">Loading…</span>");
+    expect(markup).toContain('type="range" min="0" max="0"');
+    expect(markup).toContain('disabled=""');
+    expect(markup).toContain('aria-valuetext="Stored resolutions unavailable"');
+    expect(markup).not.toContain("2.5 Mb");
     expect(markup).not.toContain("2 Mb");
+    expect(markup).not.toContain("1 Mb");
   });
 
   it("reflects imported display settings", () => {

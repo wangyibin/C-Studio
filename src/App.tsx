@@ -1,8 +1,13 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { AppShell } from "./components/AppShell";
 import { exportAgpText } from "./state/agpExport";
-import { agpAutoSaveDelayMs, shouldScheduleAgpAutoSave } from "./state/agpAutoSave";
+import {
+  agpAutoSaveDelayMs,
+  agpSavePlan,
+  shouldScheduleAgpAutoSave,
+} from "./state/agpAutoSave";
 import {
   contactAutoColorScaleKey,
   contactCountSampleForColorScale,
@@ -124,6 +129,7 @@ import {
 } from "./state/uiState";
 
 export interface AppStatus {
+  version: string;
   engine: string;
   coordinate_convention: string;
   supported_operations: string[];
@@ -216,7 +222,6 @@ interface ImportedProjectDirectory {
 
 interface SourceAgpSnapshot {
   path: string;
-  writablePath: string | null;
   layout: AgpLayout;
   canonicalText: string;
 }
@@ -287,6 +292,7 @@ const samplePaf = [
 ].join("\n");
 
 const browserFallbackStatus: AppStatus = {
+  version: "browser-preview",
   engine: "cstudio-core",
   coordinate_convention: "0-based half-open internal; 1-based closed AGP",
   supported_operations: ["split", "move", "flip", "copy", "insert_gap", "delete_gap"],
@@ -984,7 +990,7 @@ export function App() {
     invoke<AppStatus>("get_app_status")
       .then((nextStatus) => {
         setStatus(nextStatus);
-        setStatusMessage("Backend connected");
+        setStatusMessage(`C-Studio ${nextStatus.version} ready`);
       })
       .catch(() => {
         setStatus(browserFallbackStatus);
@@ -2626,7 +2632,6 @@ export function App() {
       sourceAgpRef.current = sourceAgpSnapshot(
         importedDataset.agp_layout,
         importedDataset.agp_path,
-        null,
       );
       savedAgpPathRef.current = null;
       setSavedAgpPath(null);
@@ -2654,7 +2659,6 @@ export function App() {
       sourceAgpRef.current = sourceAgpSnapshot(
         example.dataset.agp_layout,
         example.dataset.agp_path,
-        null,
       );
       savedAgpPathRef.current = null;
       setSavedAgpPath(null);
@@ -2685,7 +2689,7 @@ export function App() {
     const summary = summarizeAgpText(text);
     const agpLayout = parseAgpLayout(text);
 
-    sourceAgpRef.current = sourceAgpSnapshot(agpLayout, file.name, null);
+    sourceAgpRef.current = sourceAgpSnapshot(agpLayout, file.name);
     savedAgpPathRef.current = null;
     setSavedAgpPath(null);
     setSavedAgpText(exportAgpText(agpLayout.blocks));
@@ -2736,51 +2740,59 @@ export function App() {
   }
 
   async function importContactFile() {
-    let selected: ImportedContactFile | null = null;
     try {
-      selected = await invoke<ImportedContactFile | null>("select_contact_file");
+      const path = await open({
+        title: "Select a .cool or .mcool contact map",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Contact maps", extensions: ["cool", "mcool"] }],
+      });
+      if (!path) {
+        setStatusMessage("Contact map import canceled");
+        return;
+      }
+      const selected = await invoke<ImportedContactFile>("load_contact_file", { path });
+
+      setDataset((current) => ({
+        ...buildDatasetSummary({
+          agpPath: current?.agp_path ?? "",
+          mcoolPath: selected.name,
+          coolPath: selected.path,
+          agpLines: current?.agp_lines ?? 0,
+          agpObjects: current?.agp_objects ?? 0,
+          agpComponents: current?.agp_components ?? 0,
+          agpGaps: current?.agp_gaps ?? 0,
+          maxObjectSpan: current?.max_object_span ?? 0,
+          mcoolSizeBytes: selected.size_bytes,
+          coveragePath: current?.coverage_path ?? null,
+          agpLayout: current?.agp_layout ?? emptyAgpLayout(),
+          availableResolutions: selected.available_resolutions,
+        }),
+      }));
+      setContactAvailableResolutions(selected.available_resolutions ?? []);
+      setStatusMessage(`Contact map imported: ${selected.name}`);
+      dispatchUi({ type: "appendLog", message: `Contact map imported: ${selected.name}` });
     } catch (error) {
       setStatusMessage(`Contact map import failed: ${String(error)}`);
       dispatchUi({
         type: "appendLog",
         message: `Contact map import failed: ${String(error)}`,
       });
-      return;
     }
-
-    if (!selected) {
-      setStatusMessage("Contact map import canceled");
-      return;
-    }
-
-    setDataset((current) => ({
-      ...buildDatasetSummary({
-        agpPath: current?.agp_path ?? "",
-        mcoolPath: selected.name,
-        coolPath: selected.path,
-        agpLines: current?.agp_lines ?? 0,
-        agpObjects: current?.agp_objects ?? 0,
-        agpComponents: current?.agp_components ?? 0,
-        agpGaps: current?.agp_gaps ?? 0,
-        maxObjectSpan: current?.max_object_span ?? 0,
-        mcoolSizeBytes: selected.size_bytes,
-        coveragePath: current?.coverage_path ?? null,
-        agpLayout: current?.agp_layout ?? emptyAgpLayout(),
-        availableResolutions: selected.available_resolutions,
-      }),
-    }));
-    setContactAvailableResolutions(selected.available_resolutions ?? []);
-    setStatusMessage(`Contact map imported: ${selected.name}`);
-    dispatchUi({ type: "appendLog", message: `Contact map imported: ${selected.name}` });
   }
 
   async function loadProjectDirectory() {
     try {
-      const project = await invoke<ImportedProjectDirectory | null>("select_project_directory");
-      if (!project) {
+      const path = await open({
+        title: "Select a C-Studio project folder",
+        multiple: false,
+        directory: true,
+      });
+      if (!path) {
         setStatusMessage("Project load canceled");
         return;
       }
+      const project = await invoke<ImportedProjectDirectory>("load_project_directory", { path });
 
       const agpText = project.agp?.text;
       const agpLayout = agpText ? parseAgpLayout(agpText) : emptyAgpLayout();
@@ -2790,13 +2802,13 @@ export function App() {
         throw new Error(`${project.gfa.name}: no GFA S records found`);
       }
 
-      savedAgpPathRef.current = project.agp && !project.agp.path.toLowerCase().endsWith(".gz")
-        ? project.agp.path
-        : null;
+      // A loaded source file is not a user-confirmed save destination. The
+      // first explicit Save must ask where the edited AGP should be written.
+      savedAgpPathRef.current = null;
       sourceAgpRef.current = project.agp
-        ? sourceAgpSnapshot(agpLayout, project.agp.path, savedAgpPathRef.current)
+        ? sourceAgpSnapshot(agpLayout, project.agp.path)
         : null;
-      setSavedAgpPath(savedAgpPathRef.current);
+      setSavedAgpPath(null);
       setSavedAgpText(project.agp ? exportAgpText(agpLayout.blocks) : "");
       dispatchUi({ type: "setAssemblyBlocks", blocks: agpLayout.blocks });
       if (project.agp) {
@@ -2849,11 +2861,20 @@ export function App() {
 
   async function requestPafFile() {
     try {
-      const selected = await invoke<ImportedContactFile | null>("select_paf_file");
-      if (!selected) {
+      const path = await open({
+        title: "Select a PAF alignment file",
+        multiple: false,
+        directory: false,
+        filters: [{
+          name: "PAF alignments",
+          extensions: ["paf", "txt", "paf.gz", "txt.gz"],
+        }],
+      });
+      if (!path) {
         setStatusMessage("PAF import canceled");
         return;
       }
+      const selected = await invoke<ImportedContactFile>("load_paf_file", { path });
       setPafPath(selected.path);
       setPafText("");
       setPafImported(true);
@@ -2887,11 +2908,29 @@ export function App() {
 
   async function requestCoverageFile() {
     try {
-      const selected = await invoke<ImportedContactFile | null>("select_coverage_file");
-      if (!selected) {
+      const path = await open({
+        title: "Select a bedGraph coverage file",
+        multiple: false,
+        directory: false,
+        filters: [{
+          name: "Coverage tracks",
+          extensions: [
+            "depth",
+            "bedgraph",
+            "bg",
+            "txt",
+            "depth.gz",
+            "bedgraph.gz",
+            "bg.gz",
+            "txt.gz",
+          ],
+        }],
+      });
+      if (!path) {
         setStatusMessage("Coverage import canceled");
         return;
       }
+      const selected = await invoke<ImportedContactFile>("load_coverage_file", { path });
 
       setCoverageRecords([]);
       setDataset((current) => ({
@@ -3027,8 +3066,8 @@ export function App() {
     }
 
     const layout = cloneAgpLayout(source.layout);
-    savedAgpPathRef.current = source.writablePath;
-    setSavedAgpPath(source.writablePath);
+    savedAgpPathRef.current = null;
+    setSavedAgpPath(null);
     setSavedAgpText(source.canonicalText);
     setDataset((current) => current ? {
       ...current,
@@ -3047,22 +3086,28 @@ export function App() {
     });
   }
 
-  async function exportEditedAgp(options: { automatic?: boolean } = {}) {
+  async function exportEditedAgp(options: { automatic?: boolean; saveAs?: boolean } = {}) {
     if (assemblyLayout.blocks.length === 0) {
+      setStatusMessage("No AGP layout to save");
       dispatchUi({ type: "appendLog", message: "No AGP layout to save" });
       return;
     }
     if (savingAgpRef.current) {
+      setStatusMessage("AGP save is already in progress");
+      dispatchUi({ type: "appendLog", message: "AGP save request ignored: save already in progress" });
       return;
     }
 
     savingAgpRef.current = true;
     const agpText = currentAgpText;
     const filename = editedAgpFilename(dataset?.agp_path ?? "assembly.agp");
-    const savedStatus = options.automatic ? "AGP auto-saved" : "AGP saved";
+    const automatic = options.automatic === true;
+    const saveAs = options.saveAs === true;
+    const savedStatus = automatic ? "AGP auto-saved" : saveAs ? "AGP saved as" : "AGP saved";
     try {
       const existingPath = savedAgpPathRef.current;
-      if (existingPath) {
+      const plan = agpSavePlan({ automatic, saveAs, savePath: existingPath });
+      if (plan === "overwrite" && existingPath) {
         const overwritten = await invoke<boolean>("overwrite_agp_file", {
           path: existingPath,
           contents: agpText,
@@ -3075,17 +3120,40 @@ export function App() {
         }
         savedAgpPathRef.current = null;
         setSavedAgpPath(null);
+        dispatchUi({
+          type: "appendLog",
+          message: `AGP save target is unavailable: ${existingPath}`,
+        });
+        if (automatic) {
+          setStatusMessage("AGP auto-save target is unavailable; use Save to choose a new path");
+          return;
+        }
+      }
+      if (plan === "unavailable") {
+        setStatusMessage("AGP auto-save target is unavailable; use Save to choose a new path");
+        return;
       }
 
-      const savedPath = await invoke<string | null>("save_agp_file", {
-        defaultFilename: existingPath ? pathBasename(existingPath) : filename,
-        contents: agpText,
+      setStatusMessage("Opening AGP save dialog…");
+      dispatchUi({ type: "appendLog", message: "Opening AGP Save As dialog" });
+      const selectedPath = await saveDialog({
+        title: saveAs ? "Save edited AGP as" : "Save edited AGP",
+        defaultPath: existingPath ?? filename,
+        filters: [
+          { name: "AGP files", extensions: ["agp"] },
+          { name: "Text files", extensions: ["txt"] },
+        ],
       });
 
-      if (!savedPath) {
+      if (!selectedPath) {
         setStatusMessage("AGP save canceled");
         return;
       }
+
+      const savedPath = await invoke<string>("write_agp_file", {
+        path: selectedPath,
+        contents: agpText,
+      });
 
       savedAgpPathRef.current = savedPath;
       setSavedAgpPath(savedPath);
@@ -3356,7 +3424,8 @@ export function App() {
       onPafFileSelected={importPafFile}
       onCoverageFileRequested={requestCoverageFile}
       onCoverageFileSelected={importCoverageFile}
-      onExportAgp={exportEditedAgp}
+      onExportAgp={() => { void exportEditedAgp(); }}
+      onExportAgpAs={() => { void exportEditedAgp({ saveAs: true }); }}
       autoSaveEnabled={autoSaveEnabled}
       autoSaveAvailable={savedAgpPath !== null}
       isAgpDirty={isAgpDirty}
@@ -3519,12 +3588,10 @@ function cloneAgpLayout(layout: AgpLayout): AgpLayout {
 function sourceAgpSnapshot(
   layout: AgpLayout,
   path: string,
-  writablePath: string | null,
 ): SourceAgpSnapshot {
   const sourceLayout = cloneAgpLayout(layout);
   return {
     path,
-    writablePath,
     layout: sourceLayout,
     canonicalText: exportAgpText(sourceLayout.blocks),
   };

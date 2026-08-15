@@ -25,6 +25,22 @@ export interface ContactTileGpuRenderer {
   destroy: () => void;
 }
 
+/**
+ * A WebGL frame is presentable only when every populated descriptor reached a
+ * draw call. Empty tiles are already represented by the white framebuffer
+ * clear, but silently skipping one failed texture upload would leave a false
+ * rectangular hole and must force the 2D fallback instead.
+ */
+export function contactTileGpuDrawCoverageIsComplete(
+  descriptors: readonly ContactTileCanvasDescriptor[],
+  drawnDescriptorKeys: ReadonlySet<string>,
+): boolean {
+  return descriptors.every((descriptor) => (
+    contactTileCellCount(descriptor.tile) === 0
+    || drawnDescriptorKeys.has(descriptor.key)
+  ));
+}
+
 interface GpuTextureEntry {
   texture: WebGLTexture;
   tile: ContactMapTile;
@@ -242,6 +258,7 @@ export function createContactTileGpuRenderer(
     const scaleX = canvas.width / cssWidth;
     const scaleY = canvas.height / cssHeight;
     const protectedKeys = new Set<string>();
+    const drawnDescriptorKeys = new Set<string>();
 
     for (const descriptor of scene.descriptors) {
       if (contactTileCellCount(descriptor.tile) === 0) {
@@ -284,6 +301,7 @@ export function createContactTileGpuRenderer(
       gl.bindTexture(gl.TEXTURE_2D, entry.texture);
       gl.uniform1i(resources.tileTextureLocation, 0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
+      drawnDescriptorKeys.add(descriptor.key);
     }
 
     if (textureBytes > safeTextureBudget) {
@@ -297,7 +315,11 @@ export function createContactTileGpuRenderer(
     }
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    return gl.getError() === gl.NO_ERROR;
+    const glSucceeded = gl.getError() === gl.NO_ERROR;
+    return glSucceeded && contactTileGpuDrawCoverageIsComplete(
+      scene.descriptors,
+      drawnDescriptorKeys,
+    );
   };
 
   return {

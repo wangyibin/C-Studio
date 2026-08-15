@@ -5,6 +5,7 @@ import type { ExampleDatasetSummary } from "../App";
 import { createInitialUiState } from "../state/uiState";
 import {
   assemblyCutTargetAtScreenPoint,
+  assemblyPointerStateAtScreenPoint,
   assemblyBoundaryViewportClipClassName,
   assemblySelectionProjectionBands,
   assemblyShiftClickIntent,
@@ -568,11 +569,102 @@ describe("assemblyCutTargetAtScreenPoint", () => {
       viewportYEnd: 100,
     };
 
-    expect(assemblyCutTargetAtScreenPoint({ ...input, point: { x: 12, y: 23 } })).toBeNull();
+    expect(assemblyCutTargetAtScreenPoint({ ...input, point: { x: 4, y: 32 } })).toBeNull();
     expect(assemblyCutTargetAtScreenPoint({
       ...input,
       selectedIds: new Set(),
       point: { x: 18, y: 18 },
+    })).toBeNull();
+  });
+
+  it("replays the same screen pointer against a newly narrowed viewport", () => {
+    const selectedContig = {
+      ...compactContig,
+      visualStart: 40,
+      visualEnd: 60,
+    };
+    const model = buildAssemblyEditModel([selectedContig]);
+    const input = {
+      model,
+      selectedIds: new Set([selectedContig.id]),
+      point: { x: 50, y: 50 },
+      widthPx: 100,
+      heightPx: 100,
+      viewportXStart: 0,
+      viewportYStart: 0,
+    };
+
+    expect(assemblyPointerStateAtScreenPoint({
+      ...input,
+      viewportXEnd: 200,
+      viewportYEnd: 200,
+    }).kind).toBe("select");
+    expect(assemblyPointerStateAtScreenPoint({
+      ...input,
+      viewportXEnd: 100,
+      viewportYEnd: 100,
+    })).toEqual({
+      kind: "cut",
+      blockId: selectedContig.id,
+      visualPosition: 50,
+    });
+  });
+
+  it("projects the marker onto the true genomic diagonal in a rectangular viewport", () => {
+    const selectedContig = {
+      ...compactContig,
+      visualStart: 40,
+      visualEnd: 60,
+    };
+
+    expect(assemblyCutTargetAtScreenPoint({
+      model: buildAssemblyEditModel([selectedContig]),
+      selectedIds: new Set([selectedContig.id]),
+      point: { x: 100, y: 55 },
+      widthPx: 200,
+      heightPx: 100,
+      viewportXStart: 0,
+      viewportXEnd: 100,
+      viewportYStart: 0,
+      viewportYEnd: 100,
+    })).toEqual({ blockId: selectedContig.id, visualPosition: 51 });
+  });
+
+  it("keeps an acquired cut target locked in a wider corridor and releases it outside", () => {
+    const selectedContig = {
+      ...compactContig,
+      visualStart: 10,
+      visualEnd: 90,
+    };
+    const input = {
+      model: buildAssemblyEditModel([selectedContig]),
+      selectedIds: new Set([selectedContig.id]),
+      widthPx: 100,
+      heightPx: 100,
+      viewportXStart: 0,
+      viewportXEnd: 100,
+      viewportYStart: 0,
+      viewportYEnd: 100,
+    };
+
+    expect(assemblyCutTargetAtScreenPoint({
+      ...input,
+      point: { x: 50, y: 72 },
+    })).toBeNull();
+    expect(assemblyCutTargetAtScreenPoint({
+      ...input,
+      lockedCutBlockId: selectedContig.id,
+      point: { x: 50, y: 72 },
+    })).toEqual({ blockId: selectedContig.id, visualPosition: 61 });
+    expect(assemblyCutTargetAtScreenPoint({
+      ...input,
+      lockedCutBlockId: selectedContig.id,
+      point: { x: 60, y: 80 },
+    })).toEqual({ blockId: selectedContig.id, visualPosition: 70 });
+    expect(assemblyCutTargetAtScreenPoint({
+      ...input,
+      lockedCutBlockId: selectedContig.id,
+      point: { x: 20, y: 75 },
     })).toBeNull();
   });
 });

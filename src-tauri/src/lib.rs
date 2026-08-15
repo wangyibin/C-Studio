@@ -6,6 +6,7 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if let Ok(cache_root) = app.path().app_cache_dir() {
                 cstudio_core::cool::configure_persistent_normalization_cache(
@@ -26,11 +27,11 @@ pub fn run() {
             commands::layout_gfa_bandage,
             commands::load_example_dataset,
             commands::load_example_gfa_text,
-            commands::select_contact_file,
-            commands::select_coverage_file,
-            commands::select_paf_file,
-            commands::select_project_directory,
-            commands::save_agp_file,
+            commands::load_contact_file,
+            commands::load_coverage_file,
+            commands::load_paf_file,
+            commands::load_project_directory,
+            commands::write_agp_file,
             commands::overwrite_agp_file,
             commands::set_window_title,
             commands::build_contact_map_view,

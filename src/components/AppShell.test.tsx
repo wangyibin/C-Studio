@@ -47,6 +47,7 @@ function renderShell(
       onCoverageFileRequested={() => undefined}
       onCoverageFileSelected={() => undefined}
       onExportAgp={() => undefined}
+      onExportAgpAs={() => undefined}
       autoSaveEnabled={project.autoSaveEnabled ?? false}
       autoSaveAvailable={project.autoSaveAvailable ?? false}
       isAgpDirty={project.isAgpDirty ?? false}
@@ -55,6 +56,7 @@ function renderShell(
       onReloadAssembly={() => undefined}
       onClearAllData={() => undefined}
       status={{
+        version: "0.1.2",
         engine: "c-studio-core",
         coordinate_convention: "0-based half-open",
         supported_operations: [],
@@ -94,10 +96,12 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('aria-keyshortcuts="Control+Z Meta+Z Control+U Meta+U"');
     expect(markup).toContain('aria-keyshortcuts="Meta+Shift+Z Control+Y Control+R Meta+R"');
     expect(markup).toContain('aria-label="Save edited AGP"');
+    expect(markup).toContain('aria-label="Save edited AGP as"');
     expect(markup).toContain('aria-keyshortcuts="Control+S Meta+S"');
     expect(markup).toContain('aria-label="Auto-save"');
     expect(markup).toContain("Save As once to enable auto-save");
     expect(markup).toContain('aria-label="Keyboard shortcuts"');
+    expect(markup).toContain("0.1.2");
     expect(markup).toContain(`<dt>Save AGP</dt><dd>${shortcuts.save}</dd>`);
     expect(markup).toContain(`<dt>Rename</dt><dd>${shortcuts.rename}</dd>`);
     expect(markup).toContain(`<dt>Move to debris</dt><dd>${shortcuts.moveToDebris}</dd>`);

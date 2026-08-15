@@ -259,9 +259,10 @@ export function buildGfaAssemblyGraph(
   }
 
   const edges: GfaGraphEdge[] = [];
+  const nodeIds = new Set(nodes.map((node) => node.id));
   const blocksByObject = new Map<string, ContactMapLayoutBlock[]>();
   for (const block of orderedBlocks) {
-    if (!nodes.some((node) => node.id === block.id)) {
+    if (!nodeIds.has(block.id)) {
       continue;
     }
     const values = blocksByObject.get(block.objectId) ?? [];
@@ -312,6 +313,48 @@ export function buildGfaAssemblyGraph(
     unmatchedSegmentCount: unplacedNames.length,
     ambiguousLinkCount,
     truncated: nodes.length < matchedNames.size + unplacedNames.length,
+  };
+}
+
+/**
+ * Apply a display budget after graph membership has been resolved. Required
+ * nodes are never discarded, even when they alone exceed the soft budget.
+ */
+export function limitGfaAssemblyGraph(
+  graph: GfaAssemblyGraph,
+  maxNodes: number,
+  requiredNodeIds: ReadonlySet<string> = new Set<string>(),
+): GfaAssemblyGraph {
+  const safeLimit = Number.isFinite(maxNodes)
+    ? Math.max(0, Math.floor(maxNodes))
+    : graph.nodes.length;
+  if (graph.nodes.length <= safeLimit) {
+    return graph;
+  }
+
+  const retainedIds = new Set(
+    graph.nodes
+      .filter((node) => requiredNodeIds.has(node.id))
+      .map((node) => node.id),
+  );
+  let remaining = Math.max(0, safeLimit - retainedIds.size);
+  for (const node of graph.nodes) {
+    if (retainedIds.has(node.id) || remaining === 0) {
+      continue;
+    }
+    retainedIds.add(node.id);
+    remaining -= 1;
+  }
+  const nodes = graph.nodes.filter((node) => retainedIds.has(node.id));
+  const presentGroupIds = new Set(nodes.map((node) => node.groupId));
+  return {
+    ...graph,
+    nodes,
+    edges: graph.edges.filter((edge) => (
+      retainedIds.has(edge.source) && retainedIds.has(edge.target)
+    )),
+    groupOrder: graph.groupOrder.filter((groupId) => presentGroupIds.has(groupId)),
+    truncated: true,
   };
 }
 

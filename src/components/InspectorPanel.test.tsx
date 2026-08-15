@@ -8,6 +8,7 @@ import {
 } from "./InspectorPanel";
 
 const status: AppStatus = {
+  version: "test",
   engine: "test",
   coordinate_convention: "test",
   supported_operations: ["split"],
@@ -423,7 +424,18 @@ describe("InspectorPanel", () => {
     expect(markup).toContain("1 block");
     expect(markup).toContain("2 contigs");
     expect(markup).toContain("Chr01_block_1");
-    expect(markup).toContain('aria-label="Contigs in Chr01_block_1"');
+    expect(markup).toContain('aria-label="Block details"');
+    expect(markup).toContain('aria-label="Center and select block Chr01_block_1"');
+    expect(markup).toContain("Current location");
+    expect(markup).toContain("Chr01 · 1-250 bp");
+    expect(markup).toContain("1 forward · 1 reverse");
+    expect(markup).toContain("Locked as one unit");
+    expect(markup).not.toContain('aria-label="Contig occurrences"');
+    expect(markup).toContain(
+      'class="block-member-list" aria-label="Contigs in Chr01_block_1"',
+    );
+    expect(markup).toContain('class="block-member-metadata"><span>100 bp</span>');
+    expect(markup).toContain('class="block-member-metadata"><span>150 bp</span>');
     expect(markup).toContain('class="selection-block-entry composite"');
     expect(markup).toContain("ctg1");
     expect(markup).toContain("ctg2");

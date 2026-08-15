@@ -1,0 +1,103 @@
+site_name: C-Studio
+site_description: Documentation for visual genome assembly inspection and evidence-guided curation with C-Studio
+site_url: https://wangyibin.github.io/C-Studio/
+repo_url: https://github.com/wangyibin/C-Studio
+repo_name: wangyibin/C-Studio
+docs_dir: docs/en
+site_dir: site
+copyright: Copyright &copy; 2026 C-Studio contributors
+
+theme:
+  name: material
+  language: en
+  icon:
+    logo: material/dna
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - navigation.version
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+
+plugins:
+  - search:
+      lang: en
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+extra:
+  version:
+    provider: mike
+  alternate:
+    - name: English
+      link: /C-Studio/
+      lang: en
+    - name: 简体中文
+      link: /C-Studio/zh/
+      lang: zh
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Get started: getting-started.md
+  - User guide:
+      - Project data: user-guide/project-data.md
+      - Interface: user-guide/interface.md
+      - Navigation and selection: user-guide/navigation-selection.md
+      - Assembly editing: user-guide/assembly-editing.md
+      - Evidence views: user-guide/evidence.md
+  - Reference:
+      - Data formats: reference/formats.md
+      - Keyboard shortcuts: reference/shortcuts.md
+      - Current limitations: reference/limitations.md
+      - Troubleshooting: reference/troubleshooting.md
+  - Development:
+      - Build the documentation: development/documentation.md

@@ -439,6 +439,12 @@ function SelectionSummary({ uiState, onUiAction }: SelectionSummaryProps) {
     (total, block) => total + Math.max(0, block.visualEnd - block.visualStart),
     0,
   );
+  const selectedAssemblyBlock = selection.kind === "contigs"
+    && selectedBlocks.length === 1
+    && selectedBlocks[0].isComposite
+    && selection.ids.includes(selectedBlocks[0].id)
+    ? selectedBlocks[0]
+    : null;
   const selectedContig = selectedContigs.length === 1 ? selectedContigs[0] : null;
 
   return (
@@ -465,7 +471,13 @@ function SelectionSummary({ uiState, onUiAction }: SelectionSummaryProps) {
           <dd>{formatSpan(selectedContigLength || selectedLength)}</dd>
         </div>
       </dl>
-      {selectedContig ? (
+      {selectedAssemblyBlock ? (
+        <AssemblyBlockSummary
+          block={selectedAssemblyBlock}
+          contigs={model.blocks}
+          onUiAction={onUiAction}
+        />
+      ) : selectedContig ? (
         <ContigOccurrenceSummary
           contig={selectedContig}
           blocks={model.blocks}
@@ -477,9 +489,93 @@ function SelectionSummary({ uiState, onUiAction }: SelectionSummaryProps) {
         assemblyBlocks={model.assemblyBlocks}
         contigs={model.blocks}
         selection={selection}
+        detailedBlockId={selectedAssemblyBlock?.id}
         onUiAction={onUiAction}
       />
     </div>
+  );
+}
+
+interface AssemblyBlockSummaryProps {
+  block: AssemblyBlockGroup;
+  contigs: ContactMapLayoutBlock[];
+  onUiAction: (action: UiAction) => void;
+}
+
+function AssemblyBlockSummary({
+  block,
+  contigs,
+  onUiAction,
+}: AssemblyBlockSummaryProps) {
+  const contigsById = new Map(contigs.map((contig) => [contig.id, contig]));
+  const childContigs = block.contigIds
+    .map((id) => contigsById.get(id))
+    .filter((contig): contig is ContactMapLayoutBlock => Boolean(contig));
+
+  return (
+    <section className="contig-occurrences block-details" aria-label="Block details">
+      <div className="contig-occurrence-heading">
+        <button
+          type="button"
+          aria-label={`Center and select block ${block.id}`}
+          title="Center this block in the heatmap"
+          onClick={() => onUiAction({ type: "focusAssemblyContig", id: block.id })}
+        >
+          <span>{block.id}</span>
+          <LocateFixed size={12} aria-hidden="true" />
+        </button>
+        <strong>{formatCount(childContigs.length, "contig")}</strong>
+      </div>
+      <dl>
+        <div>
+          <dt>Current location</dt>
+          <dd>{block.objectId} · {formatGenomicInterval(block.visualStart, block.visualEnd)} bp</dd>
+        </div>
+        <div>
+          <dt>Length</dt>
+          <dd>{formatSpan(Math.max(0, block.visualEnd - block.visualStart))}</dd>
+        </div>
+        <div>
+          <dt>Orientations</dt>
+          <dd>{formatBlockOrientations(childContigs)}</dd>
+        </div>
+      </dl>
+      <div className="block-member-list" aria-label={`Contigs in ${block.id}`}>
+        <span>Contigs</span>
+        <ol>
+          {childContigs.map((contig, index) => (
+            <li key={contig.id}>
+              <button
+                type="button"
+                title={`Center ${assemblyContigDisplayName(contig)} (${contig.orientation})`}
+                aria-label={`Center and select ${assemblyContigDisplayName(contig)}, orientation ${contig.orientation}`}
+                onClick={() => onUiAction({ type: "focusAssemblyContig", id: contig.id })}
+              >
+                <span className="block-member-name">
+                  <small>{index + 1}</small>
+                  <strong>{assemblyContigDisplayName(contig)}</strong>
+                </span>
+                <span className="block-member-metadata">
+                  <span>{formatSpan(Math.max(0, contig.sourceEnd - contig.sourceStart))}</span>
+                  <strong
+                    className={`selection-contig-orientation orientation-${
+                      contig.orientation === "+" ? "forward" : contig.orientation === "-" ? "reverse" : "unknown"
+                    }`}
+                    aria-hidden="true"
+                  >
+                    {contig.orientation}
+                  </strong>
+                </span>
+              </button>
+            </li>
+          ))}
+        </ol>
+      </div>
+      <div className="contig-current-copy-state block-lock-state">
+        <span>Assembly behavior</span>
+        <strong>Locked as one unit</strong>
+      </div>
+    </section>
   );
 }
 
@@ -632,11 +728,32 @@ function formatContigLocation(contig: ContactMapLayoutBlock) {
   )} bp · ${contig.orientation}`;
 }
 
+function formatBlockOrientations(contigs: ContactMapLayoutBlock[]) {
+  const counts = contigs.reduce(
+    (summary, contig) => {
+      summary[contig.orientation] += 1;
+      return summary;
+    },
+    { "+": 0, "-": 0, "?": 0, "0": 0, na: 0 } as Record<
+      ContactMapLayoutBlock["orientation"],
+      number
+    >,
+  );
+  return [
+    counts["+"] > 0 ? `${counts["+"]} forward` : null,
+    counts["-"] > 0 ? `${counts["-"]} reverse` : null,
+    counts["?"] > 0 ? `${counts["?"]} unknown` : null,
+    counts["0"] > 0 ? `${counts["0"]} unspecified` : null,
+    counts.na > 0 ? `${counts.na} not applicable` : null,
+  ].filter((label): label is string => Boolean(label)).join(" · ") || "Unknown";
+}
+
 interface ChromosomeGroupListProps {
   groups: ReturnType<typeof groupAssemblyBlocksByChromosome>;
   assemblyBlocks: AssemblyBlockGroup[];
   contigs: ContactMapLayoutBlock[];
   selection: UiState["assembly"]["selection"];
+  detailedBlockId?: string;
   onUiAction: (action: UiAction) => void;
 }
 
@@ -645,6 +762,7 @@ function ChromosomeGroupList({
   assemblyBlocks,
   contigs,
   selection,
+  detailedBlockId,
   onUiAction,
 }: ChromosomeGroupListProps) {
   const [renamingChromosome, setRenamingChromosome] = useState<{
@@ -797,7 +915,7 @@ function ChromosomeGroupList({
                     </span>
                     <small>{block.isComposite ? `${block.contigIds.length} contigs` : "contig"}</small>
                   </button>
-                  {block.isComposite ? (
+                  {block.isComposite && block.id !== detailedBlockId ? (
                     <div className="selection-contig-children" aria-label={`Contigs in ${block.id}`}>
                       {childContigs.map((contig) => (
                         <button

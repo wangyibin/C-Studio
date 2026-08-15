@@ -271,4 +271,15 @@ describe("confirmed contact map layout styles", () => {
     expect(styles).toMatch(/\.assembly-cut-guide\s*\{[^}]*background:\s*#facc15;/);
     expect(styles).toMatch(/\.assembly-cut-point\s*\{[^}]*background:\s*#facc15;/);
   });
+
+  it("replays the last heatmap pointer before paint when viewport geometry changes", () => {
+    expect(viewportSource).toContain("lastAssemblyPointerRef.current = pointer");
+    expect(viewportSource).toMatch(
+      /usePrePaintEffect\(\(\) => \{[\s\S]*?lastAssemblyPointerRef\.current[\s\S]*?refreshAssemblyHoverAtClientPosition\(pointer\)[\s\S]*?uiState\.contact\.resolution/,
+    );
+    expect(viewportSource).toMatch(
+      /onPointerLeave=\{\(\) => \{[\s\S]*?lastAssemblyPointerRef\.current = null;/,
+    );
+    expect(viewportSource).toContain("lockedCutBlockId: assemblyPointerStateRef.current.kind");
+  });
 });

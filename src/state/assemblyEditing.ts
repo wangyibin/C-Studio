@@ -616,6 +616,140 @@ export type GfaBlockCreationPlan =
   | { ok: true; selectedBlockIds: string[]; joins: GfaBlockJoinPlan[] }
   | { ok: false; reason: string };
 
+export interface UnplacedGfaPlacementInput {
+  segmentName: string;
+  length: number;
+  targetObjectId: string;
+  /** Insert before this assembly unit; null appends to the target object. */
+  targetBlockId: string | null;
+  orientation: "+" | "-";
+}
+
+export type UnplacedGfaPlacementPlan =
+  | {
+      ok: true;
+      blocks: ContactMapLayoutBlock[];
+      insertedBlockId: string;
+      insertedIndex: number;
+      gapBefore: ContactMapLayoutBlock["gapBefore"];
+      gapAfter: ContactMapLayoutBlock["gapBefore"];
+    }
+  | { ok: false; reason: string };
+
+/**
+ * Build an explicit AGP placement for one GFA segment that is absent from the
+ * current assembly. GFA topology remains evidence only: new boundaries use an
+ * unknown 100 bp AGP gap instead of inferring adjacency from an L record.
+ */
+export function planUnplacedGfaPlacement(
+  blocks: ContactMapLayoutBlock[],
+  input: UnplacedGfaPlacementInput,
+): UnplacedGfaPlacementPlan {
+  if (!input.segmentName.trim()) {
+    return { ok: false, reason: "The GFA segment name is empty." };
+  }
+  if (!Number.isSafeInteger(input.length) || input.length <= 0) {
+    return { ok: false, reason: "The GFA segment needs a known positive integer length." };
+  }
+  if (input.orientation !== "+" && input.orientation !== "-") {
+    return { ok: false, reason: "Choose a forward or reverse orientation." };
+  }
+  if (blocks.some((block) => block.sourceId === input.segmentName)) {
+    return { ok: false, reason: `${input.segmentName} is already placed in the current AGP.` };
+  }
+
+  const units = orderedAssemblyUnits(blocks);
+  const objectUnits = units.filter((unit) => unit.objectId === input.targetObjectId);
+  if (objectUnits.length === 0) {
+    return { ok: false, reason: `Target chromosome ${input.targetObjectId} is not available.` };
+  }
+
+  let insertedIndex: number;
+  if (input.targetBlockId === null) {
+    const lastObjectBlockIndex = blocks.reduce((lastIndex, block, index) => (
+      block.objectId === input.targetObjectId ? index : lastIndex
+    ), -1);
+    insertedIndex = lastObjectBlockIndex + 1;
+  } else {
+    const resolvedTargetId = resolveAssemblyUnitId(units, input.targetBlockId);
+    const targetUnit = units.find((unit) => unit.id === resolvedTargetId);
+    if (!targetUnit || targetUnit.objectId !== input.targetObjectId) {
+      return { ok: false, reason: "The insertion point is not on the selected chromosome." };
+    }
+    insertedIndex = blocks.findIndex((block) => block.id === targetUnit.blocks[0]?.id);
+  }
+  if (insertedIndex < 0 || insertedIndex > blocks.length) {
+    return { ok: false, reason: "The insertion point is no longer available." };
+  }
+
+  const previous = blocks[insertedIndex - 1];
+  const next = blocks[insertedIndex];
+  const hasPreviousInObject = previous?.objectId === input.targetObjectId;
+  const hasNextInObject = next?.objectId === input.targetObjectId;
+  const insertedBlockId = nextGfaPlacementId(
+    blocks,
+    input.targetObjectId,
+    input.segmentName,
+  );
+  const inserted: ContactMapLayoutBlock = {
+    id: insertedBlockId,
+    objectId: input.targetObjectId,
+    sourceId: input.segmentName,
+    sourceStart: 0,
+    sourceEnd: input.length,
+    visualStart: 0,
+    visualEnd: input.length,
+    orientation: input.orientation,
+    componentType: "W",
+    assemblyBlockId: null,
+    gapBefore: hasPreviousInObject ? { ...DEFAULT_INSERTED_GAP } : undefined,
+  };
+  const placed = [
+    ...blocks.slice(0, insertedIndex),
+    inserted,
+    ...blocks.slice(insertedIndex),
+  ];
+
+  // A segment placed at the start or in the middle also needs an explicit
+  // boundary on its right. Preserve an existing positive AGP gap when one is
+  // already attached to the following unit; otherwise create an unknown gap.
+  if (hasNextInObject) {
+    const followingIndex = insertedIndex + 1;
+    const following = placed[followingIndex]!;
+    if (!following.gapBefore || following.gapBefore.length <= 0) {
+      placed[followingIndex] = {
+        ...following,
+        gapBefore: { ...DEFAULT_INSERTED_GAP },
+      };
+    }
+  }
+
+  const structured = hasExplicitAssemblyStructure(blocks);
+  const normalized = recomputeVisualCoordinates(
+    structured ? rebuildAssemblyBlockMembership(placed) : placed,
+  );
+  const normalizedInsertedIndex = normalized.findIndex((block) => block.id === insertedBlockId);
+  const normalizedNext = normalized[normalizedInsertedIndex + 1];
+  return {
+    ok: true,
+    blocks: normalized,
+    insertedBlockId,
+    insertedIndex: normalizedInsertedIndex,
+    gapBefore: normalized[normalizedInsertedIndex]?.gapBefore,
+    gapAfter: normalizedNext?.objectId === input.targetObjectId
+      ? normalizedNext.gapBefore
+      : undefined,
+  };
+}
+
+export function placeUnplacedGfaSegment(
+  blocks: ContactMapLayoutBlock[],
+  input: UnplacedGfaPlacementInput,
+) {
+  const plan = planUnplacedGfaPlacement(blocks, input);
+  return plan.ok ? plan.blocks : blocks;
+}
+
 /**
  * Validate the exact, current AGP neighbours that a user wants to turn into
  * one logical block. A positive overlap is accepted only from one uniquely
@@ -1810,6 +1944,22 @@ function nextAssemblyBlockId(blocks: ContactMapLayoutBlock[], objectId: string) 
     .filter(Number.isFinite);
   const ordinal = ordinals.length > 0 ? Math.max(...ordinals) + 1 : 1;
   return `${prefix}${ordinal}`;
+}
+
+function nextGfaPlacementId(
+  blocks: ContactMapLayoutBlock[],
+  objectId: string,
+  segmentName: string,
+) {
+  const existingIds = new Set(blocks.map((block) => block.id));
+  const prefix = `gfa-placement:${objectId}:${segmentName}`;
+  let id = prefix;
+  let ordinal = 1;
+  while (existingIds.has(id)) {
+    ordinal += 1;
+    id = `${prefix}:${ordinal}`;
+  }
+  return id;
 }
 
 function nextCopyId(blocks: ContactMapLayoutBlock[], block: ContactMapLayoutBlock, sourceId: string) {

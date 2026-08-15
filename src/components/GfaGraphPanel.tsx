@@ -1,6 +1,13 @@
 import { ChevronDown, Maximize2, RotateCcw, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { ContactMapView } from "../App";
+import {
+  assemblyContigDisplayName,
+  buildAssemblyEditModel,
+  planUnplacedGfaPlacement,
+  type UnplacedGfaPlacementInput,
+} from "../state/assemblyEditing";
+import { exportAgpText } from "../state/agpExport";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import {
   defaultAssemblyScaffoldColor,
@@ -9,10 +16,12 @@ import {
 } from "../state/assemblyPalette";
 import {
   buildGfaAssemblyGraph,
+  limitGfaAssemblyGraph,
   type GfaAssemblyGraph,
   type GfaEvidenceDocument,
   type GfaGraphEdge,
   type GfaGraphNode,
+  type GfaSegmentEvidence,
   type GfaSegmentSide,
 } from "../state/gfa";
 import {
@@ -93,6 +102,17 @@ interface GfaGraphPanelProps {
   onSelectOccurrences: (ids: string[]) => void;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
+}
+
+interface GfaContextMenuState extends AssemblyContextMenuPosition {
+  kind: "assembly" | "unplaced";
+  nodeId?: string;
+}
+
+export interface GfaAgpPlacementTarget {
+  value: string;
+  label: string;
+  targetBlockId: string | null;
 }
 
 interface LayoutNode extends GfaGraphNode {
@@ -187,6 +207,46 @@ interface GfaSelectionBox {
 const defaultView: ViewTransform = { x: 24, y: 24, scale: 0.72 };
 const graphNodeLimit = 1_200;
 export const defaultGfaReviewOpen = false;
+
+export function gfaAgpPlacementObjectIds(blocks: ContactMapLayoutBlock[]) {
+  return buildAssemblyEditModel(blocks).chromosomes.map((chromosome) => chromosome.id);
+}
+
+/** List only complete assembly-unit boundaries so placement never splits a locked block. */
+export function gfaAgpPlacementTargets(
+  blocks: ContactMapLayoutBlock[],
+  objectId: string,
+): GfaAgpPlacementTarget[] {
+  const model = buildAssemblyEditModel(blocks);
+  const byId = new Map(blocks.map((block) => [block.id, block]));
+  const units = model.assemblyBlocks.filter((block) => block.objectId === objectId);
+  if (units.length === 0) {
+    return [];
+  }
+  const unitLabel = (contigIds: string[]) => {
+    const names = contigIds.flatMap((id) => {
+      const block = byId.get(id);
+      return block ? [assemblyContigDisplayName(block)] : [];
+    });
+    if (names.length <= 1) {
+      return names[0] ?? "unitig";
+    }
+    return `${names[0]}…${names[names.length - 1]} (${names.length} utgs)`;
+  };
+  return [
+    {
+      value: `before:${units[0].contigIds[0]}`,
+      label: "Start",
+      targetBlockId: units[0].contigIds[0] ?? null,
+    },
+    ...units.slice(1).map((unit) => ({
+      value: `before:${unit.contigIds[0]}`,
+      label: `Before ${unitLabel(unit.contigIds)}`,
+      targetBlockId: unit.contigIds[0] ?? null,
+    })),
+    { value: "end", label: "End", targetBlockId: null },
+  ];
+}
 
 export function gfaLayoutLayerDefaults(layoutMode: GfaLayoutMode) {
   return {
@@ -672,7 +732,9 @@ export function GfaGraphPanel({
   const [showNonHomologLinks, setShowNonHomologLinks] = useState(true);
   const [showAnchorUnanchorLinks, setShowAnchorUnanchorLinks] = useState(true);
   const [toolbarDetailsOpen, setToolbarDetailsOpen] = useState(false);
-  const [contextMenu, setContextMenu] = useState<AssemblyContextMenuPosition | null>(null);
+  const [contextMenu, setContextMenu] = useState<GfaContextMenuState | null>(null);
+  const [selectedUnplacedNodeId, setSelectedUnplacedNodeId] = useState<string | null>(null);
+  const [placementNodeId, setPlacementNodeId] = useState<string | null>(null);
   const [curationAssistantOpen, setCurationAssistantOpen] = useState(defaultGfaReviewOpen);
   const [curationAssistantView, setCurationAssistantView] = useState<CurationAssistantView>("queue");
   const [selectedCurationIssueId, setSelectedCurationIssueId] = useState<string | null>(null);
@@ -785,32 +847,45 @@ export function GfaGraphPanel({
   }]).then((results) => results[0]!), [loadEndpointHiCBatchCached]);
   const visibleScaffoldKey = [...visibleScaffoldIds].sort().join("\u0000");
   const visibleContigKey = [...visibleContigIds].sort().join("\u0000");
-  const graph = useMemo(
-    () => buildGfaAssemblyGraph(document, assemblyBlocks, graphNodeLimit),
+  const completeGraph = useMemo(
+    () => buildGfaAssemblyGraph(document, assemblyBlocks, Number.POSITIVE_INFINITY),
     [assemblyBlocks, document],
   );
+  const graph = useMemo(
+    () => limitGfaAssemblyGraph(completeGraph, graphNodeLimit),
+    [completeGraph],
+  );
   const selectedIdsRef = useRef(new Set(selectedAssemblyBlockIds));
-  selectedIdsRef.current = new Set(selectedAssemblyBlockIds);
+  selectedIdsRef.current = new Set([
+    ...selectedAssemblyBlockIds,
+    ...(selectedUnplacedNodeId ? [selectedUnplacedNodeId] : []),
+  ]);
+  const placementNode = placementNodeId
+    ? completeGraph.nodes.find((node) => node.id === placementNodeId && node.kind === "unplaced") ?? null
+    : null;
   const homologs = useMemo(
-    () => classifyGfaScaffolds(graph.groupOrder, homologPattern),
-    [graph.groupOrder, homologPattern],
+    () => classifyGfaScaffolds(completeGraph.groupOrder, homologPattern),
+    [completeGraph.groupOrder, homologPattern],
   );
   const anchoredScaffoldIds = useMemo(
     () => homologScaffoldIds(homologs),
     [homologs],
   );
   const visibleGraphWithGfaOnlyNodes = useMemo(
-    () => graphForVisibleHomologScaffolds(
-      graph,
-      visibleScaffoldIds,
-      homologs,
-      showDisconnectedNodes,
+    () => limitGfaAssemblyGraph(
+      graphForVisibleHomologScaffolds(
+        completeGraph,
+        visibleScaffoldIds,
+        homologs,
+        showDisconnectedNodes,
+      ),
+      graphNodeLimit,
     ),
-    [graph, homologs, showDisconnectedNodes, visibleScaffoldKey],
+    [completeGraph, homologs, showDisconnectedNodes, visibleScaffoldKey],
   );
   const guidedFocalNodeIds = useMemo(
-    () => gfaBandageFocalNodeIds(graph.nodes, visibleContigIds),
-    [graph, visibleContigKey],
+    () => gfaBandageFocalNodeIds(completeGraph.nodes, visibleContigIds),
+    [completeGraph, visibleContigKey],
   );
   const visibleGraph = useMemo(
     () => graphForGfaOnlyNodeVisibility(visibleGraphWithGfaOnlyNodes, showGfaOnlyNodes),
@@ -818,13 +893,14 @@ export function GfaGraphPanel({
   );
   const visibleGuidedGraph = useMemo(
     () => graphForGuidedNodeVisibility(
-      graph,
+      completeGraph,
       visibleContigIds,
       homologs,
       showGfaOnlyNodes,
       showDisconnectedNodes,
+      graphNodeLimit,
     ),
-    [graph, homologs, showDisconnectedNodes, showGfaOnlyNodes, visibleContigKey],
+    [completeGraph, homologs, showDisconnectedNodes, showGfaOnlyNodes, visibleContigKey],
   );
   const visibleBandageGraph = useMemo(
     () => graphForGfaOnlyNodeVisibility(
@@ -854,14 +930,14 @@ export function GfaGraphPanel({
       ? buildLengthNormalizedGfaHiCLinks(
         contactMap,
         assemblyBlocks,
-        layoutMode === "guided" ? activeGraph.nodes : graph.nodes,
+        activeGraph.nodes,
         maximumGfaHiCLinks,
         layoutMode === "guided"
           ? undefined
           : gfaEndpointHiCOverviewPartnerLimit(hiCLinkLimit),
       )
       : [],
-    [activeGraph.nodes, assemblyBlocks, contactMap, graph.nodes, hiCLinkLimit, layoutMode],
+    [activeGraph.nodes, assemblyBlocks, contactMap, hiCLinkLimit, layoutMode],
   );
   const activeNodesById = useMemo(
     () => new Map(activeGraph.nodes.map((node) => [node.id, node])),
@@ -1063,6 +1139,14 @@ export function GfaGraphPanel({
       fitViewPendingRef.current = true;
     }
   }, [document]);
+
+  useEffect(() => {
+    const unplacedIds = new Set(
+      completeGraph.nodes.filter((node) => node.kind === "unplaced").map((node) => node.id),
+    );
+    setSelectedUnplacedNodeId((current) => current && unplacedIds.has(current) ? current : null);
+    setPlacementNodeId((current) => current && unplacedIds.has(current) ? current : null);
+  }, [completeGraph]);
 
   useEffect(() => {
     setSelectedCurationIssueId((current) => (
@@ -1307,7 +1391,7 @@ export function GfaGraphPanel({
       homologs,
       nodesRef.current,
       layoutMode,
-      graph,
+      completeGraph,
       guidedFocalNodeIds,
       bandagePathStateRef.current,
       nativeBandageLayout?.key === bandageLayoutKey
@@ -1320,7 +1404,7 @@ export function GfaGraphPanel({
   }, [
     activeGraph,
     bandageLayoutKey,
-    graph,
+    completeGraph,
     guidedFocalNodeIds,
     guidedGraphKey,
     homologs,
@@ -1334,7 +1418,7 @@ export function GfaGraphPanel({
     if (canvas) {
       drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks, selectionBoxRef.current);
     }
-  }, [homologs, selectedAssemblyBlockIds, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks]);
+  }, [activeGraph, homologs, selectedAssemblyBlockIds, selectedUnplacedNodeId, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1430,6 +1514,12 @@ export function GfaGraphPanel({
     setCurationAssistantView("evidence");
   }
 
+  function selectUnplacedNode(node: Pick<GfaGraphNode, "id">) {
+    setSelectedUnplacedNodeId(node.id);
+    selectedIdsRef.current = new Set([node.id]);
+    onSelectOccurrences([]);
+  }
+
   function openContextMenu(event: React.MouseEvent<HTMLCanvasElement>) {
     event.preventDefault();
     event.stopPropagation();
@@ -1440,11 +1530,23 @@ export function GfaGraphPanel({
       viewRef.current,
     );
     const node = nodeAtPoint(nodesRef.current, point.x, point.y);
+    if (node?.kind === "unplaced") {
+      selectUnplacedNode(node);
+      showEvidenceForNode(node.id);
+      setContextMenu({
+        x: event.clientX,
+        y: event.clientY,
+        kind: "unplaced",
+        nodeId: node.id,
+      });
+      return;
+    }
+    setSelectedUnplacedNodeId(null);
     const selectionIntent = gfaContextMenuSelectionIntent(node, selectedIdsRef.current);
     if (selectionIntent) {
       onSelectOccurrences(selectionIntent);
     }
-    setContextMenu({ x: event.clientX, y: event.clientY });
+    setContextMenu({ x: event.clientX, y: event.clientY, kind: "assembly" });
   }
 
   function pointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
@@ -1597,11 +1699,14 @@ export function GfaGraphPanel({
         event.clientY - interaction.startClientY,
       ) >= 8;
       if (box && moved) {
-        onSelectOccurrences(gfaAssemblyUnitIdsInSelection(
+        const selection = gfaAssemblyUnitIdsInSelection(
           nodesRef.current,
           { x: box.startX, y: box.startY },
           { x: box.currentX, y: box.currentY },
-        ));
+        );
+        setSelectedUnplacedNodeId(null);
+        selectedIdsRef.current = new Set(selection);
+        onSelectOccurrences(selection);
       } else {
         const point = graphPointFromPointer(event.currentTarget, event.clientX, event.clientY, viewRef.current);
         const chromosomeSelection = gfaChromosomeLabelSelection(
@@ -1611,6 +1716,8 @@ export function GfaGraphPanel({
           viewRef.current.scale,
         );
         if (chromosomeSelection) {
+          setSelectedUnplacedNodeId(null);
+          selectedIdsRef.current = new Set(chromosomeSelection);
           onSelectOccurrences(chromosomeSelection);
           selectionBoxRef.current = null;
           event.currentTarget.classList.remove("gfa-selecting");
@@ -1621,10 +1728,17 @@ export function GfaGraphPanel({
         }
         const node = nodeAtPoint(nodesRef.current, point.x, point.y);
         const unitId = node ? gfaAssemblyUnitId(node) : null;
-        if (unitId) {
+        if (node?.kind === "unplaced") {
+          selectUnplacedNode(node);
+          showEvidenceForNode(node.id);
+        } else if (unitId) {
+          setSelectedUnplacedNodeId(null);
+          selectedIdsRef.current = new Set([unitId]);
           onSelectOccurrences([unitId]);
           showEvidenceForNode(node!.id);
         } else {
+          setSelectedUnplacedNodeId(null);
+          selectedIdsRef.current = new Set();
           onSelectOccurrences([]);
         }
       }
@@ -1634,9 +1748,16 @@ export function GfaGraphPanel({
     } else if ((interaction.kind === "node" || interaction.kind === "bandage-node") && interaction.nodeId) {
       const node = nodesRef.current.find((candidate) => candidate.id === interaction.nodeId);
       const unitId = node ? gfaAssemblyUnitId(node) : null;
-      if (!interaction.moved && unitId) {
-        onSelectOccurrences([unitId]);
-        showEvidenceForNode(node!.id);
+      if (!interaction.moved) {
+        if (node?.kind === "unplaced") {
+          selectUnplacedNode(node);
+          showEvidenceForNode(node.id);
+        } else if (unitId) {
+          setSelectedUnplacedNodeId(null);
+          selectedIdsRef.current = new Set([unitId]);
+          onSelectOccurrences([unitId]);
+          showEvidenceForNode(node!.id);
+        }
       }
       if (interaction.moved) {
         const draggedIds = new Set(interaction.draggedNodes?.map((dragged) => dragged.id));
@@ -1696,6 +1817,13 @@ export function GfaGraphPanel({
     viewRef.current.y = pointerY - graphY * nextScale;
     drawCurrentGraph(canvas, graphRef.current, nodesRef.current, viewRef.current, selectedIdsRef.current, fitViewPendingRef, homologs, showGfaLinks, showHomologLinks, showNonHomologLinks, showAnchorUnanchorLinks, showAgpLinks, visibleEndpointHiCLinks);
   }
+
+  const contextUnplacedNode = contextMenu?.kind === "unplaced" && contextMenu.nodeId
+    ? completeGraph.nodes.find((node) => node.id === contextMenu.nodeId && node.kind === "unplaced") ?? null
+    : null;
+  const placementSegment = placementNode
+    ? document.segments[placementNode.segmentName] ?? null
+    : null;
 
   return (
     <section className="gfa-graph-panel" aria-label="GFA assembly graph">
@@ -1926,13 +2054,29 @@ export function GfaGraphPanel({
           onWheel={zoom}
           onContextMenu={openContextMenu}
         />
-        {contextMenu ? (
+        {contextMenu?.kind === "assembly" ? (
           <AssemblyContextMenu
             position={contextMenu}
             uiState={uiState}
             onUiAction={onUiAction}
             onClose={() => setContextMenu(null)}
             fixed
+          />
+        ) : null}
+        {contextMenu?.kind === "unplaced" && contextUnplacedNode ? (
+          <GfaUnplacedContextMenu
+            position={contextMenu}
+            node={contextUnplacedNode}
+            segment={document.segments[contextUnplacedNode.segmentName] ?? null}
+            hasPlacementTarget={gfaAgpPlacementObjectIds(assemblyBlocks).length > 0}
+            onAdd={() => {
+              setPlacementNodeId(contextUnplacedNode.id);
+              setContextMenu(null);
+            }}
+            onDeselect={() => {
+              setSelectedUnplacedNodeId(null);
+              setContextMenu(null);
+            }}
           />
         ) : null}
         {curationAssistantOpen ? (
@@ -1947,8 +2091,212 @@ export function GfaGraphPanel({
           />
         ) : null}
       </div>
+      {placementNode && placementSegment ? (
+        <GfaUnplacedPlacementDialog
+          key={placementNode.id}
+          segment={placementSegment}
+          assemblyBlocks={assemblyBlocks}
+          onCancel={() => setPlacementNodeId(null)}
+          onConfirm={(input) => {
+            onUiAction({ type: "placeUnplacedGfaSegment", ...input });
+            setPlacementNodeId(null);
+            setSelectedUnplacedNodeId(null);
+          }}
+        />
+      ) : null}
     </section>
   );
+}
+
+function GfaUnplacedContextMenu({
+  position,
+  node,
+  segment,
+  hasPlacementTarget,
+  onAdd,
+  onDeselect,
+}: {
+  position: AssemblyContextMenuPosition;
+  node: GfaGraphNode;
+  segment: GfaSegmentEvidence | null;
+  hasPlacementTarget: boolean;
+  onAdd: () => void;
+  onDeselect: () => void;
+}) {
+  const menuWidth = 218;
+  const left = typeof window === "undefined"
+    ? position.x
+    : clamp(position.x + 8, 8, Math.max(8, window.innerWidth - menuWidth - 8));
+  const top = typeof window === "undefined"
+    ? position.y
+    : clamp(position.y + 8, 8, Math.max(8, window.innerHeight - 118));
+  const knownLength = Number.isSafeInteger(segment?.length) && Number(segment?.length) > 0;
+  const unavailableReason = !knownLength
+    ? "This GFA segment has no reliable sequence or LN length."
+    : !hasPlacementTarget
+      ? "Import an AGP chromosome before placing this segment."
+      : undefined;
+  return (
+    <div
+      className="context-menu fixed-context-menu gfa-unplaced-context-menu"
+      style={{ left, top }}
+      onClick={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      <div className="gfa-unplaced-menu-summary">
+        <strong>{node.segmentName}</strong>
+        <small>{knownLength ? `${segment!.length!.toLocaleString()} bp · Unplaced` : "Length unavailable"}</small>
+      </div>
+      <button type="button" disabled={Boolean(unavailableReason)} title={unavailableReason} onClick={onAdd}>
+        Add to AGP…
+      </button>
+      <button type="button" onClick={onDeselect}>Deselect</button>
+    </div>
+  );
+}
+
+function GfaUnplacedPlacementDialog({
+  segment,
+  assemblyBlocks,
+  onCancel,
+  onConfirm,
+}: {
+  segment: GfaSegmentEvidence;
+  assemblyBlocks: ContactMapLayoutBlock[];
+  onCancel: () => void;
+  onConfirm: (input: UnplacedGfaPlacementInput) => void;
+}) {
+  const objectIds = useMemo(() => gfaAgpPlacementObjectIds(assemblyBlocks), [assemblyBlocks]);
+  const [targetObjectId, setTargetObjectId] = useState(objectIds[0] ?? "");
+  const [targetValue, setTargetValue] = useState("end");
+  const [orientation, setOrientation] = useState<"+" | "-">("+");
+  const targets = useMemo(
+    () => gfaAgpPlacementTargets(assemblyBlocks, targetObjectId),
+    [assemblyBlocks, targetObjectId],
+  );
+  const target = targets.find((candidate) => candidate.value === targetValue)
+    ?? targets[targets.length - 1]
+    ?? null;
+  const input: UnplacedGfaPlacementInput = {
+    segmentName: segment.name,
+    length: segment.length ?? 0,
+    targetObjectId,
+    targetBlockId: target?.targetBlockId ?? null,
+    orientation,
+  };
+  const plan = useMemo(
+    () => planUnplacedGfaPlacement(assemblyBlocks, input),
+    [assemblyBlocks, input.length, input.orientation, input.segmentName, input.targetBlockId, input.targetObjectId],
+  );
+  const agpComponentRow = useMemo(() => {
+    if (!plan.ok) return null;
+    return exportAgpText(plan.blocks).split("\n").find((line) => {
+      const columns = line.split("\t");
+      return columns[0] === targetObjectId
+        && columns[5] === segment.name
+        && columns[6] === "1"
+        && columns[7] === String(segment.length);
+    }) ?? null;
+  }, [plan, segment.length, segment.name, targetObjectId]);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCancel();
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => window.removeEventListener("keydown", closeOnEscape, true);
+  }, [onCancel]);
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (plan.ok) {
+      onConfirm(input);
+    }
+  }
+
+  return (
+    <div
+      className="assembly-delete-backdrop gfa-placement-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onCancel();
+      }}
+    >
+      <form
+        className="gfa-placement-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="gfa-placement-title"
+        onSubmit={submit}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header>
+          <span>
+            <h2 id="gfa-placement-title">Add to AGP</h2>
+            <p>{segment.name} · {segment.length?.toLocaleString() ?? "unknown"} bp</p>
+          </span>
+          <button type="button" aria-label="Close Add to AGP dialog" onClick={onCancel}><X size={14} /></button>
+        </header>
+        <div className="gfa-placement-fields">
+          <label>
+            <span>Chromosome</span>
+            <select
+              autoFocus
+              value={targetObjectId}
+              onChange={(event) => {
+                setTargetObjectId(event.target.value);
+                setTargetValue("end");
+              }}
+            >
+              {objectIds.map((objectId) => <option key={objectId} value={objectId}>{objectId}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Position</span>
+            <select value={target?.value ?? ""} onChange={(event) => setTargetValue(event.target.value)}>
+              {targets.map((candidate) => (
+                <option key={candidate.value} value={candidate.value}>{candidate.label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Orientation</span>
+            <select value={orientation} onChange={(event) => setOrientation(event.target.value as "+" | "-")}>
+              <option value="+">Forward (+)</option>
+              <option value="-">Reverse (−)</option>
+            </select>
+          </label>
+        </div>
+        <section className="gfa-placement-preview" aria-label="AGP placement preview">
+          <strong>Preview</strong>
+          {plan.ok ? (
+            <>
+              <dl>
+                <div><dt>Left boundary</dt><dd>{formatPlacementGap(plan.gapBefore)}</dd></div>
+                <div><dt>Right boundary</dt><dd>{formatPlacementGap(plan.gapAfter)}</dd></div>
+              </dl>
+              {agpComponentRow ? <code>{agpComponentRow}</code> : null}
+            </>
+          ) : <p role="alert">{plan.reason}</p>}
+        </section>
+        <p className="gfa-placement-note">
+          New boundaries use unknown 100 bp AGP gaps. GFA links remain evidence and are not converted automatically.
+        </p>
+        <footer>
+          <button type="button" onClick={onCancel}>Cancel</button>
+          <button type="submit" className="gfa-placement-confirm" disabled={!plan.ok}>Add to AGP</button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function formatPlacementGap(gap: ContactMapLayoutBlock["gapBefore"]) {
+  return gap && gap.length > 0
+    ? `${gap.componentType} · ${gap.length.toLocaleString()} bp · ${gap.linkage === "no" ? "unknown" : gap.gapType}`
+    : "Chromosome end";
 }
 
 function GfaCurationAssistant({
@@ -2502,6 +2850,7 @@ export function graphForGuidedNodeVisibility(
   homologs: GfaHomologClassification,
   showGfaOnlyNodes: boolean,
   showDisconnectedNodes: boolean,
+  maxNodes = Number.POSITIVE_INFINITY,
 ) {
   const focused = graphForVisibleContigs(graph, visibleContigIds);
   let candidate = focused;
@@ -2520,15 +2869,13 @@ export function graphForGuidedNodeVisibility(
       }
     }
     candidate = inducedGfaGraph(graph, selectedIds);
-  } else {
-    candidate = graphForChromosomeConnectionVisibility(
-      focused,
-      graph,
-      homologs,
-      false,
-    );
   }
-  return graphForGfaOnlyNodeVisibility(candidate, showGfaOnlyNodes);
+  const visible = graphForGfaOnlyNodeVisibility(candidate, showGfaOnlyNodes);
+  return limitGfaAssemblyGraph(
+    visible,
+    maxNodes,
+    new Set(focused.nodes.map((node) => node.id)),
+  );
 }
 
 function homologScaffoldIds(homologs: GfaHomologClassification) {

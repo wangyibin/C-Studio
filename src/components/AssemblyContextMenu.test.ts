@@ -1,10 +1,55 @@
-import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vitest";
 
 import type { ContactMapLayoutBlock } from "../state/importers";
+import { createInitialUiState } from "../state/uiState";
 import {
+  AssemblyContextMenu,
   assemblyDeleteCopyStatus,
   fitContextMenuToViewport,
 } from "./AssemblyContextMenu";
+
+describe("AssemblyContextMenu", () => {
+  it("orders actions from direct edits through structural and destructive operations", () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let markup = "";
+    try {
+      markup = renderToStaticMarkup(createElement(AssemblyContextMenu, {
+        position: { x: 0, y: 0 },
+        uiState: createInitialUiState("ready"),
+        onUiAction: () => undefined,
+        onClose: () => undefined,
+      }));
+    } finally {
+      consoleError.mockRestore();
+    }
+    const labels = [
+      "Deselect",
+      "Rename…",
+      "Reverse / rotate selection",
+      "Copy",
+      "Dissolve block",
+      "Add chr boundaries",
+      "Remove chr boundaries",
+      "Delete gap / join blocks",
+      "Move to debris",
+      "Delete contig…",
+      "Undo",
+      "Redo",
+    ];
+
+    let previousOffset = -1;
+    for (const label of labels) {
+      const offset = markup.indexOf(label);
+      expect(offset, `${label} should be rendered`).toBeGreaterThan(-1);
+      expect(offset, `${label} should follow the preceding operation`).toBeGreaterThan(
+        previousOffset,
+      );
+      previousOffset = offset;
+    }
+  });
+});
 
 describe("fitContextMenuToViewport", () => {
   const menu = { width: 198, height: 256 };

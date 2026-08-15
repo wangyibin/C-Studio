@@ -377,6 +377,38 @@ describe("reduceUiState", () => {
     );
   });
 
+  it("centers and keeps a composite block selected from the inspector", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setAssemblyBlocks",
+      blocks: structuredAssemblyBlocks,
+    });
+    state = {
+      ...state,
+      contact: {
+        ...state.contact,
+        viewportWidthPx: 800,
+        viewportHeightPx: 600,
+        viewportSpanMb: 200,
+      },
+    };
+
+    state = reduceUiState(state, {
+      type: "focusAssemblyContig",
+      id: "Chr01_block_1",
+    });
+
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01_block_1"],
+    });
+    expect(state.contact.viewportCenterXMb).toBe(0.000075);
+    expect(state.contact.viewportCenterYMb).toBe(0.000075);
+    expect(state.logEntries[state.logEntries.length - 1]?.message).toBe(
+      "Focused block Chr01_block_1 at Chr01",
+    );
+  });
+
   it("keeps a locked contact resolution when focusing a contig from the inspector", () => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
@@ -1605,6 +1637,48 @@ describe("reduceUiState", () => {
 
     state = reduceUiState(state, { type: "undo" });
     expect(state.assembly.blocks[1]).toMatchObject({ sourceStart: 0, sourceEnd: 138 });
+  });
+
+  it("places an unplaced GFA segment through history and restores it with redo", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, {
+      type: "setAssemblyBlocks",
+      blocks: structuredAssemblyBlocks,
+    });
+    state = reduceUiState(state, {
+      type: "placeUnplacedGfaSegment",
+      segmentName: "utg-missing",
+      length: 90,
+      targetObjectId: "Chr01",
+      targetBlockId: "Chr01:4:ctgC",
+      orientation: "-",
+    });
+
+    const inserted = state.assembly.blocks.find((block) => block.sourceId === "utg-missing");
+    expect(inserted).toMatchObject({
+      objectId: "Chr01",
+      sourceStart: 0,
+      sourceEnd: 90,
+      orientation: "-",
+      componentType: "W",
+      gapBefore: { componentType: "U", length: 100 },
+    });
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: [inserted?.id],
+      exact: true,
+    });
+    expect(state.operationHistory[state.operationHistory.length - 1]).toMatchObject({
+      type: "place_unplaced",
+      label: "utg-missing added to Chr01",
+    });
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks.some((block) => block.sourceId === "utg-missing")).toBe(false);
+
+    state = reduceUiState(state, { type: "redo" });
+    expect(state.assembly.blocks.find((block) => block.sourceId === "utg-missing"))
+      .toMatchObject({ sourceEnd: 90, orientation: "-" });
   });
 
   it("moves selected contigs before a target block from the reducer", () => {

@@ -1068,7 +1068,11 @@ function ContactTileGpuCanvas({
     canvas.addEventListener("webglcontextlost", handleContextLost);
     const observer = typeof ResizeObserver === "undefined"
       ? null
-      : new ResizeObserver(() => renderer.redraw());
+      : new ResizeObserver(() => {
+          if (!renderer.redraw()) {
+            onUnavailable();
+          }
+        });
     observer?.observe(canvas);
     return () => {
       observer?.disconnect();

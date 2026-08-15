@@ -1,0 +1,201 @@
+name: Documentation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/docs.yml"
+      - "docs/**"
+      - "mkdocs_en.yml"
+      - "mkdocs_zh.yml"
+      - "requirements-docs.txt"
+      - "scripts/build-docs.sh"
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      backfill_tags:
+        description: 'Optional space-separated tags to backfill, for example "v0.1.0 v0.2.0"'
+        required: false
+        default: ""
+      update_docs_version:
+        description: 'Publish docs from the selected ref to an existing version, for example "v0.2.0"'
+        required: false
+        default: ""
+
+concurrency:
+  group: documentation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: Install documentation dependencies
+        run: python -m pip install -r requirements-docs.txt
+
+      - name: Strictly build both languages
+        run: bash scripts/build-docs.sh
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.repository == 'wangyibin/C-Studio'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      BACKFILL_TAGS: ${{ github.event.inputs.backfill_tags || '' }}
+      UPDATE_DOCS_VERSION: ${{ github.event.inputs.update_docs_version || '' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: Install documentation dependencies
+        run: python -m pip install -r requirements-docs.txt
+
+      - name: Configure Git and fetch deployment history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git fetch --tags --force
+          git fetch origin gh-pages:gh-pages || true
+
+      - name: Validate manual deployment inputs
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$BACKFILL_TAGS" && -n "$UPDATE_DOCS_VERSION" ]]; then
+            echo "backfill_tags and update_docs_version cannot be used together."
+            exit 1
+          fi
+
+      - name: Strictly build both languages
+        if: env.BACKFILL_TAGS == ''
+        run: bash scripts/build-docs.sh
+
+      - name: Deploy current ref
+        if: env.BACKFILL_TAGS == '' && env.UPDATE_DOCS_VERSION == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=${GITHUB_REF#refs/tags/}
+
+            mike deploy -F mkdocs_en.yml --push --update-aliases "$version" latest
+            mike deploy -F mkdocs_zh.yml --deploy-prefix zh --push --update-aliases "$version" latest
+            mike set-default -F mkdocs_en.yml --push latest
+            mike set-default -F mkdocs_zh.yml --deploy-prefix zh --push latest
+          else
+            mike deploy -F mkdocs_en.yml --push dev
+            mike deploy -F mkdocs_zh.yml --deploy-prefix zh --push dev
+
+            if ! git show gh-pages:index.html >/dev/null 2>&1; then
+              mike set-default -F mkdocs_en.yml --push dev
+            fi
+            if ! git show gh-pages:zh/index.html >/dev/null 2>&1; then
+              mike set-default -F mkdocs_zh.yml --deploy-prefix zh --push dev
+            fi
+          fi
+
+      - name: Update an existing version with current docs
+        if: env.UPDATE_DOCS_VERSION != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$UPDATE_DOCS_VERSION"
+          if [[ "$version" != v* ]] || ! git check-ref-format "refs/tags/$version" >/dev/null; then
+            echo "Invalid version tag: $version"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$version^{commit}" >/dev/null; then
+            echo "Tag not found: $version"
+            exit 1
+          fi
+
+          latest_tag=$(git tag --list 'v*' --sort=-version:refname | sed -n '1p')
+          if [[ "$version" == "$latest_tag" ]]; then
+            mike deploy -F mkdocs_en.yml --push --update-aliases "$version" latest
+            mike deploy -F mkdocs_zh.yml --deploy-prefix zh --push --update-aliases "$version" latest
+            mike set-default -F mkdocs_en.yml --push latest
+            mike set-default -F mkdocs_zh.yml --deploy-prefix zh --push latest
+          else
+            mike deploy -F mkdocs_en.yml --push "$version"
+            mike deploy -F mkdocs_zh.yml --deploy-prefix zh --push "$version"
+          fi
+
+      - name: Backfill historical tags
+        if: env.BACKFILL_TAGS != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_ref=$(git rev-parse HEAD)
+          latest_tag=$(git tag --list 'v*' --sort=-version:refname | sed -n '1p')
+          read -r -a tags <<< "$BACKFILL_TAGS"
+
+          for tag in "${tags[@]}"; do
+            if [[ "$tag" != v* ]] || ! git check-ref-format "refs/tags/$tag" >/dev/null; then
+              echo "Invalid version tag: $tag"
+              exit 1
+            fi
+            if ! git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; then
+              echo "Tag not found: $tag"
+              exit 1
+            fi
+            if ! git cat-file -e "$tag:docs/en/index.md" || ! git cat-file -e "$tag:docs/zh/index.md"; then
+              echo "Bilingual documentation is not present in tag: $tag"
+              exit 1
+            fi
+          done
+
+          for tag in "${tags[@]}"; do
+            echo "Backfilling $tag"
+            git checkout "$tag" -- docs
+            bash scripts/build-docs.sh
+
+            if [[ "$tag" == "$latest_tag" ]]; then
+              mike deploy -F mkdocs_en.yml --push --update-aliases "$tag" latest
+              mike deploy -F mkdocs_zh.yml --deploy-prefix zh --push --update-aliases "$tag" latest
+            else
+              mike deploy -F mkdocs_en.yml --push "$tag"
+              mike deploy -F mkdocs_zh.yml --deploy-prefix zh --push "$tag"
+            fi
+          done
+
+          git checkout "$source_ref" -- docs
+
+          if [[ -n "$latest_tag" ]]; then
+            mike set-default -F mkdocs_en.yml --push latest
+            mike set-default -F mkdocs_zh.yml --deploy-prefix zh --push latest
+          fi

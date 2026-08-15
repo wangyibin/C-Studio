@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { contactTileFloatTextureData } from "./contactTileGpu";
+import {
+  contactTileFloatTextureData,
+  contactTileGpuDrawCoverageIsComplete,
+} from "./contactTileGpu";
 
 describe("contactTileFloatTextureData", () => {
   it("packs typed tile counts and completes a diagonal tile symmetrically", () => {
@@ -37,5 +40,31 @@ describe("contactTileFloatTextureData", () => {
       tileY: 0,
       cells: [],
     }, 0)).toThrow(/positive integer/);
+  });
+
+  it("rejects a frame when one populated high-resolution tile was skipped", () => {
+    const descriptors = Array.from({ length: 16 }, (_, index) => ({
+      key: `${index}:source`,
+      tile: {
+        tileX: index % 4,
+        tileY: Math.floor(index / 4) + 8,
+        cells: [{ xBin: index % 4, yBin: index, count: index + 1 }],
+      },
+      transpose: false,
+    }));
+    const allDrawn = new Set(descriptors.map(({ key }) => key));
+    const oneMissing = new Set(allDrawn);
+    oneMissing.delete("7:source");
+
+    expect(contactTileGpuDrawCoverageIsComplete(descriptors, allDrawn)).toBe(true);
+    expect(contactTileGpuDrawCoverageIsComplete(descriptors, oneMissing)).toBe(false);
+  });
+
+  it("allows explicit empty tiles to use the white framebuffer clear", () => {
+    expect(contactTileGpuDrawCoverageIsComplete([{
+      key: "empty:source",
+      tile: { tileX: 0, tileY: 0, cells: [] },
+      transpose: false,
+    }], new Set())).toBe(true);
   });
 });

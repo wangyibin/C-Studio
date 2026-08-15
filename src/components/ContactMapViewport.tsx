@@ -8,7 +8,15 @@ import {
   Scissors,
   X,
 } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { ContactMapCell, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   assemblyContigDisplayName,
@@ -21,6 +29,7 @@ import {
   selectedBlockIds,
   type AssemblyEditModel,
   type AssemblyHit,
+  type AssemblySelection,
 } from "../state/assemblyEditing";
 import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
 import { contactColorCss } from "../state/contactColor";
@@ -79,6 +88,8 @@ import {
 import type { ContactTileGpuRenderer } from "./contactTileGpu";
 import { GenomeAxisNavigator } from "./GenomeAxisNavigator";
 import { TrackPanel } from "./TrackPanel";
+
+const usePrePaintEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
 interface ContactMapViewportProps {
   dataset: ExampleDatasetSummary | null;
@@ -143,6 +154,7 @@ interface AssemblyContextMenuState extends AssemblyContextMenuPosition {
 interface AssemblyCutTargetInput {
   model: AssemblyEditModel;
   selectedIds: ReadonlySet<string>;
+  lockedCutBlockId?: string | null;
   point: { x: number; y: number };
   widthPx: number;
   heightPx: number;
@@ -150,6 +162,15 @@ interface AssemblyCutTargetInput {
   viewportXEnd: number;
   viewportYStart: number;
   viewportYEnd: number;
+}
+
+interface AssemblyPointerTargetInput extends AssemblyCutTargetInput {
+  selectionKind?: AssemblySelection["kind"];
+}
+
+interface AssemblyPointerPosition {
+  clientX: number;
+  clientY: number;
 }
 
 export interface AssemblySelectionProjectionBands {
@@ -337,6 +358,7 @@ export function contactTileOverscanDirectionForViewports(
 export function assemblyCutTargetAtScreenPoint({
   model,
   selectedIds,
+  lockedCutBlockId = null,
   point,
   widthPx,
   heightPx,
@@ -350,60 +372,164 @@ export function assemblyCutTargetAtScreenPoint({
   const viewportXSpan = Math.max(1, viewportXEnd - viewportXStart);
   const viewportYSpan = Math.max(1, viewportYEnd - viewportYStart);
   const maxEdgeGuardPx = 18;
-  const diagonalTolerancePx = 8;
+  const acquireTolerancePx = 12;
+  const releaseTolerancePx = 36;
 
+  interface CutCandidate {
+    blockId: string;
+    visualPosition: number;
+    distancePx: number;
+  }
+
+  const candidateForBlock = (
+    block: ContactMapLayoutBlock,
+    tolerancePx: number,
+  ): CutCandidate | null => {
+    const blockSpan = block.visualEnd - block.visualStart;
+    if (blockSpan <= 0) {
+      return null;
+    }
+
+    // Use one genomic coordinate for both axes. This is the real x=y contig
+    // diagonal even when the contact viewport is rectangular or independently
+    // panned on X and Y.
+    const fullDiagonalLengthPx = Math.hypot(
+      (blockSpan / viewportXSpan) * safeWidthPx,
+      (blockSpan / viewportYSpan) * safeHeightPx,
+    );
+    const edgeGuardPx = Math.min(
+      maxEdgeGuardPx,
+      Math.max(1, fullDiagonalLengthPx * 0.2),
+    );
+    const edgeGuardFraction = Math.min(
+      0.2,
+      edgeGuardPx / Math.max(1, fullDiagonalLengthPx),
+    );
+    const safeVisualStart = block.visualStart + blockSpan * edgeGuardFraction;
+    const safeVisualEnd = block.visualEnd - blockSpan * edgeGuardFraction;
+    const visibleStart = Math.max(
+      safeVisualStart,
+      viewportXStart,
+      viewportYStart,
+    );
+    const visibleEnd = Math.min(
+      safeVisualEnd,
+      viewportXEnd,
+      viewportYEnd,
+    );
+    if (visibleStart >= visibleEnd) {
+      return null;
+    }
+
+    const startX = ((visibleStart - viewportXStart) / viewportXSpan) * safeWidthPx;
+    const startY = ((visibleStart - viewportYStart) / viewportYSpan) * safeHeightPx;
+    const endX = ((visibleEnd - viewportXStart) / viewportXSpan) * safeWidthPx;
+    const endY = ((visibleEnd - viewportYStart) / viewportYSpan) * safeHeightPx;
+    const diagonalX = endX - startX;
+    const diagonalY = endY - startY;
+    const diagonalLengthSquared = diagonalX * diagonalX + diagonalY * diagonalY;
+    if (diagonalLengthSquared <= 0) {
+      return null;
+    }
+
+    const projectionRatio = clamp01(
+      ((point.x - startX) * diagonalX + (point.y - startY) * diagonalY)
+      / diagonalLengthSquared,
+    );
+    const projectedX = startX + projectionRatio * diagonalX;
+    const projectedY = startY + projectionRatio * diagonalY;
+    const distancePx = Math.hypot(point.x - projectedX, point.y - projectedY);
+    if (distancePx > tolerancePx) {
+      return null;
+    }
+
+    return {
+      blockId: block.id,
+      visualPosition: Math.round(
+        visibleStart + projectionRatio * (visibleEnd - visibleStart),
+      ),
+      distancePx,
+    };
+  };
+
+  // Once acquired, keep the same contig locked inside a wider corridor. The
+  // scissors follows the projected diagonal point and releases only after the
+  // pointer clearly leaves that corridor.
+  if (lockedCutBlockId && selectedIds.has(lockedCutBlockId)) {
+    const lockedBlock = model.blocks.find((block) => block.id === lockedCutBlockId);
+    if (lockedBlock) {
+      const lockedCandidate = candidateForBlock(lockedBlock, releaseTolerancePx);
+      if (lockedCandidate) {
+        return {
+          blockId: lockedCandidate.blockId,
+          visualPosition: lockedCandidate.visualPosition,
+        };
+      }
+    }
+  }
+
+  let closestCandidate: CutCandidate | null = null;
   for (const block of model.blocks) {
     if (!selectedIds.has(block.id)) {
       continue;
     }
-
-    const clippedXStart = Math.max(block.visualStart, viewportXStart);
-    const clippedXEnd = Math.min(block.visualEnd, viewportXEnd);
-    const clippedYStart = Math.max(block.visualStart, viewportYStart);
-    const clippedYEnd = Math.min(block.visualEnd, viewportYEnd);
-    if (clippedXStart >= clippedXEnd || clippedYStart >= clippedYEnd) {
-      continue;
-    }
-
-    const leftPx = ((clippedXStart - viewportXStart) / viewportXSpan) * safeWidthPx;
-    const topPx = ((clippedYStart - viewportYStart) / viewportYSpan) * safeHeightPx;
-    const blockWidthPx = Math.max(4, ((clippedXEnd - clippedXStart) / viewportXSpan) * safeWidthPx);
-    const blockHeightPx = Math.max(4, ((clippedYEnd - clippedYStart) / viewportYSpan) * safeHeightPx);
-    const localX = point.x - leftPx;
-    const localY = point.y - topPx;
-    const insideBox = localX >= 0 && localY >= 0 && localX <= blockWidthPx && localY <= blockHeightPx;
-    if (!insideBox) {
-      continue;
-    }
-
-    // The old fixed 18 px guard made every contig narrower than 36 px
-    // impossible to cut. Scale the guard down with compact boxes while still
-    // keeping the first and last 20% unavailable as unsafe split endpoints.
-    const edgeGuardPx = Math.min(
-      maxEdgeGuardPx,
-      Math.max(1, Math.min(blockWidthPx, blockHeightPx) * 0.2),
-    );
-    const farEnoughFromEnds = localX >= edgeGuardPx
-      && localY >= edgeGuardPx
-      && localX <= blockWidthPx - edgeGuardPx
-      && localY <= blockHeightPx - edgeGuardPx;
-    const normalizedDiagonalDistance = Math.abs(
-      localX / blockWidthPx - localY / blockHeightPx,
-    ) * Math.min(blockWidthPx, blockHeightPx);
-    if (farEnoughFromEnds && normalizedDiagonalDistance <= diagonalTolerancePx) {
-      return {
-        blockId: block.id,
-        visualPosition: visualPositionFromPointer(
-          point.x,
-          safeWidthPx,
-          viewportXStart,
-          viewportXEnd,
-        ),
-      };
+    const candidate = candidateForBlock(block, acquireTolerancePx);
+    if (candidate && (!closestCandidate || candidate.distancePx < closestCandidate.distancePx)) {
+      closestCandidate = candidate;
     }
   }
 
-  return null;
+  return closestCandidate
+    ? {
+        blockId: closestCandidate.blockId,
+        visualPosition: closestCandidate.visualPosition,
+      }
+    : null;
+}
+
+/** Resolve the current cut/insert/select affordance from one screen point. */
+export function assemblyPointerStateAtScreenPoint(
+  input: AssemblyPointerTargetInput,
+): AssemblyPointerState {
+  if (input.selectedIds.size === 0) {
+    return { kind: "select", blockId: null, visualPosition: null };
+  }
+
+  const cutTarget = assemblyCutTargetAtScreenPoint(input);
+  if (cutTarget) {
+    return {
+      kind: "cut",
+      blockId: cutTarget.blockId,
+      visualPosition: cutTarget.visualPosition,
+    };
+  }
+
+  const insertTarget = insertionTargetAtScreenPoint(
+    input.model,
+    input.selectedIds,
+    input.point,
+    {
+      widthPx: Math.max(1, input.widthPx),
+      heightPx: Math.max(1, input.heightPx),
+      tolerancePx: 7,
+      viewportXStart: input.viewportXStart,
+      viewportXEnd: input.viewportXEnd,
+      viewportYStart: input.viewportYStart,
+      viewportYEnd: input.viewportYEnd,
+      selectionKind: input.selectionKind,
+    },
+  );
+  if (insertTarget) {
+    return {
+      kind: "insert",
+      blockId: insertTarget.targetBlockId,
+      visualPosition: insertTarget.visualPosition,
+      targetObjectId: insertTarget.targetObjectId,
+      chromosomeEnd: insertTarget.chromosomeEnd,
+    };
+  }
+
+  return { kind: "select", blockId: null, visualPosition: null };
 }
 
 function setShiftSelectionCursor(active: boolean) {
@@ -463,6 +589,8 @@ export function ContactMapViewport({
     blockId: null,
     visualPosition: null,
   });
+  const assemblyPointerStateRef = useRef(assemblyPointerState);
+  const lastAssemblyPointerRef = useRef<AssemblyPointerPosition | null>(null);
   const [tilePresentedSurfaceRevision, setTilePresentedSurfaceRevision] = useState(0);
   const hasContactMap = Boolean(dataset?.mcool_path);
   const renderGeneration = contactMap?.renderGeneration;
@@ -771,6 +899,8 @@ export function ContactMapViewport({
 
     function handleWindowBlur() {
       setShiftSelectionCursor(false);
+      lastAssemblyPointerRef.current = null;
+      setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
     }
 
     window.addEventListener("click", closeContextMenu);
@@ -848,8 +978,10 @@ export function ContactMapViewport({
           totalSpanMb,
           false,
         );
+        // Do not let an mcool fall back to generic resolution levels while
+        // metadata is unavailable; an empty list intentionally disables the
+        // resolution-wheel action until the physical pyramid is known.
         const resolutionOptions = useStoredResolutionOptions
-          && availableResolutionBasePairs.length > 0
           ? storedContactResolutionsForDataset(availableResolutionBasePairs)
           : viewportResolutionOptions;
         const nextResolution = contactResolutionWheelIntent({
@@ -1303,15 +1435,18 @@ export function ContactMapViewport({
   }
 
   function setAssemblyPointerStateIfChanged(nextState: AssemblyPointerState) {
-    setAssemblyPointerState((current) =>
+    const current = assemblyPointerStateRef.current;
+    if (
       current.kind === nextState.kind
       && current.blockId === nextState.blockId
       && current.visualPosition === nextState.visualPosition
       && current.targetObjectId === nextState.targetObjectId
       && current.chromosomeEnd === nextState.chromosomeEnd
-        ? current
-        : nextState,
-    );
+    ) {
+      return;
+    }
+    assemblyPointerStateRef.current = nextState;
+    setAssemblyPointerState(nextState);
   }
 
   function startAssemblyPointer(event: React.PointerEvent<HTMLDivElement>) {
@@ -1319,6 +1454,7 @@ export function ContactMapViewport({
       return;
     }
 
+    lastAssemblyPointerRef.current = latestPointerCoordinates(event.nativeEvent);
     event.preventDefault();
     window.getSelection()?.removeAllRanges();
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -1333,12 +1469,33 @@ export function ContactMapViewport({
       viewportYEnd: displayViewport.yEnd,
     });
 
-    if (!event.shiftKey && assemblyPointerState.kind === "cut" && assemblyPointerState.blockId) {
+    const currentPointerState = assemblyPointerStateRef.current;
+    const confirmedCutState = !event.shiftKey && currentPointerState.kind === "cut"
+      ? assemblyPointerStateAtScreenPoint({
+          model: assemblyModel,
+          selectedIds: selectedAssemblyBlockIds,
+          lockedCutBlockId: currentPointerState.blockId,
+          point,
+          widthPx: Math.max(1, bounds.width),
+          heightPx: Math.max(1, bounds.height),
+          viewportXStart: displayViewport.xStart,
+          viewportXEnd: displayViewport.xEnd,
+          viewportYStart: displayViewport.yStart,
+          viewportYEnd: displayViewport.yEnd,
+          selectionKind: uiState.assembly.selection?.kind,
+        })
+      : null;
+    if (
+      confirmedCutState?.kind === "cut"
+      && confirmedCutState.blockId !== null
+      && confirmedCutState.blockId === currentPointerState.blockId
+      && confirmedCutState.visualPosition !== null
+    ) {
       event.stopPropagation();
       onUiAction({
         type: "splitAssemblyContig",
-        blockId: assemblyPointerState.blockId,
-        visualPosition: visualPositionFromPointer(point.x, bounds.width, liveViewport.xStart, liveViewport.xEnd),
+        blockId: confirmedCutState.blockId,
+        visualPosition: confirmedCutState.visualPosition,
       });
       return;
     }
@@ -1399,67 +1556,76 @@ export function ContactMapViewport({
   }
 
   function moveAssemblyHover(event: React.PointerEvent<HTMLDivElement>) {
+    const pointer = latestPointerCoordinates(event.nativeEvent);
+    lastAssemblyPointerRef.current = pointer;
     // Panning is a compositor-only operation. Do not mix it with the O(n)
     // contig cut/insert hit-test path on every pointer sample.
     if (dragStateRef.current || assemblySelectionDrag) {
       return;
     }
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const point = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
-    const selectedIds = selectedAssemblyBlockIds;
-    if (selectedIds.size === 0) {
+    refreshAssemblyHoverAtClientPosition(pointer, event.currentTarget);
+  }
+
+  function refreshAssemblyHoverAtClientPosition(
+    pointer: AssemblyPointerPosition,
+    target: HTMLElement | null = canvasFrameRef.current,
+  ) {
+    if (!target) {
+      return;
+    }
+    const bounds = target.getBoundingClientRect();
+    const pointerInside = bounds.width > 0
+      && bounds.height > 0
+      && pointer.clientX >= bounds.left
+      && pointer.clientX <= bounds.right
+      && pointer.clientY >= bounds.top
+      && pointer.clientY <= bounds.bottom;
+    if (!pointerInside) {
+      lastAssemblyPointerRef.current = null;
       setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
       return;
     }
 
-    const viewportXStart = displayViewport.xStart;
-    const viewportXEnd = displayViewport.xEnd;
-    const viewportYStart = displayViewport.yStart;
-    const viewportYEnd = displayViewport.yEnd;
-    const cutTarget = assemblyCutTargetAtScreenPoint({
+    setAssemblyPointerStateIfChanged(assemblyPointerStateAtScreenPoint({
       model: assemblyModel,
-      selectedIds,
-      point,
+      selectedIds: selectedAssemblyBlockIds,
+      lockedCutBlockId: assemblyPointerStateRef.current.kind === "cut"
+        ? assemblyPointerStateRef.current.blockId
+        : null,
+      point: {
+        x: pointer.clientX - bounds.left,
+        y: pointer.clientY - bounds.top,
+      },
       widthPx: bounds.width,
       heightPx: bounds.height,
-      viewportXStart,
-      viewportXEnd,
-      viewportYStart,
-      viewportYEnd,
-    });
-    if (cutTarget) {
-      setAssemblyPointerStateIfChanged({
-        kind: "cut",
-        blockId: cutTarget.blockId,
-        visualPosition: cutTarget.visualPosition,
-      });
-      return;
-    }
-
-    const insertTargetId = insertionTargetAtScreenPoint(assemblyModel, selectedIds, point, {
-      widthPx: Math.max(1, bounds.width),
-      heightPx: Math.max(1, bounds.height),
-      tolerancePx: 7,
-      viewportXStart,
-      viewportXEnd,
-      viewportYStart,
-      viewportYEnd,
+      viewportXStart: displayViewport.xStart,
+      viewportXEnd: displayViewport.xEnd,
+      viewportYStart: displayViewport.yStart,
+      viewportYEnd: displayViewport.yEnd,
       selectionKind: uiState.assembly.selection?.kind,
-    });
+    }));
+  }
 
-    if (insertTargetId) {
-      setAssemblyPointerStateIfChanged({
-        kind: "insert",
-        blockId: insertTargetId.targetBlockId,
-        visualPosition: insertTargetId.visualPosition,
-        targetObjectId: insertTargetId.targetObjectId,
-        chromosomeEnd: insertTargetId.chromosomeEnd,
-      });
+  usePrePaintEffect(() => {
+    if (dragStateRef.current || assemblySelectionDrag) {
       return;
     }
-
-    setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
-  }
+    const pointer = lastAssemblyPointerRef.current;
+    if (pointer) {
+      refreshAssemblyHoverAtClientPosition(pointer);
+    }
+  }, [
+    assemblyModel,
+    assemblySelectionDrag,
+    displayViewport.xEnd,
+    displayViewport.xStart,
+    displayViewport.yEnd,
+    displayViewport.yStart,
+    dragState,
+    selectedAssemblyBlockIds,
+    uiState.assembly.selection?.kind,
+    uiState.contact.resolution,
+  ]);
 
   function moveAssemblyPointer(event: React.PointerEvent<HTMLDivElement>) {
     if (!assemblySelectionDrag || assemblySelectionDrag.pointerId !== event.pointerId) {
@@ -1478,6 +1644,7 @@ export function ContactMapViewport({
   }
 
   function stopAssemblyPointer(event: React.PointerEvent<HTMLDivElement>) {
+    lastAssemblyPointerRef.current = latestPointerCoordinates(event.nativeEvent);
     if (assemblySelectionDrag?.pointerId === event.pointerId) {
       const bounds = event.currentTarget.getBoundingClientRect();
       const moved = Math.hypot(
@@ -1708,11 +1875,13 @@ export function ContactMapViewport({
             }}
             onPointerUp={stopAssemblyPointer}
             onPointerCancel={(event) => {
+              lastAssemblyPointerRef.current = null;
               setAssemblySelectionDrag(null);
               stopPan(event);
               setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
             }}
             onPointerLeave={() => {
+              lastAssemblyPointerRef.current = null;
               if (!assemblySelectionDrag && !dragStateRef.current) {
                 setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
               }
@@ -2391,17 +2560,6 @@ export function assemblyBoundaryViewportClipClassName(
     visualStart < viewportYStart ? "viewport-clipped-top" : "",
     visualEnd > viewportYEnd ? "viewport-clipped-bottom" : "",
   ].filter(Boolean).join(" ");
-}
-
-function visualPositionFromPointer(
-  x: number,
-  width: number,
-  viewportStart: number,
-  viewportEnd: number,
-) {
-  const viewportSpan = Math.max(1, viewportEnd - viewportStart);
-
-  return Math.round(viewportStart + (x / Math.max(1, width)) * viewportSpan);
 }
 
 function formatBytes(bytes: number) {

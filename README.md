@@ -3,6 +3,26 @@
 C-Studio is a desktop application for inspecting and editing genome assemblies,
 built with Tauri 2, React, and Rust.
 
+## Documentation
+
+- [English documentation](https://wangyibin.github.io/C-Studio/latest/)
+- [简体中文文档](https://wangyibin.github.io/C-Studio/zh/latest/)
+
+The documentation follows the bilingual, versioned C-Phasing layout. Zensical
+builds the English and Chinese sources separately, while Mike retains released
+versions on the `gh-pages` branch. To build both languages locally:
+
+```bash
+python3 -m venv .venv-docs
+source .venv-docs/bin/activate
+python -m pip install -r requirements-docs.txt
+bash scripts/build-docs.sh
+python -m http.server --directory site 8000
+```
+
+Open `http://127.0.0.1:8000/` for English or
+`http://127.0.0.1:8000/zh/` for Chinese.
+
 ## Development
 
 Install the frontend dependencies and start the development application with:

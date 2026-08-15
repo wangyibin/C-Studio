@@ -1,0 +1,105 @@
+site_name: C-Studio
+site_description: C-Studio 可视化基因组组装检查与证据辅助校订文档
+site_url: https://wangyibin.github.io/C-Studio/zh/
+repo_url: https://github.com/wangyibin/C-Studio
+repo_name: wangyibin/C-Studio
+docs_dir: docs/zh
+site_dir: site/zh
+copyright: Copyright &copy; 2026 C-Studio contributors
+
+theme:
+  name: material
+  language: zh
+  icon:
+    logo: material/dna
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: 切换到深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: 切换到浅色模式
+  features:
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - navigation.version
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+
+plugins:
+  - search:
+      lang:
+        - zh
+        - en
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+extra:
+  version:
+    provider: mike
+  alternate:
+    - name: English
+      link: /C-Studio/
+      lang: en
+    - name: 简体中文
+      link: /C-Studio/zh/
+      lang: zh
+
+nav:
+  - 主页: index.md
+  - 安装: installation.md
+  - 快速开始: getting-started.md
+  - 用户指南:
+      - 项目数据: user-guide/project-data.md
+      - 界面说明: user-guide/interface.md
+      - 导航与选择: user-guide/navigation-selection.md
+      - 组装编辑: user-guide/assembly-editing.md
+      - 证据视图: user-guide/evidence.md
+  - 参考:
+      - 数据格式: reference/formats.md
+      - 键盘快捷键: reference/shortcuts.md
+      - 当前限制: reference/limitations.md
+      - 故障排查: reference/troubleshooting.md
+  - 开发:
+      - 构建文档: development/documentation.md

@@ -1,7 +1,7 @@
 {
   "name": "c-studio",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
     "lucide-react": "^0.468.0",
     "pixi.js": "^8.19.0",
     "react": "^18.3.1",

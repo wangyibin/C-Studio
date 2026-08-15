@@ -688,6 +688,7 @@ impl From<ContactNormalizationRequest>
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AppStatus {
+    pub version: String,
     pub engine: String,
     pub coordinate_convention: String,
     pub supported_operations: Vec<String>,
@@ -1334,6 +1335,7 @@ pub fn get_app_status() -> AppStatus {
     let status = cstudio_core::core_status();
 
     AppStatus {
+        version: env!("CARGO_PKG_VERSION").to_string(),
         engine: status.engine.to_string(),
         coordinate_convention: status.coordinate_convention.to_string(),
         supported_operations: status
@@ -1463,47 +1465,30 @@ pub fn load_example_gfa_text() -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn select_contact_file() -> Result<Option<ImportedContactFile>, String> {
-    let Some(path) = choose_contact_file_path()? else {
-        return Ok(None);
-    };
-
-    contact_file_from_path(&path).map(Some)
+pub fn load_contact_file(path: String) -> Result<ImportedContactFile, String> {
+    contact_file_from_path(Path::new(&path))
 }
 
 #[tauri::command]
-pub fn select_coverage_file() -> Result<Option<ImportedContactFile>, String> {
-    let Some(path) = choose_coverage_file_path()? else {
-        return Ok(None);
-    };
-
-    coverage_file_from_path(&path).map(Some)
+pub fn load_coverage_file(path: String) -> Result<ImportedContactFile, String> {
+    coverage_file_from_path(Path::new(&path))
 }
 
 #[tauri::command]
-pub fn select_paf_file() -> Result<Option<ImportedContactFile>, String> {
-    let Some(path) = choose_paf_file_path()? else {
-        return Ok(None);
-    };
-    paf_file_from_path(&path).map(Some)
+pub fn load_paf_file(path: String) -> Result<ImportedContactFile, String> {
+    paf_file_from_path(Path::new(&path))
 }
 
 #[tauri::command]
-pub fn select_project_directory() -> Result<Option<ImportedProjectDirectory>, String> {
-    let Some(path) = choose_project_directory_path()? else {
-        return Ok(None);
-    };
-    scan_project_directory(&path).map(Some)
+pub fn load_project_directory(path: String) -> Result<ImportedProjectDirectory, String> {
+    scan_project_directory(Path::new(&path))
 }
 
 #[tauri::command]
-pub fn save_agp_file(default_filename: String, contents: String) -> Result<Option<String>, String> {
-    let Some(path) = choose_agp_save_path(&default_filename)? else {
-        return Ok(None);
-    };
-
+pub fn write_agp_file(path: String, contents: String) -> Result<String, String> {
+    let path = PathBuf::from(path);
     fs::write(&path, contents).map_err(|error| error.to_string())?;
-    Ok(Some(path.to_string_lossy().to_string()))
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -4126,195 +4111,6 @@ fn paf_file_from_path(path: &Path) -> Result<ImportedContactFile, String> {
     })
 }
 
-#[cfg(target_os = "macos")]
-fn choose_contact_file_path() -> Result<Option<PathBuf>, String> {
-    use std::process::Command;
-
-    // AppleScript's `of type` expects registered macOS type identifiers, not
-    // filename extensions. `.cool` and `.mcool` normally have no registered
-    // UTI, so filtering here disables valid files in the native picker. Keep
-    // the picker unfiltered and enforce the extensions in
-    // `contact_file_from_path` instead.
-    let script = r#"set selectedFile to choose file with prompt "Select a .cool or .mcool contact map"
-POSIX path of selectedFile"#;
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            return Ok(None);
-        }
-        return Err(stderr.trim().to_string());
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(PathBuf::from(path)))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn choose_contact_file_path() -> Result<Option<PathBuf>, String> {
-    Err("native contact file picker is only implemented for macOS".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn choose_coverage_file_path() -> Result<Option<PathBuf>, String> {
-    use std::process::Command;
-
-    let script = r#"set selectedFile to choose file with prompt "Select a bedGraph coverage file"
-POSIX path of selectedFile"#;
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            return Ok(None);
-        }
-        return Err(stderr.trim().to_string());
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PathBuf::from(path)))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn choose_coverage_file_path() -> Result<Option<PathBuf>, String> {
-    Err("native coverage file picker is only implemented for macOS".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn choose_paf_file_path() -> Result<Option<PathBuf>, String> {
-    use std::process::Command;
-
-    let script = r#"set selectedFile to choose file with prompt "Select a PAF alignment file"
-POSIX path of selectedFile"#;
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            return Ok(None);
-        }
-        return Err(stderr.trim().to_string());
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
-}
-
-#[cfg(target_os = "macos")]
-fn choose_project_directory_path() -> Result<Option<PathBuf>, String> {
-    use std::process::Command;
-    let script = r#"set selectedFolder to choose folder with prompt "Select a C-Studio project folder"
-POSIX path of selectedFolder"#;
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            return Ok(None);
-        }
-        return Err(stderr.trim().to_string());
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn choose_project_directory_path() -> Result<Option<PathBuf>, String> {
-    Err("native project directory picker is only implemented for macOS".to_string())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn choose_paf_file_path() -> Result<Option<PathBuf>, String> {
-    Err("native PAF file picker is only implemented for macOS".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn choose_agp_save_path(default_filename: &str) -> Result<Option<PathBuf>, String> {
-    use std::process::Command;
-
-    let safe_filename = default_filename.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!(
-        r#"set saveFile to choose file name with prompt "Save edited AGP" default name "{safe_filename}"
-POSIX path of saveFile"#
-    );
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            return Ok(None);
-        }
-        return Err(stderr.trim().to_string());
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(PathBuf::from(path)))
-}
-
-#[cfg(target_os = "windows")]
-fn choose_agp_save_path(default_filename: &str) -> Result<Option<PathBuf>, String> {
-    use std::process::Command;
-
-    let safe_filename = default_filename.replace('\'', "''");
-    let script = format!(
-        r#"Add-Type -AssemblyName System.Windows.Forms
-$dialog = New-Object System.Windows.Forms.SaveFileDialog
-$dialog.Title = 'Save edited AGP'
-$dialog.FileName = '{safe_filename}'
-$dialog.Filter = 'AGP files (*.agp)|*.agp|Text files (*.txt)|*.txt|All files (*.*)|*.*'
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
-  [Console]::Out.Write($dialog.FileName)
-}}"#
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn choose_agp_save_path(_default_filename: &str) -> Result<Option<PathBuf>, String> {
-    Err("native AGP save dialog is only implemented for macOS and Windows".to_string())
-}
-
 #[tauri::command]
 pub fn build_synteny_view(request: SyntenyViewRequest) -> Result<SyntenyViewResponse, String> {
     let query = synteny_query_from_parts(
@@ -4588,10 +4384,10 @@ mod tests {
     use super::{
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
         build_synteny_view, contact_overview_aggregate_cell_bound, get_app_status,
-        layout_gfa_bandage_response, open_text_reader, persistent_lod_cache_key,
-        scan_project_directory, sort_project_contact_candidates, write_existing_agp_path,
-        BedGraphRecordRequest, ContactMapBinRequest, ContactMapLayoutBlockRequest,
-        ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
+        layout_gfa_bandage_response, load_project_directory, open_text_reader,
+        persistent_lod_cache_key, sort_project_contact_candidates, write_agp_file,
+        write_existing_agp_path, BedGraphRecordRequest, ContactMapBinRequest,
+        ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
         ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
         ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
         CoverageViewFromBedGraphRequest, CoverageViewRequest, GfaBandageLayoutEdgeRequest,
@@ -4711,7 +4507,7 @@ mod tests {
         fs::write(root.join("reads.paf.gz"), b"").unwrap();
         fs::write(root.join("track.depth.gz"), b"").unwrap();
 
-        let project = scan_project_directory(&root).unwrap();
+        let project = load_project_directory(root.to_string_lossy().into_owned()).unwrap();
         assert_eq!(project.agp.as_ref().unwrap().name, "a.agp");
         assert_eq!(project.gfa.as_ref().unwrap().text, "S\tctg1\tACGT\n");
         assert_eq!(project.paf.as_ref().unwrap().name, "reads.paf.gz");
@@ -5388,6 +5184,7 @@ mod tests {
         let status = get_app_status();
 
         assert_eq!(status.engine, "cstudio-core");
+        assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             status.coordinate_convention,
             "0-based half-open internal; 1-based closed AGP"
@@ -5411,6 +5208,28 @@ mod tests {
             .expect("a missing target should request Save As"));
         fs::write(&path, "old").expect("test target should be created");
         assert!(write_existing_agp_path(&path, "new").expect("target should be overwritten"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("saved AGP should be readable"),
+            "new"
+        );
+
+        fs::remove_file(path).expect("test target should be removed");
+    }
+
+    #[test]
+    fn writes_a_new_agp_save_target_selected_by_the_dialog() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "c-studio-save-as-{}-{unique}.agp",
+            std::process::id()
+        ));
+
+        let saved_path = write_agp_file(path.to_string_lossy().into_owned(), "new".to_string())
+            .expect("a selected Save As target should be written");
+        assert_eq!(saved_path, path.to_string_lossy());
         assert_eq!(
             fs::read_to_string(&path).expect("saved AGP should be readable"),
             "new"

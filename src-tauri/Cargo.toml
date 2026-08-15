@@ -1,6 +1,6 @@
 [package]
 name = "c-studio"
-version = "0.1.0"
+version = "0.1.2"
 description = "C-Studio desktop application"
 edition = "2021"
 
@@ -19,6 +19,7 @@ cstudio-core = { path = "../crates/cstudio-core" }
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 
 [dev-dependencies]
 serde_json = "1"

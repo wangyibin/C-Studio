@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildGfaAssemblyGraph, parseGfaText } from "./gfa";
+import { buildGfaAssemblyGraph, limitGfaAssemblyGraph, parseGfaText } from "./gfa";
 
 describe("GFA evidence import", () => {
   it("parses hifiasm S/L/A records and canonicalizes reverse-equivalent links", () => {
@@ -67,5 +67,28 @@ describe("GFA evidence import", () => {
     ]);
 
     expect(graph.nodes[0].length).toBe(240);
+  });
+
+  it("keeps required focus nodes outside the leading display budget", () => {
+    const document = parseGfaText([
+      "S\ta\t*\tLN:i:100",
+      "S\tb\t*\tLN:i:100",
+      "S\tc\t*\tLN:i:100",
+      "L\tb\t+\tc\t+\t10M",
+    ].join("\n"));
+    const complete = buildGfaAssemblyGraph(document, [
+      { id: "a1", objectId: "Chr01", sourceId: "a", sourceStart: 0, sourceEnd: 100, visualStart: 0, visualEnd: 100, orientation: "+" },
+      { id: "b1", objectId: "Chr02", sourceId: "b", sourceStart: 0, sourceEnd: 100, visualStart: 100, visualEnd: 200, orientation: "+" },
+      { id: "c1", objectId: "Chr02", sourceId: "c", sourceStart: 0, sourceEnd: 100, visualStart: 200, visualEnd: 300, orientation: "+" },
+    ], Number.POSITIVE_INFINITY);
+
+    const limited = limitGfaAssemblyGraph(complete, 1, new Set(["b1", "c1"]));
+
+    expect(limited.nodes.map((node) => node.id)).toEqual(["b1", "c1"]);
+    expect(limited.edges.map((edge) => edge.id)).toEqual([
+      "agp:Chr02:b1:c1",
+      "gfa-link-1",
+    ]);
+    expect(limited.truncated).toBe(true);
   });
 });

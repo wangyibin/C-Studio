@@ -7,6 +7,8 @@ import {
   defaultGfaReviewOpen,
   gfaAgpJunctionPoints,
   gfaAgpBandageJunctionPoints,
+  gfaAgpPlacementObjectIds,
+  gfaAgpPlacementTargets,
   gfaBandageDragPlan,
   gfaAssemblyUnitId,
   gfaAssemblyUnitIdsInSelection,
@@ -30,6 +32,7 @@ import {
 } from "./GfaGraphPanel";
 import { classifyGfaScaffolds } from "../state/gfaHomologLayout";
 import type { GfaAssemblyGraph, GfaGraphNode } from "../state/gfa";
+import type { ContactMapLayoutBlock } from "../state/importers";
 
 describe("GFA chromosome palette", () => {
   it("provides sixteen non-repeating categorical colors for a homolog group", () => {
@@ -150,6 +153,27 @@ describe("GFA layout layer defaults", () => {
       showDisconnectedNodes: false,
       showAgpLinks: true,
     });
+  });
+});
+
+describe("GFA Add to AGP targets", () => {
+  const placementBlocks: ContactMapLayoutBlock[] = [
+    { id: "a", objectId: "Chr01", sourceId: "utgA", sourceStart: 0, sourceEnd: 10, visualStart: 0, visualEnd: 10, orientation: "+", assemblyBlockId: "block-1" },
+    { id: "b", objectId: "Chr01", sourceId: "utgB", sourceStart: 0, sourceEnd: 10, visualStart: 10, visualEnd: 20, orientation: "+", assemblyBlockId: "block-1" },
+    { id: "c", objectId: "Chr01", sourceId: "utgC", sourceStart: 0, sourceEnd: 10, visualStart: 120, visualEnd: 130, orientation: "+", assemblyBlockId: null, gapBefore: { componentType: "U", length: 100, gapType: "contig", linkage: "no", linkageEvidence: "na" } },
+    { id: "d", objectId: "Chr02", sourceId: "utgD", sourceStart: 0, sourceEnd: 10, visualStart: 130, visualEnd: 140, orientation: "+", assemblyBlockId: null },
+  ];
+
+  it("offers chromosomes in AGP order and only complete block boundaries", () => {
+    expect(gfaAgpPlacementObjectIds(placementBlocks)).toEqual(["Chr01", "Chr02"]);
+    expect(gfaAgpPlacementTargets(placementBlocks, "Chr01")).toEqual([
+      { value: "before:a", label: "Start", targetBlockId: "a" },
+      { value: "before:c", label: "Before utgC", targetBlockId: "c" },
+      { value: "end", label: "End", targetBlockId: null },
+    ]);
+    expect(gfaAgpPlacementTargets(placementBlocks, "Chr01").some((target) => (
+      target.targetBlockId === "b"
+    ))).toBe(false);
   });
 });
 
@@ -609,5 +633,82 @@ describe("GFA homolog and unanchored filtering", () => {
       false,
       false,
     ).edges.map((edge) => edge.id)).toEqual(["selected-refreshed"]);
+  });
+
+  it("keeps a selected unanchored Guided window when Disconnected is hidden", () => {
+    const graph: GfaAssemblyGraph = {
+      nodes: [
+        node("chromosome", "Chr01g1"),
+        node("selected", "utg000024l"),
+        node("neighbor", "utg000025l"),
+      ],
+      edges: [{ id: "selected-neighbor", source: "selected", target: "neighbor", kind: "gfa-link" }],
+      groupOrder: ["Chr01g1", "utg000024l", "utg000025l"],
+      matchedSegmentCount: 3,
+      unmatchedSegmentCount: 0,
+      ambiguousLinkCount: 0,
+      truncated: false,
+    };
+    const homologs = classifyGfaScaffolds(graph.groupOrder);
+
+    const guided = graphForGuidedNodeVisibility(
+      graph,
+      new Set(["selected"]),
+      homologs,
+      false,
+      false,
+    );
+
+    expect(guided.nodes.map((candidate) => candidate.id)).toEqual(["selected", "neighbor"]);
+    expect(guided.edges.map((edge) => edge.id)).toEqual(["selected-neighbor"]);
+  });
+
+  it("resolves a late Guided focus before applying the node budget", () => {
+    const leadingNodes = Array.from({ length: 1_200 }, (_, index) => (
+      node(`leading-${index}`, "Chr01g1")
+    ));
+    const focus = {
+      ...node("focus", "Chr05g3"),
+      assemblyBlockId: "Chr05g3_block_7",
+      order: 1_200,
+    };
+    const blockMate = {
+      ...node("block-mate", "Chr05g3"),
+      assemblyBlockId: "Chr05g3_block_7",
+      order: 1_201,
+    };
+    const gfaNeighbor = {
+      ...node("gfa-neighbor", "utg000066l"),
+      order: 1_202,
+    };
+    const graph: GfaAssemblyGraph = {
+      nodes: [...leadingNodes, focus, blockMate, gfaNeighbor],
+      edges: [
+        { id: "focus-neighbor", source: "focus", target: "gfa-neighbor", kind: "gfa-link" },
+      ],
+      groupOrder: ["Chr01g1", "Chr05g3", "utg000066l"],
+      matchedSegmentCount: 1_203,
+      unmatchedSegmentCount: 0,
+      ambiguousLinkCount: 0,
+      truncated: false,
+    };
+    const homologs = classifyGfaScaffolds(graph.groupOrder);
+
+    const guided = graphForGuidedNodeVisibility(
+      graph,
+      new Set(["focus"]),
+      homologs,
+      false,
+      false,
+      2,
+    );
+
+    expect(guided.nodes.map((candidate) => candidate.id)).toEqual([
+      "focus",
+      "block-mate",
+      "gfa-neighbor",
+    ]);
+    expect(guided.edges.map((edge) => edge.id)).toEqual(["focus-neighbor"]);
+    expect(guided.truncated).toBe(true);
   });
 });

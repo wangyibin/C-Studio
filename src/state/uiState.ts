@@ -9,6 +9,7 @@ import {
   dissolveAssemblyBlockSelection,
   moveSelectionBefore,
   moveSelectionToDebris,
+  placeUnplacedGfaSegment,
   removeChromosomeBoundariesFromSelection,
   assemblyRenameTarget,
   renameAssemblySelection,
@@ -80,6 +81,7 @@ export type ContextOperationType =
   | "delete_gap"
   | "rename"
   | "create_block"
+  | "place_unplaced"
   | "dissolve_block";
 
 export interface LogEntry {
@@ -266,6 +268,14 @@ export type UiAction =
     }
   | { type: "moveAssemblySelectionToDebris" }
   | { type: "deleteAssemblySelection" }
+  | {
+      type: "placeUnplacedGfaSegment";
+      segmentName: string;
+      length: number;
+      targetObjectId: string;
+      targetBlockId: string | null;
+      orientation: "+" | "-";
+    }
   | { type: "createAssemblyBlockFromGfa"; links: GfaLinkEvidence[] }
   | { type: "dissolveAssemblyBlockSelection" }
   | { type: "addAssemblyChromosomeBoundaries" }
@@ -1390,19 +1400,33 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
     }
     case "focusAssemblyContig": {
       const contig = state.assembly.blocks.find((block) => block.id === action.id);
-      if (!contig) {
+      const firstBlockMember = contig
+        ? null
+        : state.assembly.blocks.find((block) => block.assemblyBlockId === action.id);
+      const focusedBlocks = contig
+        ? [contig]
+        : firstBlockMember
+          ? state.assembly.blocks.filter((block) => (
+              block.assemblyBlockId === action.id
+              && block.objectId === firstBlockMember.objectId
+            ))
+          : [];
+      if (focusedBlocks.length === 0) {
         return state;
       }
+      const visualStart = Math.min(...focusedBlocks.map((block) => block.visualStart));
+      const visualEnd = Math.max(...focusedBlocks.map((block) => block.visualEnd));
+      const objectId = focusedBlocks[0].objectId;
       const centerMb = roundContactViewportMb(
-        (contig.visualStart + contig.visualEnd) / 2_000_000,
+        (visualStart + visualEnd) / 2_000_000,
       );
       const totalSpanMb = Math.max(
         0.000001,
         ...state.assembly.blocks.map((block) => block.visualEnd / 1_000_000),
       );
-      const contigSpanMb = Math.max(
+      const focusedSpanMb = Math.max(
         0.000001,
-        (contig.visualEnd - contig.visualStart) / 1_000_000,
+        (visualEnd - visualStart) / 1_000_000,
       );
       const viewportWidthPx = sanitizeContactViewportSizePx(state.contact.viewportWidthPx);
       const viewportHeightPx = sanitizeContactViewportSizePx(state.contact.viewportHeightPx);
@@ -1412,7 +1436,7 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         0.000001,
         (2 * Math.min(centerMb, totalSpanMb - centerMb)) / longestAxisScale,
       );
-      const contextSpanMb = Math.max(contigSpanMb * 4, totalSpanMb * 0.02);
+      const contextSpanMb = Math.max(focusedSpanMb * 4, totalSpanMb * 0.02);
       const viewportSpanMb = roundContactViewportMb(Math.max(
         0.000001,
         Math.min(state.contact.viewportSpanMb, contextSpanMb, centeredSpanLimitMb),
@@ -1446,10 +1470,14 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           },
           assembly: {
             ...state.assembly,
-            selection: { kind: "contigs", ids: [contig.id], exact: true },
+            selection: contig
+              ? { kind: "contigs", ids: [contig.id], exact: true }
+              : { kind: "contigs", ids: [action.id] },
           },
         },
-        `Focused contig ${contig.sourceId} at ${contig.objectId}`,
+        contig
+          ? `Focused contig ${contig.sourceId} at ${objectId}`
+          : `Focused block ${action.id} at ${objectId}`,
       );
     }
     case "selectAssemblyContigs":
@@ -1594,6 +1622,29 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         },
         `${deletedCount} ${deletedCount === 1 ? "contig" : "contigs"} deleted`,
         "delete_contig",
+      );
+    }
+    case "placeUnplacedGfaSegment": {
+      const blocks = placeUnplacedGfaSegment(state.assembly.blocks, {
+        segmentName: action.segmentName,
+        length: action.length,
+        targetObjectId: action.targetObjectId,
+        targetBlockId: action.targetBlockId,
+        orientation: action.orientation,
+      });
+      const inserted = blocks === state.assembly.blocks
+        ? null
+        : blocks.find((block) => block.sourceId === action.segmentName) ?? null;
+      return withAssemblyHistory(
+        state,
+        {
+          blocks,
+          selection: inserted
+            ? { kind: "contigs", ids: [inserted.id], exact: true }
+            : state.assembly.selection,
+        },
+        `${action.segmentName} added to ${action.targetObjectId}`,
+        "place_unplaced",
       );
     }
     case "createAssemblyBlockFromGfa":

@@ -39,9 +39,13 @@ export function HeatmapToolbar({
     safeTotalSpanMb,
     false,
   );
-  const resolutionOptions = useStoredResolutionOptions && availableResolutionBasePairs.length > 0
+  // An mcool control must never invent a generic pyramid while its physical
+  // levels are unavailable. Showing (and accepting) e.g. 2 Mb during that
+  // fallback can dispatch a request for a group the file does not contain.
+  const resolutionOptions = useStoredResolutionOptions
     ? storedContactResolutionsForDataset(availableResolutionBasePairs)
     : viewportResolutionOptions;
+  const resolutionOptionsReady = resolutionOptions.length > 0;
   const resolutionIndex = resolutionOptions.indexOf(uiState.contact.resolution);
   const safeResolutionIndex = Math.max(0, resolutionIndex);
   const resolutionSignature = resolutionOptions.join("|");
@@ -139,7 +143,9 @@ export function HeatmapToolbar({
           <span className="heatmap-resolution-heading">
             <span className="heatmap-toolbar-label" aria-hidden="true">Resolution</span>
             <span className="heatmap-resolution-value" aria-live="polite">
-              {resolutionOptions[draftResolutionIndex] ?? uiState.contact.resolution}
+              {resolutionOptionsReady
+                ? resolutionOptions[draftResolutionIndex] ?? uiState.contact.resolution
+                : "Loading…"}
             </span>
           </span>
           <span className="heatmap-resolution-track">
@@ -147,11 +153,14 @@ export function HeatmapToolbar({
               className="heatmap-resolution-range"
               type="range"
               min="0"
-              max={resolutionOptions.length - 1}
+              max={Math.max(0, resolutionOptions.length - 1)}
               step="1"
               value={draftResolutionIndex}
+              disabled={!resolutionOptionsReady}
               aria-label="Contact map resolution"
-              aria-valuetext={resolutionOptions[draftResolutionIndex] ?? uiState.contact.resolution}
+              aria-valuetext={resolutionOptionsReady
+                ? resolutionOptions[draftResolutionIndex] ?? uiState.contact.resolution
+                : "Stored resolutions unavailable"}
               onChange={(event) => setDraftResolutionIndex(Number(event.target.value))}
               onBlur={(event) => commitResolution(Number(event.currentTarget.value))}
               onKeyUp={(event) => commitResolution(Number(event.currentTarget.value))}

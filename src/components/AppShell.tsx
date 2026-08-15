@@ -8,6 +8,7 @@ import {
   RefreshCcw,
   Redo2,
   Save,
+  SaveAll,
   Trash2,
   Undo2,
 } from "lucide-react";
@@ -91,6 +92,7 @@ interface AppShellProps {
   onCoverageFileRequested: () => void;
   onCoverageFileSelected: (file: File) => void;
   onExportAgp: () => void;
+  onExportAgpAs: () => void;
   autoSaveEnabled: boolean;
   autoSaveAvailable: boolean;
   isAgpDirty: boolean;
@@ -178,6 +180,7 @@ export function AppShell({
   onCoverageFileRequested,
   onCoverageFileSelected,
   onExportAgp,
+  onExportAgpAs,
   autoSaveEnabled,
   autoSaveAvailable,
   isAgpDirty,
@@ -862,9 +865,19 @@ export function AppShell({
               aria-keyshortcuts="Control+S Meta+S"
               title={`Save edited AGP (${shortcuts.save})`}
               disabled={!uiState.assembly.blocks.length}
-              onClick={onExportAgp}
+              onClick={() => onExportAgp()}
             >
               <Save size={16} aria-hidden="true" />
+            </button>
+            <button
+              className="global-icon-button export-project-button"
+              type="button"
+              aria-label="Save edited AGP as"
+              title="Save edited AGP as a new file"
+              disabled={!uiState.assembly.blocks.length}
+              onClick={() => onExportAgpAs()}
+            >
+              <SaveAll size={16} aria-hidden="true" />
             </button>
             <button
               className={`global-icon-button${uiState.layout.rightCollapsed ? "" : " active"}`}
@@ -882,6 +895,7 @@ export function AppShell({
                 <Ellipsis size={17} aria-hidden="true" />
               </summary>
               <div className="toolbar-popover app-menu-popover">
+                <p><span>Version</span><strong>{status.version}</strong></p>
                 <p><span>Core</span><strong>{status.engine}</strong></p>
                 <p><span>Coordinates</span><strong>{status.coordinate_convention}</strong></p>
                 <p><span>Status</span><strong>{statusMessage}</strong></p>

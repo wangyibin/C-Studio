@@ -1750,6 +1750,36 @@ button {
   color: var(--danger);
 }
 
+.gfa-unplaced-context-menu {
+  grid-auto-rows: auto;
+}
+
+.gfa-unplaced-menu-summary {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 5px 10px 8px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+}
+
+.gfa-unplaced-menu-summary strong,
+.gfa-unplaced-menu-summary small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gfa-unplaced-menu-summary strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.gfa-unplaced-menu-summary small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
 .assembly-delete-backdrop {
   position: fixed;
   inset: 0;
@@ -1771,6 +1801,193 @@ button {
   border-radius: 8px;
   background: var(--surface);
   box-shadow: var(--shadow);
+}
+
+.gfa-placement-dialog {
+  display: grid;
+  gap: 14px;
+  width: min(540px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  padding: 18px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.gfa-placement-dialog > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.gfa-placement-dialog > header span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.gfa-placement-dialog h2,
+.gfa-placement-dialog p {
+  margin: 0;
+}
+
+.gfa-placement-dialog h2 {
+  color: var(--text);
+  font-size: 17px;
+}
+
+.gfa-placement-dialog > header p {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gfa-placement-dialog > header button {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 27px;
+  width: 27px;
+  height: 27px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.gfa-placement-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr) minmax(0, 0.9fr);
+  gap: 10px;
+}
+
+.gfa-placement-fields label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.gfa-placement-fields select {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.gfa-placement-fields select:focus {
+  border-color: var(--accent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.gfa-placement-preview {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.gfa-placement-preview > strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.gfa-placement-preview dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.gfa-placement-preview dl div {
+  display: grid;
+  gap: 2px;
+}
+
+.gfa-placement-preview dt {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.gfa-placement-preview dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.gfa-placement-preview code {
+  display: block;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 10px;
+  white-space: pre;
+}
+
+.gfa-placement-preview p[role="alert"] {
+  color: var(--danger);
+  font-size: 11px;
+}
+
+.gfa-placement-dialog .gfa-placement-note {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.gfa-placement-dialog > footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.gfa-placement-dialog > footer button {
+  min-width: 92px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.gfa-placement-dialog > footer .gfa-placement-confirm {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.gfa-placement-dialog > footer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+@media (max-width: 680px) {
+  .gfa-placement-fields {
+    grid-template-columns: 1fr;
+  }
 }
 
 .assembly-delete-dialog h2,
@@ -2793,6 +3010,89 @@ button {
   max-width: 155px;
   overflow-wrap: anywhere;
   text-align: right;
+}
+
+.block-member-list {
+  display: grid;
+  gap: 5px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.block-member-list > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.block-member-list ol {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.block-member-list button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.block-member-list button:hover,
+.block-member-list button:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+}
+
+.block-member-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.block-member-name small {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 13%, var(--surface-2));
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.block-member-name strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.block-member-metadata {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 9px;
+  white-space: nowrap;
 }
 
 .contig-current-copy-state {
