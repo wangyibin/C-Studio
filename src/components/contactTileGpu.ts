@@ -268,13 +268,15 @@ export function createContactTileGpuRenderer(
   let panOffsetY = 0;
   let destroyed = false;
   let lutColormap: ContactTileRenderStyle["colormap"] | null = null;
+  let presentedCssWidth = 1;
+  let presentedCssHeight = 1;
 
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.CULL_FACE);
   gl.disable(gl.BLEND);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
-  const draw = (): boolean => {
+  const draw = (panOnly = false): boolean => {
     const activeScene = deltaScene ?? scene;
     if (destroyed || !activeScene || gl.isContextLost()) {
       return false;
@@ -285,9 +287,13 @@ export function createContactTileGpuRenderer(
     if (deltaScene?.deferTextureUpdates) {
       return true;
     }
-    resizeCanvasToDisplaySize(canvas, gl);
-    updateLutTexture(gl, resources.lutTexture, activeScene.renderStyle, lutColormap);
-    lutColormap = activeScene.renderStyle.colormap;
+    if (!panOnly) {
+      resizeCanvasToDisplaySize(canvas, gl);
+      presentedCssWidth = Math.max(1, canvas.clientWidth || canvas.width);
+      presentedCssHeight = Math.max(1, canvas.clientHeight || canvas.height);
+      updateLutTexture(gl, resources.lutTexture, activeScene.renderStyle, lutColormap);
+      lutColormap = activeScene.renderStyle.colormap;
+    }
 
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.clearColor(1, 1, 1, 1);
@@ -318,12 +324,16 @@ export function createContactTileGpuRenderer(
     const viewportWidth = Math.max(1, activeScene.viewport.xEnd - activeScene.viewport.xStart);
     const viewportHeight = Math.max(1, activeScene.viewport.yEnd - activeScene.viewport.yStart);
     const tileSpanBp = activeScene.resolution * activeScene.tileSizeBins;
-    const cssWidth = Math.max(1, canvas.clientWidth || canvas.width);
-    const cssHeight = Math.max(1, canvas.clientHeight || canvas.height);
+    // Pointer pans reuse the dimensions captured by the last complete scene
+    // draw. Reading clientWidth/clientHeight in every animation frame can force
+    // synchronous layout in WebView2, while ResizeObserver already schedules a
+    // complete redraw whenever those dimensions actually change.
+    const cssWidth = presentedCssWidth;
+    const cssHeight = presentedCssHeight;
     const scaleX = canvas.width / cssWidth;
     const scaleY = canvas.height / cssHeight;
-    const protectedKeys = new Set<string>();
-    const drawnDescriptorKeys = new Set<string>();
+    const protectedKeys = panOnly ? null : new Set<string>();
+    const drawnDescriptorKeys = panOnly ? null : new Set<string>();
 
     for (const descriptor of activeScene.descriptors) {
       const deltaBuffer = deltaScene
@@ -333,35 +343,46 @@ export function createContactTileGpuRenderer(
         continue;
       }
       const textureKey = gpuTextureKey(activeScene, descriptor.tile);
-      protectedKeys.add(textureKey);
-      const entry = deltaScene && deltaBuffer
-        ? ensureDeltaTileTexture(
-            gl,
-            textureCache,
-            textureKey,
-            deltaBuffer,
-            deltaScene.generation,
-            deltaScene.tileSizeBins,
-            ++useCounter,
-            deltaScratch,
-          )
-        : ensureTileTexture(
-            gl,
-            textureCache,
-            textureKey,
-            descriptor.tile,
-            activeScene.generation,
-            activeScene.tileSizeBins,
-            ++useCounter,
-          );
+      protectedKeys?.add(textureKey);
+      const cachedEntry = panOnly ? textureCache.get(textureKey) : undefined;
+      const cachedEntryMatches = cachedEntry && (deltaScene && deltaBuffer
+        ? cachedEntry.generation === deltaScene.generation
+          && cachedEntry.deltaBuffer === deltaBuffer
+        : cachedEntry.tile === descriptor.tile);
+      if (panOnly && !cachedEntryMatches) {
+        // Scene changes normally run a complete draw before pointer input can
+        // reach this path. Fall back defensively if that ordering is ever
+        // broken instead of presenting a partially translated surface.
+        return draw();
+      }
+      const entry = cachedEntryMatches
+        ? cachedEntry
+        : deltaScene && deltaBuffer
+          ? ensureDeltaTileTexture(
+              gl,
+              textureCache,
+              textureKey,
+              deltaBuffer,
+              deltaScene.generation,
+              deltaScene.tileSizeBins,
+              ++useCounter,
+              deltaScratch,
+            )
+          : ensureTileTexture(
+              gl,
+              textureCache,
+              textureKey,
+              descriptor.tile,
+              activeScene.generation,
+              activeScene.tileSizeBins,
+              ++useCounter,
+            );
       if (!entry) {
         continue;
       }
       if (!textureCache.has(textureKey)) {
         continue;
       }
-      textureBytes = cachedTextureBytes(textureCache);
-
       const renderedTileX = descriptor.transpose ? descriptor.tile.tileY : descriptor.tile.tileX;
       const renderedTileY = descriptor.transpose ? descriptor.tile.tileX : descriptor.tile.tileY;
       const left = (
@@ -381,24 +402,34 @@ export function createContactTileGpuRenderer(
       gl.bindTexture(gl.TEXTURE_2D, entry.texture);
       gl.uniform1i(resources.tileTextureLocation, 0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
-      drawnDescriptorKeys.add(descriptor.key);
+      drawnDescriptorKeys?.add(descriptor.key);
     }
 
-    if (textureBytes > safeTextureBudget) {
+    // Cache size is independent of descriptor count. Recomputing it inside the
+    // tile loop made a pan frame O(visible tiles * cached textures), which is
+    // particularly costly in Windows WebView2/ANGLE. A pointer-only redraw
+    // cannot change the cache at all, so it skips accounting and eviction.
+    if (!panOnly) {
+      textureBytes = cachedTextureBytes(textureCache);
+    }
+    if (!panOnly && textureBytes > safeTextureBudget) {
       textureBytes = evictLeastRecentlyUsedTextures(
         gl,
         textureCache,
         textureBytes,
         safeTextureBudget,
-        protectedKeys,
+        protectedKeys!,
       );
     }
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    if (panOnly) {
+      return true;
+    }
     const glSucceeded = gl.getError() === gl.NO_ERROR;
     return glSucceeded && (
       deltaScene !== null
-      || contactTileGpuDrawCoverageIsComplete(activeScene.descriptors, drawnDescriptorKeys)
+      || contactTileGpuDrawCoverageIsComplete(activeScene.descriptors, drawnDescriptorKeys!)
     );
   };
 
@@ -513,7 +544,7 @@ export function createContactTileGpuRenderer(
     setPanOffset: (x, y) => {
       panOffsetX = Number.isFinite(x) ? x : 0;
       panOffsetY = Number.isFinite(y) ? y : 0;
-      draw();
+      draw(true);
     },
     resetPanOffset: () => {
       if (panOffsetX === 0 && panOffsetY === 0) {
@@ -521,7 +552,7 @@ export function createContactTileGpuRenderer(
       }
       panOffsetX = 0;
       panOffsetY = 0;
-      draw();
+      draw(true);
     },
     redraw: draw,
     destroy: () => {

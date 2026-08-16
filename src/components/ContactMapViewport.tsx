@@ -129,6 +129,15 @@ interface PendingPanFrame {
   height: number;
 }
 
+interface WheelPanSession {
+  sourceContactMap: ContactMapView;
+  startViewport: ContactViewport;
+  previewViewport: ContactViewport;
+  velocitySample: ContactViewportVelocitySample;
+  width: number;
+  height: number;
+}
+
 interface AssemblySelectionDragState {
   pointerId: number;
   startX: number;
@@ -212,6 +221,32 @@ const maxBufferedContactCells = 360_000;
 const contactMapImageDataCache = new WeakMap<HTMLCanvasElement, ImageData>();
 const shiftSelectionClassName = "shift-selection-active";
 const resolutionWheelCooldownMs = 140;
+// Coalesce a physical wheel burst into one committed UI viewport. Preview
+// generations still start while the wheel is moving, so Windows WebView2 does
+// not repeatedly cancel the first visible-tile stream before it can paint.
+const wheelPanCommitDelayMs = 80;
+
+export function contactWheelPanCommitDelta(
+  startViewport: ContactViewport,
+  previewViewport: ContactViewport,
+) {
+  const deltaXMb = (previewViewport.xStart - startViewport.xStart) / 1_000_000;
+  const deltaYMb = (previewViewport.yStart - startViewport.yStart) / 1_000_000;
+  return deltaXMb === 0 && deltaYMb === 0 ? null : { deltaXMb, deltaYMb };
+}
+
+export function contactPanPreviewTileSignature(
+  viewport: ContactViewport,
+  prefetchViewport: ContactViewport,
+  resolution: number,
+  tileSizeBins: number,
+  totalSpanBp: number,
+) {
+  return [
+    contactTileViewportSignature(viewport, resolution, tileSizeBins, totalSpanBp),
+    contactTileViewportSignature(prefetchViewport, resolution, tileSizeBins, totalSpanBp),
+  ].join("=>");
+}
 
 interface ContactResolutionWheelInput {
   deltaX: number;
@@ -772,6 +807,8 @@ export function ContactMapViewport({
   const panPreviewTileSignatureRef = useRef<string | null>(null);
   const panPreviewSequenceRef = useRef(0);
   const panVelocitySampleRef = useRef<ContactViewportVelocitySample | null>(null);
+  const wheelPanSessionRef = useRef<WheelPanSession | null>(null);
+  const wheelPanCommitTimerRef = useRef<number | null>(null);
   const panAnimationFrameRef = useRef<number | null>(null);
   const redrawAnimationFrameRef = useRef<number | null>(null);
   const prepaintedCellContactMapRef = useRef<ContactMapView | null>(null);
@@ -1218,6 +1255,7 @@ export function ContactMapViewport({
       setShiftSelectionCursor(false);
       lastAssemblyPointerRef.current = null;
       panVelocitySampleRef.current = null;
+      finishWheelPan();
       setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
     }
 
@@ -1227,6 +1265,11 @@ export function ContactMapViewport({
     window.addEventListener("blur", handleWindowBlur);
 
     return () => {
+      if (wheelPanCommitTimerRef.current !== null) {
+        window.clearTimeout(wheelPanCommitTimerRef.current);
+        wheelPanCommitTimerRef.current = null;
+      }
+      wheelPanSessionRef.current = null;
       window.removeEventListener("click", closeContextMenu);
       window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("keyup", handleKeyUp, true);
@@ -1272,6 +1315,7 @@ export function ContactMapViewport({
       const sourceContactMap = latestContactMapRef.current;
       const navigationMode = contactWheelNavigationMode(event);
       if (navigationMode === "resolution") {
+        finishWheelPan();
         event.preventDefault();
         event.stopPropagation();
         if (!sourceContactMap) {
@@ -1329,15 +1373,30 @@ export function ContactMapViewport({
       const bounds = canvasFrameRef.current?.getBoundingClientRect()
         ?? stage!.getBoundingClientRect();
       const latestUiState = latestUiStateRef.current;
-      const currentViewport = buildCenteredContactViewport({
-        centerMb: latestUiState.contact.viewportCenterMb,
-        centerXMb: latestUiState.contact.viewportCenterXMb,
-        centerYMb: latestUiState.contact.viewportCenterYMb,
-        totalSpanBp: totalSpanMb * 1_000_000,
-        windowSizeBp: latestUiState.contact.viewportSpanMb * 1_000_000,
-        viewportWidthPx: latestUiState.contact.viewportWidthPx,
-        viewportHeightPx: latestUiState.contact.viewportHeightPx,
-      });
+      let wheelSession = wheelPanSessionRef.current;
+      const startsWheelSession = wheelSession === null;
+      if (!wheelSession) {
+        const startViewport = buildCenteredContactViewport({
+          centerMb: latestUiState.contact.viewportCenterMb,
+          centerXMb: latestUiState.contact.viewportCenterXMb,
+          centerYMb: latestUiState.contact.viewportCenterYMb,
+          totalSpanBp: totalSpanMb * 1_000_000,
+          windowSizeBp: latestUiState.contact.viewportSpanMb * 1_000_000,
+          viewportWidthPx: latestUiState.contact.viewportWidthPx,
+          viewportHeightPx: latestUiState.contact.viewportHeightPx,
+        });
+        const startedAt = contactPanPerformanceTimestamp();
+        wheelSession = {
+          sourceContactMap: { ...sourceContactMap, viewport: startViewport },
+          startViewport,
+          previewViewport: startViewport,
+          velocitySample: sampleContactViewportVelocity(null, startViewport, startedAt),
+          width: Math.max(1, bounds.width),
+          height: Math.max(1, bounds.height),
+        };
+        wheelPanSessionRef.current = wheelSession;
+      }
+      const currentViewport = wheelSession.previewViewport;
       const intent = contactWheelPanIntent({
         deltaX: event.deltaX,
         deltaY: event.deltaY,
@@ -1347,12 +1406,18 @@ export function ContactMapViewport({
         viewport: currentViewport,
       });
       if (!intent) {
+        if (startsWheelSession) {
+          wheelPanSessionRef.current = null;
+        }
         return;
       }
 
       event.preventDefault();
       event.stopPropagation();
-      const currentContactMap = { ...sourceContactMap, viewport: currentViewport };
+      const currentContactMap = {
+        ...wheelSession.sourceContactMap,
+        viewport: currentViewport,
+      };
       const previewContactMap = contactMapWithPannedViewport(
         currentContactMap,
         -intent.deltaXPx,
@@ -1364,17 +1429,40 @@ export function ContactMapViewport({
       const deltaXMb = (previewContactMap.viewport.xStart - currentViewport.xStart) / 1_000_000;
       const deltaYMb = (previewContactMap.viewport.yStart - currentViewport.yStart) / 1_000_000;
       if (deltaXMb === 0 && deltaYMb === 0) {
+        if (startsWheelSession) {
+          wheelPanSessionRef.current = null;
+        }
         return;
       }
 
+      const velocitySample = sampleContactViewportVelocity(
+        wheelSession.velocitySample,
+        previewContactMap.viewport,
+        contactPanPerformanceTimestamp(),
+      );
+      wheelSession.previewViewport = previewContactMap.viewport;
+      wheelSession.velocitySample = velocitySample;
+      wheelSession.width = Math.max(1, bounds.width);
+      wheelSession.height = Math.max(1, bounds.height);
       updatePanOverscanDirection(currentViewport, previewContactMap.viewport);
+      requestPanPreviewTiles(
+        previewContactMap.viewport,
+        velocitySample,
+        wheelSession.sourceContactMap,
+      );
       schedulePanTransform(
-        currentContactMap,
-        previewContactMap,
+        wheelSession.sourceContactMap,
+        { ...wheelSession.sourceContactMap, viewport: previewContactMap.viewport },
         bounds.width,
         bounds.height,
       );
-      onUiAction({ type: "panContactViewport", deltaXMb, deltaYMb });
+      if (wheelPanCommitTimerRef.current !== null) {
+        window.clearTimeout(wheelPanCommitTimerRef.current);
+      }
+      wheelPanCommitTimerRef.current = window.setTimeout(
+        finishWheelPan,
+        wheelPanCommitDelayMs,
+      );
     }
 
     stage.addEventListener("wheel", handleWheelPan, { passive: false });
@@ -1383,6 +1471,7 @@ export function ContactMapViewport({
     availableResolutionBasePairs,
     onUiAction,
     useStoredResolutionOptions,
+    onContactViewportPreview,
     totalSpanMb,
   ]);
 
@@ -1472,7 +1561,40 @@ export function ContactMapViewport({
     });
   }
 
+  function finishWheelPan() {
+    if (wheelPanCommitTimerRef.current !== null) {
+      window.clearTimeout(wheelPanCommitTimerRef.current);
+      wheelPanCommitTimerRef.current = null;
+    }
+    const session = wheelPanSessionRef.current;
+    wheelPanSessionRef.current = null;
+    if (!session) {
+      return;
+    }
+
+    cancelScheduledPanFrame();
+    applyPanTransform(
+      session.sourceContactMap,
+      { ...session.sourceContactMap, viewport: session.previewViewport },
+      session.width,
+      session.height,
+    );
+    const commitDelta = contactWheelPanCommitDelta(
+      session.startViewport,
+      session.previewViewport,
+    );
+    if (commitDelta) {
+      onUiAction({ type: "panContactViewport", ...commitDelta });
+    } else {
+      resetPanTransform();
+    }
+    panPreviewTileSignatureRef.current = null;
+    panVelocitySampleRef.current = null;
+    onContactViewportPreview?.(null);
+  }
+
   function startPan(event: React.PointerEvent<HTMLElement>) {
+    finishWheelPan();
     if (!liveContactMap || event.button !== 0) {
       return;
     }
@@ -1591,25 +1713,27 @@ export function ContactMapViewport({
   function requestPanPreviewTiles(
     previewViewport: ContactViewport,
     velocity: ContactViewportVelocity = { xBpPerMs: 0, yBpPerMs: 0 },
+    sourceContactMap: ContactMapView | null = liveContactMap,
   ) {
-    if (!onContactViewportPreview || !liveContactMap) {
+    if (!onContactViewportPreview || !sourceContactMap) {
       return;
     }
-    const tileSpanBp = liveContactMap.resolution * (liveContactMap.tileSizeBins ?? 256);
+    const tileSpanBp = sourceContactMap.resolution * (sourceContactMap.tileSizeBins ?? 256);
     const prefetchViewport = contactViewportWithVelocityAwareLead(
-      liveContactMap.viewport,
+      sourceContactMap.viewport,
       previewViewport,
       tileSpanBp,
       velocity,
       totalSpanMb * 1_000_000,
     );
-    // Key preview generations from the look-ahead window. Slow pans retain a
-    // half-tile lead; faster motion grows to at most one and a half tiles while
-    // preserving the exact pointer-following displayed view.
-    const signature = contactTileViewportSignature(
+    // Start a generation when either the visible grid or its look-ahead grid
+    // changes. Tracking only the lead can miss the later visible-tile boundary
+    // during a continuous wheel burst.
+    const signature = contactPanPreviewTileSignature(
+      previewViewport,
       prefetchViewport,
-      liveContactMap.resolution,
-      liveContactMap.tileSizeBins ?? 256,
+      sourceContactMap.resolution,
+      sourceContactMap.tileSizeBins ?? 256,
       totalSpanMb * 1_000_000,
     );
     if (signature === panPreviewTileSignatureRef.current) {

@@ -13,6 +13,7 @@ import {
   assemblyShiftClickIntent,
   ContactMapViewport,
   contactCoverageFramesMatch,
+  contactPanPreviewTileSignature,
   contactCanvasBackingSizeFromBounds,
   contactResolutionWheelIntent,
   lockedContactResolutionWheelZoomIntent,
@@ -20,6 +21,7 @@ import {
   contactViewportSizePxFromBounds,
   contactTileOverscanDirectionForViewports,
   contactWheelNavigationMode,
+  contactWheelPanCommitDelta,
   contactWheelPanMode,
   contactWheelPanIntent,
   historyPreviewBoxes,
@@ -438,6 +440,44 @@ describe("lockedContactResolutionWheelZoomIntent", () => {
 });
 
 describe("contactWheelPanIntent", () => {
+  it("refreshes a wheel preview when the visible grid crosses after its lead grid", () => {
+    const prefetchViewport = {
+      xStart: 256_000,
+      xEnd: 512_000,
+      yStart: 256_000,
+      yEnd: 512_000,
+    };
+    const beforeVisibleBoundary = contactPanPreviewTileSignature(
+      { xStart: 10_000, xEnd: 250_000, yStart: 10_000, yEnd: 250_000 },
+      prefetchViewport,
+      1_000,
+      256,
+      1_000_000,
+    );
+    const afterVisibleBoundary = contactPanPreviewTileSignature(
+      { xStart: 20_000, xEnd: 270_000, yStart: 20_000, yEnd: 270_000 },
+      prefetchViewport,
+      1_000,
+      256,
+      1_000_000,
+    );
+
+    expect(afterVisibleBoundary).not.toBe(beforeVisibleBoundary);
+  });
+
+  it("commits one cumulative viewport delta after a wheel burst", () => {
+    expect(contactWheelPanCommitDelta(
+      viewport,
+      {
+        xStart: viewport.xStart + 25_000_000,
+        xEnd: viewport.xEnd + 25_000_000,
+        yStart: viewport.yStart + 15_000_000,
+        yEnd: viewport.yEnd + 15_000_000,
+      },
+    )).toEqual({ deltaXMb: 25, deltaYMb: 15 });
+    expect(contactWheelPanCommitDelta(viewport, viewport)).toBeNull();
+  });
+
   it("maps plain wheel to diagonal pan and Command/Ctrl-Shift wheel to vertical pan", () => {
     expect(contactWheelNavigationMode({
       ctrlKey: false,

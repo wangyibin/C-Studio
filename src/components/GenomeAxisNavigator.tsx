@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, PointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { assemblyScaffoldColorMap, unplacedAssemblyColor } from "../state/assemblyPalette";
@@ -300,6 +300,7 @@ export function GenomeAxisNavigator({
     () => assemblyScaffoldColorMap(segments.map((segment) => segment.objectId), homologPattern),
     [homologPattern, segments],
   );
+  const segmentCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const dragSession = useRef<DragSession | null>(null);
   const [previewCenterRatio, setPreviewCenterRatio] = useState<number | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -312,6 +313,72 @@ export function GenomeAxisNavigator({
   const minimumCenterMb = displayedWindow.spanRatio * safeTotalSpanMb / 2;
   const maximumCenterMb = Math.max(minimumCenterMb, safeTotalSpanMb - minimumCenterMb);
   const viewBox = axis === "x" ? "0 0 100 20" : "0 0 20 100";
+
+  useEffect(() => {
+    const canvas = segmentCanvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    const drawSegments = () => {
+      const bounds = canvas.getBoundingClientRect();
+      const width = Math.max(0, bounds.width);
+      const height = Math.max(0, bounds.height);
+      if (width <= 0 || height <= 0) {
+        return;
+      }
+
+      const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+      const bitmapWidth = Math.max(1, Math.round(width * pixelRatio));
+      const bitmapHeight = Math.max(1, Math.round(height * pixelRatio));
+      if (canvas.width !== bitmapWidth || canvas.height !== bitmapHeight) {
+        canvas.width = bitmapWidth;
+        canvas.height = bitmapHeight;
+      }
+
+      const context = canvas.getContext("2d");
+      if (!context) {
+        return;
+      }
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, width, height);
+
+      const railLength = axis === "x" ? width : height;
+      const railThickness = axis === "x" ? height : width;
+      const inset = Math.min(1, railThickness / 10);
+      const bandThickness = Math.max(0, railThickness - inset * 2);
+      context.fillStyle = "#c9cbd0";
+      if (axis === "x") {
+        context.fillRect(0, inset, railLength, bandThickness);
+      } else {
+        context.fillRect(inset, 0, bandThickness, railLength);
+      }
+      for (const segment of segments) {
+        const start = clamp(segment.startRatio, 0, 1) * railLength;
+        const end = clamp(segment.endRatio, 0, 1) * railLength;
+        const span = Math.max(0, end - start);
+        if (span <= 0) {
+          continue;
+        }
+        context.fillStyle = chromosomeColors.get(segment.objectId) ?? unplacedAssemblyColor;
+        if (axis === "x") {
+          context.fillRect(start, inset, span, bandThickness);
+        } else {
+          context.fillRect(inset, start, bandThickness, span);
+        }
+      }
+    };
+
+    drawSegments();
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(drawSegments);
+      observer.observe(canvas);
+      return () => observer.disconnect();
+    }
+
+    window.addEventListener("resize", drawSegments);
+    return () => window.removeEventListener("resize", drawSegments);
+  }, [axis, chromosomeColors, segments]);
 
   function handlePointerDown(event: PointerEvent<HTMLDivElement>) {
     if (event.button !== 0 || safeTotalSpanMb <= 0) {
@@ -451,6 +518,12 @@ export function GenomeAxisNavigator({
             document.body,
           )
         : null}
+      <canvas
+        ref={segmentCanvasRef}
+        className="genome-axis-segment-canvas"
+        data-segment-count={segments.length}
+        aria-hidden="true"
+      />
       <svg
         className="genome-axis-rail"
         viewBox={viewBox}
@@ -465,63 +538,6 @@ export function GenomeAxisNavigator({
         ) : (
           <rect className="genome-axis-track" x="2" y="0" width="16" height="100" rx="2" />
         )}
-
-        <g className="genome-axis-segments genome-axis-chromosome-track">
-          {segments.map((segment, index) => {
-            const start = segment.startRatio * 100;
-            const span = segment.spanRatio * 100;
-            return axis === "x" ? (
-              <rect
-                className={`genome-axis-segment segment-tone-${index % 5}`}
-                style={{ fill: chromosomeColors.get(segment.objectId) ?? unplacedAssemblyColor }}
-                data-object-id={segment.objectId}
-                key={segment.id}
-                x={start}
-                y="2"
-                width={span}
-                height="16"
-                rx="0.7"
-                onPointerEnter={(event) => setHoveredSegment({
-                  objectId: segment.objectId,
-                  clientX: event.clientX,
-                  clientY: event.clientY,
-                })}
-                onPointerLeave={() => {
-                  if (!dragSession.current) {
-                    setHoveredSegment(null);
-                  }
-                }}
-              >
-                <title>{`${segment.objectId}: ${formatMb(segment.startMb)}–${formatMb(segment.endMb)} Mb`}</title>
-              </rect>
-            ) : (
-              <rect
-                className={`genome-axis-segment segment-tone-${index % 5}`}
-                style={{ fill: chromosomeColors.get(segment.objectId) ?? unplacedAssemblyColor }}
-                data-object-id={segment.objectId}
-                key={segment.id}
-                x="2"
-                y={start}
-                width="16"
-                height={span}
-                rx="0.7"
-                onPointerEnter={(event) => setHoveredSegment({
-                  objectId: segment.objectId,
-                  clientX: event.clientX,
-                  clientY: event.clientY,
-                })}
-                onPointerLeave={() => {
-                  if (!dragSession.current) {
-                    setHoveredSegment(null);
-                  }
-                }}
-              >
-                <title>{`${segment.objectId}: ${formatMb(segment.startMb)}–${formatMb(segment.endMb)} Mb`}</title>
-              </rect>
-            );
-          })}
-        </g>
-
         <g className="genome-axis-window-group">
           {axis === "x" ? (
             <>

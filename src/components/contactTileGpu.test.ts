@@ -9,6 +9,10 @@ import {
 function mockWebGlCanvas() {
   const texImage2D = vi.fn();
   const texSubImage2D = vi.fn();
+  const getError = vi.fn(() => 0);
+  const drawArrays = vi.fn();
+  const clientWidthRead = vi.fn(() => 256);
+  const clientHeightRead = vi.fn(() => 256);
   const gl = {
     VERTEX_SHADER: 1,
     FRAGMENT_SHADER: 2,
@@ -74,20 +78,72 @@ function mockWebGlCanvas() {
     texParameteri: vi.fn(),
     texImage2D,
     texSubImage2D,
-    drawArrays: vi.fn(),
-    getError: vi.fn(() => 0),
+    drawArrays,
+    getError,
   };
   const canvas = {
     width: 256,
     height: 256,
-    clientWidth: 256,
-    clientHeight: 256,
     getContext: vi.fn(() => gl),
   } as unknown as HTMLCanvasElement;
-  return { canvas, texImage2D, texSubImage2D };
+  Object.defineProperty(canvas, "clientWidth", { get: clientWidthRead });
+  Object.defineProperty(canvas, "clientHeight", { get: clientHeightRead });
+  return {
+    canvas,
+    clientHeightRead,
+    clientWidthRead,
+    drawArrays,
+    getError,
+    texImage2D,
+    texSubImage2D,
+  };
 }
 
 describe("contactTileFloatTextureData", () => {
+  it("keeps pointer-only pans off layout, upload, and GL validation paths", () => {
+    const {
+      canvas,
+      clientHeightRead,
+      clientWidthRead,
+      drawArrays,
+      getError,
+      texImage2D,
+    } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const tile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 1, yBin: 0, count: 9 }],
+    };
+
+    expect(renderer?.setScene({
+      descriptors: [{ key: "0:0:source", tile, transpose: false }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    const layoutReadsBeforePan = clientWidthRead.mock.calls.length
+      + clientHeightRead.mock.calls.length;
+    const uploadsBeforePan = texImage2D.mock.calls.length;
+    const validationsBeforePan = getError.mock.calls.length;
+    const drawsBeforePan = drawArrays.mock.calls.length;
+
+    renderer?.setPanOffset(12, -8);
+
+    expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
+      .toBe(layoutReadsBeforePan);
+    expect(texImage2D).toHaveBeenCalledTimes(uploadsBeforePan);
+    expect(getError).toHaveBeenCalledTimes(validationsBeforePan);
+    expect(drawArrays.mock.calls.length).toBe(drawsBeforePan + 1);
+    renderer?.destroy();
+  });
+
   it("updates a visible delta texture with texSubImage2D and promotes it without texImage2D", () => {
     const { canvas, texImage2D, texSubImage2D } = mockWebGlCanvas();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);

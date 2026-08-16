@@ -5745,37 +5745,39 @@ summary:focus-visible,
   transform: translateX(-50%);
 }
 
+.genome-axis-segment-canvas {
+  position: absolute;
+  display: block;
+  overflow: hidden;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.genome-axis-navigator.axis-x .genome-axis-segment-canvas {
+  top: 50%;
+  left: 0;
+  width: 100%;
+  height: 10px;
+  transform: translateY(-50%);
+}
+
+.genome-axis-navigator.axis-y .genome-axis-segment-canvas {
+  top: 0;
+  left: 50%;
+  width: 10px;
+  height: 100%;
+  transform: translateX(-50%);
+}
+
+.genome-axis-rail {
+  z-index: 2;
+}
+
 .genome-axis-track {
-  fill: #c9cbd0;
+  fill: none;
   stroke: #aeb1b8;
   stroke-width: 0.8;
   vector-effect: non-scaling-stroke;
-}
-
-.genome-axis-segment {
-  stroke: rgba(255, 255, 255, 0.94);
-  stroke-width: 1;
-  vector-effect: non-scaling-stroke;
-}
-
-.genome-axis-segment.segment-tone-0 {
-  fill: #aebbc8;
-}
-
-.genome-axis-segment.segment-tone-1 {
-  fill: #c9b8b6;
-}
-
-.genome-axis-segment.segment-tone-2 {
-  fill: #b8c5ae;
-}
-
-.genome-axis-segment.segment-tone-3 {
-  fill: #c3b8cf;
-}
-
-.genome-axis-segment.segment-tone-4 {
-  fill: #cfbea7;
 }
 
 .genome-axis-window {

@@ -126,7 +126,7 @@ describe("GenomeAxisNavigator", () => {
     { id: "b2", objectId: "Chr02", visualStart: 60_000_000, visualEnd: 100_000_000 },
   ];
 
-  it("renders an X chromosome band whose names are only exposed as hover titles", () => {
+  it("rasterizes an X chromosome band into one canvas while keeping the SVG window", () => {
     const markup = renderToStaticMarkup(
       <GenomeAxisNavigator
         axis="x"
@@ -140,12 +140,10 @@ describe("GenomeAxisNavigator", () => {
 
     expect(markup).toContain('class="genome-axis-navigator axis-x"');
     expect(markup).toContain('aria-orientation="horizontal"');
-    expect(markup).toContain('class="genome-axis-segments genome-axis-chromosome-track"');
-    expect(markup).toContain('class="genome-axis-segment segment-tone-0" style="fill:#94a3b8" data-object-id="Chr01" x="0" y="2" width="60"');
-    expect(markup).toContain('class="genome-axis-segment segment-tone-1" style="fill:#94a3b8" data-object-id="Chr02" x="60" y="2" width="40"');
+    expect(markup).toContain('class="genome-axis-segment-canvas" data-segment-count="2"');
     expect(markup).toContain('class="genome-axis-window" x="40" y="2" width="20" height="16"');
-    expect(markup).toContain('<title>Chr01: 0–60 Mb</title>');
-    expect(markup).toContain('<title>Chr02: 60–100 Mb</title>');
+    expect(markup).not.toContain('data-object-id="Chr01"');
+    expect(markup).not.toContain('<title>');
     expect(markup).not.toContain('class="genome-axis-object-labels"');
     expect(markup).not.toContain('>Chr01</span>');
     expect(markup).not.toContain('>Chr02</span>');
@@ -169,11 +167,33 @@ describe("GenomeAxisNavigator", () => {
     expect(markup).toContain('aria-valuemin="10"');
     expect(markup).toContain('aria-valuemax="90"');
     expect(markup).toContain('aria-valuenow="50"');
-    expect(markup).toContain('class="genome-axis-segments genome-axis-chromosome-track"');
-    expect(markup).toContain('class="genome-axis-segment segment-tone-0" style="fill:#94a3b8" data-object-id="Chr01" x="2" y="0" width="16" height="60"');
-    expect(markup).toContain('class="genome-axis-segment segment-tone-1" style="fill:#94a3b8" data-object-id="Chr02" x="2" y="60" width="16" height="40"');
+    expect(markup).toContain('class="genome-axis-segment-canvas" data-segment-count="2"');
     expect(markup).toContain('class="genome-axis-window" x="2" y="40" width="16" height="20"');
     expect(markup).toContain('class="genome-axis-handle handle-start"');
     expect(markup).toContain('class="genome-axis-handle handle-end"');
+  });
+
+  it("keeps large assemblies out of the SVG/DOM node count", () => {
+    const largeAssembly = Array.from({ length: 4_250 }, (_, index) => ({
+      id: `b${index}`,
+      objectId: `Chr${index}`,
+      visualStart: index * 1_000_000,
+      visualEnd: (index + 1) * 1_000_000,
+    }));
+    const markup = renderToStaticMarkup(
+      <GenomeAxisNavigator
+        axis="x"
+        totalSpanMb={4_250}
+        viewportSpanMb={100}
+        centerMb={2_125}
+        assemblyBlocks={largeAssembly}
+        onCommit={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('class="genome-axis-segment-canvas" data-segment-count="4250"');
+    expect(markup).not.toContain('class="genome-axis-segment ');
+    expect(markup).not.toContain('data-object-id=');
+    expect(markup.length).toBeLessThan(2_500);
   });
 });

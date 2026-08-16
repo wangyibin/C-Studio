@@ -2412,7 +2412,8 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
         eprintln!(
             "CSTUDIO_PERF event=contact_tile_delta_stream status=ok scenario={} request_id={} \
              generation={} target_resolution={} requested_tiles={} emitted_chunks={} \
-             response_cells={} response_bytes={} indexed_visitor={} emit_cell_threshold={} \
+             response_cells={} response_bytes={} indexed_visitor={} first_emit_cell_threshold={} \
+             emit_cell_threshold={} \
              hdf5_chunks={} scanned_pixels={} visited_contacts={} prepare_us={} \
              hdf5_read_us={} scan_project_us={} finish_chunk_us={} encode_send_us={} \
              first_emit_us={} command_us={}",
@@ -2425,6 +2426,7 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
             stats.response_cells,
             stats.response_bytes,
             stats.indexed_visitor,
+            stats.first_emit_cell_threshold,
             stats.emit_cell_threshold,
             stats.visit_timings.hdf5_chunks,
             stats.visit_timings.scanned_pixels,
@@ -2449,12 +2451,21 @@ struct ContactTileDeltaStreamStats {
     visited_contacts: usize,
     first_emit_us: Option<u128>,
     indexed_visitor: bool,
+    first_emit_cell_threshold: usize,
     emit_cell_threshold: usize,
     visit_timings: cstudio_core::cool::CoolContactVisitTimings,
     encode_send: Duration,
 }
 
 const DEFAULT_CONTACT_TILE_DELTA_EMIT_CELL_THRESHOLD: usize = 32_768;
+// Source-resolution LOD projection can revisit the same target cell across
+// many HDF5 chunks. After the immediate first patch, aggregate the remaining
+// work into one large update to avoid repeatedly shipping cumulative tiles.
+const DEFAULT_CONTACT_TILE_DELTA_LOD_EMIT_CELL_THRESHOLD: usize = 1_048_576;
+// The first non-empty HDF5 chunk should become visible immediately. This adds
+// at most one small IPC message because subsequent chunks return to the steady
+// aggregation threshold below.
+const DEFAULT_CONTACT_TILE_DELTA_FIRST_EMIT_CELL_THRESHOLD: usize = 1;
 
 fn contact_tile_delta_indexed_visitor_enabled() -> bool {
     std::env::var("CSTUDIO_CONTACT_DELTA_INDEXED").as_deref() != Ok("0")
@@ -2466,6 +2477,35 @@ fn contact_tile_delta_emit_cell_threshold() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| (1..=1_048_576).contains(value))
         .unwrap_or(DEFAULT_CONTACT_TILE_DELTA_EMIT_CELL_THRESHOLD)
+}
+
+fn contact_tile_delta_lod_emit_cell_threshold() -> usize {
+    std::env::var("CSTUDIO_CONTACT_DELTA_LOD_EMIT_CELLS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=1_048_576).contains(value))
+        .unwrap_or(DEFAULT_CONTACT_TILE_DELTA_LOD_EMIT_CELL_THRESHOLD)
+}
+
+fn contact_tile_delta_first_emit_cell_threshold(emit_cell_threshold: usize) -> usize {
+    std::env::var("CSTUDIO_CONTACT_DELTA_FIRST_EMIT_CELLS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=1_048_576).contains(value))
+        .unwrap_or(DEFAULT_CONTACT_TILE_DELTA_FIRST_EMIT_CELL_THRESHOLD)
+        .min(emit_cell_threshold)
+}
+
+fn contact_tile_delta_flush_threshold(
+    has_emitted: bool,
+    first_emit_cell_threshold: usize,
+    emit_cell_threshold: usize,
+) -> usize {
+    if has_emitted {
+        emit_cell_threshold
+    } else {
+        first_emit_cell_threshold
+    }
 }
 
 fn compute_contact_tile_deltas_single_scan<F>(
@@ -2532,7 +2572,22 @@ where
     let stats = RefCell::new(ContactTileDeltaStreamStats::default());
     let stream_started = Instant::now();
     let indexed_visitor = contact_tile_delta_indexed_visitor_enabled();
-    let emit_cell_threshold = contact_tile_delta_emit_cell_threshold();
+    let source_resolution = request
+        .source_resolution
+        .unwrap_or(request.target_resolution);
+    if source_resolution == 0 || request.target_resolution % source_resolution != 0 {
+        return Err(format!(
+            "contact tile delta source resolution {} must divide target resolution {}",
+            source_resolution, request.target_resolution,
+        ));
+    }
+    let emit_cell_threshold = if request.source_resolution.is_some() {
+        contact_tile_delta_lod_emit_cell_threshold()
+    } else {
+        contact_tile_delta_emit_cell_threshold()
+    };
+    let first_emit_cell_threshold =
+        contact_tile_delta_first_emit_cell_threshold(emit_cell_threshold);
     let mut flush_projected_delta = || -> cstudio_core::CStudioResult<()> {
         let view = projector.borrow_mut().take_view();
         if view.cells.is_empty() {
@@ -2570,7 +2625,7 @@ where
         cstudio_core::cool::visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
             &request.cool_path,
             &source_ranges,
-            Some(request.target_resolution),
+            Some(source_resolution),
             request.normalization.into(),
             should_cancel,
             &mut visit_timings,
@@ -2587,7 +2642,12 @@ where
                 Ok(())
             },
             || {
-                if projector.borrow().pending_cell_count() < emit_cell_threshold {
+                let threshold = contact_tile_delta_flush_threshold(
+                    stats.borrow().first_emit_us.is_some(),
+                    first_emit_cell_threshold,
+                    emit_cell_threshold,
+                );
+                if projector.borrow().pending_cell_count() < threshold {
                     return Ok(());
                 }
                 flush_projected_delta()
@@ -2597,7 +2657,7 @@ where
         cstudio_core::cool::visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
             &request.cool_path,
             &source_ranges,
-            Some(request.target_resolution),
+            Some(source_resolution),
             request.normalization.into(),
             should_cancel,
             &mut visit_timings,
@@ -2608,7 +2668,12 @@ where
                 Ok(())
             },
             || {
-                if projector.borrow().pending_cell_count() < emit_cell_threshold {
+                let threshold = contact_tile_delta_flush_threshold(
+                    stats.borrow().first_emit_us.is_some(),
+                    first_emit_cell_threshold,
+                    emit_cell_threshold,
+                );
+                if projector.borrow().pending_cell_count() < threshold {
                     return Ok(());
                 }
                 flush_projected_delta()
@@ -2630,6 +2695,7 @@ where
     stats.encode_send += final_encode_send;
     stats.visited_contacts = visited_contacts;
     stats.indexed_visitor = indexed_visitor;
+    stats.first_emit_cell_threshold = first_emit_cell_threshold;
     stats.emit_cell_threshold = emit_cell_threshold;
     stats.visit_timings = visit_timings;
     Ok(stats)
@@ -4715,6 +4781,22 @@ mod tests {
         GfaBandageLayoutEdgeRequest, GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest,
         PafRecordRequest, SyntenyViewRequest, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
+
+    #[test]
+    fn contact_tile_delta_stream_uses_a_small_first_chunk_then_the_steady_threshold() {
+        assert_eq!(
+            super::contact_tile_delta_flush_threshold(false, 1, 32_768),
+            1
+        );
+        assert_eq!(
+            super::contact_tile_delta_flush_threshold(true, 1, 32_768),
+            32_768
+        );
+        assert_eq!(
+            super::DEFAULT_CONTACT_TILE_DELTA_LOD_EMIT_CELL_THRESHOLD,
+            1_048_576
+        );
+    }
 
     #[test]
     fn gfa_bandage_layout_command_maps_nodes_edges_and_orientation() {
@@ -7370,7 +7452,7 @@ mod tests {
                 .expect("POJ single-scan deltas should render");
                 let final_count = aggregate.values().copied().sum::<f64>();
                 println!(
-                    "CSTUDIO_POJ_BENCH result scenario={} sample={} total_us={} requested_tiles={} emitted_chunks={} first_emit_us={} response_delta_cells={} final_cells={} final_count={} response_bytes={} indexed_visitor={} emit_cell_threshold={} hdf5_chunks={} scanned_pixels={} visited_contacts={} prepare_us={} hdf5_read_us={} scan_project_us={} finish_chunk_us={} encode_send_us={}",
+                    "CSTUDIO_POJ_BENCH result scenario={} sample={} total_us={} requested_tiles={} emitted_chunks={} first_emit_us={} response_delta_cells={} final_cells={} final_count={} response_bytes={} indexed_visitor={} first_emit_cell_threshold={} emit_cell_threshold={} hdf5_chunks={} scanned_pixels={} visited_contacts={} prepare_us={} hdf5_read_us={} scan_project_us={} finish_chunk_us={} encode_send_us={}",
                     scenario,
                     sample + 1,
                     started.elapsed().as_micros(),
@@ -7382,6 +7464,7 @@ mod tests {
                     final_count,
                     stats.response_bytes,
                     stats.indexed_visitor,
+                    stats.first_emit_cell_threshold,
                     stats.emit_cell_threshold,
                     stats.visit_timings.hdf5_chunks,
                     stats.visit_timings.scanned_pixels,
@@ -7423,6 +7506,43 @@ mod tests {
                     layout_blocks: Arc::clone(&layout_blocks),
                 };
                 let started = Instant::now();
+                if std::env::var("CSTUDIO_POJ_BENCH_LOD_DELTA").as_deref() == Ok("1") {
+                    let mut aggregate = BTreeMap::<(u64, u64, u64, u64), f64>::new();
+                    let stats = super::compute_contact_tile_deltas_single_scan(
+                        request,
+                        &|| false,
+                        |delta_tiles| {
+                            for tile in delta_tiles {
+                                for cell in &tile.cells {
+                                    *aggregate
+                                        .entry((tile.tile_x, tile.tile_y, cell.x_bin, cell.y_bin))
+                                        .or_insert(0.0) += cell.count;
+                                }
+                            }
+                            super::encode_contact_map_tiles_binary_v1(
+                                delta_tiles,
+                                tile_size_bins,
+                                &|| false,
+                            )
+                            .map(|bytes| bytes.len())
+                        },
+                    )
+                    .expect("POJ tiled LOD delta stream should render");
+                    println!(
+                        "CSTUDIO_POJ_BENCH result scenario={} mode=delta sample={} total_us={} first_batch_us={} requested_tiles={} returned_tiles={} batches={} response_cells={} response_count={} response_bytes={}",
+                        scenario,
+                        sample + 1,
+                        started.elapsed().as_micros(),
+                        stats.first_emit_us.unwrap_or(0),
+                        tiles.len(),
+                        tiles.len(),
+                        stats.emitted_chunks,
+                        aggregate.len(),
+                        aggregate.values().sum::<f64>(),
+                        stats.response_bytes,
+                    );
+                    continue;
+                }
                 let mut first_chunk_us = None;
                 let mut response_count = 0_f64;
                 let (returned_tiles, response_cells, response_bytes) =
