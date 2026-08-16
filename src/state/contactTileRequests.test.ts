@@ -94,6 +94,53 @@ describe("contact tile in-flight requests", () => {
     await expect(lower).resolves.toMatchObject([{ value: "shared" }]);
   });
 
+  it("queues visible work first and lets the next generation reuse directional prefetch", async () => {
+    const registry = new ContactTileFlightRegistry<TestTile>();
+    const visibleResponse = deferred<TestTile[]>();
+    const urgentResponse = deferred<TestTile[]>();
+    const visibleTile = { tileX: 1, tileY: 1 };
+    const urgentTile = { tileX: 1, tileY: 2 };
+    const calls: Array<{ requestId: number; tiles: ContactMapTileKey[] }> = [];
+    let requestId = 0;
+    const load = (nextRequestId: number, tiles: ContactMapTileKey[]) => {
+      calls.push({ requestId: nextRequestId, tiles });
+      return nextRequestId === 1 ? visibleResponse.promise : urgentResponse.promise;
+    };
+
+    const visibleResult = registry.loadBatch({
+      scope: "scope",
+      tiles: [visibleTile],
+      nextRequestId: () => ++requestId,
+      load,
+    });
+    const urgentResult = registry.loadBatch({
+      scope: "scope",
+      tiles: [urgentTile],
+      nextRequestId: () => ++requestId,
+      load,
+    });
+    const nextGenerationVisibleResult = registry.loadBatch({
+      scope: "scope",
+      tiles: [urgentTile],
+      nextRequestId: () => ++requestId,
+      load,
+    });
+    await Promise.resolve();
+
+    expect(calls).toEqual([
+      { requestId: 1, tiles: [visibleTile] },
+      { requestId: 2, tiles: [urgentTile] },
+    ]);
+    expect(registry.requestIdsFor("scope", [urgentTile])).toEqual([2]);
+
+    urgentResponse.resolve([{ ...urgentTile, value: "prefetched" }]);
+    await expect(urgentResult).resolves.toMatchObject([{ value: "prefetched" }]);
+    await expect(nextGenerationVisibleResult).resolves.toMatchObject([{ value: "prefetched" }]);
+    visibleResponse.resolve([{ ...visibleTile, value: "visible" }]);
+    await expect(visibleResult).resolves.toMatchObject([{ value: "visible" }]);
+    expect(requestId).toBe(2);
+  });
+
   it("cleans rejected flights so a current generation can retry", async () => {
     const registry = new ContactTileFlightRegistry<TestTile>();
     const tile = { tileX: 3, tileY: 3 };

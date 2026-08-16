@@ -1523,6 +1523,7 @@ export function App() {
         maxContactMainLodPrefetchTiles,
         contactMainLodVisibleBatchSize,
         contactMainLodPrefetchBatchSize,
+        panPerformancePreview?.urgentPrefetchTileCount ?? 0,
       );
       const mainLodMapForWorld = (world: typeof mainLodWorld): ContactMapView => ({
         ...projectContactTileWorldView(world),
@@ -1706,6 +1707,72 @@ export function App() {
         const mainLodVisibleTiles = combineContactMainLodVisibleBatches(
           mainLodLoadPlan.visibleBatches,
         );
+        const loadMainLodPrefetchTiles = async (tiles: ContactMapTileKey[]) => {
+          const loadBatch = () => contactMainLodTileFlightsRef.current.loadBatch({
+            scope: mainLodScope,
+            tiles,
+            cacheKeyForTile: mainLodCacheKeyForTile,
+            nextRequestId: () => {
+              const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+              contactTileBackendRequestIdRef.current = nextRequestId;
+              return nextRequestId;
+            },
+            load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
+              contactLayoutHandleRegistry,
+              assemblyLayout.blocks,
+              {
+                requestId: backendRequestId,
+                generation,
+                purpose: "spatial_prefetch",
+                coolPath: contactCoolPath,
+                baseResolution: mainLodPlan.sourceResolution,
+                sourceResolution: mainLodPlan.sourceResolution,
+                targetResolution: mainLodPlan.targetResolution,
+                tileSizeBins: lodTileSizeBins,
+                normalization,
+                tiles: requestedTiles,
+                adaptiveRefinement: false,
+              },
+            ),
+          });
+          try {
+            return await loadBatch();
+          } catch (error) {
+            if (cancelled || generation !== contactTileGenerationRef.current) {
+              return [];
+            }
+            if (!isContactTileRequestCancelled(error)) {
+              throw error;
+            }
+            return loadBatch();
+          }
+        };
+        let urgentPrefetchPromise: Promise<ContactMapTile[]> | null = null;
+        const startUrgentPrefetch = () => {
+          if (
+            urgentPrefetchPromise
+            || mainLodLoadPlan.urgentPrefetchTiles.length === 0
+            || cancelled
+            || generation !== contactTileGenerationRef.current
+          ) {
+            return;
+          }
+          urgentPrefetchPromise = loadMainLodPrefetchTiles(
+            mainLodLoadPlan.urgentPrefetchTiles,
+          ).catch((error) => {
+            if (
+              !cancelled
+              && generation === contactTileGenerationRef.current
+              && !isContactTileRequestCancelled(error)
+            ) {
+              dispatchUi({
+                type: "appendLog",
+                message: `Directional contact LOD prefetch failed: ${String(error)}`,
+              });
+            }
+            return [];
+          });
+        };
         if (mainLodVisibleTiles.length > 0) {
           contactPanPerformance.markIpcStart(generation);
           let directDeltaPaintReported = false;
@@ -1784,9 +1851,15 @@ export function App() {
               )
             ),
           });
+          const visibleLoadPromise = loadVisibleTiles();
+          // The visible invoke is queued first. Start one bounded leading-edge
+          // request beside it so continuous wheel generations can retain that
+          // work when those tiles become visible instead of starving prefetch
+          // until the complete foreground scan finishes.
+          startUrgentPrefetch();
           let loadedTiles: ContactMapTile[];
           try {
-            loadedTiles = await loadVisibleTiles();
+            loadedTiles = await visibleLoadPromise;
           } catch (error) {
             if (cancelled || generation !== contactTileGenerationRef.current) {
               return;
@@ -1800,47 +1873,17 @@ export function App() {
             return;
           }
           commitMainLodTiles("visible", loadedTiles);
+        } else {
+          startUrgentPrefetch();
+        }
+        if (urgentPrefetchPromise) {
+          const urgentTiles = await urgentPrefetchPromise;
+          if (!cancelled && generation === contactTileGenerationRef.current) {
+            commitMainLodTiles("prefetch", urgentTiles);
+          }
         }
         for (const tiles of mainLodLoadPlan.prefetchBatches) {
-          const loadBatch = () => contactMainLodTileFlightsRef.current.loadBatch({
-            scope: mainLodScope,
-            tiles,
-            cacheKeyForTile: mainLodCacheKeyForTile,
-            nextRequestId: () => {
-              const nextRequestId = contactTileBackendRequestIdRef.current + 1;
-              contactTileBackendRequestIdRef.current = nextRequestId;
-              return nextRequestId;
-            },
-            load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
-              contactLayoutHandleRegistry,
-              assemblyLayout.blocks,
-              {
-                requestId: backendRequestId,
-                generation,
-                purpose: "spatial_prefetch",
-                coolPath: contactCoolPath,
-                baseResolution: mainLodPlan.sourceResolution,
-                sourceResolution: mainLodPlan.sourceResolution,
-                targetResolution: mainLodPlan.targetResolution,
-                tileSizeBins: lodTileSizeBins,
-                normalization,
-                tiles: requestedTiles,
-                adaptiveRefinement: false,
-              },
-            ),
-          });
-          let loadedTiles: ContactMapTile[];
-          try {
-            loadedTiles = await loadBatch();
-          } catch (error) {
-            if (cancelled || generation !== contactTileGenerationRef.current) {
-              return;
-            }
-            if (!isContactTileRequestCancelled(error)) {
-              throw error;
-            }
-            loadedTiles = await loadBatch();
-          }
+          const loadedTiles = await loadMainLodPrefetchTiles(tiles);
           if (cancelled || generation !== contactTileGenerationRef.current) {
             return;
           }
@@ -1923,6 +1966,7 @@ export function App() {
       maxBackgroundPrefetchTiles,
       visibleBatchSize,
       prefetchContactTileRequestBatchSize,
+      panPerformancePreview?.urgentPrefetchTileCount ?? 0,
     );
     if (pendingResolutionPerformance) {
       contactTilePerformance.startGeneration({
@@ -2388,7 +2432,7 @@ export function App() {
           current === generation ? current : generation
         ));
 
-        if (tileBatches.length === 0) {
+        if (tileBatches.length === 0 && loadPlan.urgentPrefetchTiles.length === 0) {
           setStatusMessage(renderedStatusMessage);
           scheduleAdjacentResolutionPrefetch();
           return;
@@ -2445,6 +2489,72 @@ export function App() {
             accumulator: progressiveGpuStagingAccumulator,
             retainPreviousFrame: true,
           });
+        }
+        let urgentPrefetchPromise: Promise<ContactMapTile[]> | null = null;
+        const startUrgentPrefetch = () => {
+          if (
+            urgentPrefetchPromise
+            || loadPlan.urgentPrefetchTiles.length === 0
+            || usesAdaptiveMcoolRefinement
+            || cancelled
+            || generation !== contactTileGenerationRef.current
+          ) {
+            return;
+          }
+          const tiles = loadPlan.urgentPrefetchTiles;
+          urgentPrefetchPromise = contactTileFlightsRef.current.loadBatch({
+            scope: tileScope,
+            tiles,
+            cacheKeyForTile,
+            nextRequestId: () => {
+              const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+              contactTileBackendRequestIdRef.current = nextRequestId;
+              return nextRequestId;
+            },
+            load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
+              contactLayoutHandleRegistry,
+              assemblyLayout.blocks,
+              {
+                requestId: backendRequestId,
+                generation,
+                purpose: "spatial_prefetch",
+                coolPath: contactCoolPath,
+                baseResolution: 1000,
+                targetResolution,
+                tileSizeBins,
+                normalization,
+                tiles: requestedTiles,
+                adaptiveRefinement: false,
+              },
+            ),
+          });
+          void urgentPrefetchPromise.then((tiles) => {
+            if (!cancelled && generation === contactTileGenerationRef.current) {
+              commitLoadedTiles("prefetch", tiles);
+            }
+          }).catch((error) => {
+            if (
+              !cancelled
+              && generation === contactTileGenerationRef.current
+              && !isContactTileRequestCancelled(error)
+            ) {
+              dispatchUi({
+                type: "appendLog",
+                message: `Directional contact prefetch failed: ${String(error)}`,
+              });
+            }
+          });
+        };
+        const loadVisibleWithUrgentPrefetch = <T,>(load: () => Promise<T>) => {
+          const visiblePromise = load();
+          // ContactTileFlightRegistry queues the visible invoke first. The
+          // leading-edge request starts immediately afterward and is retained
+          // if the next wheel generation turns those tiles into foreground.
+          startUrgentPrefetch();
+          return visiblePromise;
+        };
+        if (loadPlan.visibleBatches.length === 0) {
+          startUrgentPrefetch();
         }
         let streamedVisibleBatches = false;
         for (const batch of tileBatches) {
@@ -2535,7 +2645,7 @@ export function App() {
             });
             let tiles: ContactMapTile[];
             try {
-              tiles = await loadVisibleDeltas();
+              tiles = await loadVisibleWithUrgentPrefetch(loadVisibleDeltas);
             } catch (error) {
               if (cancelled || generation !== contactTileGenerationRef.current) {
                 return;
@@ -2543,7 +2653,7 @@ export function App() {
               if (!isContactTileRequestCancelled(error)) {
                 throw error;
               }
-              tiles = await loadVisibleDeltas();
+              tiles = await loadVisibleWithUrgentPrefetch(loadVisibleDeltas);
             }
             if (cancelled || generation !== contactTileGenerationRef.current) {
               return;
@@ -2604,7 +2714,7 @@ export function App() {
 
             let tiles: ContactMapTile[];
             try {
-              tiles = await loadVisibleStream();
+              tiles = await loadVisibleWithUrgentPrefetch(loadVisibleStream);
             } catch (error) {
               if (cancelled || generation !== contactTileGenerationRef.current) {
                 return;
@@ -2612,7 +2722,7 @@ export function App() {
               if (!isContactTileRequestCancelled(error)) {
                 throw error;
               }
-              tiles = await loadVisibleStream();
+              tiles = await loadVisibleWithUrgentPrefetch(loadVisibleStream);
             }
             if (cancelled || generation !== contactTileGenerationRef.current) {
               return;
@@ -2657,7 +2767,9 @@ export function App() {
 
           let tiles: ContactMapTile[];
           try {
-            tiles = await loadBatch();
+            tiles = await (batch.kind === "visible"
+              ? loadVisibleWithUrgentPrefetch(loadBatch)
+              : loadBatch());
           } catch (error) {
             if (cancelled || generation !== contactTileGenerationRef.current) {
               return;
@@ -2668,7 +2780,9 @@ export function App() {
             // A retained batch may already have crossed its cancellation
             // checkpoint. Its per-tile entries are now clean, so retry once as
             // work owned by the current generation.
-            tiles = await loadBatch();
+            tiles = await (batch.kind === "visible"
+              ? loadVisibleWithUrgentPrefetch(loadBatch)
+              : loadBatch());
           }
           if (cancelled || generation !== contactTileGenerationRef.current) {
             return;

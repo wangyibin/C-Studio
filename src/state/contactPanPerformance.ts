@@ -3,6 +3,8 @@ import type { ContactViewport } from "./contactViewport";
 export interface ContactPanPreview {
   viewport: ContactViewport;
   prefetchViewport?: ContactViewport;
+  /** Leading tiles promoted from background warming while a fast pan is active. */
+  urgentPrefetchTileCount?: number;
   sequence: number;
   pointerTimestamp: number;
 }

@@ -32,11 +32,14 @@ export interface ContactViewportVelocitySample extends ContactViewportVelocity {
 
 const defaultWindowSizeBp = 200_000_000;
 const minimumVelocityLeadTiles = 0.5;
-const maximumVelocityLeadTiles = 1.5;
+const maximumVelocityLeadTiles = 2.5;
 const maximumLeadVelocityTilesPerSecond = 4;
 const minimumDirectionalVelocityTilesPerSecond = 0.05;
 const minimumVelocitySampleIntervalMs = 4;
 const maximumVelocitySampleIntervalMs = 250;
+const minimumUrgentPrefetchVelocityTilesPerSecond = 1;
+const maximumUrgentPrefetchVelocityTilesPerSecond = 4;
+export const maximumUrgentContactPrefetchTiles = 8;
 
 export function buildCenteredContactViewport({
   centerMb,
@@ -146,7 +149,7 @@ export function contactViewportWithDirectionalLead(
 
 /**
  * Build a data-only look-ahead viewport from current pan velocity. Slow motion
- * retains the existing half-tile lead while fast motion grows smoothly to one
+ * retains the existing half-tile lead while fast motion grows smoothly to two
  * and a half tiles. The displayed viewport is never changed by this hint.
  */
 export function contactViewportWithVelocityAwareLead(
@@ -206,6 +209,45 @@ export function contactViewportWithVelocityAwareLead(
     velocity.yBpPerMs,
   );
   return { xStart, xEnd, yStart, yEnd };
+}
+
+/**
+ * Promote only genuinely fast directional motion into the foreground request
+ * schedule. Slow pans keep spatial warming in the background, while a fast
+ * trackpad/wheel burst can carry a bounded leading-edge batch (up to eight tiles)
+ * across generation changes through the shared flight registry.
+ */
+export function urgentContactPrefetchTileCount(
+  velocity: ContactViewportVelocity,
+  tileSpanBp: number,
+  maximumTiles = maximumUrgentContactPrefetchTiles,
+) {
+  const safeTileSpan = Number.isFinite(tileSpanBp) ? Math.max(0, tileSpanBp) : 0;
+  const safeMaximumTiles = Number.isFinite(maximumTiles)
+    ? Math.max(0, Math.floor(maximumTiles))
+    : 0;
+  if (safeTileSpan === 0 || safeMaximumTiles === 0) {
+    return 0;
+  }
+  const speedBpPerMs = Math.max(
+    Math.abs(Number.isFinite(velocity.xBpPerMs) ? velocity.xBpPerMs : 0),
+    Math.abs(Number.isFinite(velocity.yBpPerMs) ? velocity.yBpPerMs : 0),
+  );
+  const speedTilesPerSecond = speedBpPerMs * 1_000 / safeTileSpan;
+  if (speedTilesPerSecond < minimumUrgentPrefetchVelocityTilesPerSecond) {
+    return 0;
+  }
+  const ratio = Math.min(
+    1,
+    (speedTilesPerSecond - minimumUrgentPrefetchVelocityTilesPerSecond)
+      / (maximumUrgentPrefetchVelocityTilesPerSecond
+        - minimumUrgentPrefetchVelocityTilesPerSecond),
+  );
+  // Keep the foreground schedule in two stable tiers. Per-sample budgets would
+  // otherwise oscillate between 1..8 and create extra generations during one
+  // physical wheel burst.
+  const mediumBudget = Math.max(1, Math.ceil(safeMaximumTiles / 2));
+  return ratio <= 0.5 ? mediumBudget : safeMaximumTiles;
 }
 
 /** Coalesce noisy pointer samples into a stable genomic pan velocity. */

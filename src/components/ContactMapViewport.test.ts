@@ -465,6 +465,32 @@ describe("contactWheelPanIntent", () => {
     expect(afterVisibleBoundary).not.toBe(beforeVisibleBoundary);
   });
 
+  it("starts urgent prefetch immediately without generating on every fast-speed tier", () => {
+    const currentViewport = {
+      xStart: 10_000,
+      xEnd: 250_000,
+      yStart: 10_000,
+      yEnd: 250_000,
+    };
+    const prefetchViewport = {
+      xStart: 256_000,
+      xEnd: 512_000,
+      yStart: 256_000,
+      yEnd: 512_000,
+    };
+    const signature = (urgentTiles: number) => contactPanPreviewTileSignature(
+      currentViewport,
+      prefetchViewport,
+      1_000,
+      256,
+      1_000_000,
+      urgentTiles,
+    );
+
+    expect(signature(4)).not.toBe(signature(0));
+    expect(signature(8)).toBe(signature(4));
+  });
+
   it("commits one cumulative viewport delta after a wheel burst", () => {
     expect(contactWheelPanCommitDelta(
       viewport,

@@ -38,6 +38,8 @@ export interface ContactTileWorld {
 
 export interface ContactTileLoadPlan {
   visibleBatches: ContactMapTileKey[][];
+  /** Directionally leading tiles that should start beside the visible request. */
+  urgentPrefetchTiles: ContactMapTileKey[];
   prefetchBatches: ContactMapTileKey[][];
 }
 
@@ -112,6 +114,7 @@ export function buildContactTileLoadPlan(
   maxPrefetchTiles: number,
   visibleBatchSize = 4,
   prefetchBatchSize = visibleBatchSize,
+  urgentPrefetchTileCount = 0,
 ): ContactTileLoadPlan {
   const safeVisibleBatchSize = Math.max(1, Math.floor(visibleBatchSize));
   const safePrefetchBatchSize = Math.max(1, Math.floor(prefetchBatchSize));
@@ -149,10 +152,19 @@ export function buildContactTileLoadPlan(
     .filter((tile) => !visibleKeys.has(contactTileKey(tile)))
     .sort(byDistanceFrom(prefetchCenterTileX, prefetchCenterTileY))
     .slice(0, Math.max(0, Math.floor(maxPrefetchTiles)));
+  const urgentCount = Math.min(
+    prefetch.length,
+    Math.max(0, Math.floor(
+      Number.isFinite(urgentPrefetchTileCount) ? urgentPrefetchTileCount : 0,
+    )),
+  );
+  const urgentPrefetchTiles = prefetch.slice(0, urgentCount);
+  const backgroundPrefetchTiles = prefetch.slice(urgentCount);
 
   return {
     visibleBatches: chunkTiles(visible, safeVisibleBatchSize),
-    prefetchBatches: chunkTiles(prefetch, safePrefetchBatchSize),
+    urgentPrefetchTiles,
+    prefetchBatches: chunkTiles(backgroundPrefetchTiles, safePrefetchBatchSize),
   };
 }
 

@@ -47,6 +47,7 @@ import {
   buildCenteredContactViewport,
   contactViewportWithVelocityAwareLead,
   sampleContactViewportVelocity,
+  urgentContactPrefetchTileCount,
   type ContactViewport,
   type ContactViewportVelocity,
   type ContactViewportVelocitySample,
@@ -241,10 +242,12 @@ export function contactPanPreviewTileSignature(
   resolution: number,
   tileSizeBins: number,
   totalSpanBp: number,
+  urgentPrefetchTileCount = 0,
 ) {
   return [
     contactTileViewportSignature(viewport, resolution, tileSizeBins, totalSpanBp),
     contactTileViewportSignature(prefetchViewport, resolution, tileSizeBins, totalSpanBp),
+    urgentPrefetchTileCount > 0 ? "urgent" : "background",
   ].join("=>");
 }
 
@@ -1726,15 +1729,17 @@ export function ContactMapViewport({
       velocity,
       totalSpanMb * 1_000_000,
     );
-    // Start a generation when either the visible grid or its look-ahead grid
-    // changes. Tracking only the lead can miss the later visible-tile boundary
-    // during a continuous wheel burst.
+    // Start a generation when the visible grid, look-ahead grid, or urgent mode
+    // changes. The urgent signature is deliberately boolean so speed sampling
+    // cannot create a new generation for every 4/8-tile budget transition.
+    const urgentPrefetchTileCount = urgentContactPrefetchTileCount(velocity, tileSpanBp);
     const signature = contactPanPreviewTileSignature(
       previewViewport,
       prefetchViewport,
       sourceContactMap.resolution,
       sourceContactMap.tileSizeBins ?? 256,
       totalSpanMb * 1_000_000,
+      urgentPrefetchTileCount,
     );
     if (signature === panPreviewTileSignatureRef.current) {
       return;
@@ -1744,6 +1749,7 @@ export function ContactMapViewport({
     onContactViewportPreview({
       viewport: previewViewport,
       prefetchViewport,
+      urgentPrefetchTileCount,
       sequence: panPreviewSequenceRef.current,
       pointerTimestamp: contactPanPerformanceTimestamp(),
     });

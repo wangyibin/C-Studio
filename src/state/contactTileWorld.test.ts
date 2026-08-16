@@ -121,9 +121,36 @@ describe("contact tile world", () => {
     expect(plan.visibleBatches.flat()).toHaveLength(world.missingVisibleTiles.length);
     expect(plan.visibleBatches.every((batch) => batch.length <= 2)).toBe(true);
     expect(plan.prefetchBatches.flat()).toHaveLength(5);
+    expect(plan.urgentPrefetchTiles).toEqual([]);
     expect(plan.prefetchBatches.every((batch) => batch.length <= 4)).toBe(true);
     expect(plan.visibleBatches.length).toBeGreaterThan(1);
     expect(plan.prefetchBatches.flat()).not.toContainEqual({ tileX: 0, tileY: 1 });
+  });
+
+  it("promotes the closest directional look-ahead tiles without expanding the total budget", () => {
+    const prefetchViewport = {
+      xStart: 512_000,
+      xEnd: 1_024_000,
+      yStart: 256_000,
+      yEnd: 768_000,
+    };
+    const world = buildContactTileWorld({
+      viewport,
+      prefetchViewport,
+      resolution: 1_000,
+      tileSizeBins: 256,
+      totalSpanBp: 2_000_000,
+      scope,
+      cache: new Map(),
+    });
+    const plan = buildContactTileLoadPlan(world, 5, 2, 4, 3);
+    const background = plan.prefetchBatches.flat();
+
+    expect(plan.urgentPrefetchTiles).toHaveLength(3);
+    expect(background).toHaveLength(2);
+    expect([...plan.urgentPrefetchTiles, ...background]).toHaveLength(5);
+    expect(background).not.toEqual(expect.arrayContaining(plan.urgentPrefetchTiles));
+    expect(plan.urgentPrefetchTiles).toContainEqual({ tileX: 2, tileY: 2 });
   });
 
   it("bounds visible and prefetched tiles at the genome edge while the viewport shows empty field", () => {

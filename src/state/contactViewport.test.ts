@@ -8,6 +8,8 @@ import {
   contactViewportWithVelocityAwareLead,
   horizontalViewportDragDeltaMb,
   horizontalViewportFocusRatio,
+  maximumUrgentContactPrefetchTiles,
+  urgentContactPrefetchTileCount,
 } from "./contactViewport";
 import { contactTileViewportSignature } from "./contactTiles";
 
@@ -112,7 +114,7 @@ describe("contactViewportWithDirectionalLead", () => {
 });
 
 describe("velocity-aware contact prefetch", () => {
-  it("grows independently from half a tile to one and a half tiles per moving axis", () => {
+  it("grows independently from half a tile to two and a half tiles per moving axis", () => {
     const source = { xStart: 100, xEnd: 300, yStart: 100, yEnd: 300 };
     const target = { xStart: 120, xEnd: 320, yStart: 80, yEnd: 280 };
 
@@ -129,7 +131,26 @@ describe("velocity-aware contact prefetch", () => {
       40,
       { xBpPerMs: 0.16, yBpPerMs: -0.08 },
       1_000,
-    )).toEqual({ xStart: 180, xEnd: 380, yStart: 40, yEnd: 240 });
+    )).toEqual({ xStart: 220, xEnd: 420, yStart: 20, yEnd: 220 });
+  });
+
+  it("promotes up to one leading edge only for genuinely fast motion", () => {
+    expect(urgentContactPrefetchTileCount(
+      { xBpPerMs: 0.02, yBpPerMs: 0 },
+      40,
+    )).toBe(0);
+    expect(urgentContactPrefetchTileCount(
+      { xBpPerMs: 0.08, yBpPerMs: 0 },
+      40,
+    )).toBe(4);
+    expect(urgentContactPrefetchTileCount(
+      { xBpPerMs: 0.16, yBpPerMs: -0.08 },
+      40,
+    )).toBe(maximumUrgentContactPrefetchTiles);
+    expect(urgentContactPrefetchTileCount(
+      { xBpPerMs: Number.NaN, yBpPerMs: 1 },
+      0,
+    )).toBe(0);
   });
 
   it("switches the prefetch side immediately when current velocity reverses", () => {
@@ -139,7 +160,7 @@ describe("velocity-aware contact prefetch", () => {
       40,
       { xBpPerMs: -0.04, yBpPerMs: 0 },
       1_000,
-    )).toEqual({ xStart: 110, xEnd: 310, yStart: 100, yEnd: 300 });
+    )).toEqual({ xStart: 100, xEnd: 300, yStart: 100, yEnd: 300 });
   });
 
   it("samples stable velocity, resets after a pause, and preserves tile-signature deduplication", () => {
