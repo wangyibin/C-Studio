@@ -10,14 +10,14 @@ built with Tauri 2, React, and Rust.
 
 The documentation follows the bilingual, versioned C-Phasing layout. Zensical
 builds the English and Chinese sources separately, while Mike retains released
-versions on the `gh-pages` branch. To build both languages locally:
+versions on the `gh-pages` branch. Install
+[Pixi](https://pixi.sh/latest/installation/) once, then build both languages
+from the application repository:
 
 ```bash
-python3 -m venv .venv-docs
-source .venv-docs/bin/activate
-python -m pip install -r requirements-docs.txt
-bash scripts/build-docs.sh
-python -m http.server --directory site 8000
+pixi install -e docs
+pixi run --locked -e docs docs-build
+pixi run --locked -e docs docs-serve
 ```
 
 Open `http://127.0.0.1:8000/` for English or
@@ -25,22 +25,27 @@ Open `http://127.0.0.1:8000/` for English or
 
 ## Development
 
-Install the frontend dependencies and start the development application with:
+Pixi provides the pinned Node.js, Rust, CMake, and Ninja toolchain. The npm and
+Cargo lock files continue to pin the application's JavaScript and Rust source
+dependencies. Install the package environment and start the development
+application with:
 
 ```bash
-npm ci
-npm run tauri dev
+pixi install -e package
+pixi run --locked -e package tauri-dev
 ```
 
-The default local Rust build uses the HDF5 installation available on the host
-system. Release builds enable `portable-hdf5`, which statically links HDF5 with
-zlib support so that end users do not need to install HDF5 separately.
+The Pixi development and release tasks enable `portable-hdf5`, which builds and
+statically links HDF5 with zlib support. Neither developers nor end users need
+to install HDF5 separately.
 
 ## Manual packaging
 
 Download the source code using **Code → Download ZIP** on GitHub and extract the
 archive, or clone the repository with Git. Open a terminal in the extracted
-C-Studio application directory before running the commands below.
+C-Studio application directory before running the commands below. Install
+[Pixi](https://pixi.sh/latest/installation/) first; it installs the shared
+packaging toolchain from `pixi.lock`.
 
 Release packaging enables `portable-hdf5`, which builds and statically links
 HDF5 with zlib support. The generated application therefore does not require a
@@ -50,28 +55,21 @@ separate HDF5 installation on the end user's computer.
 
 Install the following prerequisites:
 
-- Node.js 22 and npm
-- Rust using `rustup`
+- Pixi
 - Xcode Command Line Tools
-- CMake
 
-Install both Apple Rust targets, install the project dependencies, and build a
-Universal package that runs on Apple Silicon and Intel Macs:
+Run this on an Apple Silicon Mac to build the ARM64 package:
 
 ```bash
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
-npm ci
-APPLE_SIGNING_IDENTITY="-" npm run tauri -- build \
-  --target universal-apple-darwin \
-  --features portable-hdf5 \
-  --bundles app,dmg
+pixi install -e package
+pixi run --locked -e package package-macos
 ```
 
 The generated files are placed under:
 
 ```text
-src-tauri/target/universal-apple-darwin/release/bundle/macos/C-Studio.app
-src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+src-tauri/target/aarch64-apple-darwin/release/bundle/macos/C-Studio.app
+src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
 ```
 
 Open the DMG and drag C-Studio into the Applications folder. The command above
@@ -80,23 +78,17 @@ right-clicking the application and selecting **Open** on first launch.
 
 ### Windows
 
-Perform the Windows build on a Windows x86-64 computer. Install the following
-prerequisites:
+For production packages, perform the Windows build on a Windows x86-64
+computer. Install the following prerequisites:
 
-- Node.js 22 and npm
-- Rust with the MSVC toolchain
+- Pixi
 - Visual Studio C++ Build Tools with **Desktop development with C++**
-- CMake
 
 Open PowerShell in the C-Studio application directory and run:
 
 ```powershell
-rustup target add x86_64-pc-windows-msvc
-npm ci
-npm run tauri -- build `
-  --target x86_64-pc-windows-msvc `
-  --features portable-hdf5 `
-  --bundles nsis,msi
+pixi install -e package
+pixi run --locked -e package package-windows
 ```
 
 The generated installers are placed under:
@@ -108,6 +100,77 @@ src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
 
 Install C-Studio using either the NSIS `.exe` installer or the WiX `.msi`
 package.
+
+#### Experimental Windows NSIS build from macOS
+
+The same Pixi task can cross-compile the Windows x64 application and NSIS
+installer on macOS. MSI packages cannot be produced on macOS. In addition to
+Pixi and Xcode Command Line Tools, install the external tools that are not
+available from conda-forge for macOS:
+
+```bash
+cargo install --locked cargo-xwin
+brew install nsis
+brew install --cask wine-stable
+```
+
+Then run:
+
+```bash
+pixi install -e package
+pixi run --locked -e package package-windows
+```
+
+Pixi supplies the cross-compilation Clang/LLVM linker tools and Windows Rust
+standard library. The generated installer is placed under:
+
+```text
+src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+```
+
+Cross-compilation is less thoroughly tested than a native Windows build. Test
+the installer and all file-open/save dialogs on a real Windows computer before
+distribution. Use the GitHub workflow below when an MSI installer or a native
+Windows build is required. `cargo-xwin` caches the downloaded Windows SDK under
+`src-tauri/target/xwin-cache`. If a stale local proxy causes an error mentioning
+`127.0.0.1`, disable or correct that proxy and rerun the task.
+
+## GitHub Actions packaging
+
+The [desktop packaging workflow](.github/workflows/package-desktop.yml) uses the
+same locked Pixi environment and the same platform-aware `package-macos` and
+`package-windows` tasks as the manual commands above. GitHub builds each package
+on its native runner:
+
+- `macos-15` builds the Apple Silicon `.app` and `.dmg` packages.
+- `windows-latest` builds the x64 NSIS `.exe` and WiX `.msi` installers.
+
+To start a build manually:
+
+1. Open the repository on GitHub.
+2. Select **Actions → Package desktop apps**.
+3. Select **Run workflow**, choose the branch, and confirm the run.
+4. When both jobs finish, open the workflow run and download the macOS and
+   Windows archives from the **Artifacts** section.
+
+The workflow also runs when a version tag beginning with `v` is pushed:
+
+```bash
+git tag v0.1.3
+git push origin v0.1.3
+```
+
+The workflow installs Pixi 0.75.0, checks `pixi.toml` against the committed
+`pixi.lock`, restores the Pixi and Rust build caches, and then invokes:
+
+```text
+pixi run --locked -e package package-macos
+pixi run --locked -e package package-windows
+```
+
+GitHub Actions stores the packages as workflow artifacts for seven days. This
+workflow does not create a GitHub Release or publish the installers
+automatically.
 
 ### Distribution limitations
 

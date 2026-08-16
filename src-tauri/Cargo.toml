@@ -1,6 +1,6 @@
 [package]
 name = "c-studio"
-version = "0.1.2"
+version = "0.1.3"
 description = "C-Studio desktop application"
 edition = "2021"
 
@@ -29,3 +29,8 @@ serde_json = "1"
 # loop so `tauri dev` does not turn a seconds-scale release scan into minutes.
 [profile.dev]
 opt-level = 2
+
+# [profile.release]
+# opt-level = 3
+# lto = "thin"
+# codegen-units = 1

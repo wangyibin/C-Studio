@@ -13,27 +13,31 @@ docs/
 └── zh/                 # Simplified Chinese source
 mkdocs_en.yml           # English -> site/
 mkdocs_zh.yml           # Chinese -> site/zh/
-requirements-docs.txt   # Zensical and pinned Zensical-compatible Mike
-scripts/build-docs.sh   # strict two-language build
+pixi.toml               # docs environment and reusable tasks
+pixi.lock               # exact Conda and PyPI dependency lock
+scripts/build-docs.sh   # compatibility wrapper around the Pixi task
 .github/workflows/docs.yml
 ```
 
-## Install Zensical
+## Install the documentation environment
+
+Install [Pixi](https://pixi.sh/latest/installation/), then create the locked
+`docs` environment:
 
 ```bash
-python3 -m venv .venv-docs
-source .venv-docs/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-docs.txt
+pixi install -e docs
 ```
+
+Pixi installs Python, Git, Zensical, and the pinned Zensical-compatible Mike
+commit. Do not install these tools into a separate virtual environment.
 
 ## Build both languages
 
 ```bash
-bash scripts/build-docs.sh
+pixi run --locked -e docs docs-build
 ```
 
-The script runs:
+The task runs:
 
 ```bash
 zensical build --strict --clean -f mkdocs_en.yml
@@ -46,7 +50,7 @@ validation is enabled, and strict mode turns warnings into build failures.
 Preview the combined result:
 
 ```bash
-python -m http.server --directory site 8000
+pixi run --locked -e docs docs-serve
 ```
 
 Open `http://127.0.0.1:8000/` and
@@ -55,7 +59,7 @@ Open `http://127.0.0.1:8000/` and
 For live preview of one language while writing:
 
 ```bash
-zensical serve -f mkdocs_en.yml
+pixi run --locked -e docs docs-serve-en
 ```
 
 ## Keep translations synchronized
@@ -99,10 +103,9 @@ The workflow provides two optional manual inputs:
 Leave both inputs empty to deploy the selected tag, or to refresh `dev` from
 the selected branch. The workflow rejects using the two inputs together.
 
-Mike is pinned to the Zensical-compatible fork and commit used by the
-documentation environment. `scripts/build-docs.sh` runs a strict Zensical build
-before any deployment, and Mike then commits each generated version to
-`gh-pages`.
+Mike is pinned to the Zensical-compatible fork and commit in `pixi.lock`. The
+workflow runs the strict `docs-build` task before any deployment, and Mike then
+commits each generated version to `gh-pages`.
 
 Configure **Settings → Pages → Source** as **Deploy from a branch**, choose
 `gh-pages`, and select `/ (root)`. The workflow has write permission only in
@@ -112,11 +115,11 @@ build without publishing.
 To inspect a versioned site locally in a disposable clone, omit `--push`:
 
 ```bash
-mike deploy -F mkdocs_en.yml v0.0.0-test latest
-mike deploy -F mkdocs_zh.yml --deploy-prefix zh v0.0.0-test latest
-mike set-default -F mkdocs_en.yml latest
-mike set-default -F mkdocs_zh.yml --deploy-prefix zh latest
-mike serve
+pixi run --locked -e docs mike deploy -F mkdocs_en.yml v0.0.0-test latest
+pixi run --locked -e docs mike deploy -F mkdocs_zh.yml --deploy-prefix zh v0.0.0-test latest
+pixi run --locked -e docs mike set-default -F mkdocs_en.yml latest
+pixi run --locked -e docs mike set-default -F mkdocs_zh.yml --deploy-prefix zh latest
+pixi run --locked -e docs mike serve
 ```
 
 These commands create local `gh-pages` commits. Do not add `--push` when only

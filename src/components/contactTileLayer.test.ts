@@ -2,16 +2,21 @@ import { createElement, createRef } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { createInitialUiState } from "../state/uiState";
+import { ContactTileDeltaAccumulator } from "../state/contactTileDelta";
 import {
   canonicalTilesForRendering,
   ContactTileLayer,
+  contactTileDeltaStagingSlot,
+  contactTileGpuSlotTextureBudgetBytes,
   contactTileCanvasBox,
   contactTileCanvasDescriptorsForViewport,
   contactTileCanvasPaintDependencyValues,
+  contactTileViewportForBufferedSurface,
   contactVisibleTileIdentitySignature,
   createContactTileLayerBufferState,
   createContactTilePaintCoordinator,
   discardContactTileStagingBuffer,
+  deferContactTileGpuDeltaUpdates,
   drawTileCanvas,
   revealContactTileLayerBuffer,
   syncContactTileLayerBuffer,
@@ -19,6 +24,7 @@ import {
   type ContactTilePaintCoordinator,
   type ContactTileRenderStyle,
 } from "./ContactTileLayer";
+import { contactTileGpuTextureBudgetBytes } from "./contactTileGpu";
 
 function initialRenderStyle(): ContactTileRenderStyle {
   const uiState = createInitialUiState("ready");
@@ -159,6 +165,96 @@ describe("contact tile paint epochs", () => {
 });
 
 describe("contact tile presentation buffer", () => {
+  it("reserves one persistent back slot for a retained delta generation", () => {
+    const presented = contactTileFrame(1, 1_000);
+    const target = contactTileFrame(2, 1_000_000);
+    const stream = {
+      generation: 2,
+      resolution: 1_000_000,
+      viewport: target.contactMap.viewport,
+      accumulator: new ContactTileDeltaAccumulator([{ tileX: 0, tileY: 0 }], 256),
+      retainPreviousFrame: true,
+    };
+    const initial = createContactTileLayerBufferState(presented);
+    const staged = syncContactTileLayerBuffer(initial, target, false);
+    const revealed = revealContactTileLayerBuffer(
+      staged,
+      1,
+      target,
+      { renderEpoch: 1, canvasCount: 1, paintRevision: 2 },
+    );
+
+    expect(contactTileDeltaStagingSlot(initial, stream)).toBe(1);
+    expect(contactTileDeltaStagingSlot(staged, stream)).toBe(1);
+    expect(contactTileDeltaStagingSlot(revealed, stream)).toBe(1);
+    expect(contactTileDeltaStagingSlot(initial, { ...stream, retainPreviousFrame: false })).toBeNull();
+  });
+
+  it("splits the global tile-texture budget evenly across front and staging slots", () => {
+    expect(contactTileGpuSlotTextureBudgetBytes * 2).toBe(contactTileGpuTextureBudgetBytes);
+  });
+
+  it("defers GPU updates only while an old front frame covers the staging stream", () => {
+    expect(deferContactTileGpuDeltaUpdates({ retainPreviousFrame: true })).toBe(true);
+    expect(deferContactTileGpuDeltaUpdates({ retainPreviousFrame: false })).toBe(false);
+    expect(deferContactTileGpuDeltaUpdates({})).toBe(false);
+  });
+
+  it("keeps each buffer slot in its own viewport during a fine-to-coarse swap", () => {
+    const fine = contactTileFrame(1, 1_000);
+    fine.contactMap.requestedResolution = 1_000;
+    fine.contactMap.viewport = {
+      xStart: 236_000_000,
+      xEnd: 237_200_000,
+      yStart: 236_000_000,
+      yEnd: 237_200_000,
+    };
+    const coarse = contactTileFrame(2, 1_000_000);
+    coarse.contactMap.requestedResolution = 1_000_000;
+    coarse.contactMap.viewport = {
+      xStart: 0,
+      xEnd: 473_741_399,
+      yStart: 0,
+      yEnd: 473_741_399,
+    };
+
+    expect(contactTileViewportForBufferedSurface(
+      "presented",
+      fine,
+      coarse,
+      coarse.contactMap.viewport,
+    )).toBe(fine.contactMap.viewport);
+    expect(contactTileViewportForBufferedSurface(
+      "staging",
+      coarse,
+      coarse,
+      coarse.contactMap.viewport,
+    )).toBe(coarse.contactMap.viewport);
+    expect(contactTileViewportForBufferedSurface(
+      "presented",
+      coarse,
+      coarse,
+      coarse.contactMap.viewport,
+    )).toBe(coarse.contactMap.viewport);
+  });
+
+  it("stages a selected-resolution change even when both choices reuse one LOD resolution", () => {
+    const fineChoice = contactTileFrame(1, 500_000);
+    fineChoice.contactMap.requestedResolution = 1_000;
+    const coarseChoice = contactTileFrame(2, 500_000);
+    coarseChoice.contactMap.requestedResolution = 5_000;
+
+    const staged = syncContactTileLayerBuffer(
+      createContactTileLayerBufferState(fineChoice),
+      coarseChoice,
+      false,
+    );
+
+    expect(staged.frontSlot).toBe(0);
+    expect(staged.stagingSlot).toBe(1);
+    expect(staged.slots).toEqual([fineChoice, coarseChoice]);
+  });
+
   it("keeps the presented frame and its color scale frozen while a target is loading", () => {
     const presented = contactTileFrame(1, 1_000, 10);
     const initial = createContactTileLayerBufferState(presented);

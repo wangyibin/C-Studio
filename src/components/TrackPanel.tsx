@@ -84,6 +84,15 @@ const minimumCoverageMultiplier = 1;
 const maximumCoverageMultiplier = 100;
 const coverageDragThresholdPx = 4;
 const adaptiveCoverageHighPercentile = 0.98;
+export const maximumCoverageRenderBars = 4_096;
+
+/** At most one coverage bar per CSS pixel, with a fixed ultrawide safety ceiling. */
+export function coverageRenderBarLimitForWidth(viewportWidthPx: number) {
+  const safeWidth = Number.isFinite(viewportWidthPx)
+    ? Math.max(1, Math.ceil(viewportWidthPx))
+    : 1;
+  return Math.min(maximumCoverageRenderBars, safeWidth);
+}
 
 export function TrackPanel({
   coverageView: sourceCoverageView,
@@ -121,9 +130,14 @@ export function TrackPanel({
         }
       : sourceCoverageView
   ), [sourceCoverageView, viewport]);
+  const coverageRenderBarLimit = coverageRenderBarLimitForWidth(coverageViewportWidthPx);
   const bars = useMemo(
-    () => buildCoverageTrackBars(coverageView, uiState.assembly.blocks),
-    [coverageView, uiState.assembly.blocks],
+    () => buildCoverageTrackBars(
+      coverageView,
+      uiState.assembly.blocks,
+      coverageRenderBarLimit,
+    ),
+    [coverageRenderBarLimit, coverageView, uiState.assembly.blocks],
   );
   const selectedIds = new Set(selectedBlockIds(
     uiState.assembly.blocks,
@@ -609,6 +623,7 @@ export function TrackPanel({
           data-resolution={coverageView?.resolution ?? undefined}
           data-viewport-x-start={coverageView?.viewport.xStart ?? undefined}
           data-viewport-x-end={coverageView?.viewport.xEnd ?? undefined}
+          data-rendered-bar-count={bars.length}
           data-scale-min={scale.min}
           data-scale-max={scale.max}
           data-auto-multiplier={automaticMultiplier}
@@ -918,22 +933,48 @@ export function coverageBlockIdAtRatio(
 export function buildCoverageTrackBars(
   coverageView: CoverageView | null,
   blocks: ContactMapLayoutBlock[],
+  maximumBars = Number.MAX_SAFE_INTEGER,
 ): CoverageTrackBar[] {
   if (!coverageView || coverageView.resolution <= 0) {
     return [];
   }
 
-  const values = new Map(coverageView.bins.map((bin) => [bin.xBin, bin.value]));
   const startBin = Math.floor(coverageView.viewport.xStart / coverageView.resolution);
   const endBin = Math.ceil(coverageView.viewport.xEnd / coverageView.resolution) - 1;
+  const sourceBinCount = Math.max(0, endBin - startBin + 1);
+  if (sourceBinCount === 0) {
+    return [];
+  }
+  const renderBarCount = Math.min(
+    sourceBinCount,
+    Number.isFinite(maximumBars)
+      ? Math.max(1, Math.floor(maximumBars))
+      : sourceBinCount,
+  );
+  const values = new Map(coverageView.bins.map((bin) => [bin.xBin, bin.value]));
+  const bucketSums = new Float64Array(renderBarCount);
+  for (const [xBin, value] of values) {
+    const sourceIndex = xBin - startBin;
+    if (sourceIndex < 0 || sourceIndex >= sourceBinCount || !Number.isFinite(value)) {
+      continue;
+    }
+    const bucketIndex = Math.min(
+      renderBarCount - 1,
+      Math.floor(sourceIndex * renderBarCount / sourceBinCount),
+    );
+    bucketSums[bucketIndex] += value;
+  }
   const viewportSpan = Math.max(1, coverageView.viewport.xEnd - coverageView.viewport.xStart);
   const orderedBlocks = [...blocks].sort((left, right) => left.visualStart - right.visualStart);
   let blockIndex = 0;
 
-  return Array.from({ length: Math.max(0, endBin - startBin + 1) }, (_, index) => {
-    const xBin = startBin + index;
+  return Array.from({ length: renderBarCount }, (_, index) => {
+    const bucketStartOffset = Math.ceil(index * sourceBinCount / renderBarCount);
+    const bucketEndOffset = Math.ceil((index + 1) * sourceBinCount / renderBarCount);
+    const bucketBinCount = Math.max(1, bucketEndOffset - bucketStartOffset);
+    const xBin = startBin + bucketStartOffset;
     const binStart = xBin * coverageView.resolution;
-    const binEnd = binStart + coverageView.resolution;
+    const binEnd = (startBin + bucketEndOffset) * coverageView.resolution;
     const visibleStart = Math.max(binStart, coverageView.viewport.xStart);
     const visibleEnd = Math.min(binEnd, coverageView.viewport.xEnd);
     const visualPosition = (visibleStart + visibleEnd) / 2;
@@ -948,7 +989,7 @@ export function buildCoverageTrackBars(
       : null;
     return {
       xBin,
-      value: values.get(xBin) ?? 0,
+      value: bucketSums[index] / bucketBinCount,
       blockId: block?.id ?? null,
       leftRatio: (visibleStart - coverageView.viewport.xStart) / viewportSpan,
       widthRatio: Math.max(0, visibleEnd - visibleStart) / viewportSpan,

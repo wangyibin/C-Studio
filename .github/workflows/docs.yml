@@ -9,8 +9,8 @@ on:
       - "docs/**"
       - "mkdocs_en.yml"
       - "mkdocs_zh.yml"
-      - "requirements-docs.txt"
-      - "scripts/build-docs.sh"
+      - "pixi.toml"
+      - "pixi.lock"
   push:
     branches:
       - main
@@ -41,18 +41,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Pixi docs environment
+        uses: prefix-dev/setup-pixi@v0.10.0
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-docs.txt
-
-      - name: Install documentation dependencies
-        run: python -m pip install -r requirements-docs.txt
+          pixi-version: v0.75.0
+          environments: docs
+          locked: true
+          activate-environment: docs
 
       - name: Strictly build both languages
-        run: bash scripts/build-docs.sh
+        run: pixi run --locked -e docs docs-build
 
   deploy:
     if: github.event_name != 'pull_request' && github.repository == 'wangyibin/C-Studio'
@@ -68,15 +66,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Pixi docs environment
+        uses: prefix-dev/setup-pixi@v0.10.0
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-docs.txt
-
-      - name: Install documentation dependencies
-        run: python -m pip install -r requirements-docs.txt
+          pixi-version: v0.75.0
+          environments: docs
+          locked: true
+          activate-environment: docs
 
       - name: Configure Git and fetch deployment history
         shell: bash
@@ -100,7 +96,7 @@ jobs:
 
       - name: Strictly build both languages
         if: env.BACKFILL_TAGS == ''
-        run: bash scripts/build-docs.sh
+        run: pixi run --locked -e docs docs-build
 
       - name: Deploy current ref
         if: env.BACKFILL_TAGS == '' && env.UPDATE_DOCS_VERSION == ''
@@ -182,7 +178,7 @@ jobs:
           for tag in "${tags[@]}"; do
             echo "Backfilling $tag"
             git checkout "$tag" -- docs
-            bash scripts/build-docs.sh
+            pixi run --locked -e docs docs-build
 
             if [[ "$tag" == "$latest_tag" ]]; then
               mike deploy -F mkdocs_en.yml --push --update-aliases "$tag" latest

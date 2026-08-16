@@ -21,10 +21,12 @@ import {
 import { contactTileCellCount } from "./state/contactTileData";
 import {
   ContactTileDeltaAccumulator,
+  mergeCompleteContactTilesIntoDeltaAccumulator,
   type ContactTileDeltaRenderStream,
 } from "./state/contactTileDelta";
 import {
   displayContactMapForPendingLayer,
+  contactTileDeltaStreamMode,
   shouldHoldPreviousContactMapFrame,
   shouldPublishContactMapLayer,
 } from "./state/contactMapView";
@@ -66,6 +68,7 @@ import {
   nextContactResolutionForPerformance,
   type ContactTileRenderMilestone,
 } from "./state/contactTilePerformance";
+import { createContactResolutionResponsivenessTracker } from "./state/contactResolutionResponsiveness";
 import {
   adjacentContactResolutions,
   interleaveContactPrefetchBatches,
@@ -81,6 +84,13 @@ import {
 } from "./state/contactOverviewTiles";
 import {
   buildContactMainLodPlan,
+  combineContactMainLodVisibleBatches,
+  contactMainLodPrefetchBatchSize,
+  contactMainLodTileCacheLimits,
+  contactMainLodTileSizeBins,
+  contactMainLodVisibleBatchSize,
+  maxAdaptiveMcoolExactTiles,
+  maxContactMainLodPrefetchTiles,
   maxExactMainContactTiles,
 } from "./state/contactMainLod";
 import {
@@ -95,6 +105,12 @@ import {
   type ContactMapLayoutBlock,
   summarizeAgpText,
 } from "./state/importers";
+import {
+  operationHistoryFilename,
+  parseOperationHistory,
+  serializeOperationHistory,
+  type OperationHistoryArchive,
+} from "./state/operationHistoryPersistence";
 import { parseGfaText, type GfaEvidenceDocument } from "./state/gfa";
 import type {
   GfaBandageLayoutLoader,
@@ -159,6 +175,8 @@ export interface ContactMapCell {
 
 export interface ContactMapView {
   resolution: number;
+  /** User-selected mcool level fulfilled by this frame; LOD may be coarser. */
+  requestedResolution?: number;
   /** Normalization of the pixels currently displayed, not merely selected. */
   normalization?: ContactNormalization;
   viewport: {
@@ -173,7 +191,7 @@ export interface ContactMapView {
   cachedTiles?: ContactMapTile[];
   /** Display-only reprojected tiles; authoritative tiles override by coordinate. */
   previewTiles?: ContactMapTile[];
-  /** Screen-scale LOD shown only until an explicit slider selection finishes. */
+  /** True only for a display layer that must still be replaced before completion. */
   isTransientResolutionPreview?: boolean;
   /** Layout snapshot used to produce this visual layer. */
   layoutBlocks?: ContactMapLayoutBlock[];
@@ -213,11 +231,17 @@ interface ImportedProjectTextFile {
 interface ImportedProjectDirectory {
   directory: string;
   agp: ImportedProjectTextFile | null;
+  history: ImportedProjectTextFile | null;
   gfa: ImportedProjectTextFile | null;
   paf: ImportedContactFile | null;
   coverage: ImportedContactFile | null;
   contact: ImportedContactFile | null;
   ignoredCandidates: string[];
+}
+
+interface ImportedAgpBundle {
+  agp: ImportedProjectTextFile;
+  history: ImportedProjectTextFile | null;
 }
 
 interface SourceAgpSnapshot {
@@ -250,10 +274,13 @@ interface ContactTileHandleRequest {
   purpose: ContactTileRequestPurpose;
   coolPath: string;
   baseResolution: number;
+  /** Stored Cooler level to read before aggregating into targetResolution. */
+  sourceResolution?: number;
   targetResolution: number;
   tileSizeBins: number;
   normalization: ContactNormalization;
   tiles: ContactMapTileKey[];
+  adaptiveRefinement?: boolean;
 }
 
 interface ContactTileFrontendIpcPerformanceRequest {
@@ -311,7 +338,10 @@ const idleAdjacentContactTileBatchSize = 2;
 const maxAdjacentResolutionPrefetchBatches = 4;
 const contactTileRequestCancelledMessage = "contact tile request cancelled";
 const autoSavePreferenceKey = "c-studio:auto-save-agp";
-const contactTileIpcPerformanceEnabled = isContactTilePerformanceEnabled();
+const contactTileIpcPerformanceEnabled = (
+  import.meta.env.CSTUDIO_PERF_LOG === "1"
+  || isContactTilePerformanceEnabled()
+);
 const contactTileBinaryEnabled = import.meta.env.VITE_CSTUDIO_TILE_BINARY !== "0";
 const contactTileStreamEnabled = import.meta.env.VITE_CSTUDIO_TILE_STREAM !== "0";
 const contactTileSingleScanEnabled = import.meta.env.VITE_CSTUDIO_TILE_SINGLE_SCAN !== "0";
@@ -760,6 +790,18 @@ export function App() {
   }
   const contactTileCacheLru = contactTileCacheLruRef.current;
   const contactTileCacheRef = useRef<Map<string, ContactMapTile>>(contactTileCacheLru.toMap());
+  const contactMainLodTileCacheLruRef = useRef<
+    ContactTileResolutionLru<ContactMapTile> | null
+  >(null);
+  if (contactMainLodTileCacheLruRef.current === null) {
+    contactMainLodTileCacheLruRef.current = new ContactTileResolutionLru<ContactMapTile>(
+      contactMainLodTileCacheLimits,
+    );
+  }
+  const contactMainLodTileCacheLru = contactMainLodTileCacheLruRef.current;
+  const contactMainLodTileCacheRef = useRef<Map<string, ContactMapTile>>(
+    contactMainLodTileCacheLru.toMap(),
+  );
   const autoColorScaleCacheRef = useRef<Map<string, ContactColorScale>>(new Map());
   const lastCompleteContactMapRef = useRef<ContactMapView | null>(null);
   // The Rust process can outlive a WebView reload, so start both monotonic
@@ -767,6 +809,9 @@ export function App() {
   const contactTileGenerationRef = useRef(Date.now() * 1_000);
   const contactTileBackendRequestIdRef = useRef(Date.now() * 1_000);
   const contactTileFlightsRef = useRef(new ContactTileFlightRegistry<ContactMapTile>());
+  const contactMainLodTileFlightsRef = useRef(
+    new ContactTileFlightRegistry<ContactMapTile>(),
+  );
   const normalizationPrewarmRequestIdRef = useRef<number | null>(null);
   const endpointContactTileCacheRef = useRef(new Map<string, ContactMapTile>());
   const endpointContactTileFlightsRef = useRef(new ContactTileFlightRegistry<ContactMapTile>());
@@ -798,6 +843,7 @@ export function App() {
   const [savedAgpPath, setSavedAgpPath] = useState<string | null>(null);
   const savingAgpRef = useRef(false);
   const [savedAgpText, setSavedAgpText] = useState("");
+  const [savedHistoryIdentity, setSavedHistoryIdentity] = useState("");
   const sourceAgpRef = useRef<SourceAgpSnapshot | null>(null);
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(readAutoSavePreference);
   const agpInputRef = useRef<HTMLInputElement>(null);
@@ -817,10 +863,29 @@ export function App() {
       emit: (output) => {
         console.info(output.logfmt);
         setContactTilePerformanceLog(output.logfmt);
+        void invoke("log_contact_frontend_performance", {
+          line: output.logfmt,
+        }).catch(() => undefined);
       },
     });
   }
   const contactTilePerformance = contactTilePerformanceRef.current;
+  const contactResolutionResponsivenessRef = useRef<ReturnType<
+    typeof createContactResolutionResponsivenessTracker
+  > | null>(null);
+  if (contactResolutionResponsivenessRef.current === null) {
+    contactResolutionResponsivenessRef.current = createContactResolutionResponsivenessTracker({
+      enabled: contactTileIpcPerformanceEnabled,
+      emit: (output) => {
+        console.info(output.logfmt);
+        setContactTilePerformanceLog(output.logfmt);
+        void invoke("log_contact_frontend_performance", {
+          line: output.logfmt,
+        }).catch(() => undefined);
+      },
+    });
+  }
+  const contactResolutionResponsiveness = contactResolutionResponsivenessRef.current;
   const contactPanPerformanceRef = useRef<ReturnType<
     typeof createContactPanPerformanceTracker
   > | null>(null);
@@ -845,29 +910,27 @@ export function App() {
   }, []);
   const latestUiStateRef = useRef(uiState);
   latestUiStateRef.current = uiState;
-  const pendingManualResolutionRef = useRef<ContactResolution | null>(null);
   const pendingResolutionPerformanceRef = useRef<PendingResolutionPerformance | null>(null);
   const contactTilePresentationScheduleRef = useRef<ContactTilePresentationSchedule | null>(null);
   const dispatchMeasuredUiAction = useCallback((action: UiAction) => {
     const currentUiState = latestUiStateRef.current;
-    if (
-      action.type === "setContactResolution"
-      && action.resolution !== currentUiState.contact.resolution
-    ) {
-      pendingManualResolutionRef.current = action.resolution;
-    }
     const nextResolution = contactTilePerformance.enabled
       ? nextContactResolutionForPerformance(action, currentUiState)
       : null;
     if (nextResolution) {
+      const startedAt = contactTilePerformance.timestamp();
       pendingResolutionPerformanceRef.current = {
-        startedAt: contactTilePerformance.timestamp(),
+        startedAt,
         fromResolution: currentUiState.contact.resolution,
         toResolution: nextResolution,
       };
+      contactResolutionResponsiveness.startGeneration(
+        contactTileGenerationRef.current + 1,
+        startedAt,
+      );
     }
     dispatchUi(action);
-  }, [contactTilePerformance]);
+  }, [contactResolutionResponsiveness, contactTilePerformance]);
   const handleContactTileLayerCommit = useCallback((event: ContactTileRenderMilestone) => {
     if (event.generation === contactTileGenerationRef.current) {
       contactTilePerformance.markReactCommit(
@@ -895,9 +958,8 @@ export function App() {
         current === event.generation ? current : event.generation
       ));
     }
-    // A screen-scale main LOD is only a temporary preview. It must not finish
-    // resolution timing or unlock background overview work before the exact
-    // slider-selected tile layer has actually reached the screen.
+    // Only genuinely transient layers wait for a replacement. A screen-scale
+    // main LOD is terminal whenever the large-view policy selected it.
     if (!paintsTerminalLayer) {
       return;
     }
@@ -907,7 +969,10 @@ export function App() {
     const tracksPanPerformance = Boolean(
       contactPanPerformance.snapshot(event.generation),
     );
-    if (!tracksResolutionPerformance && !tracksPanPerformance) {
+    const tracksResolutionResponsiveness = (
+      contactResolutionResponsiveness.activeGeneration() === event.generation
+    );
+    if (!tracksResolutionPerformance && !tracksPanPerformance && !tracksResolutionResponsiveness) {
       return;
     }
     const previous = contactTilePresentationScheduleRef.current;
@@ -944,12 +1009,37 @@ export function App() {
         if (tracksResolutionPerformance) {
           contactTilePerformance.markLastTilePaint(event.generation, event.canvasCount);
         }
+        if (tracksResolutionResponsiveness) {
+          contactResolutionResponsiveness.finishGeneration(event.generation);
+        }
         if (tracksPanPerformance) {
           contactPanPerformance.markGpuPaint(event.generation);
         }
       });
     });
-  }, [contactPanPerformance, contactTilePerformance]);
+  }, [contactPanPerformance, contactResolutionResponsiveness, contactTilePerformance]);
+  useEffect(() => {
+    if (
+      contactResolutionResponsiveness.activeGeneration() === null
+      || contactMap?.visibleLayerComplete !== true
+      || contactMap.isTransientResolutionPreview === true
+      || contactMap.requestedResolution !== resolutionToBasePairs(uiState.contact.resolution)
+    ) {
+      return;
+    }
+    let secondFrame: number | null = null;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        contactResolutionResponsiveness.finishActiveGeneration();
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) {
+        window.cancelAnimationFrame(secondFrame);
+      }
+    };
+  }, [contactMap, contactResolutionResponsiveness, uiState.contact.resolution]);
   const contactCoolPath = dataset?.cool_path ?? null;
   const contactIsMcool = contactCoolPath?.toLowerCase().endsWith(".mcool") ?? false;
   const datasetAgpLayout = dataset?.agp_layout ?? null;
@@ -967,7 +1057,14 @@ export function App() {
     () => exportAgpText(assemblyLayout.blocks),
     [assemblyLayout.blocks],
   );
-  const isAgpDirty = assemblyLayout.blocks.length > 0 && currentAgpText !== savedAgpText;
+  const currentHistoryIdentity = useMemo(() => operationHistoryIdentity({
+    nextOperationId: uiState.nextOperationId,
+    operationHistory: uiState.operationHistory,
+    redoStack: uiState.redoStack,
+  }), [uiState.nextOperationId, uiState.operationHistory, uiState.redoStack]);
+  const isAgpDirty = assemblyLayout.blocks.length > 0 && (
+    currentAgpText !== savedAgpText || currentHistoryIdentity !== savedHistoryIdentity
+  );
   const backgroundAssemblyLayout = useDebouncedValue(assemblyLayout, secondaryTrackRequestDelayMs);
 
   useEffect(() => {
@@ -1003,11 +1100,14 @@ export function App() {
     contactTileCacheLru.clear();
     contactTileCacheRef.current = emptyTileCache;
     contactTileFlightsRef.current.clear();
+    contactMainLodTileCacheLru.clear();
+    contactMainLodTileCacheRef.current = new Map();
+    contactMainLodTileFlightsRef.current.clear();
     endpointContactTileCacheRef.current.clear();
     endpointContactTileFlightsRef.current.clear();
     autoColorScaleCacheRef.current.clear();
     lastCompleteContactMapRef.current = null;
-  }, [contactCoolPath, contactTileCacheLru]);
+  }, [contactCoolPath, contactMainLodTileCacheLru, contactTileCacheLru]);
 
   useEffect(() => {
     // A different matrix or normalization must never inherit the old overview.
@@ -1078,16 +1178,27 @@ export function App() {
       && pendingResolutionCandidate.toResolution === uiState.contact.resolution
         ? pendingResolutionCandidate
         : null;
-    const pendingManualResolutionCandidate = pendingManualResolutionRef.current;
-    pendingManualResolutionRef.current = null;
-    const refinesManualResolution = pendingManualResolutionCandidate
-      === uiState.contact.resolution;
+    if (pendingResolutionPerformance) {
+      if (contactResolutionResponsiveness.activeGeneration() === null) {
+        contactResolutionResponsiveness.startGeneration(
+          generation,
+          pendingResolutionPerformance.startedAt,
+        );
+      } else {
+        contactResolutionResponsiveness.retargetGeneration(generation);
+      }
+    } else if (contactResolutionResponsiveness.activeGeneration() !== null) {
+      contactResolutionResponsiveness.retargetGeneration(generation);
+    }
     if (!contactCoolPath || assemblyLayout.blocks.length === 0) {
       setContactMap((current) => (current === null ? current : null));
       contactTileCacheLru.clear();
       contactTileCacheRef.current = new Map();
       lastCompleteContactMapRef.current = null;
       contactTileFlightsRef.current.clear();
+      contactMainLodTileCacheLru.clear();
+      contactMainLodTileCacheRef.current = new Map();
+      contactMainLodTileFlightsRef.current.clear();
       void invoke("begin_contact_tile_generation", {
         request: { generation, retainedRequestIds: [] },
       }).catch(() => undefined);
@@ -1106,6 +1217,9 @@ export function App() {
       contactTileCacheRef.current = new Map();
       lastCompleteContactMapRef.current = null;
       contactTileFlightsRef.current.clear();
+      contactMainLodTileCacheLru.clear();
+      contactMainLodTileCacheRef.current = new Map();
+      contactMainLodTileFlightsRef.current.clear();
       void invoke("begin_contact_tile_generation", {
         request: { generation, retainedRequestIds: [] },
       }).catch(() => undefined);
@@ -1202,75 +1316,243 @@ export function App() {
       cache: contactTileCacheRef.current,
       cacheKeyForTile,
     });
-    // Advance/cancel exactly once for this generation. A retained foreground
-    // flight may satisfy one of the visible tiles while the screen-scale LOD is
-    // being prepared; background-only work is intentionally not retained.
-    const retainedRequestIds = contactTileFlightsRef.current.requestIdsFor(
-      tileScope,
-      tileWorld.visibleTiles,
-      cacheKeyForTile,
-    );
-    const generationStart = invoke<number[]>("begin_contact_tile_generation", {
-      request: { generation, retainedRequestIds },
-    }).then(
-      () => null,
-      (error: unknown) => error,
-    );
-    const mainLodPlan = contactMainLodEnabled && tileWorld.missingVisibleTiles.length > 0
+    const usesAdaptiveMcoolExactPolicy = normalization === "raw"
+      && targetResolution === 2_500_000
+      && contactCoolPath.toLowerCase().endsWith(".mcool");
+    // The adaptive 2.5 Mb safety boundary is not a diagnostic toggle: even a
+    // build with general main-canvas LOD disabled must not fan out recursive
+    // 1 kb refinement beyond the local exact limit.
+    const mainLodPlan = contactMainLodEnabled || usesAdaptiveMcoolExactPolicy
       ? buildContactMainLodPlan({
           viewport,
           selectedResolution: targetResolution,
           viewportWidthPx: uiState.contact.viewportWidthPx,
           viewportHeightPx: uiState.contact.viewportHeightPx,
           visibleTileCount: tileWorld.visibleTiles.length,
+          exactTileLimit: usesAdaptiveMcoolExactPolicy
+            ? maxAdaptiveMcoolExactTiles
+            : maxExactMainContactTiles,
         }, contactAvailableResolutions)
       : null;
-    let mainLodReady: Promise<void> = Promise.resolve();
-    if (mainLodPlan) {
-      const mainLodScope = contactTileScope(
+    const mainLodTileState = (() => {
+      if (!mainLodPlan) {
+        return null;
+      }
+      const lodTileSizeBins = contactMainLodTileSizeBins;
+      const lodScope = contactTileScope(
         contactCoolPath,
         mainLodPlan.targetResolution,
-        Math.max(
-          1,
-          Math.ceil((viewport.xEnd - viewport.xStart) / mainLodPlan.targetResolution),
-          Math.ceil((viewport.yEnd - viewport.yStart) / mainLodPlan.targetResolution),
-        ),
+        lodTileSizeBins,
         normalization,
         assemblyLayout.blocks,
       );
-      const retainedMainLod = lastCompleteContactMapRef.current;
-      const hasMatchingMainLod = Boolean(
-        retainedMainLod
-        && retainedMainLod.layoutScope === mainLodScope
-        && retainedMainLod.normalization === normalization
-        && retainedMainLod.viewport.xStart === viewport.xStart
-        && retainedMainLod.viewport.xEnd === viewport.xEnd
-        && retainedMainLod.viewport.yStart === viewport.yStart
-        && retainedMainLod.viewport.yEnd === viewport.yEnd
+      const lodLayerScope = {
+        id: `main-lod|${contactTileDataScope(
+          contactCoolPath,
+          mainLodPlan.targetResolution,
+          lodTileSizeBins,
+          normalization,
+        )}`,
+        resolution: mainLodPlan.targetResolution,
+      };
+      const lodCacheKeyForTile = createContactTileCacheKeyResolver(
+        contactCoolPath,
+        mainLodPlan.targetResolution,
+        lodTileSizeBins,
+        normalization,
+        assemblyLayout.blocks,
       );
+      const untouchedLodWorld = buildContactTileWorld({
+        viewport,
+        prefetchViewport,
+        resolution: mainLodPlan.targetResolution,
+        tileSizeBins: lodTileSizeBins,
+        totalSpanBp,
+        scope: lodScope,
+        cache: contactMainLodTileCacheRef.current,
+        cacheKeyForTile: lodCacheKeyForTile,
+      });
+      const visibleKeys = new Set(
+        untouchedLodWorld.visibleTiles.map(lodCacheKeyForTile),
+      );
+      const warmKeys = untouchedLodWorld.prefetchTiles
+        .map(lodCacheKeyForTile)
+        .filter((key) => !visibleKeys.has(key));
+      contactMainLodTileCacheLru.touch(
+        lodLayerScope,
+        [...warmKeys, ...visibleKeys],
+        {
+          keys: visibleKeys,
+          scopes: new Set([lodLayerScope.id]),
+        },
+      );
+      contactMainLodTileCacheRef.current = contactMainLodTileCacheLru.toMap();
+      const lodWorld = buildContactTileWorld({
+        viewport,
+        prefetchViewport,
+        resolution: mainLodPlan.targetResolution,
+        tileSizeBins: lodTileSizeBins,
+        totalSpanBp,
+        scope: lodScope,
+        cache: contactMainLodTileCacheRef.current,
+        cacheKeyForTile: lodCacheKeyForTile,
+      });
+      return {
+        lodTileSizeBins,
+        lodScope,
+        lodLayerScope,
+        lodCacheKeyForTile,
+        lodWorld,
+      };
+    })();
+    // Advance/cancel exactly once for this generation. Large views deliberately
+    // retain overlapping work from the independent coarse or exact tile layer.
+    const retainedRequestIds = mainLodTileState
+      ? contactMainLodTileFlightsRef.current.requestIdsFor(
+          mainLodTileState.lodScope,
+          mainLodTileState.lodWorld.visibleTiles,
+          mainLodTileState.lodCacheKeyForTile,
+        )
+      : contactTileFlightsRef.current.requestIdsFor(
+          tileScope,
+          tileWorld.visibleTiles,
+          cacheKeyForTile,
+        );
+    const generationStart = invoke<number[]>("begin_contact_tile_generation", {
+      request: { generation, retainedRequestIds },
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    if (mainLodPlan) {
+      const {
+        lodTileSizeBins,
+        lodScope: mainLodScope,
+        lodLayerScope: mainLodLayerScope,
+        lodCacheKeyForTile: mainLodCacheKeyForTile,
+        lodWorld: mainLodWorld,
+      } = mainLodTileState!;
+      if (panPerformancePreview) {
+        contactPanPerformance.startGeneration({
+          generation,
+          sequence: panPerformancePreview.sequence,
+          pointerTimestamp: panPerformancePreview.pointerTimestamp,
+          visibleTiles: mainLodWorld.visibleTiles.length,
+          cacheHit: mainLodWorld.missingVisibleTiles.length === 0,
+        });
+        if (!contactTilePreviewViewport) {
+          pendingPanPerformancePreviewRef.current = null;
+        }
+      }
+      const mainLodProtectedKeys = new Set(
+        mainLodWorld.prefetchTiles.map(mainLodCacheKeyForTile),
+      );
+      const assemblingMainLodVisibleTiles = new Map(
+        mainLodWorld.cachedVisibleTiles.map((tile) => [
+          mainLodCacheKeyForTile(tile),
+          tile,
+        ]),
+      );
+      const previousCompleteMap = lastCompleteContactMapRef.current;
+      const holdsPreviousCompleteFrame = shouldHoldPreviousContactMapFrame(
+        previousCompleteMap,
+        mainLodPlan.targetResolution,
+        lodTileSizeBins,
+        mainLodScope,
+      );
+      const mainLodLoadPlan = buildContactTileLoadPlan(
+        mainLodWorld,
+        maxContactMainLodPrefetchTiles,
+        contactMainLodVisibleBatchSize,
+        contactMainLodPrefetchBatchSize,
+      );
+      const mainLodMapForWorld = (world: typeof mainLodWorld): ContactMapView => ({
+        ...projectContactTileWorldView(world),
+        requestedResolution: targetResolution,
+        normalization,
+        layoutBlocks: assemblyLayout.blocks,
+        layoutScope: mainLodScope,
+        visibleLayerComplete: world.missingVisibleTiles.length === 0,
+        renderGeneration: generation,
+        isTransientResolutionPreview: false,
+      });
       const mainLodAutoColorScaleKey = contactAutoColorScaleKey(
         contactCoolPath,
         mainLodPlan.targetResolution,
-        tileSizeBins,
+        lodTileSizeBins,
         uiState.contact.colorScale.log,
       );
-      if (hasMatchingMainLod && retainedMainLod) {
-        const matchingMainLod = retainedMainLod.isTransientResolutionPreview
-          === refinesManualResolution
-          ? retainedMainLod
-          : {
-              ...retainedMainLod,
-              isTransientResolutionPreview: refinesManualResolution,
-            };
-        lastCompleteContactMapRef.current = matchingMainLod;
-        setContactMap((current) => (current === matchingMainLod ? current : matchingMainLod));
+      const applyMainLodAutoColorScale = (map: ContactMapView) => {
+        if (!uiState.contact.colorScale.auto || !hasContactMapData(map)) {
+          return;
+        }
+        const cachedScale = autoColorScaleCacheRef.current.get(mainLodAutoColorScaleKey);
+        if (cachedScale) {
+          dispatchUi({ type: "setAutoColorScale", scale: cachedScale });
+          return;
+        }
+        const counts = contactCountSampleForColorScale(map);
+        if (!counts.some((value) => Number.isFinite(value) && value > 0)) {
+          return;
+        }
+        const scale = estimateContactColorScale(counts, uiState.contact.colorScale.log);
+        autoColorScaleCacheRef.current.set(mainLodAutoColorScaleKey, scale);
+        dispatchUi({ type: "setAutoColorScale", scale });
+      };
+      let mainLodPaintScheduled = false;
+      const markMainLodPainted = () => {
+        if (mainLodPaintScheduled) {
+          return;
+        }
+        mainLodPaintScheduled = true;
+        const pendingPanPaint = contactPanPerformance.activeSnapshot();
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            if (!cancelled && generation === contactTileGenerationRef.current) {
+              if (pendingPanPaint?.generation === generation) {
+                contactPanPerformance.markGpuPaintForSequence(
+                  pendingPanPaint.panSequence,
+                );
+              }
+              setPaintedContactTileGeneration((current) => (
+                current === generation ? current : generation
+              ));
+            }
+          });
+        });
+      };
+      const reuseMainLodAsOverview = (map: ContactMapView) => {
+        const reusableOverview = wholeAssemblyOverviewFromCoveringMap(
+          map,
+          assemblyLayout.totalSpan,
+        );
+        if (reusableOverview) {
+          overviewContactMapRef.current = reusableOverview;
+          setOverviewContactMap(reusableOverview);
+        }
+      };
+      const initialMainLodMap = mainLodMapForWorld(mainLodWorld);
+      let mainLodVisibleReady = mainLodWorld.missingVisibleTiles.length === 0;
+      if (mainLodVisibleReady) {
+        applyMainLodAutoColorScale(initialMainLodMap);
+        lastCompleteContactMapRef.current = initialMainLodMap;
+        setContactMap(initialMainLodMap);
+        reuseMainLodAsOverview(initialMainLodMap);
       } else {
+        const displayedMainLod = displayContactMapForPendingLayer(
+          initialMainLodMap,
+          previousCompleteMap,
+          false,
+        );
+        if (shouldPublishContactMapLayer(holdsPreviousCompleteFrame, false)) {
+          setContactMap(displayedMainLod);
+        }
         setStatusMessage(
-          `Loading screen-scale contact map at ${formatBasePairResolution(mainLodPlan.targetResolution)}…`,
+          `Loading reusable LOD tiles at ${formatBasePairResolution(mainLodPlan.targetResolution)}…`,
         );
       }
 
-      mainLodReady = (async () => {
+      void (async () => {
         const generationStartError = await generationStart;
         if (generationStartError !== null) {
           throw generationStartError;
@@ -1281,81 +1563,181 @@ export function App() {
         setBackendStartedContactTileGeneration((current) => (
           current === generation ? current : generation
         ));
-        if (hasMatchingMainLod) {
+        if (mainLodVisibleReady) {
           setStatusMessage(
-            `Contact map preview at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
+            `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
           );
-          return;
+          markMainLodPainted();
         }
-
-        const nextRequestId = contactTileBackendRequestIdRef.current + 1;
-        contactTileBackendRequestIdRef.current = nextRequestId;
-        const response = await loadContactOverviewWithLayoutHandle(
-          contactLayoutHandleRegistry,
-          assemblyLayout.blocks,
-          {
-            requestId: nextRequestId,
-            generation,
-            coolPath: contactCoolPath,
-            sourceResolution: mainLodPlan.sourceResolution,
-            targetResolution: mainLodPlan.targetResolution,
-            normalization,
-            viewport: mainLodPlan.viewport,
-          },
-        );
-        if (cancelled || generation !== contactTileGenerationRef.current) {
-          return;
-        }
-        const mainLodMap: ContactMapView = {
-          resolution: response.resolution,
-          normalization,
-          viewport: response.viewport,
-          cells: response.cells,
-          layoutBlocks: assemblyLayout.blocks,
-          layoutScope: mainLodScope,
-          visibleLayerComplete: true,
-          renderGeneration: generation,
-          isTransientResolutionPreview: refinesManualResolution,
-        };
-        if (uiState.contact.colorScale.auto && hasContactMapData(mainLodMap)) {
-          const cachedScale = autoColorScaleCacheRef.current.get(mainLodAutoColorScaleKey);
-          if (cachedScale) {
-            dispatchUi({ type: "setAutoColorScale", scale: cachedScale });
-          } else {
-            const counts = contactCountSampleForColorScale(mainLodMap);
-            if (counts.some((value) => Number.isFinite(value) && value > 0)) {
-              const scale = estimateContactColorScale(
-                counts,
-                uiState.contact.colorScale.log,
-              );
-              autoColorScaleCacheRef.current.set(mainLodAutoColorScaleKey, scale);
-              dispatchUi({ type: "setAutoColorScale", scale });
+        const commitMainLodTiles = (
+          kind: "visible" | "prefetch",
+          tiles: ContactMapTile[],
+        ) => {
+          if (
+            tiles.length === 0
+            || cancelled
+            || generation !== contactTileGenerationRef.current
+          ) {
+            return;
+          }
+          if (kind === "visible") {
+            contactTilePerformance.markIpcResponse(generation);
+            contactPanPerformance.markIpcResponse(generation);
+            for (const tile of tiles) {
+              assemblingMainLodVisibleTiles.set(mainLodCacheKeyForTile(tile), tile);
             }
           }
-        }
-        lastCompleteContactMapRef.current = mainLodMap;
-        setContactMap(mainLodMap);
-        const reusableOverview = wholeAssemblyOverviewFromCoveringMap(
-          mainLodMap,
-          assemblyLayout.totalSpan,
-        );
-        if (reusableOverview) {
-          overviewContactMapRef.current = reusableOverview;
-          setOverviewContactMap(reusableOverview);
-        }
-        setStatusMessage(
-          `Contact map preview at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
-        );
-        if (!refinesManualResolution) {
-          window.requestAnimationFrame(() => {
-            window.requestAnimationFrame(() => {
-              if (!cancelled && generation === contactTileGenerationRef.current) {
-                setPaintedContactTileGeneration((current) => (
-                  current === generation ? current : generation
-                ));
-              }
-            });
+          contactMainLodTileCacheLru.merge(
+            mainLodLayerScope,
+            tiles.map((tile) => ({
+              key: mainLodCacheKeyForTile(tile),
+              value: tile,
+              cellCount: contactTileCellCount(tile),
+            })),
+            {
+              recency: kind === "visible" ? "foreground" : "background",
+              keys: mainLodProtectedKeys,
+              scopes: new Set([mainLodLayerScope.id]),
+            },
+          );
+          const nextMainLodCache = contactMainLodTileCacheLru.toMap();
+          contactMainLodTileCacheRef.current = nextMainLodCache;
+          const renderCache = contactTileRenderCache(
+            nextMainLodCache,
+            assemblingMainLodVisibleTiles,
+          );
+          if (kind === "visible") {
+            contactTilePerformance.markCacheMerge(generation);
+            contactPanPerformance.markCacheMerge(generation);
+          }
+          const updatedMainLodWorld = buildContactTileWorld({
+            viewport,
+            prefetchViewport,
+            resolution: mainLodPlan.targetResolution,
+            tileSizeBins: lodTileSizeBins,
+            totalSpanBp,
+            scope: mainLodScope,
+            cache: renderCache,
+            cacheKeyForTile: mainLodCacheKeyForTile,
           });
+          const updatedMainLodMap = mainLodMapForWorld(updatedMainLodWorld);
+          const layerComplete = updatedMainLodWorld.missingVisibleTiles.length === 0;
+          const displayedMainLodMap = displayContactMapForPendingLayer(
+            updatedMainLodMap,
+            lastCompleteContactMapRef.current,
+            layerComplete,
+          );
+          if (layerComplete) {
+            lastCompleteContactMapRef.current = updatedMainLodMap;
+          }
+          if (shouldPublishContactMapLayer(holdsPreviousCompleteFrame, layerComplete)) {
+            if (kind === "visible" && layerComplete) {
+              applyMainLodAutoColorScale(updatedMainLodMap);
+            }
+            setContactMap(displayedMainLodMap);
+          }
+          if (kind === "visible" && layerComplete) {
+            mainLodVisibleReady = true;
+            reuseMainLodAsOverview(updatedMainLodMap);
+            setStatusMessage(
+              `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
+            );
+            markMainLodPainted();
+          }
+        };
+        const mainLodVisibleTiles = combineContactMainLodVisibleBatches(
+          mainLodLoadPlan.visibleBatches,
+        );
+        if (mainLodVisibleTiles.length > 0) {
+          contactPanPerformance.markIpcStart(generation);
+          const loadVisibleTiles = () => contactMainLodTileFlightsRef.current.loadBatch({
+            scope: mainLodScope,
+            tiles: mainLodVisibleTiles,
+            cacheKeyForTile: mainLodCacheKeyForTile,
+            nextRequestId: () => {
+              const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+              contactTileBackendRequestIdRef.current = nextRequestId;
+              return nextRequestId;
+            },
+            load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
+              contactLayoutHandleRegistry,
+              assemblyLayout.blocks,
+              {
+                requestId: backendRequestId,
+                generation,
+                purpose: "visible",
+                coolPath: contactCoolPath,
+                baseResolution: mainLodPlan.sourceResolution,
+                sourceResolution: mainLodPlan.sourceResolution,
+                targetResolution: mainLodPlan.targetResolution,
+                tileSizeBins: lodTileSizeBins,
+                normalization,
+                tiles: requestedTiles,
+                adaptiveRefinement: false,
+              },
+            ),
+          });
+          let loadedTiles: ContactMapTile[];
+          try {
+            loadedTiles = await loadVisibleTiles();
+          } catch (error) {
+            if (cancelled || generation !== contactTileGenerationRef.current) {
+              return;
+            }
+            if (!isContactTileRequestCancelled(error)) {
+              throw error;
+            }
+            loadedTiles = await loadVisibleTiles();
+          }
+          if (cancelled || generation !== contactTileGenerationRef.current) {
+            return;
+          }
+          commitMainLodTiles("visible", loadedTiles);
+        }
+        for (const tiles of mainLodLoadPlan.prefetchBatches) {
+          const loadBatch = () => contactMainLodTileFlightsRef.current.loadBatch({
+            scope: mainLodScope,
+            tiles,
+            cacheKeyForTile: mainLodCacheKeyForTile,
+            nextRequestId: () => {
+              const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+              contactTileBackendRequestIdRef.current = nextRequestId;
+              return nextRequestId;
+            },
+            load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
+              contactLayoutHandleRegistry,
+              assemblyLayout.blocks,
+              {
+                requestId: backendRequestId,
+                generation,
+                purpose: "spatial_prefetch",
+                coolPath: contactCoolPath,
+                baseResolution: mainLodPlan.sourceResolution,
+                sourceResolution: mainLodPlan.sourceResolution,
+                targetResolution: mainLodPlan.targetResolution,
+                tileSizeBins: lodTileSizeBins,
+                normalization,
+                tiles: requestedTiles,
+                adaptiveRefinement: false,
+              },
+            ),
+          });
+          let loadedTiles: ContactMapTile[];
+          try {
+            loadedTiles = await loadBatch();
+          } catch (error) {
+            if (cancelled || generation !== contactTileGenerationRef.current) {
+              return;
+            }
+            if (!isContactTileRequestCancelled(error)) {
+              throw error;
+            }
+            loadedTiles = await loadBatch();
+          }
+          if (cancelled || generation !== contactTileGenerationRef.current) {
+            return;
+          }
+          commitMainLodTiles("prefetch", loadedTiles);
         }
       })().catch((error) => {
         if (
@@ -1365,17 +1747,19 @@ export function App() {
         ) {
           return;
         }
-        setStatusMessage(`Contact map LOD failed: ${String(error)}`);
+        setStatusMessage(
+          mainLodVisibleReady
+            ? `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`
+            : `Contact map tiled LOD failed: ${String(error)}`,
+        );
         dispatchUi({
           type: "appendLog",
-          message: `Contact map LOD failed: ${String(error)}`,
+          message: `${mainLodVisibleReady ? "Contact LOD prefetch" : "Contact map tiled LOD"} failed: ${String(error)}`,
         });
       });
-      if (!refinesManualResolution) {
-        return () => {
-          cancelled = true;
-        };
-      }
+      return () => {
+        cancelled = true;
+      };
     }
     if (panPerformancePreview) {
       contactPanPerformance.startGeneration({
@@ -1444,6 +1828,7 @@ export function App() {
     }
     const contactMapForWorld = (world: typeof tileWorld): ContactMapView => ({
       ...projectContactTileWorldView(world),
+      requestedResolution: targetResolution,
       normalization,
       layoutBlocks: assemblyLayout.blocks,
       layoutScope: tileScope,
@@ -1565,6 +1950,16 @@ export function App() {
               }
 
               const candidateTargetResolution = resolutionToBasePairs(candidateResolution);
+              if (
+                normalization === "raw"
+                && contactIsMcool
+                && candidateTargetResolution === 2_500_000
+              ) {
+                // Never seed the exact main cache with a non-adaptive 2.5 Mb
+                // background result; a later local view requires 1 kb boundary
+                // refinement and must own that cache entry.
+                return [];
+              }
               const candidateTotalSpanBp = Math.max(
                 candidateTargetResolution,
                 assemblyLayout.totalSpan,
@@ -1882,13 +2277,6 @@ export function App() {
         if (cancelled || generation !== contactTileGenerationRef.current) {
           return;
         }
-        // The LOD is a fast first frame, never the terminal result of a manual
-        // resolution choice. Once it is visible (or fails), continue into the
-        // center-first exact tile plan for the slider-selected resolution.
-        await mainLodReady;
-        if (cancelled || generation !== contactTileGenerationRef.current) {
-          return;
-        }
         setBackendStartedContactTileGeneration((current) => (
           current === generation ? current : generation
         ));
@@ -1907,7 +2295,8 @@ export function App() {
           && loadPlan.visibleBatches.length > 1;
         const usesAdaptiveMcoolRefinement = normalization === "raw"
           && targetResolution === 2_500_000
-          && contactCoolPath.toLowerCase().endsWith(".mcool");
+          && contactCoolPath.toLowerCase().endsWith(".mcool")
+          && tileWorld.visibleTiles.length <= maxAdaptiveMcoolExactTiles;
         const shouldSingleScanVisibleTiles = contactTileBinaryEnabled
           && contactTileStreamEnabled
           && contactTileSingleScanEnabled
@@ -1916,15 +2305,52 @@ export function App() {
           // Keep the dense frontend accumulator bounded even in a diagnostic
           // build where main-canvas LOD has been explicitly disabled.
           && tileWorld.visibleTiles.length <= maxExactMainContactTiles;
+        const directDeltaStreamMode = contactTileDeltaStreamMode(
+          contactTileDirectDeltaEnabled,
+          holdsPreviousCompleteFrame,
+        );
+        const presentsDirectDeltaStream = directDeltaStreamMode === "overlay";
+        const visibleTilesForGeneration = loadPlan.visibleBatches.flat();
+        const progressiveGpuStagingAccumulator = (
+          directDeltaStreamMode === "staging"
+          && !shouldSingleScanVisibleTiles
+          && visibleTilesForGeneration.length > 0
+        )
+          ? new ContactTileDeltaAccumulator(visibleTilesForGeneration, tileSizeBins)
+          : null;
+        const stagedCompleteTileKeys = new Set<string>();
+        const stageCompleteTiles = (tiles: readonly ContactMapTile[]) => {
+          if (!progressiveGpuStagingAccumulator) {
+            return;
+          }
+          mergeCompleteContactTilesIntoDeltaAccumulator(
+            progressiveGpuStagingAccumulator,
+            stagedCompleteTileKeys,
+            tiles,
+          );
+        };
+        if (progressiveGpuStagingAccumulator) {
+          stageCompleteTiles(tileWorld.cachedVisibleTiles);
+          setContactTileDeltaStream({
+            generation,
+            resolution: targetResolution,
+            viewport,
+            accumulator: progressiveGpuStagingAccumulator,
+            retainPreviousFrame: true,
+          });
+        }
         let streamedVisibleBatches = false;
         for (const batch of tileBatches) {
+          if (usesAdaptiveMcoolRefinement && batch.kind !== "visible") {
+            continue;
+          }
           if (batch.kind === "visible" && shouldSingleScanVisibleTiles) {
             if (streamedVisibleBatches) {
               continue;
             }
             streamedVisibleBatches = true;
             contactPanPerformance.markIpcStart(generation);
-            const visibleTiles = loadPlan.visibleBatches.flat();
+            const visibleTiles = visibleTilesForGeneration;
             let directDeltaPaintReported = false;
             const loadVisibleDeltas = () => contactTileFlightsRef.current.loadBatch({
               scope: tileScope,
@@ -1949,9 +2375,10 @@ export function App() {
                     tileSizeBins,
                     normalization,
                     tiles: requestedTiles,
+                    adaptiveRefinement: usesAdaptiveMcoolRefinement,
                   },
                   {
-                    onStart: contactTileDirectDeltaEnabled
+                    onStart: directDeltaStreamMode !== "disabled"
                       ? (accumulator) => {
                           if (cancelled || generation !== contactTileGenerationRef.current) {
                             return;
@@ -1961,7 +2388,8 @@ export function App() {
                             resolution: targetResolution,
                             viewport,
                             accumulator,
-                            onFirstPaint: () => {
+                            retainPreviousFrame: directDeltaStreamMode === "staging",
+                            onFirstPaint: presentsDirectDeltaStream ? () => {
                               if (
                                 directDeltaPaintReported
                                 || cancelled
@@ -1981,7 +2409,7 @@ export function App() {
                                   );
                                 });
                               });
-                            },
+                            } : undefined,
                           });
                         }
                       : undefined,
@@ -1991,7 +2419,7 @@ export function App() {
                       contactTilePerformance.markCacheMerge(generation);
                       contactPanPerformance.markCacheMerge(generation);
                     },
-                    onChunk: contactTileDirectDeltaEnabled
+                    onChunk: directDeltaStreamMode !== "disabled"
                       ? undefined
                       : (changedTiles) => commitLoadedTiles("visible", changedTiles),
                   },
@@ -2024,7 +2452,7 @@ export function App() {
             }
             streamedVisibleBatches = true;
             contactPanPerformance.markIpcStart(generation);
-            const visibleTiles = loadPlan.visibleBatches.flat();
+            const visibleTiles = visibleTilesForGeneration;
             const streamedKeys = new Set<string>();
             const loadVisibleStream = () => contactTileFlightsRef.current.loadBatch({
               scope: tileScope,
@@ -2053,9 +2481,11 @@ export function App() {
                     tileSizeBins,
                     normalization,
                     tiles: requestedTiles,
+                    adaptiveRefinement: usesAdaptiveMcoolRefinement,
                   },
                   streamChunks,
                   (chunkTiles) => {
+                    stageCompleteTiles(chunkTiles);
                     for (const tile of chunkTiles) {
                       streamedKeys.add(cacheKeyForTile(tile));
                     }
@@ -2080,6 +2510,7 @@ export function App() {
             if (cancelled || generation !== contactTileGenerationRef.current) {
               return;
             }
+            stageCompleteTiles(tiles);
             commitLoadedTiles(
               "visible",
               tiles.filter((tile) => !streamedKeys.has(cacheKeyForTile(tile))),
@@ -2111,6 +2542,8 @@ export function App() {
                 tileSizeBins,
                 normalization,
                 tiles,
+                adaptiveRefinement: batch.kind === "visible"
+                  && usesAdaptiveMcoolRefinement,
               },
             ),
           });
@@ -2132,6 +2565,9 @@ export function App() {
           }
           if (cancelled || generation !== contactTileGenerationRef.current) {
             return;
+          }
+          if (batch.kind === "visible") {
+            stageCompleteTiles(tiles);
           }
           commitLoadedTiles(batch.kind, tiles);
         }
@@ -2188,8 +2624,10 @@ export function App() {
       cancelAdjacentIdleTask?.();
     };
   }, [
+    contactMainLodTileCacheLru,
     contactTileCacheLru,
     contactPanPerformance,
+    contactResolutionResponsiveness,
     contactTilePerformance,
     contactCoolPath,
     contactAvailableResolutions,
@@ -2487,6 +2925,7 @@ export function App() {
     }
 
     let cancelled = false;
+    const renderGeneration = contactTileGenerationRef.current;
     const totalSpanBp = Math.max(1, backgroundAssemblyLayout.totalSpan);
     const viewport = buildCenteredContactViewport({
       centerMb: uiState.contact.viewportCenterXMb,
@@ -2518,16 +2957,19 @@ export function App() {
 
     coveragePromise
       .then((view) => {
-        if (!cancelled) {
-          setCoverageView(view);
+        if (!cancelled && renderGeneration === contactTileGenerationRef.current) {
+          setCoverageView({ ...view, renderGeneration });
         }
       })
       .catch((error) => {
-        if (cancelled) {
+        if (cancelled || renderGeneration !== contactTileGenerationRef.current) {
           return;
         }
         if (coverageRecords.length > 0) {
-          setCoverageView(buildBrowserCoverageView(request));
+          setCoverageView({
+            ...buildBrowserCoverageView(request),
+            renderGeneration,
+          });
           return;
         }
         setCoverageView(null);
@@ -2539,13 +2981,17 @@ export function App() {
     };
   }, [
     backgroundAssemblyLayout,
+    contactAvailableResolutions,
     coverageRecords,
     dataset?.coverage_path,
+    uiState.contact.colorScale.auto,
+    uiState.contact.colorScale.log,
     uiState.contact.resolution,
     uiState.contact.viewportCenterXMb,
     uiState.contact.viewportSpanMb,
     uiState.contact.viewportWidthPx,
     uiState.contact.viewportHeightPx,
+    uiState.normalization,
   ]);
 
   useEffect(() => {
@@ -2635,7 +3081,9 @@ export function App() {
       );
       savedAgpPathRef.current = null;
       setSavedAgpPath(null);
-      setSavedAgpText(exportAgpText(importedDataset.agp_layout.blocks));
+      const canonicalAgp = exportAgpText(importedDataset.agp_layout.blocks);
+      setSavedAgpText(canonicalAgp);
+      setSavedHistoryIdentity(emptyOperationHistoryIdentity());
       setDataset(importedDataset);
       setContactAvailableResolutions(importedDataset.available_resolutions ?? []);
       setCoverageRecords([]);
@@ -2662,7 +3110,9 @@ export function App() {
       );
       savedAgpPathRef.current = null;
       setSavedAgpPath(null);
-      setSavedAgpText(exportAgpText(example.dataset.agp_layout.blocks));
+      const canonicalAgp = exportAgpText(example.dataset.agp_layout.blocks);
+      setSavedAgpText(canonicalAgp);
+      setSavedHistoryIdentity(emptyOperationHistoryIdentity());
       setDataset(example.dataset);
       setContactAvailableResolutions(example.dataset.available_resolutions ?? [1_000]);
       setCoverageRecords(example.coverageRecords);
@@ -2684,6 +3134,40 @@ export function App() {
     }
   }
 
+  function restoreImportedHistory(
+    historyText: string | null,
+    canonicalAgp: string,
+    historyName: string,
+  ): OperationHistoryArchive | null {
+    if (!historyText) return null;
+    try {
+      return parseOperationHistory(historyText, canonicalAgp);
+    } catch (error) {
+      dispatchUi({
+        type: "appendLog",
+        message: `History sidecar ignored (${historyName}): ${String(error)}`,
+      });
+      return null;
+    }
+  }
+
+  function dispatchAssemblyImport(
+    blocks: ContactMapLayoutBlock[],
+    history: OperationHistoryArchive | null,
+  ) {
+    if (!history) {
+      dispatchUi({ type: "setAssemblyBlocks", blocks });
+      return;
+    }
+    dispatchUi({
+      type: "restoreAssemblyHistory",
+      blocks,
+      operationHistory: history.operationHistory,
+      redoStack: history.redoStack,
+      nextOperationId: history.nextOperationId,
+    });
+  }
+
   async function importAgpFile(file: File) {
     const text = await readImportedTextFile(file);
     const summary = summarizeAgpText(text);
@@ -2692,7 +3176,9 @@ export function App() {
     sourceAgpRef.current = sourceAgpSnapshot(agpLayout, file.name);
     savedAgpPathRef.current = null;
     setSavedAgpPath(null);
-    setSavedAgpText(exportAgpText(agpLayout.blocks));
+    const canonicalAgp = exportAgpText(agpLayout.blocks);
+    setSavedAgpText(canonicalAgp);
+    setSavedHistoryIdentity(emptyOperationHistoryIdentity());
     setDataset((current) => ({
       ...buildDatasetSummary({
         agpPath: file.name,
@@ -2716,6 +3202,70 @@ export function App() {
     });
     setStatusMessage(`AGP imported: ${file.name}`);
     dispatchUi({ type: "appendLog", message: `AGP imported: ${file.name}` });
+  }
+
+  async function requestAgpFile() {
+    if (!("__TAURI_INTERNALS__" in window)) {
+      agpInputRef.current?.click();
+      return;
+    }
+    try {
+      const path = await open({
+        title: "Select an AGP assembly",
+        multiple: false,
+        directory: false,
+        filters: [
+          { name: "AGP files", extensions: ["agp", "txt", "gz"] },
+        ],
+      });
+      if (!path) {
+        setStatusMessage("AGP import canceled");
+        return;
+      }
+      const bundle = await invoke<ImportedAgpBundle>("load_agp_bundle", { path });
+      const summary = summarizeAgpText(bundle.agp.text);
+      const agpLayout = parseAgpLayout(bundle.agp.text);
+      const canonicalAgp = exportAgpText(agpLayout.blocks);
+      const restoredHistory = restoreImportedHistory(
+        bundle.history?.text ?? null,
+        canonicalAgp,
+        bundle.history?.name ?? operationHistoryFilename(bundle.agp.name),
+      );
+
+      sourceAgpRef.current = sourceAgpSnapshot(agpLayout, bundle.agp.path);
+      savedAgpPathRef.current = null;
+      setSavedAgpPath(null);
+      setSavedAgpText(canonicalAgp);
+      setSavedHistoryIdentity(historyIdentityForArchive(restoredHistory));
+      setDataset((current) => buildDatasetSummary({
+        agpPath: bundle.agp.path,
+        mcoolPath: current?.mcool_path ?? "",
+        coolPath: current?.cool_path ?? "",
+        agpLines: summary.lineCount,
+        agpObjects: summary.objectCount,
+        agpComponents: summary.componentCount,
+        agpGaps: summary.gapCount,
+        maxObjectSpan: summary.maxObjectSpan,
+        mcoolSizeBytes: current?.mcool_size_bytes ?? 0,
+        coveragePath: current?.coverage_path ?? null,
+        agpLayout,
+        availableResolutions: current?.available_resolutions,
+      }));
+      dispatchAssemblyImport(agpLayout.blocks, restoredHistory);
+      dispatchUi({ type: "fitContactViewport", totalSpanMb: agpLayout.totalSpan / 1_000_000 });
+      const historyCount = restoredHistory
+        ? restoredHistory.operationHistory.length + restoredHistory.redoStack.length
+        : 0;
+      const historySuffix = historyCount > 0 ? ` with ${historyCount} history operation${historyCount === 1 ? "" : "s"}` : "";
+      setStatusMessage(`AGP imported: ${bundle.agp.name}${historySuffix}`);
+      dispatchUi({
+        type: "appendLog",
+        message: `AGP imported: ${bundle.agp.name}${historySuffix}`,
+      });
+    } catch (error) {
+      setStatusMessage(`AGP import failed: ${String(error)}`);
+      dispatchUi({ type: "appendLog", message: `AGP import failed: ${String(error)}` });
+    }
   }
 
   async function importGfaFile(file: File) {
@@ -2796,6 +3346,14 @@ export function App() {
 
       const agpText = project.agp?.text;
       const agpLayout = agpText ? parseAgpLayout(agpText) : emptyAgpLayout();
+      const canonicalAgp = exportAgpText(agpLayout.blocks);
+      const restoredHistory = project.agp
+        ? restoreImportedHistory(
+            project.history?.text ?? null,
+            canonicalAgp,
+            project.history?.name ?? operationHistoryFilename(project.agp.name),
+          )
+        : null;
       const agpSummary = agpText ? summarizeAgpText(agpText) : null;
       const gfaDocument = project.gfa ? parseGfaText(project.gfa.text, project.gfa.name) : null;
       if (project.gfa && gfaDocument?.summary.segmentCount === 0) {
@@ -2809,8 +3367,9 @@ export function App() {
         ? sourceAgpSnapshot(agpLayout, project.agp.path)
         : null;
       setSavedAgpPath(null);
-      setSavedAgpText(project.agp ? exportAgpText(agpLayout.blocks) : "");
-      dispatchUi({ type: "setAssemblyBlocks", blocks: agpLayout.blocks });
+      setSavedAgpText(project.agp ? canonicalAgp : "");
+      setSavedHistoryIdentity(project.agp ? historyIdentityForArchive(restoredHistory) : "");
+      dispatchAssemblyImport(agpLayout.blocks, restoredHistory);
       if (project.agp) {
         dispatchUi({ type: "fitContactViewport", totalSpanMb: agpLayout.totalSpan / 1_000_000 });
       }
@@ -2844,7 +3403,7 @@ export function App() {
       }));
       setContactAvailableResolutions(contact?.available_resolutions ?? []);
 
-      const loaded = [project.agp, project.gfa, project.paf, project.coverage, project.contact]
+      const loaded = [project.agp, project.history, project.gfa, project.paf, project.coverage, project.contact]
         .filter((file): file is ImportedProjectTextFile | ImportedContactFile => file !== null)
         .map((file) => file.name);
       const skipped = project.ignoredCandidates.length;
@@ -2994,8 +3553,8 @@ export function App() {
     const generation = contactTileGenerationRef.current + 1;
     contactTileGenerationRef.current = generation;
     contactTilePerformance.supersedeBefore(generation);
+    contactResolutionResponsiveness.supersedeBefore(generation);
     pendingPanPerformancePreviewRef.current = null;
-    pendingManualResolutionRef.current = null;
     pendingResolutionPerformanceRef.current = null;
 
     const presentationSchedule = contactTilePresentationScheduleRef.current;
@@ -3005,6 +3564,9 @@ export function App() {
     contactTileCacheLru.clear();
     contactTileCacheRef.current = new Map();
     contactTileFlightsRef.current.clear();
+    contactMainLodTileCacheLru.clear();
+    contactMainLodTileCacheRef.current = new Map();
+    contactMainLodTileFlightsRef.current.clear();
     autoColorScaleCacheRef.current.clear();
     lastCompleteContactMapRef.current = null;
     overviewContactMapRef.current = null;
@@ -3014,6 +3576,7 @@ export function App() {
     savedAgpPathRef.current = null;
     setSavedAgpPath(null);
     setSavedAgpText("");
+    setSavedHistoryIdentity("");
     setDataset(null);
     setContactAvailableResolutions([]);
     setContactMap(null);
@@ -3069,6 +3632,7 @@ export function App() {
     savedAgpPathRef.current = null;
     setSavedAgpPath(null);
     setSavedAgpText(source.canonicalText);
+    setSavedHistoryIdentity(emptyOperationHistoryIdentity());
     setDataset((current) => current ? {
       ...current,
       agp_path: source.path,
@@ -3100,6 +3664,12 @@ export function App() {
 
     savingAgpRef.current = true;
     const agpText = currentAgpText;
+    const historyText = serializeOperationHistory({
+      canonicalAgp: agpText,
+      operationHistory: uiState.operationHistory,
+      redoStack: uiState.redoStack,
+      nextOperationId: uiState.nextOperationId,
+    });
     const filename = editedAgpFilename(dataset?.agp_path ?? "assembly.agp");
     const automatic = options.automatic === true;
     const saveAs = options.saveAs === true;
@@ -3108,14 +3678,17 @@ export function App() {
       const existingPath = savedAgpPathRef.current;
       const plan = agpSavePlan({ automatic, saveAs, savePath: existingPath });
       if (plan === "overwrite" && existingPath) {
-        const overwritten = await invoke<boolean>("overwrite_agp_file", {
+        const overwritten = await invoke<boolean>("overwrite_agp_bundle", {
           path: existingPath,
           contents: agpText,
+          historyContents: historyText,
         });
         if (overwritten) {
           setSavedAgpText(agpText);
-          setStatusMessage(`${savedStatus}: ${existingPath}`);
-          dispatchUi({ type: "appendLog", message: `${savedStatus}: ${existingPath}` });
+          setSavedHistoryIdentity(currentHistoryIdentity);
+          const message = agpBundleSavedMessage(savedStatus, existingPath);
+          setStatusMessage(message);
+          dispatchUi({ type: "appendLog", message });
           return;
         }
         savedAgpPathRef.current = null;
@@ -3150,17 +3723,20 @@ export function App() {
         return;
       }
 
-      const savedPath = await invoke<string>("write_agp_file", {
+      const savedPath = await invoke<string>("write_agp_bundle", {
         path: selectedPath,
         contents: agpText,
+        historyContents: historyText,
       });
 
       savedAgpPathRef.current = savedPath;
       setSavedAgpPath(savedPath);
       setSavedAgpText(agpText);
+      setSavedHistoryIdentity(currentHistoryIdentity);
       setDataset((current) => current ? { ...current, agp_path: savedPath } : current);
-      setStatusMessage(`${savedStatus}: ${savedPath}`);
-      dispatchUi({ type: "appendLog", message: `${savedStatus}: ${savedPath}` });
+      const message = agpBundleSavedMessage(savedStatus, savedPath);
+      setStatusMessage(message);
+      dispatchUi({ type: "appendLog", message });
     } catch (error) {
       if (savedAgpPathRef.current) {
         setStatusMessage(`AGP save failed: ${String(error)}`);
@@ -3168,12 +3744,18 @@ export function App() {
         return;
       }
       downloadTextFile(filename, agpText, "text/plain;charset=utf-8");
+      downloadTextFile(
+        operationHistoryFilename(filename),
+        historyText,
+        "application/json;charset=utf-8",
+      );
       setSavedAgpText(agpText);
+      setSavedHistoryIdentity(currentHistoryIdentity);
       setDataset((current) => current ? { ...current, agp_path: filename } : current);
-      setStatusMessage(`AGP downloaded: ${filename}`);
+      setStatusMessage(`AGP and history downloaded: ${filename}, ${operationHistoryFilename(filename)}`);
       dispatchUi({
         type: "appendLog",
-        message: `AGP downloaded in browser preview: ${filename}; native save failed: ${String(error)}`,
+        message: `AGP and history downloaded in browser preview: ${filename}, ${operationHistoryFilename(filename)}; native save failed: ${String(error)}`,
       });
     } finally {
       savingAgpRef.current = false;
@@ -3194,7 +3776,7 @@ export function App() {
       void exportEditedAgp({ automatic: true });
     }, agpAutoSaveDelayMs);
     return () => window.clearTimeout(timeout);
-  }, [autoSaveEnabled, currentAgpText, isAgpDirty, savedAgpPath]);
+  }, [autoSaveEnabled, currentAgpText, currentHistoryIdentity, isAgpDirty, savedAgpPath]);
 
   const loadGfaEndpointHiCBatch = useCallback<GfaEndpointHiCBatchLoader>(async (requests) => {
     if (requests.length === 0) {
@@ -3417,6 +3999,7 @@ export function App() {
       gfaInputRef={gfaInputRef}
       pafInputRef={pafInputRef}
       coverageInputRef={coverageInputRef}
+      onAgpFileRequested={requestAgpFile}
       onAgpFileSelected={importAgpFile}
       onGfaFileSelected={importGfaFile}
       onContactFileSelected={importContactFile}
@@ -3600,6 +4183,30 @@ function sourceAgpSnapshot(
 function editedAgpFilename(path: string) {
   const basename = path.split(/[\\/]/).filter(Boolean).pop() ?? "assembly.agp";
   return basename.replace(/(?:\.agp|\.txt)?$/i, ".edited.agp");
+}
+
+function agpBundleSavedMessage(status: string, agpPath: string) {
+  return `${status}: ${agpPath}; history: ${operationHistoryFilename(agpPath)}`;
+}
+
+function operationHistoryIdentity(history: OperationHistoryArchive) {
+  return [
+    history.nextOperationId,
+    history.operationHistory.map((operation) => operation.id).join(","),
+    history.redoStack.map((operation) => operation.id).join(","),
+  ].join("|");
+}
+
+function historyIdentityForArchive(history: OperationHistoryArchive | null) {
+  return operationHistoryIdentity(history ?? {
+    operationHistory: [],
+    redoStack: [],
+    nextOperationId: 1,
+  });
+}
+
+function emptyOperationHistoryIdentity() {
+  return historyIdentityForArchive(null);
 }
 
 function pathBasename(path: string) {

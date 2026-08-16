@@ -1,6 +1,8 @@
 import type { ContactMapTile } from "../App";
 import { contactColorLut } from "../state/contactColor";
+import type { ContactTileDenseDeltaBuffer } from "../state/contactTileDelta";
 import { contactTileCellCount, validatedPackedContactTileCells } from "../state/contactTileData";
+import { contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
 import type {
   ContactTileCanvasDescriptor,
@@ -11,6 +13,19 @@ export const contactTileGpuTextureBudgetBytes = 96 * 1024 * 1024;
 
 export interface ContactTileGpuScene {
   descriptors: readonly ContactTileCanvasDescriptor[];
+  generation?: number;
+  resolution: number;
+  tileSizeBins: number;
+  viewport: ContactViewport;
+  renderStyle: ContactTileRenderStyle;
+}
+
+export interface ContactTileGpuDeltaScene {
+  buffers: readonly ContactTileDenseDeltaBuffer[];
+  /** Accumulate into mutable CPU buffers and upload only during terminal promotion. */
+  deferTextureUpdates?: boolean;
+  descriptors: readonly ContactTileCanvasDescriptor[];
+  generation: number;
   resolution: number;
   tileSizeBins: number;
   viewport: ContactViewport;
@@ -19,6 +34,8 @@ export interface ContactTileGpuScene {
 
 export interface ContactTileGpuRenderer {
   setScene: (scene: ContactTileGpuScene) => boolean;
+  setDeltaScene: (scene: ContactTileGpuDeltaScene) => boolean;
+  updateDeltaTiles: (changedTileKeys: readonly string[]) => boolean;
   setPanOffset: (x: number, y: number) => void;
   resetPanOffset: () => void;
   redraw: () => boolean;
@@ -43,7 +60,9 @@ export function contactTileGpuDrawCoverageIsComplete(
 
 interface GpuTextureEntry {
   texture: WebGLTexture;
-  tile: ContactMapTile;
+  tile: ContactMapTile | null;
+  deltaBuffer?: ContactTileDenseDeltaBuffer;
+  generation?: number;
   bytes: number;
   lastUsed: number;
 }
@@ -177,6 +196,42 @@ export function contactTileFloatTextureData(
   return values;
 }
 
+/** Convert the mutable streamed accumulator into the R32F texture layout. */
+export function contactTileDenseFloatTextureData(
+  buffer: ContactTileDenseDeltaBuffer,
+  tileSizeBins: number,
+  target?: Float32Array,
+): Float32Array {
+  if (!Number.isSafeInteger(tileSizeBins) || tileSizeBins <= 0) {
+    throw new RangeError("contact tile size must be a positive integer");
+  }
+  const cellCount = tileSizeBins * tileSizeBins;
+  if (buffer.counts.length !== cellCount || buffer.occupied.length !== cellCount) {
+    throw new RangeError("contact delta buffer does not match tile size");
+  }
+  const values = target ?? new Float32Array(cellCount);
+  if (values.length !== cellCount) {
+    throw new RangeError("contact delta texture target does not match tile size");
+  }
+  values.fill(-1);
+  const mirrorsDiagonal = buffer.tile.tileX === buffer.tile.tileY;
+  for (let index = 0; index < cellCount; index += 1) {
+    if (buffer.occupied[index] === 0) {
+      continue;
+    }
+    const value = buffer.counts[index];
+    values[index] = value;
+    if (mirrorsDiagonal) {
+      const x = index % tileSizeBins;
+      const y = Math.floor(index / tileSizeBins);
+      if (x !== y) {
+        values[x * tileSizeBins + y] = value;
+      }
+    }
+  }
+  return values;
+}
+
 export function createContactTileGpuRenderer(
   canvas: HTMLCanvasElement,
   textureBudgetBytes = contactTileGpuTextureBudgetBytes,
@@ -206,6 +261,9 @@ export function createContactTileGpuRenderer(
   let textureBytes = 0;
   let useCounter = 0;
   let scene: ContactTileGpuScene | null = null;
+  let deltaScene: ContactTileGpuDeltaScene | null = null;
+  let deltaBuffers = new Map<string, ContactTileDenseDeltaBuffer>();
+  let deltaScratch = new Float32Array(0);
   let panOffsetX = 0;
   let panOffsetY = 0;
   let destroyed = false;
@@ -217,12 +275,19 @@ export function createContactTileGpuRenderer(
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
   const draw = (): boolean => {
-    if (destroyed || !scene || gl.isContextLost()) {
+    const activeScene = deltaScene ?? scene;
+    if (destroyed || !activeScene || gl.isContextLost()) {
       return false;
     }
+    // A retained front frame completely covers this staging canvas. Uploading
+    // every streamed chunk here cannot improve what the user sees; defer the
+    // first texture allocation until the terminal scene is promoted.
+    if (deltaScene?.deferTextureUpdates) {
+      return true;
+    }
     resizeCanvasToDisplaySize(canvas, gl);
-    updateLutTexture(gl, resources.lutTexture, scene.renderStyle, lutColormap);
-    lutColormap = scene.renderStyle.colormap;
+    updateLutTexture(gl, resources.lutTexture, activeScene.renderStyle, lutColormap);
+    lutColormap = activeScene.renderStyle.colormap;
 
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.clearColor(1, 1, 1, 1);
@@ -233,26 +298,26 @@ export function createContactTileGpuRenderer(
     gl.vertexAttribPointer(resources.positionLocation, 2, gl.FLOAT, false, 0, 0);
     gl.uniform2f(resources.canvasSizeLocation, canvas.width, canvas.height);
 
-    const minimum = Math.max(0, scene.renderStyle.colorScale.min);
-    const maximum = Math.max(minimum, scene.renderStyle.colorScale.max);
+    const minimum = Math.max(0, activeScene.renderStyle.colorScale.min);
+    const maximum = Math.max(minimum, activeScene.renderStyle.colorScale.max);
     gl.uniform4f(
       resources.scaleLocation,
       minimum,
       maximum,
-      scene.renderStyle.colorScale.log ? 1 : 0,
+      activeScene.renderStyle.colorScale.log ? 1 : 0,
       0,
     );
     gl.uniform1f(
       resources.paletteStopCountLocation,
-      paletteStopCount(scene.renderStyle.colormap),
+      paletteStopCount(activeScene.renderStyle.colormap),
     );
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, resources.lutTexture);
     gl.uniform1i(resources.lutTextureLocation, 1);
 
-    const viewportWidth = Math.max(1, scene.viewport.xEnd - scene.viewport.xStart);
-    const viewportHeight = Math.max(1, scene.viewport.yEnd - scene.viewport.yStart);
-    const tileSpanBp = scene.resolution * scene.tileSizeBins;
+    const viewportWidth = Math.max(1, activeScene.viewport.xEnd - activeScene.viewport.xStart);
+    const viewportHeight = Math.max(1, activeScene.viewport.yEnd - activeScene.viewport.yStart);
+    const tileSpanBp = activeScene.resolution * activeScene.tileSizeBins;
     const cssWidth = Math.max(1, canvas.clientWidth || canvas.width);
     const cssHeight = Math.max(1, canvas.clientHeight || canvas.height);
     const scaleX = canvas.width / cssWidth;
@@ -260,20 +325,35 @@ export function createContactTileGpuRenderer(
     const protectedKeys = new Set<string>();
     const drawnDescriptorKeys = new Set<string>();
 
-    for (const descriptor of scene.descriptors) {
-      if (contactTileCellCount(descriptor.tile) === 0) {
+    for (const descriptor of activeScene.descriptors) {
+      const deltaBuffer = deltaScene
+        ? deltaBuffers.get(contactTileKey(descriptor.tile))
+        : undefined;
+      if (deltaScene ? !deltaBuffer || deltaBuffer.occupiedCount === 0 : contactTileCellCount(descriptor.tile) === 0) {
         continue;
       }
-      const textureKey = gpuTextureKey(scene, descriptor.tile);
+      const textureKey = gpuTextureKey(activeScene, descriptor.tile);
       protectedKeys.add(textureKey);
-      const entry = ensureTileTexture(
-        gl,
-        textureCache,
-        textureKey,
-        descriptor.tile,
-        scene.tileSizeBins,
-        ++useCounter,
-      );
+      const entry = deltaScene && deltaBuffer
+        ? ensureDeltaTileTexture(
+            gl,
+            textureCache,
+            textureKey,
+            deltaBuffer,
+            deltaScene.generation,
+            deltaScene.tileSizeBins,
+            ++useCounter,
+            deltaScratch,
+          )
+        : ensureTileTexture(
+            gl,
+            textureCache,
+            textureKey,
+            descriptor.tile,
+            activeScene.generation,
+            activeScene.tileSizeBins,
+            ++useCounter,
+          );
       if (!entry) {
         continue;
       }
@@ -285,11 +365,11 @@ export function createContactTileGpuRenderer(
       const renderedTileX = descriptor.transpose ? descriptor.tile.tileY : descriptor.tile.tileX;
       const renderedTileY = descriptor.transpose ? descriptor.tile.tileX : descriptor.tile.tileY;
       const left = (
-        ((renderedTileX * tileSpanBp - scene.viewport.xStart) / viewportWidth) * cssWidth
+        ((renderedTileX * tileSpanBp - activeScene.viewport.xStart) / viewportWidth) * cssWidth
         + panOffsetX
       ) * scaleX;
       const top = (
-        ((renderedTileY * tileSpanBp - scene.viewport.yStart) / viewportHeight) * cssHeight
+        ((renderedTileY * tileSpanBp - activeScene.viewport.yStart) / viewportHeight) * cssHeight
         + panOffsetY
       ) * scaleY;
       const width = (tileSpanBp / viewportWidth) * canvas.width;
@@ -316,19 +396,117 @@ export function createContactTileGpuRenderer(
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
     const glSucceeded = gl.getError() === gl.NO_ERROR;
-    return glSucceeded && contactTileGpuDrawCoverageIsComplete(
-      scene.descriptors,
-      drawnDescriptorKeys,
+    return glSucceeded && (
+      deltaScene !== null
+      || contactTileGpuDrawCoverageIsComplete(activeScene.descriptors, drawnDescriptorKeys)
     );
   };
 
   return {
     setScene: (nextScene) => {
       const viewportChanged = !scene || !sameViewport(scene.viewport, nextScene.viewport);
+      if (
+        deltaScene
+        && nextScene.generation !== undefined
+        && deltaScene.generation === nextScene.generation
+      ) {
+        for (const buffer of deltaBuffers.values()) {
+          if (buffer.occupiedCount === 0) {
+            continue;
+          }
+          const textureKey = gpuTextureKey(deltaScene, {
+            tileX: buffer.tile.tileX,
+            tileY: buffer.tile.tileY,
+          });
+          const cached = textureCache.get(textureKey);
+          const cachedMatchesBuffer = cached?.generation === deltaScene.generation
+            && cached.deltaBuffer === buffer;
+          const entry = ensureDeltaTileTexture(
+            gl,
+            textureCache,
+            textureKey,
+            buffer,
+            deltaScene.generation,
+            deltaScene.tileSizeBins,
+            ++useCounter,
+            deltaScratch,
+          );
+          if (
+            !entry
+            || (cachedMatchesBuffer && !updateDeltaTileTexture(
+              gl,
+              entry,
+              buffer,
+              deltaScene.tileSizeBins,
+              deltaScratch,
+            ))
+          ) {
+            return false;
+          }
+        }
+      }
+      deltaScene = null;
+      deltaBuffers = new Map();
       scene = nextScene;
       if (viewportChanged) {
         panOffsetX = 0;
         panOffsetY = 0;
+      }
+      return draw();
+    },
+    setDeltaScene: (nextScene) => {
+      const previousViewport = deltaScene?.viewport ?? scene?.viewport;
+      const viewportChanged = !previousViewport || !sameViewport(previousViewport, nextScene.viewport);
+      scene = null;
+      deltaScene = nextScene;
+      deltaBuffers = new Map(
+        nextScene.buffers.map((buffer) => [contactTileKey(buffer.tile), buffer]),
+      );
+      const requiredScratchLength = nextScene.tileSizeBins * nextScene.tileSizeBins;
+      if (deltaScratch.length !== requiredScratchLength) {
+        deltaScratch = new Float32Array(requiredScratchLength);
+      }
+      if (viewportChanged) {
+        panOffsetX = 0;
+        panOffsetY = 0;
+      }
+      return draw();
+    },
+    updateDeltaTiles: (changedTileKeys) => {
+      if (!deltaScene || destroyed || gl.isContextLost()) {
+        return false;
+      }
+      if (deltaScene.deferTextureUpdates) {
+        return true;
+      }
+      const changed = new Set(changedTileKeys);
+      for (const [key, buffer] of deltaBuffers) {
+        if (!changed.has(key)) {
+          continue;
+        }
+        const textureKey = gpuTextureKey(deltaScene, {
+          tileX: buffer.tile.tileX,
+          tileY: buffer.tile.tileY,
+        });
+        const entry = ensureDeltaTileTexture(
+          gl,
+          textureCache,
+          textureKey,
+          buffer,
+          deltaScene.generation,
+          deltaScene.tileSizeBins,
+          ++useCounter,
+          deltaScratch,
+        );
+        if (!entry || !updateDeltaTileTexture(
+          gl,
+          entry,
+          buffer,
+          deltaScene.tileSizeBins,
+          deltaScratch,
+        )) {
+          return false;
+        }
       }
       return draw();
     },
@@ -462,6 +640,7 @@ function ensureTileTexture(
   cache: Map<string, GpuTextureEntry>,
   key: string,
   tile: ContactMapTile,
+  generation: number | undefined,
   tileSizeBins: number,
   lastUsed: number,
 ): GpuTextureEntry | null {
@@ -471,6 +650,17 @@ function ensureTileTexture(
   gl.activeTexture(gl.TEXTURE0);
   const cached = cache.get(key);
   if (cached?.tile === tile) {
+    cached.lastUsed = lastUsed;
+    return cached;
+  }
+  if (
+    cached
+    && generation !== undefined
+    && cached.generation === generation
+    && cached.deltaBuffer
+  ) {
+    cached.tile = tile;
+    cached.deltaBuffer = undefined;
     cached.lastUsed = lastUsed;
     return cached;
   }
@@ -506,11 +696,94 @@ function ensureTileTexture(
   const entry = {
     texture,
     tile,
+    generation,
     bytes: tileSizeBins * tileSizeBins * Float32Array.BYTES_PER_ELEMENT,
     lastUsed,
   };
   cache.set(key, entry);
   return entry;
+}
+
+function ensureDeltaTileTexture(
+  gl: WebGL2RenderingContext,
+  cache: Map<string, GpuTextureEntry>,
+  key: string,
+  buffer: ContactTileDenseDeltaBuffer,
+  generation: number,
+  tileSizeBins: number,
+  lastUsed: number,
+  scratch: Float32Array,
+): GpuTextureEntry | null {
+  gl.activeTexture(gl.TEXTURE0);
+  const cached = cache.get(key);
+  if (
+    cached?.generation === generation
+    && cached.deltaBuffer === buffer
+  ) {
+    cached.lastUsed = lastUsed;
+    return cached;
+  }
+  if (cached) {
+    gl.deleteTexture(cached.texture);
+    cache.delete(key);
+  }
+  const texture = gl.createTexture();
+  if (!texture) {
+    return null;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.R32F,
+    tileSizeBins,
+    tileSizeBins,
+    0,
+    gl.RED,
+    gl.FLOAT,
+    contactTileDenseFloatTextureData(buffer, tileSizeBins, scratch),
+  );
+  if (gl.getError() !== gl.NO_ERROR) {
+    gl.deleteTexture(texture);
+    return null;
+  }
+  const entry: GpuTextureEntry = {
+    texture,
+    tile: null,
+    deltaBuffer: buffer,
+    generation,
+    bytes: tileSizeBins * tileSizeBins * Float32Array.BYTES_PER_ELEMENT,
+    lastUsed,
+  };
+  cache.set(key, entry);
+  return entry;
+}
+
+function updateDeltaTileTexture(
+  gl: WebGL2RenderingContext,
+  entry: GpuTextureEntry,
+  buffer: ContactTileDenseDeltaBuffer,
+  tileSizeBins: number,
+  scratch: Float32Array,
+) {
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+  gl.texSubImage2D(
+    gl.TEXTURE_2D,
+    0,
+    0,
+    0,
+    tileSizeBins,
+    tileSizeBins,
+    gl.RED,
+    gl.FLOAT,
+    contactTileDenseFloatTextureData(buffer, tileSizeBins, scratch),
+  );
+  return gl.getError() === gl.NO_ERROR;
 }
 
 function updateLutTexture(
@@ -542,7 +815,9 @@ function updateLutTexture(
 }
 
 function resizeCanvasToDisplaySize(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext) {
-  const pixelRatio = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+  const pixelRatio = typeof window === "undefined"
+    ? 1
+    : Math.min(2, Math.max(1, window.devicePixelRatio || 1));
   const width = Math.max(1, Math.round((canvas.clientWidth || 1) * pixelRatio));
   const height = Math.max(1, Math.round((canvas.clientHeight || 1) * pixelRatio));
   if (canvas.width !== width || canvas.height !== height) {
@@ -552,7 +827,10 @@ function resizeCanvasToDisplaySize(canvas: HTMLCanvasElement, gl: WebGL2Renderin
   }
 }
 
-function gpuTextureKey(scene: ContactTileGpuScene, tile: ContactMapTile) {
+function gpuTextureKey(
+  scene: Pick<ContactTileGpuScene, "resolution" | "tileSizeBins">,
+  tile: Pick<ContactMapTile, "tileX" | "tileY">,
+) {
   return `${scene.resolution}:${scene.tileSizeBins}:${tile.tileX}:${tile.tileY}`;
 }
 

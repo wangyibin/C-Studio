@@ -4,11 +4,13 @@ import {
   contactCellsForViewport,
   contactPreviewTilesForMissing,
   contactTilesWithPreviewFallback,
+  contactTileDeltaStreamMode,
   displayContactMapForPendingLayer,
   maxDrawableContactCells,
   maxInteractivePreviewContactCells,
   reprojectContactMapLayout,
   shouldHoldPreviousContactMapFrame,
+  shouldPresentContactTileDeltaStream,
   shouldPublishContactMapLayer,
 } from "./contactMapView";
 import type { ContactMapLayoutBlock } from "./importers";
@@ -405,6 +407,15 @@ describe("contact map layer publishing", () => {
     expect(shouldHoldPreviousContactMapFrame(null, 100_000, 256, "layout-a")).toBe(false);
     expect(shouldPublishContactMapLayer(false, false)).toBe(true);
     expect(shouldPublishContactMapLayer(false, true)).toBe(true);
+  });
+
+  it("keeps direct delta canvases off the retained frame during a resolution transition", () => {
+    expect(shouldPresentContactTileDeltaStream(true, true)).toBe(false);
+    expect(shouldPresentContactTileDeltaStream(true, false)).toBe(true);
+    expect(shouldPresentContactTileDeltaStream(false, false)).toBe(false);
+    expect(contactTileDeltaStreamMode(true, false)).toBe("overlay");
+    expect(contactTileDeltaStreamMode(true, true)).toBe("staging");
+    expect(contactTileDeltaStreamMode(false, true)).toBe("disabled");
   });
 });
 

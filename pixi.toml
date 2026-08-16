@@ -1,0 +1,53 @@
+[workspace]
+name = "c-studio"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
+
+[feature.package.dependencies]
+nodejs = "22.*"
+rust = "1.97.*"
+cmake = ">=3.30,<5"
+ninja = ">=1.12,<2"
+
+# Native Windows packaging gets this standard library through `rust`. Keep it
+# in macOS package environments as well so the local cargo-xwin fallback can
+# build an NSIS installer when a Windows runner is not available.
+[feature.package.target.osx-arm64.dependencies]
+clang = "22.*"
+lld = "22.*"
+rust-std-x86_64-pc-windows-msvc = "1.97.*"
+
+[feature.package.target.osx-64.dependencies]
+clang = "22.*"
+lld = "22.*"
+rust-std-x86_64-pc-windows-msvc = "1.97.*"
+
+[feature.package.tasks]
+# These tasks are the single source of truth for both local packaging and the
+# GitHub Actions desktop workflow. The Windows dispatcher uses the native build
+# on Windows and the documented NSIS-only cross-build on macOS.
+package-install = "npm ci"
+tauri-dev = { cmd = "npm run tauri -- dev --features portable-hdf5", depends-on = ["package-install"] }
+package-test = { cmd = "npm test", depends-on = ["package-install"] }
+package-frontend = { cmd = "npm run build", depends-on = ["package-install"] }
+package-rust-check = "cargo check --manifest-path src-tauri/Cargo.toml --features portable-hdf5"
+package-macos = { cmd = "node scripts/package-macos.mjs", depends-on = ["package-install"], env = { APPLE_SIGNING_IDENTITY = "-" } }
+package-windows = { cmd = "node scripts/package-windows.mjs", depends-on = ["package-install"] }
+
+[feature.docs.dependencies]
+python = "3.12.*"
+git = ">=2.45"
+zensical = ">=0.0.45,<0.1"
+
+[feature.docs.pypi-dependencies]
+mike = { git = "https://github.com/squidfunk/mike.git", rev = "2d4ad799442f4592db8ad53b179bfb33db8c69ac" }
+
+[feature.docs.tasks]
+docs-build = "zensical build --strict --clean -f mkdocs_en.yml && zensical build --strict --clean -f mkdocs_zh.yml"
+docs-serve = "python -m http.server --directory site 8000"
+docs-serve-en = "zensical serve -f mkdocs_en.yml"
+docs-serve-zh = "zensical serve -f mkdocs_zh.yml"
+
+[environments]
+package = { features = ["package"], no-default-feature = true }
+docs = { features = ["docs"], no-default-feature = true }

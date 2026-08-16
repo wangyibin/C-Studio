@@ -12,11 +12,13 @@ import {
   coverageBlockIdAtRatio,
   coverageContigIdsInRatioRange,
   coverageRatioWindowStyle,
+  coverageRenderBarLimitForWidth,
   coverageReferenceDepth,
   coverageReferenceMultiples,
   coverageSelectionIsAdditive,
   coverageValueHeightRatio,
   normalizeCoverageMultiplier,
+  maximumCoverageRenderBars,
   TrackPanel,
 } from "./TrackPanel";
 
@@ -175,6 +177,47 @@ describe("TrackPanel", () => {
       expect.objectContaining({ xBin: 1, leftRatio: 0.25, widthRatio: 0.5 }),
       expect.objectContaining({ xBin: 2, leftRatio: 0.75, widthRatio: 0.25 }),
     ]);
+  });
+
+  it("aggregates a 1 kb whole-genome view to a hard pixel-scale bar budget", () => {
+    const totalSpanBp = 473_741_399;
+    const limit = coverageRenderBarLimitForWidth(1_200);
+    const bars = buildCoverageTrackBars({
+      resolution: 1_000,
+      viewport: { xStart: 0, xEnd: totalSpanBp, yStart: 0, yEnd: 1 },
+      bins: [
+        { xBin: 0, value: 10 },
+        { xBin: Math.floor((totalSpanBp - 1) / 1_000), value: 30 },
+      ],
+    }, [], limit);
+
+    expect(limit).toBe(1_200);
+    expect(bars).toHaveLength(limit);
+    expect(bars.length).toBeLessThan(Math.ceil(totalSpanBp / 1_000));
+    expect(bars.reduce((sum, bar) => sum + bar.widthRatio, 0)).toBeCloseTo(1);
+    expect(coverageRenderBarLimitForWidth(100_000)).toBe(maximumCoverageRenderBars);
+  });
+
+  it("never mounts one coverage element per genomic bin for a whole-genome view", () => {
+    const uiState = createInitialUiState("ready");
+    const totalSpanBp = 473_741_399;
+    const markup = renderToStaticMarkup(
+      <TrackPanel
+        coverageView={{
+          resolution: 1_000,
+          viewport: { xStart: 0, xEnd: totalSpanBp, yStart: 0, yEnd: 1 },
+          bins: [
+            { xBin: 0, value: 10 },
+            { xBin: Math.floor((totalSpanBp - 1) / 1_000), value: 30 },
+          ],
+        }}
+        uiState={uiState}
+        onUiAction={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('data-rendered-bar-count="1000"');
+    expect(markup.match(/class="coverage-bin /g)).toHaveLength(1_000);
   });
 
   it("defaults to 2.5 times automatic headroom and accepts a custom multiplier", () => {

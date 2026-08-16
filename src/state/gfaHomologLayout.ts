@@ -1030,6 +1030,69 @@ export function gfaBandageControlPoint(
   };
 }
 
+export interface GfaSmoothLinkCurve {
+  sourceControl: GfaGraphPoint;
+  midpointIn: GfaGraphPoint;
+  midpoint: GfaGraphPoint;
+  midpointOut: GfaGraphPoint;
+  targetControl: GfaGraphPoint;
+}
+
+/**
+ * Build a two-segment cubic curve that leaves and enters the current visual
+ * endpoint tangents. The bowed midpoint keeps parallel links readable while
+ * the endpoint controls prevent the sharp side-entry produced by one
+ * endpoint-only quadratic control point.
+ */
+export function gfaSmoothLinkCurve(
+  source: GfaGraphPoint,
+  target: GfaGraphPoint,
+  sourceOutward: GfaGraphPoint,
+  targetOutward: GfaGraphPoint,
+  bendDirection: 1 | -1,
+): GfaSmoothLinkCurve {
+  const dx = target.x - source.x;
+  const dy = target.y - source.y;
+  const distance = Math.hypot(dx, dy);
+  const chord = distance > 0.001
+    ? { x: dx / distance, y: dy / distance }
+    : { x: 1, y: 0 };
+  const normalize = (vector: GfaGraphPoint, fallback: GfaGraphPoint) => {
+    const length = Math.hypot(vector.x, vector.y);
+    return length > 0.001
+      ? { x: vector.x / length, y: vector.y / length }
+      : fallback;
+  };
+  const sourceDirection = normalize(sourceOutward, chord);
+  const targetDirection = normalize(targetOutward, { x: -chord.x, y: -chord.y });
+  const endpointHandle = Math.min(96, Math.max(8, distance * 0.28));
+  const midpointHandle = Math.min(48, Math.max(6, distance * 0.12));
+  const bend = Math.min(72, Math.max(8, distance * 0.18)) * bendDirection;
+  const midpoint = {
+    x: (source.x + target.x) / 2 - chord.y * bend,
+    y: (source.y + target.y) / 2 + chord.x * bend,
+  };
+  return {
+    sourceControl: {
+      x: source.x + sourceDirection.x * endpointHandle,
+      y: source.y + sourceDirection.y * endpointHandle,
+    },
+    midpointIn: {
+      x: midpoint.x - chord.x * midpointHandle,
+      y: midpoint.y - chord.y * midpointHandle,
+    },
+    midpoint,
+    midpointOut: {
+      x: midpoint.x + chord.x * midpointHandle,
+      y: midpoint.y + chord.y * midpointHandle,
+    },
+    targetControl: {
+      x: target.x + targetDirection.x * endpointHandle,
+      y: target.y + targetDirection.y * endpointHandle,
+    },
+  };
+}
+
 function naturalCompare(left: string, right: string) {
   return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
 }

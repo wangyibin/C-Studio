@@ -17,6 +17,7 @@ import {
   gfaNodeMatchesAssemblySelection,
   gfaBandagePathContainsPoint,
   gfaBandagePathPort,
+  gfaBandagePathPortGeometry,
   gfaBandageFocalNodeIds,
   gfaEndpointHiCRequestBatchSize,
   gfaEndpointHiCLinksForRelationVisibility,
@@ -330,6 +331,19 @@ describe("Bandage adaptive movement", () => {
     expect(moved[moved.length - 1].y).toBeGreaterThan(moved[0].y);
     expect(gfaBandagePathPort(moved, "+", "start")).toEqual(moved[0]);
     expect(gfaBandagePathPort(moved, "-", "start")).toEqual(moved[moved.length - 1]);
+  });
+
+  it("updates a GFA port tangent from the deformed Bandage path", () => {
+    const path = [{ x: 10, y: 30 }, { x: 35, y: 10 }, { x: 90, y: 20 }];
+
+    expect(gfaBandagePathPortGeometry(path, "+", "start")).toEqual({
+      point: { x: 10, y: 30 },
+      outward: { x: -25, y: 20 },
+    });
+    expect(gfaBandagePathPortGeometry(path, "-", "start")).toEqual({
+      point: { x: 90, y: 20 },
+      outward: { x: 55, y: 10 },
+    });
   });
 
   it("hits the bent polyline rather than its old rectangular centre", () => {

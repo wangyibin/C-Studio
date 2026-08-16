@@ -27,6 +27,7 @@ import { canonicalContactTile, contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
 import type { ContactColormap } from "../state/uiState";
 import {
+  contactTileGpuTextureBudgetBytes,
   createContactTileGpuRenderer,
   type ContactTileGpuRenderer,
 } from "./contactTileGpu";
@@ -89,6 +90,10 @@ export interface ContactTileCanvasDescriptor {
 
 type ContactTileBufferSlot = 0 | 1;
 
+export const contactTileGpuSlotTextureBudgetBytes = Math.floor(
+  contactTileGpuTextureBudgetBytes / 2,
+);
+
 export interface ContactTileLayerFrame {
   contactMap: ContactMapView;
   renderStyle: ContactTileRenderStyle;
@@ -100,6 +105,28 @@ export interface ContactTileLayerBufferState {
   stagingSlot: ContactTileBufferSlot | null;
   revealRevision: number;
   revealEvent: ContactTileLayerPaintEvent | null;
+}
+
+/** Keep a retained-resolution delta stream in the slot that will become front. */
+export function contactTileDeltaStagingSlot(
+  state: ContactTileLayerBufferState,
+  stream: ContactTileDeltaRenderStream | null | undefined,
+): ContactTileBufferSlot | null {
+  if (!stream?.retainPreviousFrame || state.frontSlot === null) {
+    return null;
+  }
+  const frontFrame = state.slots[state.frontSlot];
+  if (frontFrame?.contactMap.renderGeneration === stream.generation) {
+    return state.frontSlot;
+  }
+  return state.stagingSlot ?? (state.frontSlot === 0 ? 1 : 0);
+}
+
+/** Hidden retained-frame staging has no useful intermediate GPU presentation. */
+export function deferContactTileGpuDeltaUpdates(
+  stream: Pick<ContactTileDeltaRenderStream, "retainPreviousFrame">,
+) {
+  return stream.retainPreviousFrame === true;
 }
 
 export interface ContactTilePaintCoordinator {
@@ -388,9 +415,31 @@ function requiresAtomicContactTileSwap(
   incoming: ContactTileLayerFrame,
 ) {
   return current.contactMap.resolution !== incoming.contactMap.resolution
+    || current.contactMap.requestedResolution !== incoming.contactMap.requestedResolution
     || (current.contactMap.tileSizeBins ?? 256) !== (incoming.contactMap.tileSizeBins ?? 256)
     || current.contactMap.normalization !== incoming.contactMap.normalization
     || !sameContactTileRenderStyle(current.renderStyle, incoming.renderStyle);
+}
+
+/**
+ * A staging surface and the fine-grained front buffer it replaces must keep
+ * their own cameras. Applying the incoming whole-genome viewport to both
+ * surfaces makes the old fine layer redraw just before it is discarded.
+ */
+export function contactTileViewportForBufferedSurface(
+  phase: "presented" | "staging",
+  frame: ContactTileLayerFrame,
+  incomingFrame: ContactTileLayerFrame | null,
+  liveViewport?: ContactViewport,
+): ContactViewport {
+  const supersededByAtomicSwap = Boolean(
+    incomingFrame
+    && frame !== incomingFrame
+    && requiresAtomicContactTileSwap(frame, incomingFrame),
+  );
+  return phase === "staging" || supersededByAtomicSwap
+    ? frame.contactMap.viewport
+    : liveViewport ?? frame.contactMap.viewport;
 }
 
 function sameContactTileDataSurface(left: ContactMapView, right: ContactMapView) {
@@ -658,6 +707,7 @@ export function ContactTileLayer({
   }, [buffer.revealEvent, buffer.revealRevision]);
 
   const slots = [0, 1] as const;
+  const deltaStagingSlot = contactTileDeltaStagingSlot(buffer, deltaStream);
 
   return (
     <div
@@ -670,14 +720,24 @@ export function ContactTileLayer({
       <div ref={transformRef} className="contact-tile-transform-stack">
         {slots.map((slot) => {
           const frame = buffer.slots[slot];
-          if (!frame) {
+          const stagedDeltaStream = deltaStagingSlot === slot ? deltaStream : null;
+          if (!frame && !stagedDeltaStream) {
             return null;
           }
           const phase = buffer.frontSlot === slot ? "presented" : "staging";
+          const surfaceViewport = frame
+            ? contactTileViewportForBufferedSurface(
+                phase,
+                frame,
+                incomingFrame,
+                viewport,
+              )
+            : stagedDeltaStream!.viewport;
           return (
             <ContactTileSurface
               key={slot}
-              contactMap={frame.contactMap}
+              contactMap={frame?.contactMap ?? null}
+              deltaStream={stagedDeltaStream}
               layerRef={phase === "presented"
                 ? layerRef
                 : slot === 0
@@ -690,16 +750,16 @@ export function ContactTileLayer({
               onTileLayerPaintUnavailable={slot === 0
                 ? reportSlotZeroUnavailable
                 : reportSlotOneUnavailable}
-              paintRevision={frame.contactMap.renderGeneration ?? paintRevision}
+              paintRevision={frame?.contactMap.renderGeneration ?? paintRevision}
               panRendererRef={phase === "presented" ? panRendererRef : undefined}
               phase={phase}
-              renderStyle={frame.renderStyle}
+              renderStyle={frame?.renderStyle ?? renderStyle}
               overscanDirection={overscanDirection}
-              viewport={viewport ?? frame.contactMap.viewport}
+              viewport={surfaceViewport}
             />
           );
         })}
-        {deltaStream ? (
+        {deltaStream && deltaStagingSlot === null ? (
           <ContactTileDeltaOverlay
             stream={deltaStream}
             renderStyle={renderStyle}
@@ -849,6 +909,7 @@ function ContactTileDeltaCanvas({
 
 function ContactTileSurface({
   contactMap,
+  deltaStream,
   layerRef,
   paintRevision,
   onTileLayerCommit,
@@ -860,7 +921,8 @@ function ContactTileSurface({
   overscanDirection,
   viewport,
 }: {
-  contactMap: ContactMapView;
+  contactMap: ContactMapView | null;
+  deltaStream?: ContactTileDeltaRenderStream | null;
   layerRef: React.RefObject<HTMLDivElement>;
   paintRevision?: number;
   onTileLayerCommit: (event: ContactTileLayerPaintEvent) => void;
@@ -872,8 +934,8 @@ function ContactTileSurface({
   overscanDirection: ContactTileOverscanMode;
   viewport: ContactViewport;
 }) {
-  const rawTiles = contactMap.cachedTiles ?? contactMap.tiles;
-  const previewTiles = contactMap.previewTiles;
+  const rawTiles = contactMap?.cachedTiles ?? contactMap?.tiles;
+  const previewTiles = contactMap?.previewTiles;
   const tiles = useMemo(
     () => canonicalTilesForRendering(contactTilesWithPreviewFallback(
       rawTiles ?? [],
@@ -881,17 +943,19 @@ function ContactTileSurface({
     )),
     [previewTiles, rawTiles],
   );
-  const tileSizeBins = contactMap.tileSizeBins ?? 256;
+  const tileSizeBins = contactMap?.tileSizeBins ?? deltaStream?.accumulator.tileSizeBins ?? 256;
   const renderCanvases = useMemo(
-    () => contactTileCanvasDescriptorsForViewport(
-      tiles,
-      contactMap.resolution,
-      tileSizeBins,
-      viewport,
-      overscanDirection,
-    ),
+    () => contactMap
+      ? contactTileCanvasDescriptorsForViewport(
+          tiles,
+          contactMap.resolution,
+          tileSizeBins,
+          viewport,
+          overscanDirection,
+        )
+      : [],
     [
-      contactMap.resolution,
+      contactMap,
       typeof overscanDirection === "string" ? overscanDirection : overscanDirection.x,
       typeof overscanDirection === "string" ? overscanDirection : overscanDirection.y,
       tileSizeBins,
@@ -905,16 +969,17 @@ function ContactTileSurface({
   const paintEpochCounterRef = useRef(0);
   const activePaintCoordinatorRef = useRef<ContactTilePaintCoordinator | null>(null);
   const paintCanvasKeySignature = useMemo(
-    () => contactTileCanvasDescriptorsForViewport(
-      canonicalTilesForRendering(contactMap.tiles ?? tiles),
-      contactMap.resolution,
-      tileSizeBins,
-      viewport,
-      { x: 0, y: 0 },
-    ).map(({ key }) => key).join("|"),
+    () => contactMap
+      ? contactTileCanvasDescriptorsForViewport(
+          canonicalTilesForRendering(contactMap.tiles ?? tiles),
+          contactMap.resolution,
+          tileSizeBins,
+          viewport,
+          { x: 0, y: 0 },
+        ).map(({ key }) => key).join("|")
+      : "",
     [
-      contactMap.resolution,
-      contactMap.tiles,
+      contactMap,
       tileSizeBins,
       tiles,
       viewport.xEnd,
@@ -923,15 +988,17 @@ function ContactTileSurface({
       viewport.yStart,
     ],
   );
-  const visibleTileIdentitySignature = contactVisibleTileIdentitySignature(
-    contactMap.tiles,
-    tiles,
-  );
+  const visibleTileIdentitySignature = contactMap
+    ? contactVisibleTileIdentitySignature(contactMap.tiles, tiles)
+    : "";
   const paintCanvasKeys = useMemo(
     () => paintCanvasKeySignature === "" ? [] : paintCanvasKeySignature.split("|"),
     [paintCanvasKeySignature],
   );
   const paintCoordinator = useMemo(() => {
+    if (!contactMap) {
+      return null;
+    }
     paintEpochCounterRef.current += 1;
     const event: ContactTileLayerPaintEvent = {
       renderEpoch: paintEpochCounterRef.current,
@@ -949,8 +1016,7 @@ function ContactTileSurface({
     });
     return coordinator;
   }, [
-    contactMap?.resolution,
-    contactMap.visibleLayerComplete,
+    contactMap,
     onTileLayerCommit,
     onTileLayerPaintComplete,
     onTileLayerPaintUnavailable,
@@ -998,6 +1064,7 @@ function ContactTileSurface({
         {gpuAvailable ? (
           <ContactTileGpuCanvas
             contactMap={contactMap}
+            deltaStream={deltaStream}
             descriptors={renderCanvases}
             onUnavailable={disableGpu}
             paintCanvasKeys={paintCanvasKeys}
@@ -1005,9 +1072,10 @@ function ContactTileSurface({
             panRendererRef={panRendererRef}
             renderStyle={renderStyle}
             tileSizeBins={tileSizeBins}
+            textureBudgetBytes={contactTileGpuSlotTextureBudgetBytes}
             viewport={viewport}
           />
-        ) : renderCanvases.map(({ key, tile, transpose }) => (
+        ) : contactMap ? renderCanvases.map(({ key, tile, transpose }) => (
             <ContactTileCanvas
               key={key}
               contactMap={contactMap}
@@ -1019,7 +1087,7 @@ function ContactTileSurface({
               renderStyle={renderStyle}
               viewport={viewport}
             />
-          ))}
+          )) : null}
       </div>
     </div>
   );
@@ -1027,6 +1095,7 @@ function ContactTileSurface({
 
 function ContactTileGpuCanvas({
   contactMap,
+  deltaStream,
   descriptors,
   onUnavailable,
   paintCanvasKeys,
@@ -1034,9 +1103,11 @@ function ContactTileGpuCanvas({
   panRendererRef,
   renderStyle,
   tileSizeBins,
+  textureBudgetBytes,
   viewport,
 }: {
-  contactMap: ContactMapView;
+  contactMap: ContactMapView | null;
+  deltaStream?: ContactTileDeltaRenderStream | null;
   descriptors: readonly ContactTileCanvasDescriptor[];
   onUnavailable: () => void;
   paintCanvasKeys: readonly string[];
@@ -1044,10 +1115,27 @@ function ContactTileGpuCanvas({
   panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
   renderStyle: ContactTileRenderStyle;
   tileSizeBins: number;
+  textureBudgetBytes: number;
   viewport: ContactViewport;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<ContactTileGpuRenderer | null>(null);
+  const deltaDescriptors = useMemo(
+    () => deltaStream
+      ? contactTileCanvasDescriptorsForViewport(
+          deltaStream.accumulator.denseBuffers().map(({ tile }) => ({
+            tileX: tile.tileX,
+            tileY: tile.tileY,
+            cells: [],
+          })),
+          deltaStream.resolution,
+          deltaStream.accumulator.tileSizeBins,
+          deltaStream.viewport,
+          { x: 0, y: 0 },
+        )
+      : [],
+    [deltaStream],
+  );
 
   usePrePaintEffect(() => {
     const canvas = canvasRef.current;
@@ -1055,7 +1143,7 @@ function ContactTileGpuCanvas({
       onUnavailable();
       return;
     }
-    const renderer = createContactTileGpuRenderer(canvas);
+    const renderer = createContactTileGpuRenderer(canvas, textureBudgetBytes);
     if (!renderer) {
       onUnavailable();
       return;
@@ -1083,7 +1171,7 @@ function ContactTileGpuCanvas({
       rendererRef.current = null;
       renderer.destroy();
     };
-  }, [onUnavailable]);
+  }, [onUnavailable, textureBudgetBytes]);
 
   usePrePaintEffect(() => {
     const renderer = rendererRef.current;
@@ -1100,11 +1188,12 @@ function ContactTileGpuCanvas({
 
   usePrePaintEffect(() => {
     const renderer = rendererRef.current;
-    if (!renderer) {
+    if (!renderer || !contactMap) {
       return;
     }
     const painted = renderer.setScene({
       descriptors,
+      generation: contactMap.renderGeneration,
       resolution: contactMap.resolution,
       tileSizeBins,
       viewport,
@@ -1118,7 +1207,7 @@ function ContactTileGpuCanvas({
       paintCoordinator?.reportCanvasPaint(key);
     }
   }, [
-    contactMap.resolution,
+    contactMap,
     descriptors,
     onUnavailable,
     paintCanvasKeys,
@@ -1132,6 +1221,84 @@ function ContactTileGpuCanvas({
     viewport.xStart,
     viewport.yEnd,
     viewport.yStart,
+  ]);
+
+  usePrePaintEffect(() => {
+    const renderer = rendererRef.current;
+    if (
+      !renderer
+      || !deltaStream
+      || contactMap?.renderGeneration === deltaStream.generation
+    ) {
+      return;
+    }
+    let animationFrame: number | null = null;
+    let firstPaintReported = false;
+    const changedTileKeys = new Set<string>();
+    const deferTextureUpdates = deferContactTileGpuDeltaUpdates(deltaStream);
+    const reportFirstPaint = () => {
+      if (firstPaintReported) {
+        return;
+      }
+      firstPaintReported = true;
+      deltaStream.onFirstPaint?.();
+    };
+    const publish = () => {
+      animationFrame = null;
+      const changed = [...changedTileKeys];
+      changedTileKeys.clear();
+      if (changed.length === 0) {
+        return;
+      }
+      if (!renderer.updateDeltaTiles(changed)) {
+        onUnavailable();
+        return;
+      }
+      reportFirstPaint();
+    };
+    const painted = renderer.setDeltaScene({
+      buffers: deltaStream.accumulator.denseBuffers(),
+      deferTextureUpdates,
+      descriptors: deltaDescriptors,
+      generation: deltaStream.generation,
+      resolution: deltaStream.resolution,
+      tileSizeBins: deltaStream.accumulator.tileSizeBins,
+      viewport: deltaStream.viewport,
+      renderStyle,
+    });
+    if (!painted) {
+      onUnavailable();
+      return;
+    }
+    if (deferTextureUpdates) {
+      return;
+    }
+    if (deltaStream.accumulator.denseBuffers().some((buffer) => buffer.occupiedCount > 0)) {
+      reportFirstPaint();
+    }
+    const unsubscribe = deltaStream.accumulator.subscribe((batch) => {
+      for (const key of batch.changedTileKeys) {
+        changedTileKeys.add(key);
+      }
+      if (animationFrame === null) {
+        animationFrame = window.requestAnimationFrame(publish);
+      }
+    });
+    return () => {
+      unsubscribe();
+      if (animationFrame !== null) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+    };
+  }, [
+    contactMap?.renderGeneration,
+    deltaDescriptors,
+    deltaStream,
+    onUnavailable,
+    renderStyle.colormap,
+    renderStyle.colorScale.log,
+    renderStyle.colorScale.max,
+    renderStyle.colorScale.min,
   ]);
 
   return (

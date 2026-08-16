@@ -8,9 +8,9 @@ updated whenever the corresponding implementation or validation changes.
 - macOS packages use ad-hoc signing and are not notarized with an Apple
   Developer ID.
 - Windows installers are unsigned and may trigger SmartScreen.
-- The native project-directory, contact-map, PAF, and coverage pickers are
-  currently macOS-only. A Windows package does not yet provide an equivalent
-  end-to-end loading workflow.
+- Project-directory, contact-map, PAF, and coverage selection now use Tauri's
+  cross-platform dialog plugin. A real Windows desktop click-through remains a
+  separate release QA requirement.
 - No Linux packaging workflow is defined.
 - Stable public releases, archival source/test-data URLs, and a citation record
   are not established by this checkout alone.
@@ -51,4 +51,3 @@ desktop workflow before making performance claims.
 The current evidence parser recognizes `S`, `L`, and `A` records. Only explicit
 valid `L` records create graph edges. `A` record counts and `rd` tags remain
 segment metadata and are not treated as edge support.
-

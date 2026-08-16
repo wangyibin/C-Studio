@@ -91,7 +91,10 @@ CSTUDIO_POJ_BENCH_SCENARIO=overview_mcool CSTUDIO_POJ_BENCH_SAMPLES=7 cargo test
 ```
 
 Supported scenarios are `overview_mcool`, `overview_cool`,
-`overview_cool_cache`, `tiles_mcool`, `tiles_cool`, and `delta_cool`.
+`overview_cool_cache`, `lod_tiles_mcool`, `lod_tiles_cool`, `tiles_mcool`,
+`tiles_cool`, `delta_mcool_visible`, and `delta_cool`. The `lod_tiles_*`
+scenarios use the central canvas's screen-scale resolution, fixed 256-bin
+tiles, and two-tile center-first batches.
 `overview_cool_cache` computes and persists one exact projected overview, then
 loads and byte-for-byte validates repeated hits. The last scenario measures the local exact-view
 single-scan delta protocol and reconstructs the final tiles in the benchmark to
@@ -110,11 +113,15 @@ cells; the full 153-tile run exceeded five minutes and was stopped. Plain
 153 ordinary tiles took 165.03 s for 7,591,003 cells. These are backend
 measurements; they exclude WebView IPC, decode, and GPU paint.
 
-After wiring LOD-first into the 640 px central heatmap, the POJ `.mcool`
-screen-scale plan selected 17.5 Mb output bins (591 bins across the genome).
-Five release samples took 2.95-3.12 s (median 3.01 s) and returned 174,934
-cells. This is a backend measurement of the new production request shape, not a
-desktop paint timing.
+After wiring reusable coarse tiles into the 640 px central heatmap, the current
+POJ `.mcool` plan selects 17.5 Mb output bins and six canonical 256-bin tiles.
+The 2026-08-15 optimized dev/test-profile check on the 10,356,056,497 bp,
+12,089-block layout completed three process-cold tile generations in
+0.687-0.736 s. Each generation performed one HDF5 scan, returned 175,528 cells
+in three center-first 2-tile chunks, and encoded 2,106,528 bytes. One plain
+`.cool` check of the same tiled request shape completed in 6.67 s and returned
+205,120 cells. These are backend measurements, not desktop IPC/decode/GPU paint
+timings; they are deliberately not labelled release measurements.
 
 For a local exact view of the plain 251 MiB `.cool`, the 2026-08-12 matched
 16-tile release run reduced median backend completion from 14.14 s with two
@@ -435,6 +442,15 @@ The visible layer being assembled keeps references outside the reusable LRU
 until it is published, so an unusually dense visible working set cannot become
 permanently incomplete merely because it exceeds a cache budget.
 
+Pointer panning keeps the displayed matrix on the compositor/WebGL path and
+uses a separate data-only look-ahead viewport. The look-ahead is velocity
+aware on each axis: slow motion requests half a tile ahead, rising smoothly to
+one and a half tiles at four tiles per second. Direction reversals switch the
+prefetch side immediately, motion samples are smoothed, and the existing tile
+coverage signature suppresses requests until the intersecting tile set changes.
+This policy changes only spatial prefetch timing; it does not alter the visible
+viewport, contact resolution, normalization, or AGP projection.
+
 After every visible batch and the same-resolution padding ring have completed,
 the frontend waits for two animation frames and schedules the immediately
 coarser and finer visible layers through `requestIdleCallback`. WebViews without
@@ -480,15 +496,31 @@ the already current generation, so overview cannot advance the cancellation cloc
 a newer visible generation cancels an obsolete overview at the normal HDF5
 checkpoints.
 
-The central heatmap also uses this dedicated sparse command when the selected
-exact layer would require more than 16 visible tiles or more than two matrix
-bins per screen pixel. Its target resolution follows the longer genomic span
-per corresponding canvas axis; `.mcool` reads the nearest stored level and
-`.cool` reads its native level. A large generation therefore issues one LOD
-request and skips ordinary visible tiles, spatial prefetch, adjacent-resolution
-prefetch, and the tile LRU. Zooming into a local view automatically restores the
-exact AGP-aware tile path. A whole-genome central LOD is reused by the inspector
-Overview rather than scanning the same matrix again. Set
+The central heatmap switches to reusable coarse tiles when the selected exact
+layer would require more than 16 visible tiles or more than two matrix bins per
+screen pixel. Its target resolution follows the longer genomic span per canvas
+axis; `.mcool` reads the nearest stored level and `.cool` reads its native level.
+The coarse layer is aligned to the same genomic origin on a fixed 256-by-256-bin
+grid. Panning at one LOD level therefore reuses every overlapping tile and asks
+only for the newly exposed edge. Cold visible tiles are ordered by distance from
+the viewport center in batches of two; directional spatial prefetch remains
+bounded to eight off-screen tiles.
+
+The visible request carries the chosen stored `sourceResolution` separately
+from the coarser tile `targetResolution`. Rust performs one bounded dense,
+indexed HDF5 scan for the complete visible set, stores all canonical tile
+results, and then emits them in the two-tile center-first chunk order. The
+source resolution participates in backend visual-cache identity. This avoids
+both requests for nonexistent synthetic `.mcool` groups (for example 17.5 Mb)
+and the cold-start regression of scanning once per presentation chunk.
+
+Coarse navigation has a dedicated four-scope LRU (64 tiles, 1,500,000 cells)
+and in-flight registry, so whole-genome motion cannot evict exact local editing
+tiles. Resolution/layout transitions retain the previous complete surface;
+same-LOD pans can immediately compose cached overlap while missing edge tiles
+arrive. Zooming into a local view automatically restores the exact AGP-aware
+tile path. A complete whole-genome tiled LOD is reused by the inspector Overview
+rather than scanning the same matrix again. Set
 `VITE_CSTUDIO_MAIN_LOD=0` for the ordinary-tile control build.
 
 ## Exact AGP-aware 2.5 Mb mcool refinement

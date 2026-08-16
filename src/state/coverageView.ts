@@ -17,6 +17,8 @@ export interface CoverageView {
   resolution: number;
   viewport: ContactViewport;
   bins: CoverageBinView[];
+  /** Contact-tile generation whose camera/resolution this view was built for. */
+  renderGeneration?: number;
 }
 
 export interface CoverageViewRequest {
@@ -63,14 +65,11 @@ export function buildCoverageViewRequest(
 ): CoverageViewRequest {
   const span = Math.max(1, Math.round(totalSpanBp));
   const requestedViewport = options.viewport;
-  const xStart = Math.min(
-    span - 1,
-    Math.max(0, Math.floor(requestedViewport?.xStart ?? 0)),
-  );
-  const xEnd = Math.min(
-    span,
-    Math.max(xStart + 1, Math.ceil(requestedViewport?.xEnd ?? span)),
-  );
+  // Keep the display camera identical to the heatmap. Rectangular whole-map
+  // views deliberately extend their longer screen axis beyond the assembly;
+  // coverage projection naturally yields no bins in that empty margin.
+  const xStart = Math.max(0, Math.floor(requestedViewport?.xStart ?? 0));
+  const xEnd = Math.max(xStart + 1, Math.ceil(requestedViewport?.xEnd ?? span));
   const displayResolution = options.displayResolution === undefined
     ? coverageResolutionForSpan(xEnd - xStart)
     : Math.max(1, Math.round(options.displayResolution));

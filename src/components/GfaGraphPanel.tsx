@@ -39,6 +39,7 @@ import {
   layoutGfaNodePathsBandage,
   layoutGfaNodesForCuration,
   layoutGfaNodesGuided,
+  gfaSmoothLinkCurve,
   type GfaLayoutMode,
   type GfaHomologClassification,
 } from "../state/gfaHomologLayout";
@@ -419,6 +420,30 @@ export function gfaBandagePathPort(
     : side;
   const point = visualSide === "start" ? pathPoints[0] : pathPoints[pathPoints.length - 1];
   return point ? copyPathPoint(point) : null;
+}
+
+/** Resolve both the live port and its outward path tangent after deformation. */
+export function gfaBandagePathPortGeometry(
+  pathPoints: ReadonlyArray<GfaPathPoint>,
+  orientation: GfaGraphNode["orientation"],
+  side: GfaSegmentSide,
+) {
+  const visualSide = orientation === "-"
+    ? side === "start" ? "end" : "start"
+    : side;
+  const pointIndex = visualSide === "start" ? 0 : pathPoints.length - 1;
+  const neighbourIndex = visualSide === "start" ? 1 : pathPoints.length - 2;
+  const point = pathPoints[pointIndex];
+  const neighbour = pathPoints[neighbourIndex];
+  if (!point) {
+    return null;
+  }
+  return {
+    point: copyPathPoint(point),
+    outward: neighbour
+      ? { x: point.x - neighbour.x, y: point.y - neighbour.y }
+      : { x: visualSide === "start" ? -1 : 1, y: 0 },
+  };
 }
 
 /** GFA editing is block-based even when a node is an individually selectable source segment. */
@@ -3525,27 +3550,44 @@ function drawGraphEdge(
   crossesAgpGap = false,
 ) {
   const isGfaLink = edge.kind === "gfa-link";
-  const junction = isGfaLink
-    ? {
-      source: nodePort(source, edge.sourceSide ?? "end"),
-      target: nodePort(target, edge.targetSide ?? "start"),
-    }
+  const sourcePort = isGfaLink
+    ? nodePortGeometry(source, edge.sourceSide ?? "end")
+    : null;
+  const targetPort = isGfaLink
+    ? nodePortGeometry(target, edge.targetSide ?? "start")
+    : null;
+  const junction = sourcePort && targetPort
+    ? { source: sourcePort.point, target: targetPort.point }
     : layoutAgpJunctionPoints(source, target);
   const sourcePoint = junction.source;
   const targetPoint = junction.target;
   context.save();
   context.beginPath();
   context.moveTo(sourcePoint.x, sourcePoint.y);
-  if (isGfaLink) {
-    const control = gfaBandageControlPoint(
+  if (isGfaLink && sourcePort && targetPort) {
+    const curve = gfaSmoothLinkCurve(
       sourcePoint,
       targetPoint,
+      sourcePort.outward,
+      targetPort.outward,
       deterministicSign(edge.id),
-      0.2,
-      18,
-      96,
     );
-    context.quadraticCurveTo(control.x, control.y, targetPoint.x, targetPoint.y);
+    context.bezierCurveTo(
+      curve.sourceControl.x,
+      curve.sourceControl.y,
+      curve.midpointIn.x,
+      curve.midpointIn.y,
+      curve.midpoint.x,
+      curve.midpoint.y,
+    );
+    context.bezierCurveTo(
+      curve.midpointOut.x,
+      curve.midpointOut.y,
+      curve.targetControl.x,
+      curve.targetControl.y,
+      targetPoint.x,
+      targetPoint.y,
+    );
   } else {
     context.lineTo(targetPoint.x, targetPoint.y);
   }
@@ -3857,15 +3899,22 @@ export function gfaPreviewPlacements(
 }
 
 function nodePort(node: LayoutNode, side: GfaSegmentSide) {
+  return nodePortGeometry(node, side).point;
+}
+
+function nodePortGeometry(node: LayoutNode, side: GfaSegmentSide) {
   if (node.layoutMode === "bandage" && node.pathPoints.length >= 2) {
-    return gfaBandagePathPort(node.pathPoints, node.orientation, side)!;
+    return gfaBandagePathPortGeometry(node.pathPoints, node.orientation, side)!;
   }
   const visualSide = node.orientation === "-"
     ? side === "start" ? "end" : "start"
     : side;
   return {
-    x: node.x + (visualSide === "start" ? -node.width / 2 : node.width / 2),
-    y: node.y,
+    point: {
+      x: node.x + (visualSide === "start" ? -node.width / 2 : node.width / 2),
+      y: node.y,
+    },
+    outward: { x: visualSide === "start" ? -1 : 1, y: 0 },
   };
 }
 

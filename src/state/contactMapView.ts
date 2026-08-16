@@ -118,6 +118,35 @@ export function shouldPublishContactMapLayer(
 }
 
 /**
+ * Direct delta canvases are useful during same-resolution pans, but mounting a
+ * second renderer over a retained LOD defeats resolution-transition double
+ * buffering. In that case, accumulate offscreen and publish only the complete
+ * replacement layer.
+ */
+export function shouldPresentContactTileDeltaStream(
+  directDeltaEnabled: boolean,
+  holdsPreviousCompleteFrame: boolean,
+): boolean {
+  return contactTileDeltaStreamMode(
+    directDeltaEnabled,
+    holdsPreviousCompleteFrame,
+  ) === "overlay";
+}
+
+export type ContactTileDeltaStreamMode = "disabled" | "overlay" | "staging";
+
+/** Select visible 2D compatibility overlay or hidden reusable GPU staging. */
+export function contactTileDeltaStreamMode(
+  directDeltaEnabled: boolean,
+  holdsPreviousCompleteFrame: boolean,
+): ContactTileDeltaStreamMode {
+  if (!directDeltaEnabled) {
+    return "disabled";
+  }
+  return holdsPreviousCompleteFrame ? "staging" : "overlay";
+}
+
+/**
  * Builds a fast, bounded preview after a pure layout permutation (move/reverse).
  * The authoritative source-contact tiles still replace this preview in the
  * background, but editing no longer has to wait for an IPC round trip.

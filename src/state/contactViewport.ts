@@ -20,7 +20,23 @@ export interface ContactViewportAxisSpans {
   ySpanBp: number;
 }
 
+export interface ContactViewportVelocity {
+  xBpPerMs: number;
+  yBpPerMs: number;
+}
+
+export interface ContactViewportVelocitySample extends ContactViewportVelocity {
+  viewport: ContactViewport;
+  sampledAt: number;
+}
+
 const defaultWindowSizeBp = 200_000_000;
+const minimumVelocityLeadTiles = 0.5;
+const maximumVelocityLeadTiles = 1.5;
+const maximumLeadVelocityTilesPerSecond = 4;
+const minimumDirectionalVelocityTilesPerSecond = 0.05;
+const minimumVelocitySampleIntervalMs = 4;
+const maximumVelocitySampleIntervalMs = 250;
 
 export function buildCenteredContactViewport({
   centerMb,
@@ -126,6 +142,109 @@ export function contactViewportWithDirectionalLead(
   );
 
   return { xStart, xEnd, yStart, yEnd };
+}
+
+/**
+ * Build a data-only look-ahead viewport from current pan velocity. Slow motion
+ * retains the existing half-tile lead while fast motion grows smoothly to one
+ * and a half tiles. The displayed viewport is never changed by this hint.
+ */
+export function contactViewportWithVelocityAwareLead(
+  source: ContactViewport,
+  target: ContactViewport,
+  tileSpanBp: number,
+  velocity: ContactViewportVelocity,
+  totalSpanBp: number,
+): ContactViewport {
+  const safeTileSpan = Number.isFinite(tileSpanBp) ? Math.max(0, tileSpanBp) : 0;
+  if (safeTileSpan === 0) {
+    return target;
+  }
+  const safeTotalSpan = Number.isFinite(totalSpanBp) ? Math.max(1, totalSpanBp) : 1;
+  const shiftAxis = (
+    sourceStart: number,
+    sourceEnd: number,
+    targetStart: number,
+    targetEnd: number,
+    rawVelocityBpPerMs: number,
+  ) => {
+    const velocityBpPerMs = Number.isFinite(rawVelocityBpPerMs) ? rawVelocityBpPerMs : 0;
+    const velocityTilesPerSecond = (velocityBpPerMs * 1_000) / safeTileSpan;
+    const fallbackDirection = Math.sign(
+      (targetStart + targetEnd) - (sourceStart + sourceEnd),
+    );
+    const direction = Math.abs(velocityTilesPerSecond)
+      >= minimumDirectionalVelocityTilesPerSecond
+      ? Math.sign(velocityTilesPerSecond)
+      : fallbackDirection;
+    if (direction === 0) {
+      return [targetStart, targetEnd] as const;
+    }
+    const velocityRatio = Math.min(
+      1,
+      Math.abs(velocityTilesPerSecond) / maximumLeadVelocityTilesPerSecond,
+    );
+    const leadTiles = minimumVelocityLeadTiles
+      + velocityRatio * (maximumVelocityLeadTiles - minimumVelocityLeadTiles);
+    const span = Math.max(1, targetEnd - targetStart);
+    const maxStart = Math.max(0, safeTotalSpan - span);
+    const nextStart = clamp(targetStart + direction * safeTileSpan * leadTiles, 0, maxStart);
+    return [nextStart, nextStart + span] as const;
+  };
+  const [xStart, xEnd] = shiftAxis(
+    source.xStart,
+    source.xEnd,
+    target.xStart,
+    target.xEnd,
+    velocity.xBpPerMs,
+  );
+  const [yStart, yEnd] = shiftAxis(
+    source.yStart,
+    source.yEnd,
+    target.yStart,
+    target.yEnd,
+    velocity.yBpPerMs,
+  );
+  return { xStart, xEnd, yStart, yEnd };
+}
+
+/** Coalesce noisy pointer samples into a stable genomic pan velocity. */
+export function sampleContactViewportVelocity(
+  previous: ContactViewportVelocitySample | null,
+  viewport: ContactViewport,
+  sampledAt: number,
+): ContactViewportVelocitySample {
+  const safeSampledAt = Number.isFinite(sampledAt) ? sampledAt : 0;
+  if (!previous) {
+    return { viewport, sampledAt: safeSampledAt, xBpPerMs: 0, yBpPerMs: 0 };
+  }
+  const elapsedMs = safeSampledAt - previous.sampledAt;
+  if (elapsedMs > 0 && elapsedMs < minimumVelocitySampleIntervalMs) {
+    return previous;
+  }
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0 || elapsedMs > maximumVelocitySampleIntervalMs) {
+    return { viewport, sampledAt: safeSampledAt, xBpPerMs: 0, yBpPerMs: 0 };
+  }
+  const instantaneousX = (viewport.xStart - previous.viewport.xStart) / elapsedMs;
+  const instantaneousY = (viewport.yStart - previous.viewport.yStart) / elapsedMs;
+  const smoothAxis = (current: number, instantaneous: number) => {
+    if (!Number.isFinite(instantaneous)) {
+      return current;
+    }
+    // A real reversal must change the prefetch side immediately. Otherwise an
+    // exponential moving average prevents one noisy pointer sample from
+    // expanding or shrinking the requested tile set.
+    if (current === 0 || Math.sign(current) !== Math.sign(instantaneous)) {
+      return instantaneous;
+    }
+    return current * 0.6 + instantaneous * 0.4;
+  };
+  return {
+    viewport,
+    sampledAt: safeSampledAt,
+    xBpPerMs: smoothAxis(previous.xBpPerMs, instantaneousX),
+    yBpPerMs: smoothAxis(previous.yBpPerMs, instantaneousY),
+  };
 }
 
 export function horizontalViewportDragDeltaMb(

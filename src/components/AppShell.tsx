@@ -84,6 +84,7 @@ interface AppShellProps {
   gfaInputRef: RefObject<HTMLInputElement>;
   pafInputRef: RefObject<HTMLInputElement>;
   coverageInputRef: RefObject<HTMLInputElement>;
+  onAgpFileRequested: () => void;
   onAgpFileSelected: (file: File) => void;
   onGfaFileSelected: (file: File) => void;
   onContactFileSelected: () => void;
@@ -117,6 +118,7 @@ export const inspectorPanelMaxWidth = 520;
 const inspectorPanelDefaultWidth = 280;
 const inspectorPanelCompactWidth = 276;
 const inspectorPanelKeyboardStep = 16;
+const brandMarkUrl = new URL("../../src-tauri/icons/icon.png", import.meta.url).href;
 export const gfaPanelMinHeight = 180;
 export const gfaPanelMaxWorkspaceShare = 0.65;
 
@@ -172,6 +174,7 @@ export function AppShell({
   gfaInputRef,
   pafInputRef,
   coverageInputRef,
+  onAgpFileRequested,
   onAgpFileSelected,
   onGfaFileSelected,
   onContactFileSelected,
@@ -602,7 +605,7 @@ export function AppShell({
         <div className="global-toolbar">
           <div className="global-toolbar-leading">
             <div className="brand" aria-label="C-Studio">
-              <img className="brand-mark" src="/src-tauri/icons/icon.png" alt="" />
+              <img className="brand-mark" src={brandMarkUrl} alt="" />
               <strong>C-Studio</strong>
             </div>
 
@@ -656,7 +659,11 @@ export function AppShell({
                   <span>Load project folder…</span>
                 </button>
                 <span className="popover-divider" aria-hidden="true" />
-                <button type="button" onClick={() => runAddDataAction(() => agpInputRef.current?.click())}>
+                <button
+                  type="button"
+                  title="Import an AGP and its same-prefix .history.json sidecar when present"
+                  onClick={() => runAddDataAction(onAgpFileRequested)}
+                >
                   <span>Assembly (.agp)</span>
                   {agpImported ? <Check size={14} aria-label="Loaded" /> : null}
                 </button>
@@ -863,7 +870,7 @@ export function AppShell({
               type="button"
               aria-label="Save edited AGP"
               aria-keyshortcuts="Control+S Meta+S"
-              title={`Save edited AGP (${shortcuts.save})`}
+              title={`Save edited AGP and operation history (${shortcuts.save})`}
               disabled={!uiState.assembly.blocks.length}
               onClick={() => onExportAgp()}
             >
@@ -873,7 +880,7 @@ export function AppShell({
               className="global-icon-button export-project-button"
               type="button"
               aria-label="Save edited AGP as"
-              title="Save edited AGP as a new file"
+              title="Save edited AGP and operation history as a new pair"
               disabled={!uiState.assembly.blocks.length}
               onClick={() => onExportAgpAs()}
             >

@@ -78,10 +78,7 @@ export function HeatmapToolbar({
     const nextIndex = Math.min(resolutionOptions.length - 1, Math.max(0, rawIndex));
     const resolution = resolutionOptions[nextIndex];
     if (resolution && resolution !== uiState.contact.resolution) {
-      onUiAction({
-        type: "setContactResolution",
-        resolution,
-      });
+      onUiAction({ type: "setContactResolution", resolution });
     }
   }
 

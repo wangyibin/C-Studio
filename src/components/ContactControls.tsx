@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import { Check, Lock, Settings, Sparkles, Unlock } from "lucide-react";
 import type { UiAction, UiState } from "../state/uiState";
-import { availableContactResolutions, normalizations } from "../state/uiState";
+import {
+  availableContactResolutions,
+  normalizations,
+} from "../state/uiState";
 
 interface ContactControlsProps {
   uiState: UiState;

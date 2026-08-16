@@ -21,12 +21,28 @@ export interface ContactTileDeltaBatch {
 
 export type ContactTileDeltaListener = (batch: ContactTileDeltaBatch) => void;
 
+/** Merge complete progressive tiles once; duplicate chunks must not add counts twice. */
+export function mergeCompleteContactTilesIntoDeltaAccumulator(
+  accumulator: ContactTileDeltaAccumulator,
+  mergedTileKeys: Set<string>,
+  tiles: readonly ContactMapTile[],
+) {
+  const unseenTiles = tiles.filter((tile) => !mergedTileKeys.has(contactTileKey(tile)));
+  const changed = accumulator.merge(unseenTiles);
+  for (const tile of unseenTiles) {
+    mergedTileKeys.add(contactTileKey(tile));
+  }
+  return changed;
+}
+
 /** A stable imperative stream handle; React only sees its start and end. */
 export interface ContactTileDeltaRenderStream {
   generation: number;
   resolution: number;
   viewport: ContactViewport;
   accumulator: ContactTileDeltaAccumulator;
+  /** Populate the hidden back GPU surface instead of overlaying the retained front frame. */
+  retainPreviousFrame?: boolean;
   onFirstPaint?: () => void;
 }
 

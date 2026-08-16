@@ -39,6 +39,7 @@ function renderShell(
       gfaInputRef={createRef<HTMLInputElement>()}
       pafInputRef={createRef<HTMLInputElement>()}
       coverageInputRef={createRef<HTMLInputElement>()}
+      onAgpFileRequested={() => undefined}
       onAgpFileSelected={() => undefined}
       onGfaFileSelected={() => undefined}
       onContactFileSelected={() => undefined}
@@ -56,7 +57,7 @@ function renderShell(
       onReloadAssembly={() => undefined}
       onClearAllData={() => undefined}
       status={{
-        version: "0.1.2",
+        version: "0.1.3",
         engine: "c-studio-core",
         coordinate_convention: "0-based half-open",
         supported_operations: [],
@@ -101,7 +102,7 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('aria-label="Auto-save"');
     expect(markup).toContain("Save As once to enable auto-save");
     expect(markup).toContain('aria-label="Keyboard shortcuts"');
-    expect(markup).toContain("0.1.2");
+    expect(markup).toContain("0.1.3");
     expect(markup).toContain(`<dt>Save AGP</dt><dd>${shortcuts.save}</dd>`);
     expect(markup).toContain(`<dt>Rename</dt><dd>${shortcuts.rename}</dd>`);
     expect(markup).toContain(`<dt>Move to debris</dt><dd>${shortcuts.moveToDebris}</dd>`);

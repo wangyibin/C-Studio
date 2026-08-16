@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { ContactTileDeltaAccumulator } from "./contactTileDelta";
+import {
+  ContactTileDeltaAccumulator,
+  mergeCompleteContactTilesIntoDeltaAccumulator,
+} from "./contactTileDelta";
 
 describe("ContactTileDeltaAccumulator", () => {
   it("adds repeated sparse deltas and preserves requested empty tiles", () => {
@@ -76,5 +79,27 @@ describe("ContactTileDeltaAccumulator", () => {
     expect(accumulator.snapshotBuildCount).toBe(0);
     accumulator.finish();
     expect(accumulator.snapshotBuildCount).toBe(16);
+  });
+
+  it("seeds cached and progressive complete tiles exactly once for GPU staging", () => {
+    const accumulator = new ContactTileDeltaAccumulator([{ tileX: 0, tileY: 0 }], 4);
+    const mergedKeys = new Set<string>();
+    const tile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 1, yBin: 2, count: 7 }],
+    };
+
+    expect(mergeCompleteContactTilesIntoDeltaAccumulator(
+      accumulator,
+      mergedKeys,
+      [tile],
+    )).toEqual(["0:0"]);
+    expect(mergeCompleteContactTilesIntoDeltaAccumulator(
+      accumulator,
+      mergedKeys,
+      [tile],
+    )).toEqual([]);
+    expect([...accumulator.finish()[0]!.packedCells!.counts]).toEqual([7]);
   });
 });

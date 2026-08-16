@@ -56,12 +56,13 @@ describe("coverageView", () => {
     expect(request.viewport).toEqual({ xStart: 45, xEnd: 155, yStart: 0, yEnd: 1 });
   });
 
-  it("clamps a requested coverage viewport to the current assembly", () => {
+  it("preserves a rectangular heatmap viewport beyond the assembly end", () => {
     const request = buildCoverageViewRequest([], blocks, 200, {
       displayResolution: 10,
       viewport: { xStart: 180, xEnd: 260, yStart: 0, yEnd: 1 },
     });
 
-    expect(request.viewport).toEqual({ xStart: 180, xEnd: 200, yStart: 0, yEnd: 1 });
+    expect(request.viewport).toEqual({ xStart: 180, xEnd: 260, yStart: 0, yEnd: 1 });
+    expect(buildBrowserCoverageView(request).viewport).toEqual(request.viewport);
   });
 });

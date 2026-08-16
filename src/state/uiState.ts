@@ -195,7 +195,7 @@ export type UiAction =
   | {
       type: "setContactResolution";
       resolution: ContactResolution;
-      /** Reserved for automatic dataset reconciliation; manual controls omit it. */
+      /** Automatic dataset reconciliation may retain the current local window. */
       preserveViewport?: boolean;
     }
   | { type: "toggleContactResolutionLock" }
@@ -251,6 +251,13 @@ export type UiAction =
   | { type: "resetColorScaleAuto" }
   | { type: "toggleColorScaleLog" }
   | { type: "setAssemblyBlocks"; blocks: ContactMapLayoutBlock[] }
+  | {
+      type: "restoreAssemblyHistory";
+      blocks: ContactMapLayoutBlock[];
+      operationHistory: OperationRecord[];
+      redoStack: OperationRecord[];
+      nextOperationId: number;
+    }
   | { type: "toggleAssemblyOverlay"; overlay: "chromosome" | "block" | "contig" }
   | { type: "setAssemblyOverlayVisibility"; chromosome: boolean; block?: boolean; contig: boolean }
   | { type: "selectAssemblyContig"; id: string; additive: boolean }
@@ -1332,6 +1339,20 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         ...state,
         operationHistory: [],
         redoStack: [],
+        nextOperationId: 1,
+        historyPreviewOperationId: null,
+        assembly: {
+          ...state.assembly,
+          blocks: action.blocks,
+          selection: null,
+        },
+      };
+    case "restoreAssemblyHistory":
+      return {
+        ...state,
+        operationHistory: action.operationHistory,
+        redoStack: action.redoStack,
+        nextOperationId: action.nextOperationId,
         historyPreviewOperationId: null,
         assembly: {
           ...state.assembly,

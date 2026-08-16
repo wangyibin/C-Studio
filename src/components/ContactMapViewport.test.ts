@@ -4,12 +4,15 @@ import { describe, expect, it } from "vitest";
 import type { ExampleDatasetSummary } from "../App";
 import { createInitialUiState } from "../state/uiState";
 import {
+  advanceContactCoveragePresentationFrame,
+  advancePaintedContactPresentationFrame,
   assemblyCutTargetAtScreenPoint,
   assemblyPointerStateAtScreenPoint,
   assemblyBoundaryViewportClipClassName,
   assemblySelectionProjectionBands,
   assemblyShiftClickIntent,
   ContactMapViewport,
+  contactCoverageFramesMatch,
   contactCanvasBackingSizeFromBounds,
   contactResolutionWheelIntent,
   lockedContactResolutionWheelZoomIntent,
@@ -20,7 +23,10 @@ import {
   contactWheelPanMode,
   contactWheelPanIntent,
   historyPreviewBoxes,
+  limitAssemblyOverlayIntervals,
+  maximumAssemblyOverlayIntervals,
   sameAssemblyOverlayPresentation,
+  shouldRetainPresentedContactViewport,
 } from "./ContactMapViewport";
 import { buildAssemblyEditModel } from "../state/assemblyEditing";
 
@@ -28,6 +34,51 @@ const bounds = {
   width: 400,
   height: 200,
 };
+
+describe("assembly overlay screen-space LOD", () => {
+  it("drops subpixel whole-genome intervals while preserving selected context", () => {
+    const intervals = Array.from({ length: 17_206 }, (_, index) => ({
+      id: `block-${index}`,
+      visualStart: index,
+      visualEnd: index + 1,
+    }));
+    const selected = new Set(["block-17", "block-9000"]);
+
+    const visible = limitAssemblyOverlayIntervals(
+      intervals,
+      0,
+      intervals.length,
+      1_200,
+      selected,
+    );
+
+    expect(visible.map((interval) => interval.id)).toEqual(["block-17", "block-9000"]);
+  });
+
+  it("enforces the viewport-pixel and global hard limits even for priority intervals", () => {
+    const intervals = Array.from({ length: 10_000 }, (_, index) => ({
+      id: `block-${index}`,
+      visualStart: index,
+      visualEnd: index + 1,
+    }));
+    const allPriority = new Set(intervals.map((interval) => interval.id));
+
+    expect(limitAssemblyOverlayIntervals(
+      intervals,
+      0,
+      intervals.length,
+      1_200,
+      allPriority,
+    )).toHaveLength(1_200);
+    expect(limitAssemblyOverlayIntervals(
+      intervals,
+      0,
+      intervals.length,
+      100_000,
+      allPriority,
+    )).toHaveLength(maximumAssemblyOverlayIntervals);
+  });
+});
 const viewport = {
   xStart: 50_000_000,
   xEnd: 250_000_000,
@@ -168,6 +219,195 @@ describe("contactResolutionWheelIntent", () => {
       currentResolution: "10 kb",
       resolutionOptions,
     })).toBeNull();
+  });
+});
+
+describe("shouldRetainPresentedContactViewport", () => {
+  it("holds the painted 1 kb camera while a 2.5 Mb whole-genome layer is pending", () => {
+    expect(shouldRetainPresentedContactViewport({
+      resolution: 1_000,
+      normalization: "raw",
+    }, 2_500_000, "raw")).toBe(true);
+  });
+
+  it("publishes a terminal screen LOD even when it is coarser than the selected level", () => {
+    expect(shouldRetainPresentedContactViewport({
+      resolution: 17_500_000,
+      requestedResolution: 2_500_000,
+      normalization: "raw",
+      isTransientResolutionPreview: false,
+    }, 2_500_000, "raw")).toBe(false);
+  });
+
+  it("holds an old whole-genome LOD while its 1 kb replacement is loading", () => {
+    expect(shouldRetainPresentedContactViewport({
+      resolution: 17_500_000,
+      requestedResolution: 2_500_000,
+      normalization: "raw",
+      isTransientResolutionPreview: false,
+    }, 1_000, "raw")).toBe(true);
+  });
+});
+
+describe("contact and coverage presentation frames", () => {
+  it("accepts a coarse rectangular frame whose X camera extends beyond the assembly", () => {
+    const contactMap = {
+      resolution: 1_000_000,
+      requestedResolution: 1_000_000,
+      viewport: {
+        xStart: 0,
+        xEnd: 631_655_199,
+        yStart: 0,
+        yEnd: 473_741_399,
+      },
+      cells: [],
+      visibleLayerComplete: true,
+      renderGeneration: 9,
+    };
+    const matchingCoverage = {
+      resolution: 1_000_000,
+      viewport: { xStart: 0, xEnd: 631_655_199, yStart: 0, yEnd: 1 },
+      bins: [],
+      renderGeneration: 9,
+    };
+    const assemblyClampedCoverage = {
+      ...matchingCoverage,
+      viewport: { xStart: 0, xEnd: 473_741_399, yStart: 0, yEnd: 1 },
+    };
+
+    expect(contactCoverageFramesMatch(contactMap, matchingCoverage)).toBe(true);
+    expect(contactCoverageFramesMatch(contactMap, assemblyClampedCoverage)).toBe(false);
+  });
+
+  it("keeps the old 1 Mb pair until the 1 kb heatmap and coverage share one generation", () => {
+    const oldViewport = { xStart: 0, xEnd: 473_741_399, yStart: 0, yEnd: 473_741_399 };
+    const fineViewport = { xStart: 236_550_000, xEnd: 237_190_000, yStart: 236_550_000, yEnd: 237_190_000 };
+    const oldContactMap = {
+      resolution: 1_000_000,
+      requestedResolution: 1_000_000,
+      viewport: oldViewport,
+      cells: [],
+      visibleLayerComplete: true,
+      renderGeneration: 7,
+    };
+    const oldCoverageView = {
+      resolution: 1_000_000,
+      viewport: { ...oldViewport, yStart: 0, yEnd: 1 },
+      bins: [],
+      renderGeneration: 7,
+    };
+    const fineCoverageView = {
+      resolution: 1_000,
+      viewport: { ...fineViewport, yStart: 0, yEnd: 1 },
+      bins: [],
+      renderGeneration: 8,
+    };
+    const fineContactMap = {
+      resolution: 1_000,
+      requestedResolution: 1_000,
+      viewport: fineViewport,
+      cells: [],
+      visibleLayerComplete: true,
+      renderGeneration: 8,
+    };
+
+    let frame = advanceContactCoveragePresentationFrame(
+      null,
+      "example",
+      oldContactMap,
+      oldCoverageView,
+    );
+    expect(frame?.contactMap).toBe(oldContactMap);
+    expect(contactCoverageFramesMatch(oldContactMap, fineCoverageView)).toBe(false);
+
+    frame = advanceContactCoveragePresentationFrame(
+      frame,
+      "example",
+      oldContactMap,
+      fineCoverageView,
+    );
+    expect(frame?.contactMap).toBe(oldContactMap);
+    expect(frame?.coverageView).toBe(oldCoverageView);
+
+    frame = advanceContactCoveragePresentationFrame(
+      frame,
+      "example",
+      fineContactMap,
+      fineCoverageView,
+    );
+    expect(frame?.contactMap).toBe(fineContactMap);
+    expect(frame?.coverageView).toBe(fineCoverageView);
+  });
+
+  it("keeps old borders and coverage until the matching heatmap buffer is painted", () => {
+    const oldContactMap = {
+      resolution: 1_000,
+      requestedResolution: 1_000,
+      viewport: { xStart: 100, xEnd: 200, yStart: 100, yEnd: 200 },
+      cells: [],
+      visibleLayerComplete: true,
+      renderGeneration: 20,
+    };
+    const coarseContactMap = {
+      resolution: 1_000_000,
+      requestedResolution: 1_000_000,
+      viewport: { xStart: 0, xEnd: 1_000, yStart: 0, yEnd: 1_000 },
+      cells: [],
+      visibleLayerComplete: true,
+      renderGeneration: 21,
+    };
+    const oldCoverage = {
+      resolution: 1_000,
+      viewport: oldContactMap.viewport,
+      bins: [],
+      renderGeneration: 20,
+    };
+    const coarseCoverage = {
+      resolution: 1_000_000,
+      viewport: coarseContactMap.viewport,
+      bins: [],
+      renderGeneration: 21,
+    };
+    const oldFrame = {
+      datasetKey: "example",
+      contactMap: oldContactMap,
+      coverageView: oldCoverage,
+    };
+    const coarseTarget = {
+      datasetKey: "example",
+      contactMap: coarseContactMap,
+      coverageView: coarseCoverage,
+    };
+
+    expect(advancePaintedContactPresentationFrame(oldFrame, coarseTarget, 20)).toBe(oldFrame);
+    expect(advancePaintedContactPresentationFrame(oldFrame, coarseTarget, undefined)).toBe(oldFrame);
+    expect(advancePaintedContactPresentationFrame(oldFrame, coarseTarget, 21)).toBe(coarseTarget);
+  });
+
+  it("does not leak an old dataset border while the next dataset heatmap paints", () => {
+    const oldFrame = {
+      datasetKey: "old",
+      contactMap: {
+        resolution: 1_000,
+        viewport: { xStart: 0, xEnd: 10, yStart: 0, yEnd: 10 },
+        cells: [],
+        renderGeneration: 1,
+      },
+      coverageView: null,
+    };
+    const nextTarget = {
+      datasetKey: "next",
+      contactMap: {
+        resolution: 1_000_000,
+        viewport: { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 },
+        cells: [],
+        renderGeneration: 2,
+      },
+      coverageView: null,
+    };
+
+    expect(advancePaintedContactPresentationFrame(oldFrame, nextTarget, 1)).toBeNull();
+    expect(advancePaintedContactPresentationFrame(oldFrame, nextTarget, 2)).toBe(nextTarget);
   });
 });
 
@@ -670,6 +910,55 @@ describe("assemblyCutTargetAtScreenPoint", () => {
 });
 
 describe("assembly overlay hierarchy", () => {
+  it("wires the whole-genome block overlay to the viewport-pixel hard limit", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.assembly.blocks = Array.from({ length: 3_000 }, (_, index) => ({
+      id: `Chr01:${index + 1}:ctg${index}`,
+      objectId: "Chr01",
+      sourceId: `ctg${index}`,
+      sourceStart: 0,
+      sourceEnd: 1,
+      visualStart: index,
+      visualEnd: index + 1,
+      orientation: "+" as const,
+    }));
+    uiState.assembly.selection = {
+      kind: "contigs",
+      ids: uiState.assembly.blocks.map((block) => block.id),
+      exact: true,
+    };
+    uiState.contact.totalSpanMb = 0.003;
+    uiState.contact.viewportSpanMb = 0.003;
+    uiState.contact.viewportCenterMb = 0.0015;
+    uiState.contact.viewportCenterXMb = 0.0015;
+    uiState.contact.viewportCenterYMb = 0.0015;
+    const dataset: ExampleDatasetSummary = {
+      agp_path: "large.agp",
+      mcool_path: "",
+      cool_path: "",
+      paf_path: null,
+      coverage_path: null,
+      agp_lines: uiState.assembly.blocks.length,
+      agp_objects: 1,
+      agp_components: uiState.assembly.blocks.length,
+      agp_gaps: 0,
+      max_object_span: 3_000,
+      mcool_size_bytes: 0,
+      agp_layout: { blocks: uiState.assembly.blocks, totalSpan: 3_000 },
+    };
+
+    const markup = renderToStaticMarkup(createElement(ContactMapViewport, {
+      dataset,
+      contactMap: null,
+      coverageView: null,
+      uiState,
+      onUiAction: () => undefined,
+    }));
+
+    expect(markup).toContain('data-rendered-block-count="640"');
+    expect(markup.match(/singleton-contig-box/g)).toHaveLength(640);
+  });
+
   it("renders atomic block boxes, child outlines only for composites, and a direct singleton", () => {
     const uiState = createInitialUiState("ready");
     uiState.assembly.blocks = [

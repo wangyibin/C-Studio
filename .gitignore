@@ -6,6 +6,7 @@ node_modules/
 dist/
 site/
 .venv-docs/
+.pixi/
 build/
 out/
 coverage/

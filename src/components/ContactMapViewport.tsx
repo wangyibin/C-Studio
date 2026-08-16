@@ -17,7 +17,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ContactMapCell, ContactMapView, ExampleDatasetSummary } from "../App";
+import type { ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   assemblyContigDisplayName,
   assemblyRenameTarget,
@@ -32,8 +32,7 @@ import {
   type AssemblySelection,
 } from "../state/assemblyEditing";
 import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
-import { contactColorCss } from "../state/contactColor";
-import { normalizeContactValue } from "../state/contactColorScale";
+import { contactColorLut } from "../state/contactColor";
 import type { ContactPanPreview } from "../state/contactPanPerformance";
 import type { ContactTileDeltaRenderStream } from "../state/contactTileDelta";
 import type { ContactTileRenderMilestone } from "../state/contactTilePerformance";
@@ -42,12 +41,15 @@ import {
   contactLayoutRasterPlanCoversViewport,
 } from "../state/contactLayoutPreview";
 import { contactCellsForViewport } from "../state/contactMapView";
-import { contactRenderGeometry } from "../state/contactRenderGeometry";
+import { rasterizeContactMapCells } from "../state/contactMapRaster";
 import { contactResolutionToBasePairs } from "../state/contactResolution";
 import {
   buildCenteredContactViewport,
-  contactViewportWithDirectionalLead,
+  contactViewportWithVelocityAwareLead,
+  sampleContactViewportVelocity,
   type ContactViewport,
+  type ContactViewportVelocity,
+  type ContactViewportVelocitySample,
 } from "../state/contactViewport";
 import { contactTileViewportSignature } from "../state/contactTiles";
 import {
@@ -68,6 +70,7 @@ import {
   availableContactResolutions,
   contactNormalizationForBackend,
   storedContactResolutionsForDataset,
+  type ContactNormalization,
   type ContactResolution,
   type OperationRecord,
   type UiAction,
@@ -206,6 +209,7 @@ export function assemblySelectionProjectionBands(
 }
 
 const maxBufferedContactCells = 360_000;
+const contactMapImageDataCache = new WeakMap<HTMLCanvasElement, ImageData>();
 const shiftSelectionClassName = "shift-selection-active";
 const resolutionWheelCooldownMs = 140;
 
@@ -352,6 +356,193 @@ export function contactTileOverscanDirectionForViewports(
       (target.yStart + target.yEnd) - (source.yStart + source.yEnd),
     ),
   };
+}
+
+/**
+ * Keep the fully painted layer in its own camera while a selected resolution
+ * or normalization is still loading. Reprojecting an old fine-resolution tile
+ * set into a newly expanded whole-genome viewport can make the surface appear
+ * blank and can force the renderer to reconsider a much larger cached set.
+ * A terminal screen LOD opts out only while it still fulfills the current
+ * selection; on the next resolution change it becomes the retained old frame.
+ */
+export function shouldRetainPresentedContactViewport(
+  contactMap: Pick<
+    ContactMapView,
+    "isTransientResolutionPreview" | "normalization" | "requestedResolution" | "resolution"
+  > | null,
+  selectedResolution: number,
+  selectedNormalization: ContactNormalization,
+): boolean {
+  if (!contactMap) {
+    return false;
+  }
+  const normalizationChanged = contactMap.normalization !== undefined
+    && contactMap.normalization !== selectedNormalization;
+  if (contactMap.isTransientResolutionPreview === false) {
+    return contactMap.requestedResolution !== undefined
+      && (
+        contactMap.requestedResolution !== selectedResolution
+        || normalizationChanged
+      );
+  }
+  return contactMap.resolution !== selectedResolution
+    || normalizationChanged;
+}
+
+export interface ContactCoveragePresentationFrame {
+  datasetKey: string;
+  contactMap: ContactMapView;
+  coverageView: CoverageView;
+}
+
+export interface PaintedContactPresentationFrame {
+  datasetKey: string;
+  contactMap: ContactMapView;
+  coverageView: CoverageView | null;
+}
+
+export const maximumAssemblyOverlayIntervals = 2_048;
+export const minimumAssemblyOverlayIntervalWidthPx = 1;
+
+interface AssemblyOverlayInterval {
+  id: string;
+  visualStart: number;
+  visualEnd: number;
+}
+
+/** Individual subpixel blocks are not visible, so do not turn them into DOM nodes. */
+export function limitAssemblyOverlayIntervals<T extends AssemblyOverlayInterval>(
+  intervals: readonly T[],
+  viewportStart: number,
+  viewportEnd: number,
+  viewportWidthPx: number,
+  priorityIds: ReadonlySet<string> = new Set(),
+  maximumIntervals = maximumAssemblyOverlayIntervals,
+): T[] {
+  if (
+    !Number.isFinite(viewportStart)
+    || !Number.isFinite(viewportEnd)
+    || viewportEnd <= viewportStart
+  ) {
+    return [];
+  }
+  const safeWidth = Number.isFinite(viewportWidthPx)
+    ? Math.max(1, Math.ceil(viewportWidthPx))
+    : 1;
+  const hardLimit = Math.max(
+    1,
+    Math.min(
+      maximumAssemblyOverlayIntervals,
+      Math.floor(Number.isFinite(maximumIntervals) ? maximumIntervals : 1),
+      safeWidth,
+    ),
+  );
+  const minimumSpan = (
+    (viewportEnd - viewportStart) / safeWidth
+  ) * minimumAssemblyOverlayIntervalWidthPx;
+  const intersecting = intervals.filter((interval) => (
+    interval.visualEnd > viewportStart
+    && interval.visualStart < viewportEnd
+  ));
+  if (intersecting.length <= hardLimit) {
+    return intersecting;
+  }
+  const visible = intersecting.filter((interval) => (
+    priorityIds.has(interval.id)
+    || interval.visualEnd - interval.visualStart >= minimumSpan
+  ));
+  if (visible.length <= hardLimit) {
+    return visible;
+  }
+
+  const priority = visible.filter((interval) => priorityIds.has(interval.id));
+  const ordinary = visible.filter((interval) => !priorityIds.has(interval.id));
+  const sampleEvenly = (source: T[], count: number) => {
+    if (source.length <= count) {
+      return source;
+    }
+    return Array.from({ length: count }, (_, index) => (
+      source[Math.min(
+        source.length - 1,
+        Math.floor((index + 0.5) * source.length / count),
+      )]
+    ));
+  };
+  const retainedPriority = sampleEvenly(priority, hardLimit);
+  const retainedOrdinary = sampleEvenly(
+    ordinary,
+    Math.max(0, hardLimit - retainedPriority.length),
+  );
+  return [...retainedPriority, ...retainedOrdinary].sort((left, right) => (
+    left.visualStart - right.visualStart || left.visualEnd - right.visualEnd
+  ));
+}
+
+/** Coverage and heatmap may be computed independently, but must be presented as one generation. */
+export function contactCoverageFramesMatch(
+  contactMap: ContactMapView | null,
+  coverageView: CoverageView | null,
+) {
+  if (
+    !contactMap
+    || !coverageView
+    || contactMap.visibleLayerComplete === false
+  ) {
+    return false;
+  }
+  const requestedResolution = contactMap.requestedResolution ?? contactMap.resolution;
+  const generationsMatch = contactMap.renderGeneration === undefined
+    ? coverageView.renderGeneration === undefined
+    : coverageView.renderGeneration === contactMap.renderGeneration;
+  return generationsMatch
+    && coverageView.resolution === requestedResolution
+    && Math.abs(coverageView.viewport.xStart - contactMap.viewport.xStart) <= 1
+    && Math.abs(coverageView.viewport.xEnd - contactMap.viewport.xEnd) <= 1;
+}
+
+export function advanceContactCoveragePresentationFrame(
+  current: ContactCoveragePresentationFrame | null,
+  datasetKey: string,
+  contactMap: ContactMapView | null,
+  coverageView: CoverageView | null,
+): ContactCoveragePresentationFrame | null {
+  if (contactCoverageFramesMatch(contactMap, coverageView)) {
+    if (
+      current?.datasetKey === datasetKey
+      && current.contactMap === contactMap
+      && current.coverageView === coverageView
+    ) {
+      return current;
+    }
+    return { datasetKey, contactMap: contactMap!, coverageView: coverageView! };
+  }
+  return current?.datasetKey === datasetKey ? current : null;
+}
+
+/**
+ * Publish annotations only after the matching tile generation is actually on
+ * the presented surface. This keeps the old viewport, chromosome borders, and
+ * coverage mounted while the replacement heatmap is still in its back buffer.
+ */
+export function advancePaintedContactPresentationFrame(
+  current: PaintedContactPresentationFrame | null,
+  target: PaintedContactPresentationFrame | null,
+  paintedGeneration: number | undefined,
+): PaintedContactPresentationFrame | null {
+  if (!target) {
+    return null;
+  }
+  const currentForDataset = current?.datasetKey === target.datasetKey ? current : null;
+  const targetGeneration = target.contactMap.renderGeneration;
+  if (
+    targetGeneration === undefined
+    || targetGeneration === paintedGeneration
+    || currentForDataset?.contactMap.renderGeneration === targetGeneration
+  ) {
+    return target;
+  }
+  return currentForDataset;
 }
 
 /** Resolve a selected contig diagonal under the pointer, including compact boxes at whole-genome scale. */
@@ -537,9 +728,9 @@ function setShiftSelectionCursor(active: boolean) {
 }
 
 export function ContactMapViewport({
-  contactMap,
+  contactMap: incomingContactMap,
   contactTileDeltaStream,
-  coverageView,
+  coverageView: incomingCoverageView,
   dataset,
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
@@ -580,8 +771,10 @@ export function ContactMapViewport({
   panOverscanDirectionRef.current = panOverscanDirection;
   const panPreviewTileSignatureRef = useRef<string | null>(null);
   const panPreviewSequenceRef = useRef(0);
+  const panVelocitySampleRef = useRef<ContactViewportVelocitySample | null>(null);
   const panAnimationFrameRef = useRef<number | null>(null);
   const redrawAnimationFrameRef = useRef<number | null>(null);
+  const prepaintedCellContactMapRef = useRef<ContactMapView | null>(null);
   const pendingPanFrameRef = useRef<PendingPanFrame | null>(null);
   const [assemblySelectionDrag, setAssemblySelectionDrag] = useState<AssemblySelectionDragState | null>(null);
   const [assemblyPointerState, setAssemblyPointerState] = useState<AssemblyPointerState>({
@@ -592,22 +785,17 @@ export function ContactMapViewport({
   const assemblyPointerStateRef = useRef(assemblyPointerState);
   const lastAssemblyPointerRef = useRef<AssemblyPointerPosition | null>(null);
   const [tilePresentedSurfaceRevision, setTilePresentedSurfaceRevision] = useState(0);
-  const hasContactMap = Boolean(dataset?.mcool_path);
-  const renderGeneration = contactMap?.renderGeneration;
+  const [presentedContactCoverageFrame, setPresentedContactCoverageFrame] = useState<
+    ContactCoveragePresentationFrame | null
+  >(null);
+  const [paintedContactPresentationFrame, setPaintedContactPresentationFrame] = useState<
+    PaintedContactPresentationFrame | null
+  >(null);
+  const targetContactPresentationFrameRef = useRef<PaintedContactPresentationFrame | null>(null);
   const tileRenderStyle = useMemo(() => ({
     colormap: uiState.contact.colormap,
     colorScale: uiState.contact.colorScale,
   }), [uiState.contact.colormap, uiState.contact.colorScale]);
-  const freezePresentedTileStyle = Boolean(
-    contactMap
-    && (
-      contactMap.resolution !== contactResolutionToBasePairs(uiState.contact.resolution)
-      || (
-        contactMap.normalization !== undefined
-        && contactMap.normalization !== contactNormalizationForBackend(uiState.normalization)
-      )
-    ),
-  );
   const reportPresentedSurfaceChange = useCallback(() => {
     setTilePresentedSurfaceRevision((revision) => revision + 1);
   }, []);
@@ -622,6 +810,11 @@ export function ContactMapViewport({
     }
   }, [onContactTileLayerCommit]);
   const reportTileLayerPaintComplete = useCallback((event: ContactTileLayerPaintEvent) => {
+    setPaintedContactPresentationFrame((current) => advancePaintedContactPresentationFrame(
+      current,
+      targetContactPresentationFrameRef.current,
+      event.paintRevision,
+    ));
     if (event.paintRevision !== undefined) {
       onContactTileLayerPaintComplete?.({
         renderEpoch: event.renderEpoch,
@@ -631,9 +824,7 @@ export function ContactMapViewport({
       });
     }
   }, [onContactTileLayerPaintComplete]);
-  const usesTiledRenderer = Boolean(
-    contactMap?.tiles || contactMap?.cachedTiles || contactMap?.previewTiles,
-  );
+  const hasContactMap = Boolean(dataset?.mcool_path);
   const contactSize = dataset?.mcool_size_bytes ? formatBytes(dataset.mcool_size_bytes) : null;
   const hasCoverageTrack = Boolean(dataset?.coverage_path);
   const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
@@ -669,7 +860,86 @@ export function ContactMapViewport({
     uiState.contact.viewportSpanMb,
     uiState.contact.viewportWidthPx,
   ]);
-  const displayViewport = dragState?.previewViewport ?? liveViewport;
+  const presentationDatasetKey = `${dataset?.mcool_path ?? ""}|${dataset?.coverage_path ?? ""}`;
+  usePrePaintEffect(() => {
+    setPresentedContactCoverageFrame((current) => advanceContactCoveragePresentationFrame(
+      current,
+      presentationDatasetKey,
+      incomingContactMap,
+      incomingCoverageView,
+    ));
+  }, [
+    incomingContactMap,
+    incomingCoverageView,
+    presentationDatasetKey,
+  ]);
+  const synchronizedFrame = presentedContactCoverageFrame?.datasetKey === presentationDatasetKey
+    ? presentedContactCoverageFrame
+    : null;
+  const usesAtomicCoverageFrame = Boolean(
+    hasCoverageTrack
+    && uiState.tracks.coverageVisible
+    && synchronizedFrame,
+  );
+  const contactMap = usesAtomicCoverageFrame
+    ? synchronizedFrame!.contactMap
+    : incomingContactMap;
+  const coverageView = usesAtomicCoverageFrame
+    ? synchronizedFrame!.coverageView
+    : incomingCoverageView;
+  const renderGeneration = contactMap?.renderGeneration;
+  const freezePresentedTileStyle = shouldRetainPresentedContactViewport(
+    contactMap,
+    contactResolutionToBasePairs(uiState.contact.resolution),
+    contactNormalizationForBackend(uiState.normalization),
+  );
+  const usesTiledRenderer = Boolean(
+    contactMap?.tiles || contactMap?.cachedTiles || contactMap?.previewTiles,
+  );
+  const targetContactPresentationFrame = useMemo<PaintedContactPresentationFrame | null>(
+    () => contactMap ? {
+      datasetKey: presentationDatasetKey,
+      contactMap,
+      coverageView,
+    } : null,
+    [contactMap, coverageView, presentationDatasetKey],
+  );
+  targetContactPresentationFrameRef.current = targetContactPresentationFrame;
+  usePrePaintEffect(() => {
+    setPaintedContactPresentationFrame((current) => advancePaintedContactPresentationFrame(
+      current,
+      targetContactPresentationFrame,
+      usesTiledRenderer ? undefined : renderGeneration,
+    ));
+  }, [renderGeneration, targetContactPresentationFrame, usesTiledRenderer]);
+  const paintedPresentationFrame = paintedContactPresentationFrame?.datasetKey === presentationDatasetKey
+    ? paintedContactPresentationFrame
+    : null;
+  const waitsForTilePaint = usesTiledRenderer && renderGeneration !== undefined;
+  const presentationFrame = waitsForTilePaint
+    ? paintedPresentationFrame
+    : targetContactPresentationFrame;
+  const presentationContactMap = presentationFrame?.contactMap ?? contactMap;
+  const presentationCoverageView = presentationFrame?.coverageView ?? (
+    waitsForTilePaint ? null : coverageView
+  );
+  const presentationReady = !waitsForTilePaint || presentationFrame !== null;
+  // Resolution changes may update the requested viewport immediately. Until
+  // the replacement frame is ready, keep the complete front buffer and all of
+  // its overlays in the camera in which it was painted.
+  const tileLiveViewport = freezePresentedTileStyle && contactMap
+    ? contactMap.viewport
+    : liveViewport;
+  const tileDisplayViewport = dragState?.previewViewport ?? tileLiveViewport;
+  const freezePresentedAnnotationViewport = shouldRetainPresentedContactViewport(
+    presentationContactMap,
+    contactResolutionToBasePairs(uiState.contact.resolution),
+    contactNormalizationForBackend(uiState.normalization),
+  );
+  const presentedLiveViewport = freezePresentedAnnotationViewport && presentationContactMap
+    ? presentationContactMap.viewport
+    : liveViewport;
+  const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
   const historyPreviewOperation = useMemo(
     () => uiState.historyPreviewOperationId === null
       ? null
@@ -678,12 +948,12 @@ export function ContactMapViewport({
     [uiState.historyPreviewOperationId, uiState.operationHistory, uiState.redoStack],
   );
   const liveContactMap = useMemo(
-    () => contactMap ? { ...contactMap, viewport: liveViewport } : null,
-    [contactMap, liveViewport],
+    () => presentationContactMap ? { ...presentationContactMap, viewport: liveViewport } : null,
+    [liveViewport, presentationContactMap],
   );
   const displayContactMap = useMemo(
-    () => contactMap ? { ...contactMap, viewport: displayViewport } : null,
-    [contactMap, displayViewport],
+    () => presentationContactMap ? { ...presentationContactMap, viewport: displayViewport } : null,
+    [displayViewport, presentationContactMap],
   );
   latestContactMapRef.current = liveContactMap;
   latestDisplayContactMapRef.current = displayContactMap;
@@ -724,7 +994,7 @@ export function ContactMapViewport({
     !layoutRasterPlan.changesPixels || showsLayoutRasterPreview
   )
     ? activeAssemblyBlocks
-    : contactMap?.layoutBlocks ?? activeAssemblyBlocks;
+    : presentationContactMap?.layoutBlocks ?? activeAssemblyBlocks;
   const assemblyModel = useMemo(() => buildAssemblyEditModel(assemblyBlocks), [assemblyBlocks]);
   const selectedAssemblyBlockIds = useMemo(
     () => new Set(selectedBlockIds(assemblyModel.blocks, uiState.assembly.selection)),
@@ -738,19 +1008,64 @@ export function ContactMapViewport({
     ),
     [assemblyModel, selectedAssemblyBlockIds],
   );
+  const compositeAssemblyContigIds = useMemo(
+    () => new Set(
+      assemblyModel.assemblyBlocks
+        .filter((block) => block.isComposite)
+        .flatMap((block) => block.contigIds),
+    ),
+    [assemblyModel],
+  );
+  const showsCompositeContigLayer = uiState.assembly.showContigBoxes
+    && compositeAssemblyContigIds.size > 0;
+  const overlayLayerCount = (
+    uiState.assembly.showBlockBoxes || uiState.assembly.showContigBoxes ? 1 : 0
+  ) + (showsCompositeContigLayer ? 1 : 0);
+  const overlayIntervalBudget = Math.max(
+    1,
+    Math.floor(
+      Math.min(
+        maximumAssemblyOverlayIntervals,
+        Math.max(1, uiState.contact.viewportWidthPx),
+      ) / Math.max(1, overlayLayerCount),
+    ),
+  );
   const visibleAssemblyContigs = useMemo(
-    () =>
-      assemblyModel.blocks.filter(
-        (block) => block.visualEnd > displayViewport.xStart && block.visualStart < displayViewport.xEnd,
-      ),
-    [assemblyModel, displayViewport.xStart, displayViewport.xEnd],
+    () => limitAssemblyOverlayIntervals(
+      assemblyModel.blocks.filter((block) => compositeAssemblyContigIds.has(block.id)),
+      displayViewport.xStart,
+      displayViewport.xEnd,
+      uiState.contact.viewportWidthPx,
+      selectedAssemblyBlockIds,
+      overlayIntervalBudget,
+    ),
+    [
+      assemblyModel,
+      compositeAssemblyContigIds,
+      displayViewport.xEnd,
+      displayViewport.xStart,
+      overlayIntervalBudget,
+      selectedAssemblyBlockIds,
+      uiState.contact.viewportWidthPx,
+    ],
   );
   const visibleAssemblyBlocks = useMemo(
-    () =>
-      assemblyModel.assemblyBlocks.filter(
-        (block) => block.visualEnd > displayViewport.xStart && block.visualStart < displayViewport.xEnd,
-      ),
-    [assemblyModel, displayViewport.xStart, displayViewport.xEnd],
+    () => limitAssemblyOverlayIntervals(
+      assemblyModel.assemblyBlocks,
+      displayViewport.xStart,
+      displayViewport.xEnd,
+      uiState.contact.viewportWidthPx,
+      selectedAssemblyUnitIds,
+      overlayIntervalBudget,
+    ),
+    [
+      assemblyModel,
+      displayViewport.xEnd,
+      displayViewport.xStart,
+      overlayIntervalBudget,
+      selectedAssemblyUnitIds,
+      uiState.contact.viewportWidthPx,
+    ],
   );
   const visibleAssemblyChromosomes = useMemo(
     () => {
@@ -864,6 +1179,7 @@ export function ContactMapViewport({
           }
           onUiAction({ type: "clearAssemblySelection" });
           dragStateRef.current = null;
+          panVelocitySampleRef.current = null;
           resetPanTransform();
           setDragState(null);
           setAssemblySelectionDrag(null);
@@ -885,6 +1201,7 @@ export function ContactMapViewport({
 
       onUiAction({ type: "clearAssemblySelection" });
       dragStateRef.current = null;
+      panVelocitySampleRef.current = null;
       resetPanTransform();
       setDragState(null);
       setAssemblySelectionDrag(null);
@@ -900,6 +1217,7 @@ export function ContactMapViewport({
     function handleWindowBlur() {
       setShiftSelectionCursor(false);
       lastAssemblyPointerRef.current = null;
+      panVelocitySampleRef.current = null;
       setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
     }
 
@@ -920,6 +1238,7 @@ export function ContactMapViewport({
   useEffect(() => {
     return () => {
       cancelScheduledPanFrame();
+      panVelocitySampleRef.current = null;
       onContactViewportPreview?.(null);
     };
   }, [onContactViewportPreview]);
@@ -1104,7 +1423,29 @@ export function ContactMapViewport({
     return () => observer.disconnect();
   }, [onUiAction, totalSpanMb, usesTiledRenderer]);
 
+  usePrePaintEffect(() => {
+    if (usesTiledRenderer || !displayContactMap) {
+      prepaintedCellContactMapRef.current = null;
+      return;
+    }
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+    const frame = canvasFrameRef.current;
+    if (frame) {
+      resizeContactMapCanvas(canvas, frame);
+    }
+    drawContactMapBuffer(canvas, displayContactMap, uiState);
+    resetPanTransform();
+    prepaintedCellContactMapRef.current = displayContactMap;
+  }, [displayContactMap?.renderGeneration, usesTiledRenderer]);
+
   useEffect(() => {
+    if (prepaintedCellContactMapRef.current === displayContactMap) {
+      prepaintedCellContactMapRef.current = null;
+      return;
+    }
     if (redrawAnimationFrameRef.current !== null) {
       window.cancelAnimationFrame(redrawAnimationFrameRef.current);
     }
@@ -1158,6 +1499,11 @@ export function ContactMapViewport({
       liveContactMap.tileSizeBins ?? 256,
       totalSpanMb * 1_000_000,
     );
+    panVelocitySampleRef.current = sampleContactViewportVelocity(
+      null,
+      liveViewport,
+      contactPanPerformanceTimestamp(),
+    );
     setDragState(nextDragState);
   }
 
@@ -1188,8 +1534,14 @@ export function ContactMapViewport({
       currentY: latestPointer.clientY,
       previewViewport: previewContactMap.viewport,
     };
+    const velocitySample = sampleContactViewportVelocity(
+      panVelocitySampleRef.current,
+      previewContactMap.viewport,
+      contactPanPerformanceTimestamp(),
+    );
+    panVelocitySampleRef.current = velocitySample;
     updatePanOverscanDirection(liveContactMap.viewport, previewContactMap.viewport);
-    requestPanPreviewTiles(previewContactMap.viewport);
+    requestPanPreviewTiles(previewContactMap.viewport, velocitySample);
     schedulePanTransform(
       liveContactMap,
       previewContactMap,
@@ -1224,6 +1576,7 @@ export function ContactMapViewport({
       currentDragState.height,
     );
     dragStateRef.current = null;
+    panVelocitySampleRef.current = null;
     setDragState(null);
     if (Math.hypot(deltaXMb, deltaYMb) >= 0.05) {
       onUiAction({ type: "panContactViewport", deltaXMb, deltaYMb });
@@ -1235,20 +1588,24 @@ export function ContactMapViewport({
     onContactViewportPreview?.(null);
   }
 
-  function requestPanPreviewTiles(previewViewport: ContactViewport) {
+  function requestPanPreviewTiles(
+    previewViewport: ContactViewport,
+    velocity: ContactViewportVelocity = { xBpPerMs: 0, yBpPerMs: 0 },
+  ) {
     if (!onContactViewportPreview || !liveContactMap) {
       return;
     }
     const tileSpanBp = liveContactMap.resolution * (liveContactMap.tileSizeBins ?? 256);
-    const prefetchViewport = contactViewportWithDirectionalLead(
+    const prefetchViewport = contactViewportWithVelocityAwareLead(
       liveContactMap.viewport,
       previewViewport,
-      tileSpanBp / 2,
+      tileSpanBp,
+      velocity,
       totalSpanMb * 1_000_000,
     );
-    // Key preview generations from the look-ahead window. This wakes the data
-    // pipeline roughly half a tile before the displayed viewport crosses the
-    // next tile boundary while preserving the exact pointer-following view.
+    // Key preview generations from the look-ahead window. Slow pans retain a
+    // half-tile lead; faster motion grows to at most one and a half tiles while
+    // preserving the exact pointer-following displayed view.
     const signature = contactTileViewportSignature(
       prefetchViewport,
       liveContactMap.resolution,
@@ -1706,6 +2063,7 @@ export function ContactMapViewport({
       );
       if (moved < 6) {
         dragStateRef.current = null;
+        panVelocitySampleRef.current = null;
         setDragState(null);
         cancelScheduledPanFrame();
         resetPanTransform();
@@ -1767,7 +2125,7 @@ export function ContactMapViewport({
         </div>
         {hasCoverageTrack ? (
           <TrackPanel
-            coverageView={coverageView}
+            coverageView={presentationCoverageView}
             viewport={displayViewport}
             totalSpanMb={totalSpanMb}
             uiState={uiState}
@@ -1817,12 +2175,12 @@ export function ContactMapViewport({
                 onTileLayerCommit={renderGeneration === undefined || !onContactTileLayerCommit
                   ? undefined
                   : reportTileLayerCommit}
-                onTileLayerPaintComplete={renderGeneration === undefined || !onContactTileLayerPaintComplete
+                onTileLayerPaintComplete={renderGeneration === undefined
                   ? undefined
                   : reportTileLayerPaintComplete}
                 onPresentedSurfaceChange={reportPresentedSurfaceChange}
                 renderStyle={tileRenderStyle}
-                viewport={displayViewport}
+                viewport={tileDisplayViewport}
               />
             ) : null}
             {showsLayoutRasterPreview && contactMap && layoutRasterPlan ? (
@@ -1842,7 +2200,7 @@ export function ContactMapViewport({
               />
             ) : null}
           </div>
-          <AssemblyOverlay
+          {presentationReady ? <AssemblyOverlay
             overlayLayerRef={assemblyOverlayLayerRef}
             selectionVerticalBandRef={assemblySelectionVerticalBandRef}
             selectionHorizontalBandRef={assemblySelectionHorizontalBandRef}
@@ -1886,7 +2244,7 @@ export function ContactMapViewport({
                 setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
               }
             }}
-          />
+          /> : null}
           {historyPreviewOperation ? (
             <HistoryOperationPreview
               operation={historyPreviewOperation}
@@ -2200,6 +2558,8 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
   return (
     <div
       className={`assembly-overlay ${pointerState.kind === "cut" ? "cut-preview-active" : ""}`.trim()}
+      data-rendered-block-count={visibleBlocks.length}
+      data-rendered-contig-count={visibleContigs.length}
       onDoubleClick={onDoubleClick}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -2701,41 +3061,36 @@ function drawContactMapBuffer(
       yEnd: contactMap.viewport.yEnd + viewportHeight,
     },
   };
-  const geometry = contactRenderGeometry({
-    resolution: contactMap.resolution,
-    viewportWidth,
-    viewportHeight,
-    canvasWidth: frameWidth,
-    canvasHeight: frameHeight,
-  });
-
   context.clearRect(0, 0, width, height);
   context.fillStyle = "#ffffff";
   context.fillRect(0, 0, width, height);
-
-  const drawCells = (cells: ContactMapCell[]) => {
-    for (const cell of cells) {
-      const xBase = cell.xBin * contactMap.resolution;
-      const yBase = cell.yBin * contactMap.resolution;
-
-      const x = frameOffsetX + ((xBase - contactMap.viewport.xStart) / viewportWidth) * frameWidth;
-      const y = frameOffsetY + ((yBase - contactMap.viewport.yStart) / viewportHeight) * frameHeight;
-      const intensity = normalizeContactValue(cell.count, uiState.contact.colorScale);
-
-      context.fillStyle = contactColorCss(uiState.contact.colormap, intensity, 0.88);
-      context.fillRect(x, y, geometry.widthPx, geometry.heightPx);
-      if (cell.xBin !== cell.yBin) {
-        const mirroredX = frameOffsetX + ((yBase - contactMap.viewport.xStart) / viewportWidth) * frameWidth;
-        const mirroredY = frameOffsetY + ((xBase - contactMap.viewport.yStart) / viewportHeight) * frameHeight;
-        context.fillRect(mirroredX, mirroredY, geometry.widthPx, geometry.heightPx);
-      }
-    }
-  };
-
-  drawCells(contactCellsForViewport(bufferContactMap, maxBufferedContactCells));
-  if (contactMap.cachedTiles) {
-    drawCells(contactCellsForViewport({ ...contactMap, cachedTiles: undefined }));
+  const rasterWidth = Math.max(1, Math.round(frameWidth));
+  const rasterHeight = Math.max(1, Math.round(frameHeight));
+  let imageData = contactMapImageDataCache.get(canvas);
+  if (!imageData || imageData.width !== rasterWidth || imageData.height !== rasterHeight) {
+    imageData = context.createImageData(rasterWidth, rasterHeight);
+    contactMapImageDataCache.set(canvas, imageData);
   }
+  const rasterInput = {
+    resolution: contactMap.resolution,
+    viewport: contactMap.viewport,
+    width: rasterWidth,
+    height: rasterHeight,
+    colorScale: uiState.contact.colorScale,
+    colormap: uiState.contact.colormap,
+    colorLut: contactColorLut(uiState.contact.colormap, 0.88),
+  };
+  rasterizeContactMapCells({
+    ...rasterInput,
+    cells: contactCellsForViewport(bufferContactMap, maxBufferedContactCells),
+  }, imageData.data);
+  if (contactMap.cachedTiles) {
+    rasterizeContactMapCells({
+      ...rasterInput,
+      cells: contactCellsForViewport({ ...contactMap, cachedTiles: undefined }),
+    }, imageData.data, false);
+  }
+  context.putImageData(imageData, Math.round(frameOffsetX), Math.round(frameOffsetY));
 }
 
 function contactMapWithPannedViewport(

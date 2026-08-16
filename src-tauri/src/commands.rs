@@ -309,6 +309,7 @@ pub struct SyntenyCacheState {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ContactTileCacheKey {
     path: String,
+    source_resolution: u64,
     resolution: u64,
     tile_size_bins: u64,
     normalization: ContactNormalizationRequest,
@@ -775,9 +776,17 @@ pub struct ImportedProjectTextFile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ImportedAgpBundle {
+    pub agp: ImportedProjectTextFile,
+    pub history: Option<ImportedProjectTextFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportedProjectDirectory {
     pub directory: String,
     pub agp: Option<ImportedProjectTextFile>,
+    pub history: Option<ImportedProjectTextFile>,
     pub gfa: Option<ImportedProjectTextFile>,
     pub paf: Option<ImportedContactFile>,
     pub coverage: Option<ImportedContactFile>,
@@ -908,10 +917,14 @@ pub struct ContactMapTilesFromCoolRequest {
     pub purpose: ContactTileRequestPurpose,
     pub cool_path: String,
     pub base_resolution: u64,
+    #[serde(default)]
+    pub source_resolution: Option<u64>,
     pub target_resolution: u64,
     pub tile_size_bins: u64,
     #[serde(default)]
     pub normalization: ContactNormalizationRequest,
+    #[serde(default)]
+    pub adaptive_refinement: bool,
     pub tiles: Vec<ContactMapTileKeyRequest>,
     #[serde(default)]
     pub layout_handle: Option<String>,
@@ -937,6 +950,54 @@ impl DerefMut for ResolvedContactMapTilesFromCoolRequest {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.request
     }
+}
+
+const MAX_ADAPTIVE_MCOOL_EXACT_TILES: usize = 4;
+
+fn adaptive_mcool_refinement_requested(
+    request: &ResolvedContactMapTilesFromCoolRequest,
+    tiles: &[ContactMapTileKeyRequest],
+) -> bool {
+    if !request.adaptive_refinement
+        || request.purpose != ContactTileRequestPurpose::Visible
+        || request.normalization != ContactNormalizationRequest::Raw
+        || request.base_resolution != 1_000
+        || request.target_resolution != 2_500_000
+        || !request.cool_path.to_ascii_lowercase().ends_with(".mcool")
+        || std::env::var("CSTUDIO_ADAPTIVE_MCOOL").as_deref() == Ok("0")
+    {
+        return false;
+    }
+
+    let coordinates = tiles
+        .iter()
+        .map(canonical_contact_tile_coordinate)
+        .collect::<BTreeSet<_>>();
+    if coordinates.is_empty() || coordinates.len() > MAX_ADAPTIVE_MCOOL_EXACT_TILES {
+        return false;
+    }
+    let min_x = coordinates
+        .iter()
+        .map(|coordinate| coordinate.0)
+        .min()
+        .unwrap_or(0);
+    let max_x = coordinates
+        .iter()
+        .map(|coordinate| coordinate.0)
+        .max()
+        .unwrap_or(min_x);
+    let min_y = coordinates
+        .iter()
+        .map(|coordinate| coordinate.1)
+        .min()
+        .unwrap_or(0);
+    let max_y = coordinates
+        .iter()
+        .map(|coordinate| coordinate.1)
+        .max()
+        .unwrap_or(min_y);
+
+    max_x.saturating_sub(min_x) <= 1 && max_y.saturating_sub(min_y) <= 1
 }
 
 fn resolve_contact_tile_request(
@@ -1485,6 +1546,21 @@ pub fn load_project_directory(path: String) -> Result<ImportedProjectDirectory, 
 }
 
 #[tauri::command]
+pub fn load_agp_bundle(path: String) -> Result<ImportedAgpBundle, String> {
+    let path = PathBuf::from(path);
+    if !has_data_suffix(&path, &["agp", "txt"]) {
+        return Err("selected file must end with .agp, .txt, or their .gz form".to_string());
+    }
+    let agp = imported_text_file(&path)?;
+    let history_path = history_sidecar_path(&path);
+    let history = history_path
+        .is_file()
+        .then(|| imported_text_file(&history_path))
+        .transpose()?;
+    Ok(ImportedAgpBundle { agp, history })
+}
+
+#[tauri::command]
 pub fn write_agp_file(path: String, contents: String) -> Result<String, String> {
     let path = PathBuf::from(path);
     fs::write(&path, contents).map_err(|error| error.to_string())?;
@@ -1492,8 +1568,33 @@ pub fn write_agp_file(path: String, contents: String) -> Result<String, String> 
 }
 
 #[tauri::command]
+pub fn write_agp_bundle(
+    path: String,
+    contents: String,
+    history_contents: String,
+) -> Result<String, String> {
+    let path = PathBuf::from(path);
+    write_agp_and_history(&path, &contents, &history_contents)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 pub fn overwrite_agp_file(path: String, contents: String) -> Result<bool, String> {
     write_existing_agp_path(Path::new(&path), &contents)
+}
+
+#[tauri::command]
+pub fn overwrite_agp_bundle(
+    path: String,
+    contents: String,
+    history_contents: String,
+) -> Result<bool, String> {
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    write_agp_and_history(&path, &contents, &history_contents)?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1508,6 +1609,17 @@ fn write_existing_agp_path(path: &Path, contents: &str) -> Result<bool, String> 
 
     fs::write(path, contents).map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+fn write_agp_and_history(
+    path: &Path,
+    contents: &str,
+    history_contents: &str,
+) -> Result<(), String> {
+    // Write the sidecar first. If the AGP write then fails, the embedded exact
+    // AGP text makes the sidecar safely reject rather than attach to stale data.
+    fs::write(history_sidecar_path(path), history_contents).map_err(|error| error.to_string())?;
+    fs::write(path, contents).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1950,6 +2062,15 @@ pub fn log_contact_pan_frontend_performance(request: ContactPanFrontendPerforman
 }
 
 #[tauri::command]
+pub fn log_contact_frontend_performance(line: String) {
+    let accepted_event = line.starts_with("CSTUDIO_PERF event=contact_tiles_frontend ")
+        || line.starts_with("CSTUDIO_PERF event=contact_resolution_responsiveness ");
+    if contact_tile_perf_logging_enabled() && line.len() <= 2_048 && accepted_event {
+        eprintln!("{line}");
+    }
+}
+
+#[tauri::command]
 pub fn log_gfa_frontend_performance(line: String) {
     if line.len() <= 1_024 && line.starts_with("CSTUDIO_PERF event=gfa_") {
         eprintln!("{line}");
@@ -2359,11 +2480,7 @@ where
     if request.tiles.is_empty() {
         return Err("contact tile delta stream requires at least one tile".to_string());
     }
-    let adaptive_requested = request.normalization == ContactNormalizationRequest::Raw
-        && request.base_resolution == 1_000
-        && request.target_resolution == 2_500_000
-        && request.cool_path.to_ascii_lowercase().ends_with(".mcool")
-        && std::env::var("CSTUDIO_ADAPTIVE_MCOOL").as_deref() != Ok("0");
+    let adaptive_requested = adaptive_mcool_refinement_requested(&request, &request.tiles);
     if adaptive_requested {
         return Err(
             "single-scan delta stream is unavailable for adaptive 2.5 Mb mcool refinement"
@@ -2538,6 +2655,77 @@ where
     F: FnMut(&[ContactMapTileResponse]) -> Result<usize, String>,
 {
     let mut stats = ContactTileProgressiveStats::default();
+    if request.source_resolution.is_some() {
+        // Screen-scale LOD tiles all derive from one stored Cooler level. Scan
+        // and project the complete visible tile set once, then serialize the
+        // already-computed tiles in the frontend's center-first chunk order.
+        // This preserves reusable tile identities without paying one HDF5 scan
+        // per two-tile presentation batch.
+        let (tiles, timings) =
+            profile_contact_tile_request(request.clone(), source_cache, tile_cache, should_cancel);
+        let ordered_chunks = contact_tile_response_chunks(tiles?, chunks)?;
+        if contact_tile_perf_logging_enabled() {
+            eprintln!(
+                "{}",
+                timings.line(ContactTilePerfContext {
+                    scenario: request.purpose.scenario_key(),
+                    request_id: request.request_id,
+                    generation: request.generation,
+                    base_resolution: request.base_resolution,
+                    target_resolution: request.target_resolution,
+                    tile_size_bins: request.tile_size_bins,
+                    normalization: request.normalization,
+                    layout_blocks: request.layout_blocks.len(),
+                    requested_tiles: request.tiles.len(),
+                    returned_tiles: ordered_chunks.iter().map(Vec::len).sum(),
+                })
+            );
+        }
+        for (chunk_offset, ordered_tiles) in ordered_chunks.iter().enumerate() {
+            ensure_contact_tile_request_active(should_cancel)?;
+            let response_cells = ordered_tiles
+                .iter()
+                .map(|tile| tile.cells.len())
+                .sum::<usize>();
+            let emit_started = Instant::now();
+            let response_bytes = emit_chunk(ordered_tiles)?;
+            let encode_send_us = emit_started.elapsed().as_micros();
+            stats.returned_tiles = stats.returned_tiles.saturating_add(ordered_tiles.len());
+            stats.response_cells = stats.response_cells.saturating_add(response_cells);
+            stats.response_bytes = stats.response_bytes.saturating_add(response_bytes);
+            if contact_tile_perf_logging_enabled() {
+                eprintln!(
+                    "{}",
+                    contact_tile_progressive_chunk_perf_line(
+                        ContactTileProgressiveChunkPerfContext {
+                            scenario: request.purpose.scenario_key(),
+                            request_id: request.request_id,
+                            generation: request.generation,
+                            target_resolution: request.target_resolution,
+                            chunk_index: chunk_offset + 1,
+                            chunk_count: chunks.len(),
+                            requested_tiles: ordered_tiles.len(),
+                            returned_tiles: ordered_tiles.len(),
+                            response_cells,
+                            response_bytes,
+                            compute_us: if chunk_offset == 0 {
+                                timings.total.get().as_micros()
+                            } else {
+                                0
+                            },
+                            encode_send_us,
+                            elapsed_us: command_started.elapsed().as_micros(),
+                        },
+                    )
+                );
+            }
+        }
+        return Ok((
+            stats.returned_tiles,
+            stats.response_cells,
+            stats.response_bytes,
+        ));
+    }
     for (chunk_offset, chunk) in chunks.iter().enumerate() {
         ensure_contact_tile_request_active(should_cancel)?;
         let chunk_started = Instant::now();
@@ -2767,6 +2955,19 @@ fn get_contact_map_tiles_from_cool_inner(
     should_cancel: &dyn Fn() -> bool,
     timings: &ContactTileStageTimings,
 ) -> Result<Vec<ContactMapTileResponse>, String> {
+    let source_resolution = request
+        .source_resolution
+        .unwrap_or(request.target_resolution);
+    if request.base_resolution == 0
+        || source_resolution == 0
+        || source_resolution % request.base_resolution != 0
+        || request.target_resolution % source_resolution != 0
+    {
+        return Err(format!(
+            "invalid contact tile source resolution: base={}, source={}, target={}",
+            request.base_resolution, source_resolution, request.target_resolution,
+        ));
+    }
     let tile_span;
     let axis_fingerprints;
     let requested_tile_keys;
@@ -2808,6 +3009,7 @@ fn get_contact_map_tiles_from_cool_inner(
             .iter()
             .map(|tile| ContactTileCacheKey {
                 path: request.cool_path.clone(),
+                source_resolution,
                 resolution: request.target_resolution,
                 tile_size_bins: request.tile_size_bins,
                 normalization: request.normalization,
@@ -2869,7 +3071,10 @@ fn get_contact_map_tiles_from_cool_inner(
         let _stage = ContactTileStageSpan::new(&timings.source_planning);
         contact_tile_work_regions(&missing_tiles)
     };
-    if work_regions.len() > 1 {
+    if work_regions.len() > 1
+        && (request.source_resolution.is_none()
+            || request.purpose != ContactTileRequestPurpose::Visible)
+    {
         for region_tiles in work_regions {
             let mut region_request = request.clone();
             region_request.tiles = region_tiles;
@@ -2891,11 +3096,7 @@ fn get_contact_map_tiles_from_cool_inner(
             .collect());
     }
 
-    let adaptive_requested = request.normalization == ContactNormalizationRequest::Raw
-        && request.base_resolution == 1_000
-        && request.target_resolution == 2_500_000
-        && request.cool_path.to_ascii_lowercase().ends_with(".mcool")
-        && std::env::var("CSTUDIO_ADAPTIVE_MCOOL").as_deref() != Ok("0");
+    let adaptive_requested = adaptive_mcool_refinement_requested(&request, &request.tiles);
     let (source_ranges, query, source_windows, source_cache_path, source_cache_keys) = {
         let _stage = ContactTileStageSpan::new(&timings.source_planning);
         let min_tile_x = missing_tiles
@@ -2938,7 +3139,7 @@ fn get_contact_map_tiles_from_cool_inner(
         // deliberately wide or very fragmented viewport cannot first allocate a
         // huge source-window vector only to bypass the cache afterwards.
         const MAX_CACHE_WINDOWS_PER_REQUEST: usize = 180;
-        let source_windows = if adaptive_requested {
+        let source_windows = if adaptive_requested || request.source_resolution.is_some() {
             None
         } else {
             source_windows_for_ranges_with_limit(
@@ -2974,7 +3175,7 @@ fn get_contact_map_tiles_from_cool_inner(
         let source_cache_keys = source_windows.as_ref().map(|source_windows| {
             SourceContactCache::keys_for_windows(
                 &source_cache_path,
-                request.target_resolution,
+                source_resolution,
                 source_windows,
             )
         });
@@ -3031,107 +3232,179 @@ fn get_contact_map_tiles_from_cool_inner(
         )
         .map_err(|error| error.to_string())?
     } else {
-        let adaptive_result = if adaptive_requested {
+        let tiled_lod_view = if request.source_resolution.is_some() {
+            let x_bins = query
+                .viewport
+                .x_end
+                .div_ceil(query.target_resolution)
+                .saturating_sub(query.viewport.x_start / query.target_resolution);
+            let y_bins = query
+                .viewport
+                .y_end
+                .div_ceil(query.target_resolution)
+                .saturating_sub(query.viewport.y_start / query.target_resolution);
+            let aggregate_cell_bound = x_bins
+                .checked_mul(y_bins)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| "tiled LOD aggregate cell bound overflowed".to_string())?;
+            if aggregate_cell_bound > MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS as usize {
+                return Err(format!(
+                    "tiled LOD aggregate could contain {aggregate_cell_bound} cells, exceeding bounded aggregate limit {MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS}"
+                ));
+            }
+            let mut projector =
+                cstudio_core::contact_map::ContactMapChunkProjector::new_for_bounded_view(
+                    &query,
+                    aggregate_cell_bound,
+                )
+                .map_err(|error| error.to_string())?;
+            let mut visit_timings = cstudio_core::cool::CoolContactVisitTimings::default();
             timings
                 .cool_reads
                 .set(timings.cool_reads.get().saturating_add(1));
-            let _stage = ContactTileStageSpan::new(&timings.cool_read);
-            cstudio_core::cool::build_contact_map_view_from_mcool_adaptive_raw_cancellable(
+            cstudio_core::cool::visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
                 &request.cool_path,
                 &source_ranges,
-                &query,
+                Some(source_resolution),
+                request.normalization.into(),
                 should_cancel,
+                &mut visit_timings,
+                |source1_index, source1, start1, source2_index, source2, start2, count| {
+                    projector.push_indexed_contact(
+                        source1_index,
+                        source1,
+                        start1,
+                        source2_index,
+                        source2,
+                        start2,
+                        count,
+                    );
+                    Ok(())
+                },
+                || Ok(()),
             )
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+            timings.cool_read.set(
+                timings
+                    .cool_read
+                    .get()
+                    .saturating_add(visit_timings.prepare + visit_timings.hdf5_read),
+            );
+            timings.projection.set(
+                timings
+                    .projection
+                    .get()
+                    .saturating_add(visit_timings.scan_project + visit_timings.finish_chunk),
+            );
+            Some(projector.take_view())
         } else {
             None
         };
-        if let Some(adaptive_result) = adaptive_result {
-            if contact_tile_perf_logging_enabled() {
-                eprintln!(
-                    "CSTUDIO_PERF event=adaptive_mcool status=ok target_resolution={} \
-                     candidate_pixels={} child_rows_read={} bin2_ids_scanned={} \
-                     child_blocks_requested={} child_blocks_cached={}",
-                    request.target_resolution,
-                    adaptive_result.stats.candidate_pixels,
-                    adaptive_result.stats.child_rows_read,
-                    adaptive_result.stats.bin2_ids_scanned,
-                    adaptive_result.stats.child_blocks_requested,
-                    adaptive_result.stats.child_blocks_cached,
-                );
-            }
-            adaptive_result.view
+        if let Some(tiled_lod_view) = tiled_lod_view {
+            tiled_lod_view
         } else {
-            let cache_window_ranges = {
-                let _stage = ContactTileStageSpan::new(&timings.source_planning);
-                source_windows.as_ref().map(|source_windows| {
-                    source_windows
-                        .iter()
-                        .map(|window| (window.source_id.clone(), window.start, window.end))
-                        .collect::<Vec<_>>()
-                })
-            };
-            let read_ranges = cache_window_ranges
-                .as_deref()
-                .unwrap_or(source_ranges.as_slice());
-            ensure_contact_tile_request_active(should_cancel)?;
-            timings
-                .cool_reads
-                .set(timings.cool_reads.get().saturating_add(1));
-            let contacts = {
+            let adaptive_result = if adaptive_requested {
+                timings
+                    .cool_reads
+                    .set(timings.cool_reads.get().saturating_add(1));
                 let _stage = ContactTileStageSpan::new(&timings.cool_read);
-                cstudio_core::cool::read_cool_contacts_for_source_ranges_at_resolution_with_normalization_cancellable(
-                &request.cool_path,
-                read_ranges,
-                Some(request.target_resolution),
-                request.normalization.into(),
-                should_cancel,
-            )
-            .map_err(|error| error.to_string())?
-            };
-            ensure_contact_tile_request_active(should_cancel)?;
-
-            let conventional_view = if let (Some(_keys), Some(source_windows)) =
-                (source_cache_keys.as_ref(), source_windows.as_ref())
-            {
-                let prepared = {
-                    let _stage = ContactTileStageSpan::new(&timings.source_cache);
-                    SourceContactCache::prepare_contacts_for_windows_cancellable(
-                        &source_cache_path,
-                        request.target_resolution,
-                        source_windows,
-                        &contacts,
-                        should_cancel,
-                    )
-                    .map_err(|error| error.to_string())?
-                };
-                {
-                    let _stage = ContactTileStageSpan::new(&timings.source_cache);
-                    let mut source_cache = source_cache
-                        .lock()
-                        .map_err(|_| "source contact cache lock poisoned".to_string())?;
-                    source_cache
-                        .insert_prepared_cancellable(prepared, should_cancel)
-                        .map_err(|error| error.to_string())?;
-                }
-                ensure_contact_tile_request_active(should_cancel)?;
-                let _stage = ContactTileStageSpan::new(&timings.projection);
-                cstudio_core::contact_map::build_contact_map_view_from_contacts_cancellable(
+                cstudio_core::cool::build_contact_map_view_from_mcool_adaptive_raw_cancellable(
+                    &request.cool_path,
+                    &source_ranges,
                     &query,
-                    contacts,
                     should_cancel,
                 )
                 .map_err(|error| error.to_string())?
             } else {
-                let _stage = ContactTileStageSpan::new(&timings.projection);
-                cstudio_core::contact_map::build_contact_map_view_from_contacts_cancellable(
-                    &query,
-                    contacts,
-                    should_cancel,
-                )
-                .map_err(|error| error.to_string())?
+                None
             };
-            conventional_view
+            if let Some(adaptive_result) = adaptive_result {
+                if contact_tile_perf_logging_enabled() {
+                    eprintln!(
+                        "CSTUDIO_PERF event=adaptive_mcool status=ok target_resolution={} \
+                     candidate_pixels={} child_rows_read={} bin2_ids_scanned={} \
+                     child_blocks_requested={} child_blocks_cached={}",
+                        request.target_resolution,
+                        adaptive_result.stats.candidate_pixels,
+                        adaptive_result.stats.child_rows_read,
+                        adaptive_result.stats.bin2_ids_scanned,
+                        adaptive_result.stats.child_blocks_requested,
+                        adaptive_result.stats.child_blocks_cached,
+                    );
+                }
+                adaptive_result.view
+            } else {
+                let cache_window_ranges = {
+                    let _stage = ContactTileStageSpan::new(&timings.source_planning);
+                    source_windows.as_ref().map(|source_windows| {
+                        source_windows
+                            .iter()
+                            .map(|window| (window.source_id.clone(), window.start, window.end))
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let read_ranges = cache_window_ranges
+                    .as_deref()
+                    .unwrap_or(source_ranges.as_slice());
+                ensure_contact_tile_request_active(should_cancel)?;
+                timings
+                    .cool_reads
+                    .set(timings.cool_reads.get().saturating_add(1));
+                let contacts = {
+                    let _stage = ContactTileStageSpan::new(&timings.cool_read);
+                    cstudio_core::cool::read_cool_contacts_for_source_ranges_at_resolution_with_normalization_cancellable(
+                &request.cool_path,
+                read_ranges,
+                Some(source_resolution),
+                request.normalization.into(),
+                should_cancel,
+            )
+            .map_err(|error| error.to_string())?
+                };
+                ensure_contact_tile_request_active(should_cancel)?;
+
+                let conventional_view = if let (Some(_keys), Some(source_windows)) =
+                    (source_cache_keys.as_ref(), source_windows.as_ref())
+                {
+                    let prepared = {
+                        let _stage = ContactTileStageSpan::new(&timings.source_cache);
+                        SourceContactCache::prepare_contacts_for_windows_cancellable(
+                            &source_cache_path,
+                            request.target_resolution,
+                            source_windows,
+                            &contacts,
+                            should_cancel,
+                        )
+                        .map_err(|error| error.to_string())?
+                    };
+                    {
+                        let _stage = ContactTileStageSpan::new(&timings.source_cache);
+                        let mut source_cache = source_cache
+                            .lock()
+                            .map_err(|_| "source contact cache lock poisoned".to_string())?;
+                        source_cache
+                            .insert_prepared_cancellable(prepared, should_cancel)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    ensure_contact_tile_request_active(should_cancel)?;
+                    let _stage = ContactTileStageSpan::new(&timings.projection);
+                    cstudio_core::contact_map::build_contact_map_view_from_contacts_cancellable(
+                        &query,
+                        contacts,
+                        should_cancel,
+                    )
+                    .map_err(|error| error.to_string())?
+                } else {
+                    let _stage = ContactTileStageSpan::new(&timings.projection);
+                    cstudio_core::contact_map::build_contact_map_view_from_contacts_cancellable(
+                        &query,
+                        contacts,
+                        should_cancel,
+                    )
+                    .map_err(|error| error.to_string())?
+                };
+                conventional_view
+            }
         }
     };
     ensure_contact_tile_request_active(should_cancel)?;
@@ -3182,6 +3455,7 @@ fn get_contact_map_tiles_from_cool_inner(
             tile_cache.insert(
                 ContactTileCacheKey {
                     path: request.cool_path.clone(),
+                    source_resolution,
                     resolution: request.target_resolution,
                     tile_size_bins: request.tile_size_bins,
                     normalization: request.normalization,
@@ -3353,6 +3627,18 @@ fn contact_projection_axis_fingerprint(
     let tile_start = axis.saturating_mul(tile_span);
     let tile_end = tile_start.saturating_add(tile_span);
     let mut segments = Vec::<ContactProjectionSegment<'_>>::new();
+    let mut source_shares_by_id = HashMap::<&str, Vec<(u64, u64)>>::new();
+    for block in layout_blocks {
+        if block.source_start < block.source_end {
+            source_shares_by_id
+                .entry(block.source_id.as_str())
+                .or_default()
+                .push((block.source_start, block.source_end));
+        }
+    }
+    for source_shares in source_shares_by_id.values_mut() {
+        source_shares.sort_unstable();
+    }
 
     if tile_end > tile_start {
         for block in layout_blocks {
@@ -3381,18 +3667,17 @@ fn contact_projection_axis_fingerprint(
                     block.source_start.saturating_add(end_offset),
                 )
             };
-            let mut source_shares = layout_blocks
-                .iter()
-                .filter(|candidate| {
-                    candidate.source_id == block.source_id
-                        && candidate.source_start < candidate.source_end
-                        && candidate.source_start < source_end
-                        && candidate.source_end > source_start
+            let mut source_shares = source_shares_by_id
+                .get(block.source_id.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|(candidate_start, candidate_end)| {
+                    *candidate_start < source_end && *candidate_end > source_start
                 })
-                .map(|candidate| {
+                .map(|(candidate_start, candidate_end)| {
                     (
-                        candidate.source_start.max(source_start),
-                        candidate.source_end.min(source_end),
+                        (*candidate_start).max(source_start),
+                        (*candidate_end).min(source_end),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -3979,6 +4264,33 @@ fn imported_text_file(path: &Path) -> Result<ImportedProjectTextFile, String> {
     })
 }
 
+fn history_sidecar_path(agp_path: &Path) -> PathBuf {
+    let filename = agp_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("assembly.agp");
+    let without_compression = if filename.to_ascii_lowercase().ends_with(".gz") {
+        &filename[..filename.len().saturating_sub(3)]
+    } else {
+        filename
+    };
+    let lowercase = without_compression.to_ascii_lowercase();
+    let prefix_length = if lowercase.ends_with(".agp") || lowercase.ends_with(".txt") {
+        without_compression.len().saturating_sub(4)
+    } else {
+        without_compression.len()
+    };
+    let prefix = &without_compression[..prefix_length];
+    agp_path.with_file_name(format!(
+        "{}.history.json",
+        if prefix.is_empty() {
+            "assembly"
+        } else {
+            prefix
+        }
+    ))
+}
+
 fn sort_project_contact_candidates(candidates: &mut [PathBuf]) {
     candidates.sort_by_key(|path| {
         (
@@ -4037,6 +4349,14 @@ fn scan_project_directory(directory: &Path) -> Result<ImportedProjectDirectory, 
         .first()
         .map(|path| imported_text_file(path))
         .transpose()?;
+    let selected_history = agp.first().and_then(|path| {
+        let history_path = history_sidecar_path(path);
+        history_path.is_file().then_some(history_path)
+    });
+    let selected_history = selected_history
+        .as_deref()
+        .map(imported_text_file)
+        .transpose()?;
     let selected_gfa = gfa
         .first()
         .map(|path| imported_text_file(path))
@@ -4064,6 +4384,7 @@ fn scan_project_directory(directory: &Path) -> Result<ImportedProjectDirectory, 
     Ok(ImportedProjectDirectory {
         directory: directory.to_string_lossy().to_string(),
         agp: selected_agp,
+        history: selected_history,
         gfa: selected_gfa,
         paf: selected_paf,
         coverage: selected_coverage,
@@ -4384,15 +4705,15 @@ mod tests {
     use super::{
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
         build_synteny_view, contact_overview_aggregate_cell_bound, get_app_status,
-        layout_gfa_bandage_response, load_project_directory, open_text_reader,
-        persistent_lod_cache_key, sort_project_contact_candidates, write_agp_file,
-        write_existing_agp_path, BedGraphRecordRequest, ContactMapBinRequest,
-        ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
-        ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
-        ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
-        CoverageViewFromBedGraphRequest, CoverageViewRequest, GfaBandageLayoutEdgeRequest,
-        GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest, PafRecordRequest, SyntenyViewRequest,
-        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
+        history_sidecar_path, layout_gfa_bandage_response, load_agp_bundle, load_project_directory,
+        open_text_reader, persistent_lod_cache_key, sort_project_contact_candidates,
+        write_agp_bundle, write_agp_file, write_existing_agp_path, BedGraphRecordRequest,
+        ContactMapBinRequest, ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest,
+        ContactMapTileKeyRequest, ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest,
+        ContactMapViewRequest, ContactMapViewportRequest, ContactNormalizationRequest,
+        ContactTileRequestPurpose, CoverageViewFromBedGraphRequest, CoverageViewRequest,
+        GfaBandageLayoutEdgeRequest, GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest,
+        PafRecordRequest, SyntenyViewRequest, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
 
     #[test]
@@ -4501,6 +4822,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("z.agp"), "chr1\t1\t10\t1\tW\tctg1\t1\t10\t+\n").unwrap();
         fs::write(root.join("a.agp"), "chr1\t1\t20\t1\tW\tctg1\t1\t20\t+\n").unwrap();
+        fs::write(root.join("a.history.json"), "{\"version\":1}").unwrap();
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(b"S\tctg1\tACGT\n").unwrap();
         fs::write(root.join("graph.gfa.gz"), encoder.finish().unwrap()).unwrap();
@@ -4509,6 +4831,8 @@ mod tests {
 
         let project = load_project_directory(root.to_string_lossy().into_owned()).unwrap();
         assert_eq!(project.agp.as_ref().unwrap().name, "a.agp");
+        assert_eq!(project.history.as_ref().unwrap().name, "a.history.json");
+        assert_eq!(project.history.as_ref().unwrap().text, "{\"version\":1}");
         assert_eq!(project.gfa.as_ref().unwrap().text, "S\tctg1\tACGT\n");
         assert_eq!(project.paf.as_ref().unwrap().name, "reads.paf.gz");
         assert_eq!(project.coverage.as_ref().unwrap().name, "track.depth.gz");
@@ -4615,9 +4939,11 @@ mod tests {
             purpose: ContactTileRequestPurpose::Visible,
             cool_path: "/tmp/input.cool".to_string(),
             base_resolution: 1_000,
+            source_resolution: None,
             target_resolution: 1_000,
             tile_size_bins: 256,
             normalization: ContactNormalizationRequest::Raw,
+            adaptive_refinement: false,
             tiles: vec![ContactMapTileKeyRequest {
                 tile_x: 0,
                 tile_y: 0,
@@ -4625,6 +4951,68 @@ mod tests {
             layout_handle,
             layout_blocks,
         }
+    }
+
+    #[test]
+    fn adaptive_mcool_refinement_requires_explicit_local_visible_request() {
+        let mut request = test_contact_tile_request(None, Vec::new());
+        request.cool_path = "/tmp/input.mcool".to_string();
+        request.target_resolution = 2_500_000;
+        request.adaptive_refinement = true;
+        request.tiles = vec![
+            ContactMapTileKeyRequest {
+                tile_x: 10,
+                tile_y: 10,
+            },
+            ContactMapTileKeyRequest {
+                tile_x: 10,
+                tile_y: 11,
+            },
+            ContactMapTileKeyRequest {
+                tile_x: 11,
+                tile_y: 10,
+            },
+            ContactMapTileKeyRequest {
+                tile_x: 11,
+                tile_y: 11,
+            },
+        ];
+        let mut resolved = super::resolve_contact_tile_request(request, None).unwrap();
+
+        assert!(super::adaptive_mcool_refinement_requested(
+            &resolved,
+            &resolved.tiles,
+        ));
+
+        resolved.adaptive_refinement = false;
+        assert!(!super::adaptive_mcool_refinement_requested(
+            &resolved,
+            &resolved.tiles,
+        ));
+        resolved.adaptive_refinement = true;
+        resolved.purpose = ContactTileRequestPurpose::SpatialPrefetch;
+        assert!(!super::adaptive_mcool_refinement_requested(
+            &resolved,
+            &resolved.tiles,
+        ));
+        resolved.purpose = ContactTileRequestPurpose::Visible;
+        resolved.tiles.push(ContactMapTileKeyRequest {
+            tile_x: 12,
+            tile_y: 12,
+        });
+        assert!(!super::adaptive_mcool_refinement_requested(
+            &resolved,
+            &resolved.tiles,
+        ));
+        resolved.tiles.truncate(4);
+        resolved.tiles[3] = ContactMapTileKeyRequest {
+            tile_x: 15,
+            tile_y: 15,
+        };
+        assert!(!super::adaptive_mcool_refinement_requested(
+            &resolved,
+            &resolved.tiles,
+        ));
     }
 
     #[test]
@@ -4867,9 +5255,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path,
                 base_resolution: 1_000,
+                source_resolution: None,
                 target_resolution: 10_000,
                 tile_size_bins: 256,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: chunks.iter().flatten().copied().collect(),
                 layout_handle: None,
                 layout_blocks,
@@ -4923,6 +5313,35 @@ mod tests {
         );
         assert_eq!(stats, (3, 0, 3));
         assert_eq!(tile_cache.lock().expect("tile cache lock").len(), 3);
+
+        let mut lod_request = request.clone();
+        lod_request.source_resolution = Some(10_000);
+        let lod_source_cache = Mutex::new(SourceContactCache::new(16 * 1024 * 1024));
+        let lod_tile_cache = Mutex::new(HashMap::new());
+        let mut lod_emitted = Vec::new();
+        let lod_stats = super::compute_contact_tile_chunks_progressively(
+            lod_request,
+            &chunks,
+            &lod_source_cache,
+            &lod_tile_cache,
+            &|| false,
+            Instant::now(),
+            |tiles| {
+                // Coarse LOD scans once, caches the whole visible set, and then
+                // preserves the center-first presentation order.
+                assert_eq!(lod_tile_cache.lock().expect("LOD tile cache lock").len(), 3);
+                lod_emitted.push(
+                    tiles
+                        .iter()
+                        .map(|tile| (tile.tile_x, tile.tile_y))
+                        .collect::<Vec<_>>(),
+                );
+                Ok(tiles.len())
+            },
+        )
+        .expect("single-scan LOD chunks should render");
+        assert_eq!(lod_emitted, emitted);
+        assert_eq!(lod_stats, (3, 0, 3));
 
         let cancelled = Cell::new(false);
         let cancelled_source_cache = Mutex::new(SourceContactCache::new(16 * 1024 * 1024));
@@ -5239,6 +5658,40 @@ mod tests {
     }
 
     #[test]
+    fn writes_and_loads_a_same_prefix_history_sidecar() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "c-studio-history-save-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.edited.agp");
+        let saved_path = write_agp_bundle(
+            path.to_string_lossy().into_owned(),
+            "chr1\t1\t10\t1\tW\tctg1\t1\t10\t+\n".to_string(),
+            "{\"format\":\"c-studio-operation-history\"}\n".to_string(),
+        )
+        .expect("AGP bundle should be written");
+
+        assert_eq!(saved_path, path.to_string_lossy());
+        assert_eq!(
+            history_sidecar_path(&path).file_name().unwrap(),
+            "sample.edited.history.json"
+        );
+        let loaded = load_agp_bundle(saved_path).expect("AGP bundle should load");
+        assert_eq!(loaded.agp.name, "sample.edited.agp");
+        assert_eq!(
+            loaded.history.expect("history sidecar should load").name,
+            "sample.edited.history.json"
+        );
+
+        fs::remove_dir_all(root).expect("test bundle should be removed");
+    }
+
+    #[test]
     fn contact_normalization_request_uses_stable_wire_values() {
         for (wire_value, expected) in [
             ("raw", ContactNormalizationRequest::Raw),
@@ -5275,6 +5728,8 @@ mod tests {
 
         assert_eq!(request.normalization, ContactNormalizationRequest::Raw);
         assert_eq!(request.purpose, ContactTileRequestPurpose::Visible);
+        assert_eq!(request.source_resolution, None);
+        assert!(!request.adaptive_refinement);
         assert_eq!(request.layout_handle, None);
     }
 
@@ -5423,9 +5878,10 @@ mod tests {
     }
 
     #[test]
-    fn contact_tile_cache_identity_includes_normalization() {
+    fn contact_tile_cache_identity_includes_source_resolution_and_normalization() {
         let raw = super::ContactTileCacheKey {
             path: "/tmp/input.cool".to_string(),
+            source_resolution: 10_000,
             resolution: 10_000,
             tile_size_bins: 256,
             normalization: ContactNormalizationRequest::Raw,
@@ -5437,8 +5893,13 @@ mod tests {
             normalization: ContactNormalizationRequest::Kr,
             ..raw.clone()
         };
+        let coarser_source = super::ContactTileCacheKey {
+            source_resolution: 2_500,
+            ..raw.clone()
+        };
 
         assert_ne!(raw, kr);
+        assert_ne!(raw, coarser_source);
     }
 
     #[test]
@@ -5562,9 +6023,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path: "/path/that/does/not/exist.cool".to_string(),
                 base_resolution: 1_000,
+                source_resolution: None,
                 target_resolution: 1_000,
                 tile_size_bins: 256,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: vec![ContactMapTileKeyRequest {
                     tile_x: 0,
                     tile_y: 0,
@@ -6192,6 +6655,7 @@ mod tests {
         let unaffected_cache = Mutex::new(HashMap::from([(
             super::ContactTileCacheKey {
                 path: cool_path.clone(),
+                source_resolution: target_resolution,
                 resolution: target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
@@ -6213,9 +6677,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path: cool_path.clone(),
                 base_resolution: target_resolution,
+                source_resolution: None,
                 target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: vec![unaffected_tile],
                 layout_handle: None,
                 layout_blocks: inserted.clone(),
@@ -6246,6 +6712,7 @@ mod tests {
         let affected_cache = Mutex::new(HashMap::from([(
             super::ContactTileCacheKey {
                 path: cool_path.clone(),
+                source_resolution: target_resolution,
                 resolution: target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
@@ -6266,9 +6733,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path,
                 base_resolution: target_resolution,
+                source_resolution: None,
                 target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: vec![affected_tile],
                 layout_handle: None,
                 layout_blocks: inserted,
@@ -6305,6 +6774,7 @@ mod tests {
         let tile_cache = Mutex::new(HashMap::from([(
             super::ContactTileCacheKey {
                 path: cool_path.clone(),
+                source_resolution: target_resolution,
                 resolution: target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
@@ -6328,9 +6798,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path,
                 base_resolution: 1_000,
+                source_resolution: None,
                 target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: vec![
                     ContactMapTileKeyRequest {
                         tile_x: 0,
@@ -6395,9 +6867,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path.clone(),
                 base_resolution: 1_000,
+                source_resolution: None,
                 target_resolution: 10_000,
                 tile_size_bins: 256,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: vec![
                     ContactMapTileKeyRequest {
                         tile_x: 10_000,
@@ -6439,9 +6913,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path,
                 base_resolution: 1_000,
+                source_resolution: None,
                 target_resolution: 10_000,
                 tile_size_bins: 256,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: vec![
                     ContactMapTileKeyRequest {
                         tile_x: 10_000,
@@ -6534,9 +7010,11 @@ mod tests {
             purpose: ContactTileRequestPurpose::Visible,
             cool_path: summary.cool_path.clone(),
             base_resolution: 1_000,
+            source_resolution: None,
             target_resolution,
             tile_size_bins,
             normalization: ContactNormalizationRequest::Raw,
+            adaptive_refinement: false,
             tiles: vec![ContactMapTileKeyRequest { tile_x, tile_y }],
             layout_handle: None,
             layout_blocks: vec![ContactMapLayoutBlockRequest {
@@ -6612,14 +7090,14 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| benchmark_root.join("groups.final.agp"));
         let cool_path = match scenario.as_str() {
-            "overview_mcool" | "tiles_mcool" | "delta_mcool_visible" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
+            "overview_mcool" | "tiles_mcool" | "lod_tiles_mcool" | "delta_mcool_visible" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| benchmark_root.join("input.q1.1k_allres.mcool")),
-            "overview_cool" | "overview_cool_cache" | "tiles_cool" | "delta_cool" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
+            "overview_cool" | "overview_cool_cache" | "tiles_cool" | "lod_tiles_cool" | "delta_cool" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| benchmark_root.join("input.q1.1k.cool")),
             other => panic!(
-                "unknown CSTUDIO_POJ_BENCH_SCENARIO={other}; expected overview_mcool, overview_cool, overview_cool_cache, tiles_mcool, delta_mcool_visible, delta_cool, or tiles_cool"
+                "unknown CSTUDIO_POJ_BENCH_SCENARIO={other}; expected overview_mcool, overview_cool, overview_cool_cache, lod_tiles_mcool, lod_tiles_cool, tiles_mcool, delta_mcool_visible, delta_cool, or tiles_cool"
             ),
         };
 
@@ -6649,7 +7127,7 @@ mod tests {
         };
         let source_resolution = if matches!(
             scenario.as_str(),
-            "overview_mcool" | "tiles_mcool" | "delta_mcool_visible"
+            "overview_mcool" | "tiles_mcool" | "lod_tiles_mcool" | "delta_mcool_visible"
         ) {
             2_500_000
         } else {
@@ -6769,7 +7247,18 @@ mod tests {
         }
 
         let tile_size_bins = 256_u64;
-        let target_resolution = if scenario == "delta_mcool_visible" {
+        let target_resolution = if scenario.starts_with("lod_tiles_") {
+            std::env::var("CSTUDIO_POJ_BENCH_TARGET_RESOLUTION")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| {
+                    total_span
+                        .div_ceil(640)
+                        .div_ceil(source_resolution)
+                        .saturating_mul(source_resolution)
+                })
+                .max(source_resolution)
+        } else if scenario == "delta_mcool_visible" {
             std::env::var("CSTUDIO_POJ_BENCH_TARGET_RESOLUTION")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -6846,9 +7335,11 @@ mod tests {
                         purpose: ContactTileRequestPurpose::Visible,
                         cool_path: cool_path.to_string_lossy().into_owned(),
                         base_resolution: 1_000,
+                        source_resolution: None,
                         target_resolution,
                         tile_size_bins,
                         normalization: ContactNormalizationRequest::Raw,
+                        adaptive_refinement: false,
                         tiles: tiles.clone(),
                         layout_handle: None,
                         layout_blocks: Vec::new(),
@@ -6906,6 +7397,76 @@ mod tests {
         }
 
         let source_cache = Mutex::new(SourceContactCache::new(256 * 1024 * 1024));
+        if scenario.starts_with("lod_tiles_") {
+            let chunks = tiles
+                .chunks(2)
+                .map(|chunk| chunk.to_vec())
+                .collect::<Vec<_>>();
+            for sample in 0..sample_count {
+                let visual_cache = Mutex::new(HashMap::new());
+                let request = super::ResolvedContactMapTilesFromCoolRequest {
+                    request: ContactMapTilesFromCoolRequest {
+                        request_id: 195_000 + sample as u64,
+                        generation: 1,
+                        purpose: ContactTileRequestPurpose::Visible,
+                        cool_path: cool_path.to_string_lossy().into_owned(),
+                        base_resolution: source_resolution,
+                        source_resolution: Some(source_resolution),
+                        target_resolution,
+                        tile_size_bins,
+                        normalization: ContactNormalizationRequest::Raw,
+                        adaptive_refinement: false,
+                        tiles: tiles.clone(),
+                        layout_handle: None,
+                        layout_blocks: Vec::new(),
+                    },
+                    layout_blocks: Arc::clone(&layout_blocks),
+                };
+                let started = Instant::now();
+                let mut first_chunk_us = None;
+                let mut response_count = 0_f64;
+                let (returned_tiles, response_cells, response_bytes) =
+                    super::compute_contact_tile_chunks_progressively(
+                        request,
+                        &chunks,
+                        &source_cache,
+                        &visual_cache,
+                        &|| false,
+                        started,
+                        |chunk| {
+                            first_chunk_us.get_or_insert_with(|| started.elapsed().as_micros());
+                            response_count += chunk
+                                .iter()
+                                .flat_map(|tile| tile.cells.iter())
+                                .map(|cell| cell.count)
+                                .sum::<f64>();
+                            super::encode_contact_map_tiles_binary_v1(
+                                chunk,
+                                tile_size_bins,
+                                &|| false,
+                            )
+                            .map(|bytes| bytes.len())
+                        },
+                    )
+                    .expect("POJ tiled LOD should render progressively");
+                println!(
+                    "CSTUDIO_POJ_BENCH result scenario={} sample={} total_us={} first_batch_us={} requested_tiles={} returned_tiles={} batches={} response_cells={} response_count={} response_bytes={}",
+                    scenario,
+                    sample + 1,
+                    started.elapsed().as_micros(),
+                    first_chunk_us.unwrap_or(0),
+                    tiles.len(),
+                    returned_tiles,
+                    chunks.len(),
+                    response_cells,
+                    response_count,
+                    response_bytes,
+                );
+            }
+            return;
+        }
+
+        let request_batch_size = 8;
         for sample in 0..sample_count {
             // A new visual cache models a new whole-genome generation while the
             // process-level source/adaptive caches remain warm after sample 1.
@@ -6917,17 +7478,25 @@ mod tests {
             let mut cool_read_us = 0_u128;
             let mut projection_us = 0_u128;
             let mut first_batch_us = None;
-            for (batch_index, batch) in tiles.chunks(8).enumerate() {
+            for (batch_index, batch) in tiles.chunks(request_batch_size).enumerate() {
                 let request = super::ResolvedContactMapTilesFromCoolRequest {
                     request: ContactMapTilesFromCoolRequest {
                         request_id: 200_000 + sample as u64 * 1_000 + batch_index as u64,
                         generation: 1,
                         purpose: ContactTileRequestPurpose::Visible,
                         cool_path: cool_path.to_string_lossy().into_owned(),
-                        base_resolution: 1_000,
+                        base_resolution: if scenario.starts_with("lod_tiles_") {
+                            source_resolution
+                        } else {
+                            1_000
+                        },
+                        source_resolution: scenario
+                            .starts_with("lod_tiles_")
+                            .then_some(source_resolution),
                         target_resolution,
                         tile_size_bins,
                         normalization: ContactNormalizationRequest::Raw,
+                        adaptive_refinement: tiles.len() <= super::MAX_ADAPTIVE_MCOOL_EXACT_TILES,
                         tiles: batch.to_vec(),
                         layout_handle: None,
                         layout_blocks: Vec::new(),
@@ -6965,13 +7534,62 @@ mod tests {
                 first_batch_us.unwrap_or(0),
                 tiles.len(),
                 returned_tiles,
-                tiles.len().div_ceil(8),
+                tiles.len().div_ceil(request_batch_size),
                 response_cells,
                 response_count,
                 cool_read_us,
                 projection_us,
             );
         }
+    }
+
+    #[test]
+    fn coarse_tiles_read_an_explicit_mcool_source_resolution() {
+        let summary = super::load_example_dataset().expect("example dataset should load");
+        let layout_blocks = summary
+            .agp_layout
+            .blocks
+            .into_iter()
+            .map(|block| ContactMapLayoutBlockRequest {
+                id: block.id,
+                source_id: block.source_id,
+                source_start: block.source_start,
+                source_end: block.source_end,
+                visual_start: block.visual_start,
+                orientation: block.orientation,
+            })
+            .collect();
+        let source_cache = Mutex::new(SourceContactCache::new(16 * 1024 * 1024));
+        let tile_cache = Mutex::new(HashMap::new());
+        let response = super::get_contact_map_tiles_from_cool_with_cache(
+            ContactMapTilesFromCoolRequest {
+                request_id: 2,
+                generation: 1,
+                purpose: ContactTileRequestPurpose::Visible,
+                cool_path: summary.cool_path,
+                base_resolution: 1_000,
+                source_resolution: Some(1_000),
+                // This synthetic LOD level is intentionally absent from the
+                // .mcool hierarchy; contacts must come from the 1 kb group.
+                target_resolution: 7_000,
+                tile_size_bins: 256,
+                normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
+                tiles: vec![ContactMapTileKeyRequest {
+                    tile_x: 0,
+                    tile_y: 0,
+                }],
+                layout_handle: None,
+                layout_blocks,
+            },
+            &source_cache,
+            &tile_cache,
+        )
+        .expect("coarse tile should aggregate from the explicit stored source group");
+
+        assert_eq!(response.len(), 1);
+        assert_eq!((response[0].tile_x, response[0].tile_y), (0, 0));
+        assert!(!response[0].cells.is_empty());
     }
 
     #[test]
@@ -7004,9 +7622,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path.clone(),
                 base_resolution: 1_000,
+                source_resolution: None,
                 target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: vec![ContactMapTileKeyRequest {
                     tile_x: 0,
                     tile_y: 0,
@@ -7029,9 +7649,11 @@ mod tests {
                 purpose: ContactTileRequestPurpose::Visible,
                 cool_path: summary.cool_path,
                 base_resolution: 1_000,
+                source_resolution: None,
                 target_resolution,
                 tile_size_bins,
                 normalization: ContactNormalizationRequest::Raw,
+                adaptive_refinement: false,
                 tiles: vec![ContactMapTileKeyRequest {
                     tile_x: 1,
                     tile_y: 1,

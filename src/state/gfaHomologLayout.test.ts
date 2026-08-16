@@ -7,6 +7,7 @@ import {
   gfaCurationNodeWidths,
   gfaHomologRowGap,
   gfaLinkScope,
+  gfaSmoothLinkCurve,
   layoutGfaNodePathsBandage,
   layoutGfaNodesBandage,
   layoutGfaNodesForCuration,
@@ -341,6 +342,33 @@ describe("GFA homologous chromosome grouping", () => {
 
     expect(first).toEqual({ x: 50, y: 20 });
     expect(moved).not.toEqual(first);
+  });
+
+  it("keeps a moving GFA link tangent to both current visual endpoints", () => {
+    const curve = gfaSmoothLinkCurve(
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+      { x: 1, y: 0 },
+      { x: -1, y: 0 },
+      1,
+    );
+    const moved = gfaSmoothLinkCurve(
+      { x: 0, y: 0 },
+      { x: 80, y: 90 },
+      { x: 0, y: -1 },
+      { x: 1, y: 0 },
+      1,
+    );
+
+    expect(curve.sourceControl.y).toBe(0);
+    expect(curve.targetControl.y).toBe(0);
+    expect(curve.midpoint.y).toBeGreaterThan(0);
+    expect(moved.sourceControl.x).toBe(0);
+    expect(moved.sourceControl.y).toBeLessThan(0);
+    expect(moved.targetControl.x).toBeGreaterThan(80);
+    expect(moved).not.toEqual(curve);
+    expect(Object.values(moved).flatMap((point) => [point.x, point.y]).every(Number.isFinite))
+      .toBe(true);
   });
 
   it("keeps placed chromosome rows fixed and puts linked unanchored nodes to the right", () => {

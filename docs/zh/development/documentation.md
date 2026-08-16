@@ -12,27 +12,31 @@ docs/
 └── zh/                 # 简体中文源文件
 mkdocs_en.yml           # 英文 -> site/
 mkdocs_zh.yml           # 中文 -> site/zh/
-requirements-docs.txt   # Zensical 与固定提交的 Zensical 版 Mike
-scripts/build-docs.sh   # 两种语言的严格构建
+pixi.toml               # 文档环境与可复用任务
+pixi.lock               # Conda 与 PyPI 依赖的精确锁定
+scripts/build-docs.sh   # Pixi 任务的兼容包装脚本
 .github/workflows/docs.yml
 ```
 
-## 安装 Zensical
+## 安装文档环境
+
+先安装 [Pixi](https://pixi.sh/latest/installation/)，再创建已锁定的 `docs`
+环境：
 
 ```bash
-python3 -m venv .venv-docs
-source .venv-docs/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-docs.txt
+pixi install -e docs
 ```
+
+Pixi 会安装 Python、Git、Zensical，以及固定到指定提交的 Zensical 兼容版 Mike。
+无需再为这些工具创建独立虚拟环境。
 
 ## 构建两种语言
 
 ```bash
-bash scripts/build-docs.sh
+pixi run --locked -e docs docs-build
 ```
 
-脚本执行：
+该任务执行：
 
 ```bash
 zensical build --strict --clean -f mkdocs_en.yml
@@ -45,7 +49,7 @@ zensical build --strict --clean -f mkdocs_zh.yml
 预览合并结果：
 
 ```bash
-python -m http.server --directory site 8000
+pixi run --locked -e docs docs-serve
 ```
 
 分别打开 `http://127.0.0.1:8000/` 与
@@ -54,7 +58,7 @@ python -m http.server --directory site 8000
 撰写时只实时预览一种语言：
 
 ```bash
-zensical serve -f mkdocs_en.yml
+pixi run --locked -e docs docs-serve-en
 ```
 
 ## 保持翻译同步
@@ -95,9 +99,9 @@ zensical serve -f mkdocs_en.yml
 两个输入都留空时，会发布所选标签，或从所选分支刷新 `dev`。工作流会拒绝同时
 使用两个输入。
 
-Mike 固定到文档环境所用的 Zensical 兼容分支及提交。每次发布前，
-`scripts/build-docs.sh` 先执行严格的 Zensical 双语构建；随后 Mike 把各版本产物
-提交到 `gh-pages`。
+Mike 固定到 `pixi.lock` 中记录的 Zensical 兼容分支及提交。每次发布前，工作流
+先运行严格的 `docs-build` 双语构建任务；随后 Mike 把各版本产物提交到
+`gh-pages`。
 
 在 **Settings → Pages → Source** 中选择 **Deploy from a branch**，分支选择
 `gh-pages`，目录选择 `/ (root)`。只有规范仓库 `wangyibin/C-Studio` 的发布任务
@@ -106,11 +110,11 @@ Mike 固定到文档环境所用的 Zensical 兼容分支及提交。每次发�
 如需本地检查完整版本站点，请在一次性克隆中运行不带 `--push` 的命令：
 
 ```bash
-mike deploy -F mkdocs_en.yml v0.0.0-test latest
-mike deploy -F mkdocs_zh.yml --deploy-prefix zh v0.0.0-test latest
-mike set-default -F mkdocs_en.yml latest
-mike set-default -F mkdocs_zh.yml --deploy-prefix zh latest
-mike serve
+pixi run --locked -e docs mike deploy -F mkdocs_en.yml v0.0.0-test latest
+pixi run --locked -e docs mike deploy -F mkdocs_zh.yml --deploy-prefix zh v0.0.0-test latest
+pixi run --locked -e docs mike set-default -F mkdocs_en.yml latest
+pixi run --locked -e docs mike set-default -F mkdocs_zh.yml --deploy-prefix zh latest
+pixi run --locked -e docs mike serve
 ```
 
 这些命令会在本地创建 `gh-pages` 提交。仅测试时不要添加 `--push`。

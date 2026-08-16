@@ -15,55 +15,42 @@ concurrency:
 
 jobs:
   package-macos:
-    name: macOS universal
-    runs-on: macos-latest
+    name: macOS Apple Silicon
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Pixi package environment
+        uses: prefix-dev/setup-pixi@v0.10.1
         with:
-          node-version: 22
-          cache: npm
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          pixi-version: v0.75.0
+          environments: package
+          locked: true
+          cache: true
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
 
-      - name: Install frontend dependencies
-        run: npm ci
-
       - name: Build macOS app and DMG
-        uses: tauri-apps/tauri-action@v1
-        env:
-          # Ad-hoc signing avoids unsigned Apple Silicon bundles being reported
-          # as damaged. Production distribution can replace this with a
-          # Developer ID certificate and notarization secrets later.
-          APPLE_SIGNING_IDENTITY: "-"
-        with:
-          args: --target universal-apple-darwin --features portable-hdf5 --bundles app,dmg
+        run: pixi run --locked -e package package-macos
 
       - name: Archive macOS app bundle
         run: >-
           ditto -c -k --sequesterRsrc --keepParent
-          "src-tauri/target/universal-apple-darwin/release/bundle/macos/C-Studio.app"
-          "src-tauri/target/universal-apple-darwin/release/bundle/macos/C-Studio-universal.app.zip"
+          "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/C-Studio.app"
+          "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/C-Studio-arm64.app.zip"
 
       - name: Upload macOS packages
         uses: actions/upload-artifact@v4
         with:
-          name: c-studio-macos-universal-${{ github.run_number }}
+          name: c-studio-macos-arm64-${{ github.run_number }}
           path: |
-            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.zip
-            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.zip
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 7
 
@@ -75,29 +62,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Pixi package environment
+        uses: prefix-dev/setup-pixi@v0.10.1
         with:
-          node-version: 22
-          cache: npm
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+          pixi-version: v0.75.0
+          environments: package
+          locked: true
+          cache: true
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
 
-      - name: Install frontend dependencies
-        run: npm ci
-
       - name: Build Windows installers
-        uses: tauri-apps/tauri-action@v1
-        with:
-          args: --target x86_64-pc-windows-msvc --features portable-hdf5 --bundles nsis,msi
+        run: pixi run --locked -e package package-windows
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4

@@ -2252,9 +2252,37 @@ describe("reduceUiState", () => {
     expect(state.assembly.selection).toBeNull();
     expect(state.operationHistory).toEqual([]);
     expect(state.redoStack).toEqual([]);
+    expect(state.nextOperationId).toBe(1);
 
     state = reduceUiState(state, { type: "undo" });
     expect(state.assembly.blocks).toEqual(nextAssembly);
+  });
+
+  it("restores an imported applied and redo history onto its AGP layout", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:1:ctg1",
+      additive: false,
+    });
+    state = reduceUiState(state, { type: "reverseAssemblySelection" });
+    const operation = state.operationHistory[0];
+    expect(operation).toBeDefined();
+
+    const restored = reduceUiState(createInitialUiState("Reloaded"), {
+      type: "restoreAssemblyHistory",
+      blocks: state.assembly.blocks,
+      operationHistory: operation ? [operation] : [],
+      redoStack: [],
+      nextOperationId: 2,
+    });
+
+    expect(restored.assembly.blocks).toEqual(state.assembly.blocks);
+    expect(restored.assembly.selection).toBeNull();
+    expect(restored.operationHistory).toEqual([operation]);
+    expect(restored.redoStack).toEqual([]);
+    expect(restored.nextOperationId).toBe(2);
   });
 
   it("clears loaded-data state and edit history while preserving workspace preferences", () => {
