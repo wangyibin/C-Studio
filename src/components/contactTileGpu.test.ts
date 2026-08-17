@@ -11,6 +11,7 @@ function mockWebGlCanvas() {
   const texSubImage2D = vi.fn();
   const getError = vi.fn(() => 0);
   const drawArrays = vi.fn();
+  const clear = vi.fn();
   const clientWidthRead = vi.fn(() => 256);
   const clientHeightRead = vi.fn(() => 256);
   const gl = {
@@ -65,7 +66,7 @@ function mockWebGlCanvas() {
     isContextLost: vi.fn(() => false),
     viewport: vi.fn(),
     clearColor: vi.fn(),
-    clear: vi.fn(),
+    clear,
     useProgram: vi.fn(),
     enableVertexAttribArray: vi.fn(),
     vertexAttribPointer: vi.fn(),
@@ -90,6 +91,7 @@ function mockWebGlCanvas() {
   Object.defineProperty(canvas, "clientHeight", { get: clientHeightRead });
   return {
     canvas,
+    clear,
     clientHeightRead,
     clientWidthRead,
     drawArrays,
@@ -141,6 +143,72 @@ describe("contactTileFloatTextureData", () => {
     expect(texImage2D).toHaveBeenCalledTimes(uploadsBeforePan);
     expect(getError).toHaveBeenCalledTimes(validationsBeforePan);
     expect(drawArrays.mock.calls.length).toBe(drawsBeforePan + 1);
+    renderer?.destroy();
+  });
+
+  it("appends pan-prefetch textures without clearing or redrawing the scene", () => {
+    const {
+      canvas,
+      clear,
+      clientHeightRead,
+      clientWidthRead,
+      drawArrays,
+      texImage2D,
+    } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const firstTile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 1, yBin: 0, count: 9 }],
+    };
+    const nextTile = {
+      tileX: 1,
+      tileY: 1,
+      cells: [{ xBin: 5, yBin: 4, count: 7 }],
+    };
+    const viewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
+
+    expect(renderer?.setScene({
+      descriptors: [{ key: "0:0:source", tile: firstTile, transpose: false }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport,
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+    const clearsBeforeAppend = clear.mock.calls.length;
+    const drawsBeforeAppend = drawArrays.mock.calls.length;
+    const uploadsBeforeAppend = texImage2D.mock.calls.length;
+    const layoutReadsBeforeAppend = clientWidthRead.mock.calls.length
+      + clientHeightRead.mock.calls.length;
+
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [{ key: "1:1:source", tile: nextTile, transpose: false }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    expect(texImage2D.mock.calls.length).toBe(uploadsBeforeAppend + 1);
+    expect(clear).toHaveBeenCalledTimes(clearsBeforeAppend);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforeAppend);
+    expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
+      .toBe(layoutReadsBeforeAppend);
+
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { ...firstTile, cells: [{ xBin: 1, yBin: 0, count: 99 }] },
+        transpose: false,
+      }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    expect(texImage2D.mock.calls.length).toBe(uploadsBeforeAppend + 1);
+
+    renderer?.setPanOffset(4, 4);
+    expect(drawArrays.mock.calls.length).toBe(drawsBeforeAppend + 2);
     renderer?.destroy();
   });
 

@@ -34,6 +34,7 @@ import {
   createContactPanPerformanceTracker,
   type ContactPanPreview,
 } from "./state/contactPanPerformance";
+import { ContactPanPrefetchBridge } from "./state/contactPanPrefetch";
 import {
   closestContactResolution,
   contactResolutionToBasePairs,
@@ -777,6 +778,11 @@ export function App() {
     ContactPanPreview | null
   >(null);
   const pendingPanPerformancePreviewRef = useRef<ContactPanPreview | null>(null);
+  const contactPanPrefetchBridgeRef = useRef<ContactPanPrefetchBridge | null>(null);
+  if (contactPanPrefetchBridgeRef.current === null) {
+    contactPanPrefetchBridgeRef.current = new ContactPanPrefetchBridge();
+  }
+  const contactPanPrefetchBridge = contactPanPrefetchBridgeRef.current;
   const [overviewContactMap, setOverviewContactMap] = useState<ContactMapView | null>(null);
   const overviewContactMapRef = useRef<ContactMapView | null>(overviewContactMap);
   overviewContactMapRef.current = overviewContactMap;
@@ -1211,6 +1217,7 @@ export function App() {
     ?.targetResolution ?? effectiveContactTileResolution;
   const effectiveContactTilePrefetchViewport = contactTilePreviewViewport
     ?.prefetchViewport ?? effectiveContactTileViewport;
+  const contactTilePanPreviewActive = contactTilePreviewViewport !== null;
   const effectiveContactTileViewportRequestKey = contactTileViewportRequestKey(
     effectiveContactTileViewport,
     effectiveContactTilePrefetchViewport,
@@ -1221,11 +1228,14 @@ export function App() {
   );
 
   useEffect(() => {
+    const panPreviewActive = contactTilePanPreviewActive;
     const generation = contactTileGenerationRef.current + 1;
     contactTileGenerationRef.current = generation;
-    setContactTileDeltaStream((current) => (
-      current?.generation === generation ? current : null
-    ));
+    if (!panPreviewActive) {
+      setContactTileDeltaStream((current) => (
+        current?.generation === generation ? current : null
+      ));
+    }
     contactTilePerformance.supersedeBefore(generation);
     if (!contactTilePreviewViewport) {
       contactPanPerformance.continueGeneration(generation);
@@ -1313,6 +1323,21 @@ export function App() {
       ?? pendingPanPerformancePreviewRef.current;
     const tileSizeBins = contactTileSizeBins;
     const normalization = contactNormalizationForBackend(uiState.normalization);
+    const publishPanPrefetchTiles = (
+      tiles: readonly ContactMapTile[],
+      resolution: number,
+      activeTileSizeBins: number,
+    ) => {
+      if (!panPreviewActive || tiles.length === 0) {
+        return;
+      }
+      contactPanPrefetchBridge.publish({
+        tiles,
+        resolution,
+        tileSizeBins: activeTileSizeBins,
+        viewport: prefetchViewport,
+      });
+    };
     const tileScope = contactTileScope(
       contactCoolPath,
       targetResolution,
@@ -1465,12 +1490,12 @@ export function App() {
     const retainedRequestIds = mainLodTileState
       ? contactMainLodTileFlightsRef.current.requestIdsFor(
           mainLodTileState.lodScope,
-          mainLodTileState.lodWorld.visibleTiles,
+          mainLodTileState.lodWorld.prefetchTiles,
           mainLodTileState.lodCacheKeyForTile,
         )
       : contactTileFlightsRef.current.requestIdsFor(
           tileScope,
-          tileWorld.visibleTiles,
+          tileWorld.prefetchTiles,
           cacheKeyForTile,
         );
     const generationStart = invoke<number[]>("begin_contact_tile_generation", {
@@ -1516,7 +1541,7 @@ export function App() {
         mainLodScope,
       );
       const mainLodDirectDeltaStreamMode = contactTileDeltaStreamMode(
-        contactTileDirectDeltaEnabled,
+        contactTileDirectDeltaEnabled && !panPreviewActive,
         holdsPreviousCompleteFrame,
       );
       const presentsMainLodDirectDeltaStream = mainLodDirectDeltaStreamMode === "overlay";
@@ -1594,23 +1619,35 @@ export function App() {
       };
       const initialMainLodMap = mainLodMapForWorld(mainLodWorld);
       let mainLodVisibleReady = mainLodWorld.missingVisibleTiles.length === 0;
+      publishPanPrefetchTiles(
+        mainLodWorld.cachedPrefetchTiles,
+        mainLodPlan.targetResolution,
+        lodTileSizeBins,
+      );
       if (mainLodVisibleReady) {
-        applyMainLodAutoColorScale(initialMainLodMap);
-        lastCompleteContactMapRef.current = initialMainLodMap;
-        setContactMap(initialMainLodMap);
-        reuseMainLodAsOverview(initialMainLodMap);
+        if (!panPreviewActive) {
+          applyMainLodAutoColorScale(initialMainLodMap);
+          lastCompleteContactMapRef.current = initialMainLodMap;
+          setContactMap(initialMainLodMap);
+          reuseMainLodAsOverview(initialMainLodMap);
+        }
       } else {
         const displayedMainLod = displayContactMapForPendingLayer(
           initialMainLodMap,
           previousCompleteMap,
           false,
         );
-        if (shouldPublishContactMapLayer(holdsPreviousCompleteFrame, false)) {
+        if (
+          !panPreviewActive
+          && shouldPublishContactMapLayer(holdsPreviousCompleteFrame, false)
+        ) {
           setContactMap(displayedMainLod);
         }
-        setStatusMessage(
-          `Loading reusable LOD tiles at ${formatBasePairResolution(mainLodPlan.targetResolution)}…`,
-        );
+        if (!panPreviewActive) {
+          setStatusMessage(
+            `Loading reusable LOD tiles at ${formatBasePairResolution(mainLodPlan.targetResolution)}…`,
+          );
+        }
       }
 
       void (async () => {
@@ -1621,14 +1658,18 @@ export function App() {
         if (cancelled || generation !== contactTileGenerationRef.current) {
           return;
         }
-        setBackendStartedContactTileGeneration((current) => (
-          current === generation ? current : generation
-        ));
+        if (!panPreviewActive) {
+          setBackendStartedContactTileGeneration((current) => (
+            current === generation ? current : generation
+          ));
+        }
         if (mainLodVisibleReady) {
-          setStatusMessage(
-            `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
-          );
-          markMainLodPainted();
+          if (!panPreviewActive) {
+            setStatusMessage(
+              `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
+            );
+            markMainLodPainted();
+          }
         }
         const commitMainLodTiles = (
           kind: "visible" | "prefetch",
@@ -1688,10 +1729,18 @@ export function App() {
             lastCompleteContactMapRef.current,
             layerComplete,
           );
-          if (layerComplete) {
+          publishPanPrefetchTiles(
+            tiles,
+            mainLodPlan.targetResolution,
+            lodTileSizeBins,
+          );
+          if (layerComplete && !panPreviewActive) {
             lastCompleteContactMapRef.current = updatedMainLodMap;
           }
-          if (shouldPublishContactMapLayer(holdsPreviousCompleteFrame, layerComplete)) {
+          if (
+            !panPreviewActive
+            && shouldPublishContactMapLayer(holdsPreviousCompleteFrame, layerComplete)
+          ) {
             if (kind === "visible" && layerComplete) {
               applyMainLodAutoColorScale(updatedMainLodMap);
             }
@@ -1699,11 +1748,13 @@ export function App() {
           }
           if (kind === "visible" && layerComplete) {
             mainLodVisibleReady = true;
-            reuseMainLodAsOverview(updatedMainLodMap);
-            setStatusMessage(
-              `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
-            );
-            markMainLodPainted();
+            if (!panPreviewActive) {
+              reuseMainLodAsOverview(updatedMainLodMap);
+              setStatusMessage(
+                `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
+              );
+              markMainLodPainted();
+            }
           }
         };
         const mainLodVisibleTiles = combineContactMainLodVisibleBatches(
@@ -1899,11 +1950,13 @@ export function App() {
         ) {
           return;
         }
-        setStatusMessage(
-          mainLodVisibleReady
-            ? `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`
-            : `Contact map tiled LOD failed: ${String(error)}`,
-        );
+        if (!panPreviewActive) {
+          setStatusMessage(
+            mainLodVisibleReady
+              ? `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`
+              : `Contact map tiled LOD failed: ${String(error)}`,
+          );
+        }
         dispatchUi({
           type: "appendLog",
           message: `${mainLodVisibleReady ? "Contact LOD prefetch" : "Contact map tiled LOD"} failed: ${String(error)}`,
@@ -1940,7 +1993,9 @@ export function App() {
       previousCompleteMap?.normalization !== undefined
       && previousCompleteMap.normalization !== normalization
     ) {
-      setStatusMessage(`Applying ${uiState.normalization} normalization…`);
+      if (!panPreviewActive) {
+        setStatusMessage(`Applying ${uiState.normalization} normalization…`);
+      }
     }
     const holdsPreviousCompleteFrame = shouldHoldPreviousContactMapFrame(
       previousCompleteMap,
@@ -2014,8 +2069,14 @@ export function App() {
       dispatchUi({ type: "setAutoColorScale", scale });
     };
     const initialContactMap = contactMapForWorld(tileWorld);
+    publishPanPrefetchTiles(
+      tileWorld.cachedPrefetchTiles,
+      targetResolution,
+      tileSizeBins,
+    );
     if (
-      holdsPreviousCompleteFrame
+      !panPreviewActive
+      && holdsPreviousCompleteFrame
       && previousCompleteMap
       && tileWorld.missingVisibleTiles.length > 0
     ) {
@@ -2034,7 +2095,8 @@ export function App() {
       `Contact map rendered with ${uiState.normalization} at ${uiState.contact.resolution}, ${formatViewportLabel(viewport)}`;
     const scheduleAdjacentResolutionPrefetch = () => {
       if (
-        adjacentPrefetchStarted
+        panPreviewActive
+        || adjacentPrefetchStarted
         || cancelled
         || generation !== contactTileGenerationRef.current
       ) {
@@ -2301,7 +2363,7 @@ export function App() {
         });
       });
     };
-    if (tileWorld.missingVisibleTiles.length === 0) {
+    if (!panPreviewActive && tileWorld.missingVisibleTiles.length === 0) {
       // Resolve the final target style before publishing the complete layer.
       // React batches this reducer update with the map update, so the hidden
       // surface is never prepared once with a provisional color scale.
@@ -2319,11 +2381,11 @@ export function App() {
         lastCompleteContactMapRef.current,
         tileWorld.missingVisibleTiles.length === 0,
       );
-      if (tileWorld.missingVisibleTiles.length === 0) {
+      if (!panPreviewActive && tileWorld.missingVisibleTiles.length === 0) {
         lastCompleteContactMapRef.current = pendingContactMap;
       }
 
-      if (shouldPublishContactMapLayer(
+      if (!panPreviewActive && shouldPublishContactMapLayer(
         holdsPreviousCompleteFrame,
         tileWorld.missingVisibleTiles.length === 0,
       )) {
@@ -2367,6 +2429,7 @@ export function App() {
         );
         const nextCache = contactTileCacheLru.toMap();
         contactTileCacheRef.current = nextCache;
+        publishPanPrefetchTiles(tiles, targetResolution, tileSizeBins);
         const renderCache = contactTileRenderCache(nextCache, assemblingVisibleTiles);
         if (kind === "visible") {
           contactTilePerformance.markCacheMerge(generation);
@@ -2375,6 +2438,7 @@ export function App() {
 
         const updatedTileWorld = buildContactTileWorld({
           viewport,
+          prefetchViewport,
           resolution: targetResolution,
           tileSizeBins,
           totalSpanBp,
@@ -2388,10 +2452,10 @@ export function App() {
           lastCompleteContactMapRef.current,
           updatedTileWorld.missingVisibleTiles.length === 0,
         );
-        if (updatedTileWorld.missingVisibleTiles.length === 0) {
+        if (!panPreviewActive && updatedTileWorld.missingVisibleTiles.length === 0) {
           lastCompleteContactMapRef.current = updatedContactMap;
         }
-        if (shouldPublishContactMapLayer(
+        if (!panPreviewActive && shouldPublishContactMapLayer(
           holdsPreviousCompleteFrame,
           updatedTileWorld.missingVisibleTiles.length === 0,
         )) {
@@ -2416,7 +2480,9 @@ export function App() {
 
         if (kind === "visible" && updatedTileWorld.missingVisibleTiles.length === 0) {
           visibleReady = true;
-          setStatusMessage(renderedStatusMessage);
+          if (!panPreviewActive) {
+            setStatusMessage(renderedStatusMessage);
+          }
         }
       };
       void (async () => {
@@ -2430,16 +2496,20 @@ export function App() {
         if (cancelled || generation !== contactTileGenerationRef.current) {
           return;
         }
-        setBackendStartedContactTileGeneration((current) => (
-          current === generation ? current : generation
-        ));
+        if (!panPreviewActive) {
+          setBackendStartedContactTileGeneration((current) => (
+            current === generation ? current : generation
+          ));
+        }
 
         if (tileBatches.length === 0 && loadPlan.urgentPrefetchTiles.length === 0) {
-          setStatusMessage(renderedStatusMessage);
+          if (!panPreviewActive) {
+            setStatusMessage(renderedStatusMessage);
+          }
           scheduleAdjacentResolutionPrefetch();
           return;
         }
-        if (visibleReady) {
+        if (visibleReady && !panPreviewActive) {
           setStatusMessage(renderedStatusMessage);
         }
 
@@ -2459,7 +2529,7 @@ export function App() {
           // build where main-canvas LOD has been explicitly disabled.
           && tileWorld.visibleTiles.length <= maxExactMainContactTiles;
         const directDeltaStreamMode = contactTileDeltaStreamMode(
-          contactTileDirectDeltaEnabled,
+          contactTileDirectDeltaEnabled && !panPreviewActive,
           holdsPreviousCompleteFrame,
         );
         const presentsDirectDeltaStream = directDeltaStreamMode === "overlay";
@@ -2796,7 +2866,7 @@ export function App() {
         }
         if (visibleReady) {
           const pendingPanPaint = contactPanPerformance.activeSnapshot();
-          if (pendingPanPaint) {
+          if (pendingPanPaint && !panPreviewActive) {
             window.requestAnimationFrame(() => {
               window.requestAnimationFrame(() => {
                 contactPanPerformance.markGpuPaintForSequence(
@@ -2818,11 +2888,13 @@ export function App() {
         if (shouldResumeContactBackgroundSchedulingAfterFailure(visibleReady)) {
           scheduleAdjacentResolutionPrefetch();
         }
-        setStatusMessage(
-          visibleReady
-            ? renderedStatusMessage
-            : `Contact map render failed: ${String(error)}`,
-        );
+        if (!panPreviewActive) {
+          setStatusMessage(
+            visibleReady
+              ? renderedStatusMessage
+              : `Contact map render failed: ${String(error)}`,
+          );
+        }
         dispatchUi({
           type: "appendLog",
           message: `${visibleReady ? "Contact prefetch" : "Contact map render"} failed: ${String(error)}`,
@@ -2834,9 +2906,11 @@ export function App() {
 
     return () => {
       cancelled = true;
-      setContactTileDeltaStream((current) => (
-        current?.generation === generation ? null : current
-      ));
+      if (!panPreviewActive) {
+        setContactTileDeltaStream((current) => (
+          current?.generation === generation ? null : current
+        ));
+      }
       window.clearTimeout(timeout);
       if (adjacentPrefetchFirstFrame !== null) {
         window.cancelAnimationFrame(adjacentPrefetchFirstFrame);
@@ -2860,6 +2934,8 @@ export function App() {
     uiState.contact.viewportWidthPx,
     uiState.contact.viewportHeightPx,
     effectiveContactTileViewportRequestKey,
+    contactTilePanPreviewActive,
+    contactPanPrefetchBridge,
     uiState.contact.colorScale.auto,
     uiState.contact.colorScale.log,
     uiState.normalization,
@@ -4240,6 +4316,7 @@ export function App() {
       uiState={uiState}
       onUiAction={dispatchMeasuredUiAction}
       onContactViewportPreview={handleContactViewportPreview}
+      contactPanPrefetchBridge={contactPanPrefetchBridge}
       onContactTileLayerCommit={contactTilePerformance.enabled
         ? handleContactTileLayerCommit
         : undefined}

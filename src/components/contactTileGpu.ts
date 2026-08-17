@@ -34,6 +34,11 @@ export interface ContactTileGpuDeltaScene {
 
 export interface ContactTileGpuRenderer {
   setScene: (scene: ContactTileGpuScene) => boolean;
+  appendSceneDescriptors: (input: {
+    descriptors: readonly ContactTileCanvasDescriptor[];
+    resolution: number;
+    tileSizeBins: number;
+  }) => boolean;
   setDeltaScene: (scene: ContactTileGpuDeltaScene) => boolean;
   updateDeltaTiles: (changedTileKeys: readonly string[]) => boolean;
   setPanOffset: (x: number, y: number) => void;
@@ -484,6 +489,87 @@ export function createContactTileGpuRenderer(
         panOffsetY = 0;
       }
       return draw();
+    },
+    appendSceneDescriptors: (input) => {
+      if (
+        destroyed
+        || !scene
+        || deltaScene
+        || gl.isContextLost()
+        || scene.resolution !== input.resolution
+        || scene.tileSizeBins !== input.tileSizeBins
+      ) {
+        return false;
+      }
+      const currentScene = scene;
+
+      const bytesPerTile = Math.max(
+        1,
+        currentScene.tileSizeBins * currentScene.tileSizeBins * Float32Array.BYTES_PER_ELEMENT,
+      );
+      const maximumUniqueTiles = Math.max(1, Math.floor(safeTextureBudget / bytesPerTile));
+      const retainedDescriptors = [...currentScene.descriptors];
+      const retainedDescriptorKeys = new Set(
+        retainedDescriptors.map((descriptor) => descriptor.key),
+      );
+      const retainedTiles = new Map<string, ContactMapTile>();
+      for (const descriptor of retainedDescriptors) {
+        retainedTiles.set(contactTileKey(descriptor.tile), descriptor.tile);
+      }
+      const appendedTileKeys = new Set<string>();
+      for (const descriptor of input.descriptors) {
+        const tileKey = contactTileKey(descriptor.tile);
+        if (retainedDescriptorKeys.has(descriptor.key)) {
+          continue;
+        }
+        const retainedTile = retainedTiles.get(tileKey);
+        if (retainedTile) {
+          retainedDescriptors.push({ ...descriptor, tile: retainedTile });
+          retainedDescriptorKeys.add(descriptor.key);
+          continue;
+        }
+        if (retainedTiles.size >= maximumUniqueTiles) {
+          continue;
+        }
+        retainedTiles.set(tileKey, descriptor.tile);
+        retainedDescriptorKeys.add(descriptor.key);
+        retainedDescriptors.push(descriptor);
+        if (!appendedTileKeys.has(tileKey) && contactTileCellCount(descriptor.tile) > 0) {
+          appendedTileKeys.add(tileKey);
+          const textureKey = gpuTextureKey(currentScene, descriptor.tile);
+          if (!ensureTileTexture(
+            gl,
+            textureCache,
+            textureKey,
+            descriptor.tile,
+            currentScene.generation,
+            currentScene.tileSizeBins,
+            ++useCounter,
+          )) {
+            return false;
+          }
+        }
+      }
+
+      // Extend the active pointer camera in place. Do not clear or redraw the
+      // framebuffer here; the next requestAnimationFrame pan uses the expanded
+      // descriptor set, while a stationary pointer keeps the current frame.
+      scene = { ...currentScene, descriptors: retainedDescriptors };
+      textureBytes = cachedTextureBytes(textureCache);
+      if (textureBytes > safeTextureBudget) {
+        const protectedKeys = new Set(
+          retainedDescriptors.map((descriptor) => gpuTextureKey(currentScene, descriptor.tile)),
+        );
+        textureBytes = evictLeastRecentlyUsedTextures(
+          gl,
+          textureCache,
+          textureBytes,
+          safeTextureBudget,
+          protectedKeys,
+        );
+      }
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      return true;
     },
     setDeltaScene: (nextScene) => {
       const previousViewport = deltaScene?.viewport ?? scene?.viewport;

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  advanceContactPanPrefetchFrontier,
   buildCenteredContactViewport,
   buildWholeGenomeContactViewport,
   sampleContactViewportVelocity,
@@ -207,6 +208,63 @@ describe("velocity-aware contact prefetch", () => {
     expect(contactTileViewportSignature(firstHint, 1, 100, 1_000)).toBe(
       contactTileViewportSignature(sameTileHint, 1, 100, 1_000),
     );
+  });
+
+  it("keeps one directional frontier when velocity lead shrinks", () => {
+    const sourceViewport = { xStart: 100, xEnd: 300, yStart: 100, yEnd: 300 };
+    const first = advanceContactPanPrefetchFrontier({
+      current: null,
+      sourceViewport,
+      targetViewport: { xStart: 140, xEnd: 340, yStart: 100, yEnd: 300 },
+      candidateViewport: { xStart: 240, xEnd: 440, yStart: 100, yEnd: 300 },
+      tileSpanBp: 100,
+      urgentPrefetchTileCount: 4,
+    });
+    const slower = advanceContactPanPrefetchFrontier({
+      current: first,
+      sourceViewport,
+      targetViewport: { xStart: 160, xEnd: 360, yStart: 100, yEnd: 300 },
+      candidateViewport: { xStart: 210, xEnd: 410, yStart: 100, yEnd: 300 },
+      tileSpanBp: 100,
+      urgentPrefetchTileCount: 0,
+    });
+
+    expect(slower.viewport).toEqual(first.viewport);
+    expect(slower.direction.x).toBe(1);
+    expect(slower.urgentPrefetchTileCount).toBe(4);
+  });
+
+  it("uses tile hysteresis before accepting a real pan reversal", () => {
+    const sourceViewport = { xStart: 100, xEnd: 300, yStart: 100, yEnd: 300 };
+    const forward = advanceContactPanPrefetchFrontier({
+      current: null,
+      sourceViewport,
+      targetViewport: { xStart: 160, xEnd: 360, yStart: 100, yEnd: 300 },
+      candidateViewport: { xStart: 240, xEnd: 440, yStart: 100, yEnd: 300 },
+      tileSpanBp: 100,
+      urgentPrefetchTileCount: 0,
+    });
+    const noisyReverse = advanceContactPanPrefetchFrontier({
+      current: forward,
+      sourceViewport,
+      targetViewport: { xStart: 135, xEnd: 335, yStart: 100, yEnd: 300 },
+      candidateViewport: { xStart: 85, xEnd: 285, yStart: 100, yEnd: 300 },
+      tileSpanBp: 100,
+      urgentPrefetchTileCount: 0,
+    });
+    const realReverse = advanceContactPanPrefetchFrontier({
+      current: noisyReverse,
+      sourceViewport,
+      targetViewport: { xStart: 110, xEnd: 310, yStart: 100, yEnd: 300 },
+      candidateViewport: { xStart: 60, xEnd: 260, yStart: 100, yEnd: 300 },
+      tileSpanBp: 100,
+      urgentPrefetchTileCount: 0,
+    });
+
+    expect(noisyReverse.direction.x).toBe(1);
+    expect(noisyReverse.viewport).toEqual(forward.viewport);
+    expect(realReverse.direction.x).toBe(-1);
+    expect(realReverse.viewport.xStart).toBe(60);
   });
 });
 

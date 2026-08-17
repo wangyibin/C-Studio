@@ -40,6 +40,7 @@ import {
 } from "../state/gfaViewportSync";
 import type { ContactTileRenderMilestone } from "../state/contactTilePerformance";
 import type { ContactPanPreview } from "../state/contactPanPerformance";
+import type { ContactPanPrefetchBridge } from "../state/contactPanPrefetch";
 import type { ContactTileDeltaRenderStream } from "../state/contactTileDelta";
 import type { SyntenyView } from "../state/syntenyView";
 import {
@@ -109,6 +110,7 @@ interface AppShellProps {
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
+  contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
   onContactTileLayerPaintComplete?: (event: ContactTileRenderMilestone) => void;
 }
@@ -195,6 +197,7 @@ export function AppShell({
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
   onContactViewportPreview,
+  contactPanPrefetchBridge,
   onUiAction,
   status,
   statusMessage,
@@ -978,6 +981,7 @@ export function AppShell({
                   onExpandPanel={expandHeatmapPanel}
                   onUiAction={onUiAction}
                   onContactViewportPreview={onContactViewportPreview}
+                  contactPanPrefetchBridge={contactPanPrefetchBridge}
                   onContactTileLayerCommit={onContactTileLayerCommit}
                   onContactTileLayerPaintComplete={onContactTileLayerPaintComplete}
                 />

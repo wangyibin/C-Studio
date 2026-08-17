@@ -30,6 +30,31 @@ export interface ContactViewportVelocitySample extends ContactViewportVelocity {
   sampledAt: number;
 }
 
+export type ContactPanPrefetchAxisDirection = -1 | 0 | 1;
+
+export interface ContactPanPrefetchFrontier {
+  viewport: ContactViewport;
+  direction: {
+    x: ContactPanPrefetchAxisDirection;
+    y: ContactPanPrefetchAxisDirection;
+  };
+  extremeCenter: {
+    x: number;
+    y: number;
+  };
+  urgentPrefetchTileCount: number;
+}
+
+interface ContactPanPrefetchFrontierInput {
+  current: ContactPanPrefetchFrontier | null;
+  sourceViewport: ContactViewport;
+  targetViewport: ContactViewport;
+  candidateViewport: ContactViewport;
+  tileSpanBp: number;
+  urgentPrefetchTileCount: number;
+  reversalHysteresisTiles?: number;
+}
+
 const defaultWindowSizeBp = 200_000_000;
 const minimumVelocityLeadTiles = 0.5;
 const maximumVelocityLeadTiles = 2.5;
@@ -209,6 +234,115 @@ export function contactViewportWithVelocityAwareLead(
     velocity.yBpPerMs,
   );
   return { xStart, xEnd, yStart, yEnd };
+}
+
+/**
+ * Keep the look-ahead grid monotonic during one physical pan. Pointer velocity
+ * naturally jitters around tile boundaries; shrinking the lead on every noisy
+ * sample repeatedly supersedes otherwise useful generations. A real reversal
+ * is accepted only after the visible camera moves back by a bounded fraction
+ * of one tile.
+ */
+export function advanceContactPanPrefetchFrontier({
+  current,
+  sourceViewport,
+  targetViewport,
+  candidateViewport,
+  tileSpanBp,
+  urgentPrefetchTileCount,
+  reversalHysteresisTiles = 0.35,
+}: ContactPanPrefetchFrontierInput): ContactPanPrefetchFrontier {
+  const center = (start: number, end: number) => (start + end) / 2;
+  const safeTileSpan = Number.isFinite(tileSpanBp) ? Math.max(1, tileSpanBp) : 1;
+  const safeHysteresisTiles = Number.isFinite(reversalHysteresisTiles)
+    ? Math.max(0, reversalHysteresisTiles)
+    : 0.35;
+  const hysteresisBp = safeTileSpan * safeHysteresisTiles;
+  const safeUrgentCount = Number.isFinite(urgentPrefetchTileCount)
+    ? Math.max(0, Math.floor(urgentPrefetchTileCount))
+    : 0;
+
+  const advanceAxis = (
+    axis: "x" | "y",
+  ): {
+    start: number;
+    end: number;
+    direction: ContactPanPrefetchAxisDirection;
+    extremeCenter: number;
+  } => {
+    const startKey = `${axis}Start` as const;
+    const endKey = `${axis}End` as const;
+    const sourceCenter = center(sourceViewport[startKey], sourceViewport[endKey]);
+    const targetCenter = center(targetViewport[startKey], targetViewport[endKey]);
+    const candidateStart = candidateViewport[startKey];
+    const candidateEnd = candidateViewport[endKey];
+    if (!current) {
+      return {
+        start: candidateStart,
+        end: candidateEnd,
+        direction: Math.sign(targetCenter - sourceCenter) as ContactPanPrefetchAxisDirection,
+        extremeCenter: targetCenter,
+      };
+    }
+
+    let direction = current.direction[axis];
+    const previousExtreme = current.extremeCenter[axis];
+    if (direction === 0) {
+      direction = Math.sign(targetCenter - sourceCenter) as ContactPanPrefetchAxisDirection;
+    }
+    const reversesForward = direction > 0 && targetCenter < previousExtreme - hysteresisBp;
+    const reversesBackward = direction < 0 && targetCenter > previousExtreme + hysteresisBp;
+    if (reversesForward || reversesBackward) {
+      return {
+        start: candidateStart,
+        end: candidateEnd,
+        direction: (direction > 0 ? -1 : 1) as ContactPanPrefetchAxisDirection,
+        extremeCenter: targetCenter,
+      };
+    }
+    if (direction > 0) {
+      return {
+        start: Math.max(current.viewport[startKey], candidateStart),
+        end: Math.max(current.viewport[endKey], candidateEnd),
+        direction,
+        extremeCenter: Math.max(previousExtreme, targetCenter),
+      };
+    }
+    if (direction < 0) {
+      return {
+        start: Math.min(current.viewport[startKey], candidateStart),
+        end: Math.min(current.viewport[endKey], candidateEnd),
+        direction,
+        extremeCenter: Math.min(previousExtreme, targetCenter),
+      };
+    }
+    return {
+      start: candidateStart,
+      end: candidateEnd,
+      direction,
+      extremeCenter: targetCenter,
+    };
+  };
+
+  const x = advanceAxis("x");
+  const y = advanceAxis("y");
+  return {
+    viewport: {
+      xStart: x.start,
+      xEnd: x.end,
+      yStart: y.start,
+      yEnd: y.end,
+    },
+    direction: { x: x.direction, y: y.direction },
+    extremeCenter: { x: x.extremeCenter, y: y.extremeCenter },
+    // Once foreground promotion begins, keep it for the rest of the gesture.
+    // Toggling around the speed threshold would otherwise create two request
+    // identities for the same visible/look-ahead grids.
+    urgentPrefetchTileCount: Math.max(
+      current?.urgentPrefetchTileCount ?? 0,
+      safeUrgentCount,
+    ),
+  };
 }
 
 /**
