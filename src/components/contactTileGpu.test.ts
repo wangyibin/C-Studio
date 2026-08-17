@@ -146,7 +146,7 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
-  it("appends pan-prefetch textures without clearing or redrawing the scene", () => {
+  it("presents appended pan-prefetch textures without clearing or replacing the scene", () => {
     const {
       canvas,
       clear,
@@ -179,6 +179,9 @@ describe("contactTileFloatTextureData", () => {
         colorScale: { log: false, min: 0, max: 10 },
       },
     })).toBe(true);
+    // Model the stopped-wheel frame: the authoritative scene is still in the
+    // old camera, while the framebuffer remains shifted to the preview camera.
+    renderer?.setPanOffset(24, -16);
     const clearsBeforeAppend = clear.mock.calls.length;
     const drawsBeforeAppend = drawArrays.mock.calls.length;
     const uploadsBeforeAppend = texImage2D.mock.calls.length;
@@ -207,8 +210,14 @@ describe("contactTileFloatTextureData", () => {
     })).toBe(true);
     expect(texImage2D.mock.calls.length).toBe(uploadsBeforeAppend + 1);
 
-    renderer?.setPanOffset(4, 4);
-    expect(drawArrays.mock.calls.length).toBe(drawsBeforeAppend + 2);
+    expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
+    expect(clear).toHaveBeenCalledTimes(clearsBeforeAppend);
+    expect(drawArrays.mock.calls.length).toBe(drawsBeforeAppend + 1);
+    expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
+      .toBe(layoutReadsBeforeAppend);
+    expect(texImage2D).toHaveBeenCalledTimes(uploadsBeforeAppend + 1);
+    expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforeAppend + 1);
     renderer?.destroy();
   });
 

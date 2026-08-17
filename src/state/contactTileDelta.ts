@@ -21,6 +21,16 @@ export interface ContactTileDeltaBatch {
 
 export type ContactTileDeltaListener = (batch: ContactTileDeltaBatch) => void;
 
+/**
+ * Cumulative pixels observed before the stream's terminal sentinel. This shape
+ * is deliberately not a ContactMapTile[] so it cannot be passed accidentally
+ * to an authoritative cache merge that expects completed tiles from finish().
+ */
+export interface ContactTileDeltaPreviewBatch {
+  completeness: "partial";
+  tiles: ContactMapTile[];
+}
+
 /** Merge complete progressive tiles once; duplicate chunks must not add counts twice. */
 export function mergeCompleteContactTilesIntoDeltaAccumulator(
   accumulator: ContactTileDeltaAccumulator,
@@ -134,14 +144,17 @@ export class ContactTileDeltaAccumulator {
     return [...this.tiles.values()];
   }
 
-  snapshotTiles(tileKeys: readonly string[]): ContactMapTile[] {
-    return tileKeys.map((key) => {
-      const tile = this.tiles.get(key);
-      if (!tile) {
-        throw new Error(`contact tile snapshot contains unrequested tile ${key}`);
-      }
-      return this.snapshot(tile);
-    });
+  previewBatch(tileKeys: readonly string[]): ContactTileDeltaPreviewBatch {
+    return {
+      completeness: "partial",
+      tiles: tileKeys.map((key) => {
+        const tile = this.tiles.get(key);
+        if (!tile) {
+          throw new Error(`contact tile snapshot contains unrequested tile ${key}`);
+        }
+        return this.snapshot(tile);
+      }),
+    };
   }
 
   finish(): ContactMapTile[] {

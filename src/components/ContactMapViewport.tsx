@@ -798,23 +798,47 @@ export function ContactMapViewport({
   const contactTileLayerRef = useRef<HTMLDivElement>(null);
   const contactTileTransformRef = useRef<HTMLDivElement>(null);
   const contactTilePanRendererRef = useRef<ContactTileGpuRenderer | null>(null);
-  useEffect(() => contactPanPrefetchBridge?.subscribe((batch) => {
-    const renderer = contactTilePanRendererRef.current;
-    if (!renderer) {
-      return;
-    }
-    renderer.appendSceneDescriptors({
-      descriptors: contactTileCanvasDescriptorsForViewport(
-        batch.tiles,
-        batch.resolution,
-        batch.tileSizeBins,
-        batch.viewport,
-        "all",
-      ),
-      resolution: batch.resolution,
-      tileSizeBins: batch.tileSizeBins,
+  const panPrefetchPresentFrameRef = useRef<number | null>(null);
+  useEffect(() => {
+    const presentPendingDescriptors = () => {
+      if (panPrefetchPresentFrameRef.current !== null) {
+        return;
+      }
+      panPrefetchPresentFrameRef.current = window.requestAnimationFrame(() => {
+        panPrefetchPresentFrameRef.current = null;
+        // Tile completion may happen while the pointer is stationary. Present
+        // only the newly uploaded quads so the exposed edge fills immediately,
+        // without publishing a React map frame or redrawing the full scene.
+        contactTilePanRendererRef.current?.presentAppendedSceneDescriptors();
+      });
+    };
+    const unsubscribe = contactPanPrefetchBridge?.subscribe((batch) => {
+      const renderer = contactTilePanRendererRef.current;
+      if (!renderer) {
+        return;
+      }
+      if (renderer.appendSceneDescriptors({
+        descriptors: contactTileCanvasDescriptorsForViewport(
+          batch.tiles,
+          batch.resolution,
+          batch.tileSizeBins,
+          batch.viewport,
+          "all",
+        ),
+        resolution: batch.resolution,
+        tileSizeBins: batch.tileSizeBins,
+      })) {
+        presentPendingDescriptors();
+      }
     });
-  }), [contactPanPrefetchBridge]);
+    return () => {
+      unsubscribe?.();
+      if (panPrefetchPresentFrameRef.current !== null) {
+        window.cancelAnimationFrame(panPrefetchPresentFrameRef.current);
+        panPrefetchPresentFrameRef.current = null;
+      }
+    };
+  }, [contactPanPrefetchBridge]);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const assemblySelectionVerticalBandRef = useRef<HTMLSpanElement>(null);
   const assemblySelectionHorizontalBandRef = useRef<HTMLSpanElement>(null);

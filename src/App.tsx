@@ -22,6 +22,7 @@ import { contactTileCellCount } from "./state/contactTileData";
 import {
   ContactTileDeltaAccumulator,
   mergeCompleteContactTilesIntoDeltaAccumulator,
+  type ContactTileDeltaPreviewBatch,
   type ContactTileDeltaRenderStream,
 } from "./state/contactTileDelta";
 import {
@@ -34,7 +35,10 @@ import {
   createContactPanPerformanceTracker,
   type ContactPanPreview,
 } from "./state/contactPanPerformance";
-import { ContactPanPrefetchBridge } from "./state/contactPanPrefetch";
+import {
+  ContactPanPrefetchBridge,
+  contactPanTileLoadPriority,
+} from "./state/contactPanPrefetch";
 import {
   closestContactResolution,
   contactResolutionToBasePairs,
@@ -678,8 +682,12 @@ function streamContactTileDeltasWithLayoutHandle(
   callbacks: {
     onStart?: (accumulator: ContactTileDeltaAccumulator) => void;
     onDelta?: () => void;
-    /** Compatibility path selected by VITE_CSTUDIO_TILE_DIRECT_DELTA=0. */
-    onChunk?: (tiles: ContactMapTile[]) => void;
+    /**
+     * Non-authoritative cumulative snapshot for the transient pan surface.
+     * A snapshot received before the terminal sentinel must never enter the
+     * reusable tile cache: cancellation can leave it permanently incomplete.
+     */
+    onPreviewChunk?: (batch: ContactTileDeltaPreviewBatch) => void;
   },
 ) {
   return registry.run(
@@ -718,8 +726,8 @@ function streamContactTileDeltasWithLayoutHandle(
           const changedTileKeys = accumulator.merge(decoded.tiles);
           if (changedTileKeys.length > 0) {
             callbacks.onDelta?.();
-            if (callbacks.onChunk) {
-              callbacks.onChunk(accumulator.snapshotTiles(changedTileKeys));
+            if (callbacks.onPreviewChunk) {
+              callbacks.onPreviewChunk(accumulator.previewBatch(changedTileKeys));
             }
           }
         } catch (error) {
@@ -1545,12 +1553,20 @@ export function App() {
         holdsPreviousCompleteFrame,
       );
       const presentsMainLodDirectDeltaStream = mainLodDirectDeltaStreamMode === "overlay";
+      const mainLodLoadPriority = contactPanTileLoadPriority({
+        previewActive: panPreviewActive,
+        hasPendingPan: panPerformancePreview !== null,
+        missingVisibleTileCount: mainLodWorld.missingVisibleTiles.length,
+        normalVisibleBatchSize: contactMainLodVisibleBatchSize,
+        activePanVisibleBatchSize: contactMainLodVisibleBatchSize,
+        urgentPrefetchTileCount: panPerformancePreview?.urgentPrefetchTileCount ?? 0,
+      });
       const mainLodLoadPlan = buildContactTileLoadPlan(
         mainLodWorld,
         maxContactMainLodPrefetchTiles,
-        contactMainLodVisibleBatchSize,
+        mainLodLoadPriority.visibleBatchSize,
         contactMainLodPrefetchBatchSize,
-        panPerformancePreview?.urgentPrefetchTileCount ?? 0,
+        mainLodLoadPriority.urgentPrefetchTileCount,
       );
       const mainLodMapForWorld = (world: typeof mainLodWorld): ContactMapView => ({
         ...projectContactTileWorldView(world),
@@ -1897,9 +1913,13 @@ export function App() {
                     contactTilePerformance.markCacheMerge(generation);
                     contactPanPerformance.markCacheMerge(generation);
                   },
-                  onChunk: mainLodDirectDeltaStreamMode !== "disabled"
+                  onPreviewChunk: mainLodDirectDeltaStreamMode !== "disabled"
                     ? undefined
-                    : (changedTiles) => commitMainLodTiles("visible", changedTiles),
+                    : (previewBatch) => publishPanPrefetchTiles(
+                        previewBatch.tiles,
+                        mainLodPlan.targetResolution,
+                        lodTileSizeBins,
+                      ),
                 },
               )
             ),
@@ -2013,17 +2033,25 @@ export function App() {
         || previousCompleteMap.viewport.yEnd !== viewport.yEnd
       ),
     );
-    const visibleBatchSize = holdsPreviousCompleteFrame
+    const normalVisibleBatchSize = holdsPreviousCompleteFrame
       ? Math.max(1, tileWorld.missingVisibleTiles.length)
-      : contactTilePreviewViewport || streamsCompatiblePan
+      : streamsCompatiblePan
         ? panVisibleContactTileRequestBatchSize
         : visibleContactTileRequestBatchSize;
+    const tileLoadPriority = contactPanTileLoadPriority({
+      previewActive: panPreviewActive,
+      hasPendingPan: panPerformancePreview !== null,
+      missingVisibleTileCount: tileWorld.missingVisibleTiles.length,
+      normalVisibleBatchSize,
+      activePanVisibleBatchSize: panVisibleContactTileRequestBatchSize,
+      urgentPrefetchTileCount: panPerformancePreview?.urgentPrefetchTileCount ?? 0,
+    });
     const loadPlan = buildContactTileLoadPlan(
       tileWorld,
       maxBackgroundPrefetchTiles,
-      visibleBatchSize,
+      tileLoadPriority.visibleBatchSize,
       prefetchContactTileRequestBatchSize,
-      panPerformancePreview?.urgentPrefetchTileCount ?? 0,
+      tileLoadPriority.urgentPrefetchTileCount,
     );
     if (pendingResolutionPerformance) {
       contactTilePerformance.startGeneration({
@@ -2708,9 +2736,13 @@ export function App() {
                       contactTilePerformance.markCacheMerge(generation);
                       contactPanPerformance.markCacheMerge(generation);
                     },
-                    onChunk: directDeltaStreamMode !== "disabled"
+                    onPreviewChunk: directDeltaStreamMode !== "disabled"
                       ? undefined
-                      : (changedTiles) => commitLoadedTiles("visible", changedTiles),
+                      : (previewBatch) => publishPanPrefetchTiles(
+                          previewBatch.tiles,
+                          targetResolution,
+                          tileSizeBins,
+                        ),
                   },
                 )
               ),

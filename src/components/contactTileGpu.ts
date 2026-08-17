@@ -39,6 +39,8 @@ export interface ContactTileGpuRenderer {
     resolution: number;
     tileSizeBins: number;
   }) => boolean;
+  /** Present newly appended pan-prefetch descriptors without replacing the scene. */
+  presentAppendedSceneDescriptors: () => boolean;
   setDeltaScene: (scene: ContactTileGpuDeltaScene) => boolean;
   updateDeltaTiles: (changedTileKeys: readonly string[]) => boolean;
   setPanOffset: (x: number, y: number) => void;
@@ -271,6 +273,7 @@ export function createContactTileGpuRenderer(
   let deltaScratch = new Float32Array(0);
   let panOffsetX = 0;
   let panOffsetY = 0;
+  const pendingAppendedDescriptors = new Map<string, ContactTileCanvasDescriptor>();
   let destroyed = false;
   let lutColormap: ContactTileRenderStyle["colormap"] | null = null;
   let presentedCssWidth = 1;
@@ -281,7 +284,11 @@ export function createContactTileGpuRenderer(
   gl.disable(gl.BLEND);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
-  const draw = (panOnly = false): boolean => {
+  const draw = (
+    panOnly = false,
+    descriptors: readonly ContactTileCanvasDescriptor[] | null = null,
+    preserveFramebuffer = false,
+  ): boolean => {
     const activeScene = deltaScene ?? scene;
     if (destroyed || !activeScene || gl.isContextLost()) {
       return false;
@@ -301,8 +308,10 @@ export function createContactTileGpuRenderer(
     }
 
     gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.clearColor(1, 1, 1, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!preserveFramebuffer) {
+      gl.clearColor(1, 1, 1, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
     gl.useProgram(resources.program);
     gl.bindBuffer(gl.ARRAY_BUFFER, resources.quadBuffer);
     gl.enableVertexAttribArray(resources.positionLocation);
@@ -338,9 +347,10 @@ export function createContactTileGpuRenderer(
     const scaleX = canvas.width / cssWidth;
     const scaleY = canvas.height / cssHeight;
     const protectedKeys = panOnly ? null : new Set<string>();
-    const drawnDescriptorKeys = panOnly ? null : new Set<string>();
+    const validatesCompleteCoverage = !panOnly && descriptors === null;
+    const drawnDescriptorKeys = validatesCompleteCoverage ? new Set<string>() : null;
 
-    for (const descriptor of activeScene.descriptors) {
+    for (const descriptor of descriptors ?? activeScene.descriptors) {
       const deltaBuffer = deltaScene
         ? deltaBuffers.get(contactTileKey(descriptor.tile))
         : undefined;
@@ -434,6 +444,7 @@ export function createContactTileGpuRenderer(
     const glSucceeded = gl.getError() === gl.NO_ERROR;
     return glSucceeded && (
       deltaScene !== null
+      || !validatesCompleteCoverage
       || contactTileGpuDrawCoverageIsComplete(activeScene.descriptors, drawnDescriptorKeys!)
     );
   };
@@ -483,6 +494,7 @@ export function createContactTileGpuRenderer(
       }
       deltaScene = null;
       deltaBuffers = new Map();
+      pendingAppendedDescriptors.clear();
       scene = nextScene;
       if (viewportChanged) {
         panOffsetX = 0;
@@ -524,8 +536,12 @@ export function createContactTileGpuRenderer(
         }
         const retainedTile = retainedTiles.get(tileKey);
         if (retainedTile) {
-          retainedDescriptors.push({ ...descriptor, tile: retainedTile });
+          const retainedDescriptor = { ...descriptor, tile: retainedTile };
+          retainedDescriptors.push(retainedDescriptor);
           retainedDescriptorKeys.add(descriptor.key);
+          if (contactTileCellCount(retainedTile) > 0) {
+            pendingAppendedDescriptors.set(retainedDescriptor.key, retainedDescriptor);
+          }
           continue;
         }
         if (retainedTiles.size >= maximumUniqueTiles) {
@@ -549,6 +565,9 @@ export function createContactTileGpuRenderer(
             return false;
           }
         }
+        if (contactTileCellCount(descriptor.tile) > 0) {
+          pendingAppendedDescriptors.set(descriptor.key, descriptor);
+        }
       }
 
       // Extend the active pointer camera in place. Do not clear or redraw the
@@ -571,10 +590,30 @@ export function createContactTileGpuRenderer(
       gl.bindTexture(gl.TEXTURE_2D, null);
       return true;
     },
+    presentAppendedSceneDescriptors: () => {
+      if (
+        destroyed
+        || !scene
+        || deltaScene
+        || gl.isContextLost()
+      ) {
+        return false;
+      }
+      const descriptors = [...pendingAppendedDescriptors.values()];
+      pendingAppendedDescriptors.clear();
+      if (descriptors.length === 0) {
+        return true;
+      }
+      // The framebuffer already contains the pointer-translated front scene.
+      // Draw only the new quads into its existing white gaps: no resize,
+      // clear, texture upload, React state change, or full-scene replacement.
+      return draw(true, descriptors, true);
+    },
     setDeltaScene: (nextScene) => {
       const previousViewport = deltaScene?.viewport ?? scene?.viewport;
       const viewportChanged = !previousViewport || !sameViewport(previousViewport, nextScene.viewport);
       scene = null;
+      pendingAppendedDescriptors.clear();
       deltaScene = nextScene;
       deltaBuffers = new Map(
         nextScene.buffers.map((buffer) => [contactTileKey(buffer.tile), buffer]),
@@ -630,7 +669,9 @@ export function createContactTileGpuRenderer(
     setPanOffset: (x, y) => {
       panOffsetX = Number.isFinite(x) ? x : 0;
       panOffsetY = Number.isFinite(y) ? y : 0;
-      draw(true);
+      if (draw(true)) {
+        pendingAppendedDescriptors.clear();
+      }
     },
     resetPanOffset: () => {
       if (panOffsetX === 0 && panOffsetY === 0) {
@@ -638,7 +679,9 @@ export function createContactTileGpuRenderer(
       }
       panOffsetX = 0;
       panOffsetY = 0;
-      draw(true);
+      if (draw(true)) {
+        pendingAppendedDescriptors.clear();
+      }
     },
     redraw: draw,
     destroy: () => {
@@ -650,6 +693,7 @@ export function createContactTileGpuRenderer(
         gl.deleteTexture(entry.texture);
       }
       textureCache.clear();
+      pendingAppendedDescriptors.clear();
       gl.deleteTexture(resources.lutTexture);
       gl.deleteBuffer(resources.quadBuffer);
       gl.deleteProgram(resources.program);

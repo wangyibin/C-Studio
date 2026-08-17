@@ -81,6 +81,26 @@ describe("ContactTileDeltaAccumulator", () => {
     expect(accumulator.snapshotBuildCount).toBe(16);
   });
 
+  it("labels pre-sentinel snapshots as partial and keeps finish as the authoritative boundary", () => {
+    const accumulator = new ContactTileDeltaAccumulator([{ tileX: 0, tileY: 0 }], 4);
+    accumulator.merge([{
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 1, yBin: 2, count: 3 }],
+    }]);
+
+    const preview = accumulator.previewBatch(["0:0"]);
+    expect(preview.completeness).toBe("partial");
+    expect([...preview.tiles[0]!.packedCells!.counts]).toEqual([3]);
+
+    accumulator.merge([{
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 1, yBin: 2, count: 4 }],
+    }]);
+    expect([...accumulator.finish()[0]!.packedCells!.counts]).toEqual([7]);
+  });
+
   it("seeds cached and progressive complete tiles exactly once for GPU staging", () => {
     const accumulator = new ContactTileDeltaAccumulator([{ tileX: 0, tileY: 0 }], 4);
     const mergedKeys = new Set<string>();
