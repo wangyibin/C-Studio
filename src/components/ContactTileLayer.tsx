@@ -936,6 +936,11 @@ function ContactTileSurface({
 }) {
   const rawTiles = contactMap?.cachedTiles ?? contactMap?.tiles;
   const previewTiles = contactMap?.previewTiles;
+  // Keep the GPU camera on the pointer-stable live viewport, but choose tile
+  // textures around the newest loaded preview viewport. The imperative pan
+  // offset then moves those ahead-of-camera textures into view without a
+  // React render for every pointer sample.
+  const tileSelectionViewport = contactMap?.viewport ?? viewport;
   const tiles = useMemo(
     () => canonicalTilesForRendering(contactTilesWithPreviewFallback(
       rawTiles ?? [],
@@ -950,7 +955,7 @@ function ContactTileSurface({
           tiles,
           contactMap.resolution,
           tileSizeBins,
-          viewport,
+          tileSelectionViewport,
           overscanDirection,
         )
       : [],
@@ -960,10 +965,10 @@ function ContactTileSurface({
       typeof overscanDirection === "string" ? overscanDirection : overscanDirection.y,
       tileSizeBins,
       tiles,
-      viewport.xEnd,
-      viewport.xStart,
-      viewport.yEnd,
-      viewport.yStart,
+      tileSelectionViewport.xEnd,
+      tileSelectionViewport.xStart,
+      tileSelectionViewport.yEnd,
+      tileSelectionViewport.yStart,
     ],
   );
   const paintEpochCounterRef = useRef(0);
@@ -974,7 +979,7 @@ function ContactTileSurface({
           canonicalTilesForRendering(contactMap.tiles ?? tiles),
           contactMap.resolution,
           tileSizeBins,
-          viewport,
+          tileSelectionViewport,
           { x: 0, y: 0 },
         ).map(({ key }) => key).join("|")
       : "",
@@ -982,10 +987,10 @@ function ContactTileSurface({
       contactMap,
       tileSizeBins,
       tiles,
-      viewport.xEnd,
-      viewport.xStart,
-      viewport.yEnd,
-      viewport.yStart,
+      tileSelectionViewport.xEnd,
+      tileSelectionViewport.xStart,
+      tileSelectionViewport.yEnd,
+      tileSelectionViewport.yStart,
     ],
   );
   const visibleTileIdentitySignature = contactMap

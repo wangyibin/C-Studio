@@ -731,6 +731,50 @@ describe("contactTileCanvasBox", () => {
     expect(markup).toContain("left:0%;top:50%;width:25%;height:50%");
     expect(markup).toContain("left:25%;top:0%;width:25%;height:50%");
   });
+
+  it("keeps loaded preview tiles mounted against the stable drag camera", () => {
+    const markup = renderToStaticMarkup(
+      createElement(ContactTileLayer, {
+        contactMap: {
+          resolution: 1_000,
+          viewport: {
+            xStart: 512_000,
+            xEnd: 768_000,
+            yStart: 512_000,
+            yEnd: 768_000,
+          },
+          cells: [],
+          tileSizeBins: 256,
+          tiles: [{
+            tileX: 2,
+            tileY: 2,
+            cells: [{ xBin: 520, yBin: 520, count: 5 }],
+          }],
+          cachedTiles: [{
+            tileX: 2,
+            tileY: 2,
+            cells: [{ xBin: 520, yBin: 520, count: 5 }],
+          }],
+        },
+        viewport: {
+          xStart: 0,
+          xEnd: 256_000,
+          yStart: 0,
+          yEnd: 256_000,
+        },
+        overscanDirection: { x: 0, y: 0 },
+        renderStyle: initialRenderStyle(),
+        layerRef: createRef<HTMLDivElement>(),
+        onPointerDown: () => undefined,
+        onPointerMove: () => undefined,
+        onPointerUp: () => undefined,
+        onPointerCancel: () => undefined,
+      }),
+    );
+
+    expect(markup.match(/contact-tile-canvas/g)).toHaveLength(1);
+    expect(markup).toContain("left:200%;top:200%;width:100%;height:100%");
+  });
 });
 
 describe("drawTileCanvas", () => {

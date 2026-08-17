@@ -9,6 +9,7 @@ import {
   contactTileKey,
   contactTileProjectionFingerprint,
   contactTileScope,
+  contactTileViewportRequestKey,
   contactTileViewportSignature,
   contactTilesForViewport,
   createContactTileCacheKeyResolver,
@@ -127,6 +128,68 @@ describe("contact tile requests", () => {
 
     expect(insideSameTiles).toBe(initial);
     expect(crossesRightEdge).not.toBe(initial);
+  });
+
+  it("refreshes the request key when look-ahead crosses before the visible viewport", () => {
+    const visibleViewport = {
+      xStart: 10_000,
+      xEnd: 250_000,
+      yStart: 10_000,
+      yEnd: 250_000,
+    };
+    const initialPrefetchViewport = {
+      xStart: 20_000,
+      xEnd: 250_000,
+      yStart: 20_000,
+      yEnd: 250_000,
+    };
+    const crossedPrefetchViewport = {
+      xStart: 256_000,
+      xEnd: 512_000,
+      yStart: 256_000,
+      yEnd: 512_000,
+    };
+    const requestKey = (prefetchViewport: typeof initialPrefetchViewport) => (
+      contactTileViewportRequestKey(
+        visibleViewport,
+        prefetchViewport,
+        1_000,
+        256,
+        1_000_000,
+      )
+    );
+
+    expect(contactTileViewportSignature(
+      visibleViewport,
+      1_000,
+      256,
+      1_000_000,
+    )).toBe("0:0");
+    expect(requestKey(crossedPrefetchViewport)).not.toBe(
+      requestKey(initialPrefetchViewport),
+    );
+  });
+
+  it("promotes the same visible and prefetch grids when urgent pan mode starts", () => {
+    const viewport = {
+      xStart: 10_000,
+      xEnd: 250_000,
+      yStart: 10_000,
+      yEnd: 250_000,
+    };
+    const requestKey = (urgentPrefetchTileCount: number) => (
+      contactTileViewportRequestKey(
+        viewport,
+        viewport,
+        1_000,
+        256,
+        1_000_000,
+        urgentPrefetchTileCount,
+      )
+    );
+
+    expect(requestKey(4)).not.toBe(requestKey(0));
+    expect(requestKey(8)).toBe(requestKey(4));
   });
 
   it("bounds visible tiles by the measured viewport after selecting 5 kb", () => {

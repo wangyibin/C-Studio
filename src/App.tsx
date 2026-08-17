@@ -53,7 +53,7 @@ import {
   contactTileKey,
   contactTileSizeBins,
   contactTilesForViewport,
-  contactTileViewportSignature,
+  contactTileViewportRequestKey,
 } from "./state/contactTiles";
 import {
   contactTileRenderCache,
@@ -1203,20 +1203,22 @@ export function App() {
         : maxExactMainContactTiles,
     }, contactAvailableResolutions)
     : null;
-  // Request identity follows the selected render grid, not pixel-exact camera
-  // coordinates. Preview -> commit and sub-tile wheel motion therefore reuse
-  // one in-flight stream instead of cancelling it on WebKit or WebView2.
+  // Request identity follows the visible and look-ahead render grids, not
+  // pixel-exact camera coordinates. Sub-tile motion therefore reuses one
+  // in-flight stream, while the next edge still starts loading before it is
+  // exposed by the WebKit/WebView2 pan transform.
   const effectiveContactTileRequestGridResolution = effectiveContactMainLodPlan
     ?.targetResolution ?? effectiveContactTileResolution;
-  const effectiveContactTileViewportRequestKey = [
+  const effectiveContactTilePrefetchViewport = contactTilePreviewViewport
+    ?.prefetchViewport ?? effectiveContactTileViewport;
+  const effectiveContactTileViewportRequestKey = contactTileViewportRequestKey(
+    effectiveContactTileViewport,
+    effectiveContactTilePrefetchViewport,
     effectiveContactTileRequestGridResolution,
-    contactTileViewportSignature(
-      effectiveContactTileViewport,
-      effectiveContactTileRequestGridResolution,
-      contactTileSizeBins,
-      effectiveContactTileTotalSpanBp,
-    ),
-  ].join("|");
+    contactTileSizeBins,
+    effectiveContactTileTotalSpanBp,
+    contactTilePreviewViewport?.urgentPrefetchTileCount ?? 0,
+  );
 
   useEffect(() => {
     const generation = contactTileGenerationRef.current + 1;

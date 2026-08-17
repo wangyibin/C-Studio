@@ -254,6 +254,37 @@ export function contactTileViewportSignature(
   ).map(contactTileKey).join("|");
 }
 
+/**
+ * One request identity for the visible grid and its directional look-ahead.
+ * The visible viewport can stay inside the same tile set while the prefetch
+ * viewport crosses the next edge, so both signatures must participate.
+ */
+export function contactTileViewportRequestKey(
+  viewport: ContactViewport,
+  prefetchViewport: ContactViewport,
+  resolution: number,
+  tileSizeBins: number,
+  totalSpanBp?: number,
+  urgentPrefetchTileCount = 0,
+): string {
+  return [
+    `${resolution}:${tileSizeBins}`,
+    contactTileViewportSignature(
+      viewport,
+      resolution,
+      tileSizeBins,
+      totalSpanBp,
+    ),
+    contactTileViewportSignature(
+      prefetchViewport,
+      resolution,
+      tileSizeBins,
+      totalSpanBp,
+    ),
+    urgentPrefetchTileCount > 0 ? "urgent" : "background",
+  ].join("=>");
+}
+
 export function missingContactTiles<Tile extends ContactMapTileKey>(
   requiredTiles: ContactMapTileKey[],
   cache: Map<string, Tile>,

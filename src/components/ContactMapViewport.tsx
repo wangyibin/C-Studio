@@ -52,7 +52,10 @@ import {
   type ContactViewportVelocity,
   type ContactViewportVelocitySample,
 } from "../state/contactViewport";
-import { contactTileViewportSignature } from "../state/contactTiles";
+import {
+  contactTileViewportRequestKey,
+  contactTileViewportSignature,
+} from "../state/contactTiles";
 import {
   contactWheelNavigationMode,
   contactWheelPanMode,
@@ -244,11 +247,14 @@ export function contactPanPreviewTileSignature(
   totalSpanBp: number,
   urgentPrefetchTileCount = 0,
 ) {
-  return [
-    contactTileViewportSignature(viewport, resolution, tileSizeBins, totalSpanBp),
-    contactTileViewportSignature(prefetchViewport, resolution, tileSizeBins, totalSpanBp),
-    urgentPrefetchTileCount > 0 ? "urgent" : "background",
-  ].join("=>");
+  return contactTileViewportRequestKey(
+    viewport,
+    prefetchViewport,
+    resolution,
+    tileSizeBins,
+    totalSpanBp,
+    urgentPrefetchTileCount,
+  );
 }
 
 interface ContactResolutionWheelInput {
