@@ -154,6 +154,7 @@ describe("contactTileFloatTextureData", () => {
       clientWidthRead,
       drawArrays,
       texImage2D,
+      texSubImage2D,
     } = mockWebGlCanvas();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
     const firstTile = {
@@ -190,6 +191,7 @@ describe("contactTileFloatTextureData", () => {
 
     expect(renderer?.appendSceneDescriptors({
       descriptors: [{ key: "1:1:source", tile: nextTile, transpose: false }],
+      generation: 8,
       resolution: 1_000,
       tileSizeBins: 4,
     })).toBe(true);
@@ -199,16 +201,33 @@ describe("contactTileFloatTextureData", () => {
     expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
       .toBe(layoutReadsBeforeAppend);
 
+    const updatedNextTile = {
+      ...nextTile,
+      cells: [{ xBin: 5, yBin: 4, count: 11 }],
+    };
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [{ key: "1:1:source", tile: updatedNextTile, transpose: false }],
+      generation: 8,
+      resolution: 1_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    expect(texImage2D.mock.calls.length).toBe(uploadsBeforeAppend + 1);
+    expect(texSubImage2D).toHaveBeenCalledOnce();
+
+    // Never replace an already complete tile from the presented generation
+    // with a partial snapshot from the next pan generation.
     expect(renderer?.appendSceneDescriptors({
       descriptors: [{
         key: "0:0:source",
         tile: { ...firstTile, cells: [{ xBin: 1, yBin: 0, count: 99 }] },
         transpose: false,
       }],
+      generation: 8,
       resolution: 1_000,
       tileSizeBins: 4,
     })).toBe(true);
     expect(texImage2D.mock.calls.length).toBe(uploadsBeforeAppend + 1);
+    expect(texSubImage2D).toHaveBeenCalledOnce();
 
     expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
     expect(clear).toHaveBeenCalledTimes(clearsBeforeAppend);
@@ -218,6 +237,43 @@ describe("contactTileFloatTextureData", () => {
     expect(texImage2D).toHaveBeenCalledTimes(uploadsBeforeAppend + 1);
     expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
     expect(drawArrays).toHaveBeenCalledTimes(drawsBeforeAppend + 1);
+
+    const uploadsBeforePromotion = texImage2D.mock.calls.length;
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "1:1:source",
+        tile: { ...updatedNextTile, cells: [...updatedNextTile.cells] },
+        transpose: false,
+      }],
+      generation: 8,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport,
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+    expect(texImage2D).toHaveBeenCalledTimes(uploadsBeforePromotion);
+
+    // Promotion is one-shot: an unrelated same-generation replacement must
+    // upload its own content instead of inheriting the preview texture.
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "1:1:source",
+        tile: { ...updatedNextTile, cells: [{ xBin: 5, yBin: 4, count: 13 }] },
+        transpose: false,
+      }],
+      generation: 8,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport,
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+    expect(texImage2D).toHaveBeenCalledTimes(uploadsBeforePromotion + 1);
     renderer?.destroy();
   });
 

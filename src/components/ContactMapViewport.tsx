@@ -807,8 +807,8 @@ export function ContactMapViewport({
       panPrefetchPresentFrameRef.current = window.requestAnimationFrame(() => {
         panPrefetchPresentFrameRef.current = null;
         // Tile completion may happen while the pointer is stationary. Present
-        // only the newly uploaded quads so the exposed edge fills immediately,
-        // without publishing a React map frame or redrawing the full scene.
+        // only appended or refreshed quads so the exposed edge fills and each
+        // cumulative batch appears immediately, without a React map frame.
         contactTilePanRendererRef.current?.presentAppendedSceneDescriptors();
       });
     };
@@ -825,6 +825,7 @@ export function ContactMapViewport({
           batch.viewport,
           "all",
         ),
+        generation: batch.generation,
         resolution: batch.resolution,
         tileSizeBins: batch.tileSizeBins,
       })) {

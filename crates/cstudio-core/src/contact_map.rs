@@ -201,6 +201,12 @@ struct DenseContactMapAggregate {
     occupied_count: usize,
 }
 
+// Visible exact requests are capped by the frontend, while screen-scale LOD
+// requests are bounded to roughly one display-sized grid. Prefer direct array
+// accumulation inside that shared safety envelope and retain the sparse map as
+// a fallback for diagnostic or external callers with a wider viewport.
+const MAX_DENSE_TILE_AGGREGATE_CELLS: usize = 1_048_576;
+
 impl<'a> ContactMapChunkProjector<'a> {
     pub fn new(query: &'a ContactMapQuery) -> CStudioResult<Self> {
         validate_query(query)?;
@@ -230,9 +236,7 @@ impl<'a> ContactMapChunkProjector<'a> {
             last_y_source: None,
             indexed_source_slots: Vec::new(),
             requested_tiles: None,
-            aggregate: ContactMapAggregate::Dense(DenseContactMapAggregate::new(
-                query, max_cells,
-            )?),
+            aggregate: ContactMapAggregate::Dense(DenseContactMapAggregate::new(query, max_cells)?),
         })
     }
 
@@ -263,6 +267,15 @@ impl<'a> ContactMapChunkProjector<'a> {
                 })
                 .collect(),
         });
+        // A tiled delta stream repeatedly aggregates source contacts into the
+        // same bounded visual grid. Hashing every projected contact dominated
+        // whole-genome LOD completion even though the grid itself is only
+        // screen-sized. Dense allocation removes that hash/sort hot path. If a
+        // caller supplies a wider diagnostic request, preserve the previous
+        // sparse behavior instead of rejecting it or allocating without bound.
+        if let Ok(dense) = DenseContactMapAggregate::new(query, MAX_DENSE_TILE_AGGREGATE_CELLS) {
+            projector.aggregate = ContactMapAggregate::Dense(dense);
+        }
         Ok(projector)
     }
 
@@ -274,18 +287,14 @@ impl<'a> ContactMapChunkProjector<'a> {
         start2: u64,
         count: f64,
     ) {
-        let Some(x_source) = Self::cached_source_slot(
-            &self.block_index,
-            &mut self.last_x_source,
-            source1,
-        ) else {
+        let Some(x_source) =
+            Self::cached_source_slot(&self.block_index, &mut self.last_x_source, source1)
+        else {
             return;
         };
-        let Some(y_source) = Self::cached_source_slot(
-            &self.block_index,
-            &mut self.last_y_source,
-            source2,
-        ) else {
+        let Some(y_source) =
+            Self::cached_source_slot(&self.block_index, &mut self.last_y_source, source2)
+        else {
             return;
         };
         self.push_contact_from_source_slots(x_source, start1, y_source, start2, count);
@@ -879,6 +888,10 @@ mod tests {
         };
         let mut projector = ContactMapChunkProjector::new_for_tiles(&query, 2, [(0, 0)])
             .expect("valid tile-filtered projector");
+        assert!(matches!(
+            &projector.aggregate,
+            super::ContactMapAggregate::Dense(_)
+        ));
         projector.push_contact("contig-a", 0, "contig-a", 1_000, 3.0);
         projector.push_contact("contig-a", 2_000, "contig-a", 3_000, 7.0);
 

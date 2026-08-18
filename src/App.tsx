@@ -1341,6 +1341,7 @@ export function App() {
       }
       contactPanPrefetchBridge.publish({
         tiles,
+        generation,
         resolution,
         tileSizeBins: activeTileSizeBins,
         viewport: prefetchViewport,

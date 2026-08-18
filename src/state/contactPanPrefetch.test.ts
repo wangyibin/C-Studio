@@ -11,6 +11,7 @@ describe("ContactPanPrefetchBridge", () => {
     const unsubscribe = bridge.subscribe(consumer);
     const batch = {
       tiles: [{ tileX: 1, tileY: 2, cells: [] }],
+      generation: 7,
       resolution: 100_000,
       tileSizeBins: 256,
       viewport: { xStart: 0, xEnd: 1, yStart: 0, yEnd: 1 },
@@ -31,6 +32,7 @@ describe("ContactPanPrefetchBridge", () => {
     bridge.subscribe(consumer);
     bridge.publish({
       tiles: [],
+      generation: 7,
       resolution: 100_000,
       tileSizeBins: 256,
       viewport: { xStart: 0, xEnd: 1, yStart: 0, yEnd: 1 },

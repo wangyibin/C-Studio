@@ -36,10 +36,11 @@ export interface ContactTileGpuRenderer {
   setScene: (scene: ContactTileGpuScene) => boolean;
   appendSceneDescriptors: (input: {
     descriptors: readonly ContactTileCanvasDescriptor[];
+    generation: number;
     resolution: number;
     tileSizeBins: number;
   }) => boolean;
-  /** Present newly appended pan-prefetch descriptors without replacing the scene. */
+  /** Present newly appended or refreshed pan-prefetch descriptors in place. */
   presentAppendedSceneDescriptors: () => boolean;
   setDeltaScene: (scene: ContactTileGpuDeltaScene) => boolean;
   updateDeltaTiles: (changedTileKeys: readonly string[]) => boolean;
@@ -69,6 +70,7 @@ interface GpuTextureEntry {
   texture: WebGLTexture;
   tile: ContactMapTile | null;
   deltaBuffer?: ContactTileDenseDeltaBuffer;
+  panPrefetchSnapshot?: boolean;
   generation?: number;
   bytes: number;
   lastUsed: number;
@@ -528,45 +530,88 @@ export function createContactTileGpuRenderer(
       for (const descriptor of retainedDescriptors) {
         retainedTiles.set(contactTileKey(descriptor.tile), descriptor.tile);
       }
-      const appendedTileKeys = new Set<string>();
+      const incomingTiles = new Map<string, ContactMapTile>();
       for (const descriptor of input.descriptors) {
-        const tileKey = contactTileKey(descriptor.tile);
-        if (retainedDescriptorKeys.has(descriptor.key)) {
+        incomingTiles.set(contactTileKey(descriptor.tile), descriptor.tile);
+      }
+      const refreshedTiles = new Map<string, ContactMapTile>();
+      for (const [tileKey, tile] of incomingTiles) {
+        const textureKey = gpuTextureKey(currentScene, tile);
+        const cached = textureCache.get(textureKey);
+        if (cached?.generation === input.generation) {
+          if (
+            cached.tile !== tile
+            && !updateTileTexture(
+              gl,
+              cached,
+              tile,
+              input.generation,
+              currentScene.tileSizeBins,
+              ++useCounter,
+            )
+          ) {
+            return false;
+          }
+          retainedTiles.set(tileKey, tile);
+          refreshedTiles.set(tileKey, tile);
           continue;
         }
-        const retainedTile = retainedTiles.get(tileKey);
-        if (retainedTile) {
-          const retainedDescriptor = { ...descriptor, tile: retainedTile };
-          retainedDescriptors.push(retainedDescriptor);
-          retainedDescriptorKeys.add(descriptor.key);
-          if (contactTileCellCount(retainedTile) > 0) {
-            pendingAppendedDescriptors.set(retainedDescriptor.key, retainedDescriptor);
-          }
+        // A complete tile already owned by the presented generation is more
+        // authoritative than a partial snapshot from the next pan generation.
+        if (retainedTiles.has(tileKey)) {
           continue;
         }
         if (retainedTiles.size >= maximumUniqueTiles) {
           continue;
         }
-        retainedTiles.set(tileKey, descriptor.tile);
-        retainedDescriptorKeys.add(descriptor.key);
-        retainedDescriptors.push(descriptor);
-        if (!appendedTileKeys.has(tileKey) && contactTileCellCount(descriptor.tile) > 0) {
-          appendedTileKeys.add(tileKey);
-          const textureKey = gpuTextureKey(currentScene, descriptor.tile);
-          if (!ensureTileTexture(
+        if (contactTileCellCount(tile) > 0) {
+          const entry = ensureTileTexture(
             gl,
             textureCache,
             textureKey,
-            descriptor.tile,
-            currentScene.generation,
+            tile,
+            input.generation,
             currentScene.tileSizeBins,
             ++useCounter,
-          )) {
+          );
+          if (!entry) {
             return false;
           }
+          entry.panPrefetchSnapshot = true;
         }
-        if (contactTileCellCount(descriptor.tile) > 0) {
-          pendingAppendedDescriptors.set(descriptor.key, descriptor);
+        retainedTiles.set(tileKey, tile);
+        refreshedTiles.set(tileKey, tile);
+      }
+
+      // Replace every source/mirror descriptor for a refreshed tile. Pointer
+      // pans require descriptor identity to match the cache entry; otherwise a
+      // later pan frame would fall back to the stale full-scene texture.
+      for (let index = 0; index < retainedDescriptors.length; index += 1) {
+        const descriptor = retainedDescriptors[index]!;
+        const tile = refreshedTiles.get(contactTileKey(descriptor.tile));
+        if (!tile) {
+          continue;
+        }
+        const refreshed = { ...descriptor, tile };
+        retainedDescriptors[index] = refreshed;
+        if (contactTileCellCount(tile) > 0) {
+          pendingAppendedDescriptors.set(refreshed.key, refreshed);
+        }
+      }
+
+      for (const descriptor of input.descriptors) {
+        if (retainedDescriptorKeys.has(descriptor.key)) {
+          continue;
+        }
+        const tile = retainedTiles.get(contactTileKey(descriptor.tile));
+        if (!tile) {
+          continue;
+        }
+        const retainedDescriptor = { ...descriptor, tile };
+        retainedDescriptors.push(retainedDescriptor);
+        retainedDescriptorKeys.add(retainedDescriptor.key);
+        if (contactTileCellCount(tile) > 0) {
+          pendingAppendedDescriptors.set(retainedDescriptor.key, retainedDescriptor);
         }
       }
 
@@ -605,8 +650,8 @@ export function createContactTileGpuRenderer(
         return true;
       }
       // The framebuffer already contains the pointer-translated front scene.
-      // Draw only the new quads into its existing white gaps: no resize,
-      // clear, texture upload, React state change, or full-scene replacement.
+      // Draw only appended or refreshed quads into the existing framebuffer:
+      // no resize, clear, React state change, or full-scene replacement.
       return draw(true, descriptors, true);
     },
     setDeltaScene: (nextScene) => {
@@ -811,6 +856,7 @@ function ensureTileTexture(
   gl.activeTexture(gl.TEXTURE0);
   const cached = cache.get(key);
   if (cached?.tile === tile) {
+    cached.panPrefetchSnapshot = false;
     cached.lastUsed = lastUsed;
     return cached;
   }
@@ -818,10 +864,11 @@ function ensureTileTexture(
     cached
     && generation !== undefined
     && cached.generation === generation
-    && cached.deltaBuffer
+    && (cached.deltaBuffer || cached.panPrefetchSnapshot)
   ) {
     cached.tile = tile;
     cached.deltaBuffer = undefined;
+    cached.panPrefetchSnapshot = false;
     cached.lastUsed = lastUsed;
     return cached;
   }
@@ -863,6 +910,38 @@ function ensureTileTexture(
   };
   cache.set(key, entry);
   return entry;
+}
+
+function updateTileTexture(
+  gl: WebGL2RenderingContext,
+  entry: GpuTextureEntry,
+  tile: ContactMapTile,
+  generation: number,
+  tileSizeBins: number,
+  lastUsed: number,
+) {
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+  gl.texSubImage2D(
+    gl.TEXTURE_2D,
+    0,
+    0,
+    0,
+    tileSizeBins,
+    tileSizeBins,
+    gl.RED,
+    gl.FLOAT,
+    contactTileFloatTextureData(tile, tileSizeBins),
+  );
+  if (gl.getError() !== gl.NO_ERROR) {
+    return false;
+  }
+  entry.tile = tile;
+  entry.deltaBuffer = undefined;
+  entry.panPrefetchSnapshot = true;
+  entry.generation = generation;
+  entry.lastUsed = lastUsed;
+  return true;
 }
 
 function ensureDeltaTileTexture(

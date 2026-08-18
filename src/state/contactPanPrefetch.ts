@@ -3,6 +3,7 @@ import type { ContactViewport } from "./contactViewport";
 
 export interface ContactPanPrefetchBatch {
   tiles: readonly ContactMapTile[];
+  generation: number;
   resolution: number;
   tileSizeBins: number;
   viewport: ContactViewport;
@@ -73,7 +74,7 @@ export function contactPanTileLoadPriority({
 /**
  * Imperative cache-to-GPU bridge used only while a pan is active. Publishing a
  * batch must not enter React state: the currently presented scene stays frozen
- * while its renderer accepts additional leading-edge textures.
+ * while its renderer accepts additional or cumulatively refreshed textures.
  */
 export class ContactPanPrefetchBridge {
   private consumers = new Set<ContactPanPrefetchConsumer>();
