@@ -1031,6 +1031,20 @@ export function ContactMapViewport({
     ? presentationContactMap.viewport
     : liveViewport;
   const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
+  usePrePaintEffect(() => {
+    // During pointer movement the annotation layer follows the retained heatmap
+    // through an imperative transform. Once React commits the new viewport its
+    // boxes are already projected into target coordinates, so remove that old
+    // transform before the browser can paint the new positions. Clearing it in
+    // a normal effect exposes one frame with both offsets applied and produces
+    // the visible post-pan boundary wobble.
+    resetPanAnnotationTransform();
+  }, [
+    displayViewport.xEnd,
+    displayViewport.xStart,
+    displayViewport.yEnd,
+    displayViewport.yStart,
+  ]);
   const historyPreviewOperation = useMemo(
     () => uiState.historyPreviewOperationId === null
       ? null
@@ -1893,6 +1907,10 @@ export function ContactMapViewport({
       contactTileTransformRef.current.style.transform = "";
     }
     contactTilePanRendererRef.current?.resetPanOffset();
+    resetPanAnnotationTransform();
+  }
+
+  function resetPanAnnotationTransform() {
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = "";
     }
@@ -1943,6 +1961,9 @@ export function ContactMapViewport({
 
   function commitAxisNavigator(axis: "x" | "y", centerRatio: number) {
     previewAxisNavigator(axis, centerRatio);
+    // Do not let the final preview animation frame reapply the old annotation
+    // transform after the committed viewport cleared it in the layout phase.
+    cancelScheduledPanFrame();
     onUiAction({
       type: "setContactViewportAxisFromNavigator",
       axis,
