@@ -5,6 +5,7 @@ import type { ExampleDatasetSummary } from "../App";
 import { createInitialUiState } from "../state/uiState";
 import {
   advanceContactCoveragePresentationFrame,
+  advanceContactBoundaryMountViewport,
   advancePaintedContactPresentationFrame,
   assemblyCutTargetAtScreenPoint,
   assemblyPointerStateAtScreenPoint,
@@ -88,6 +89,27 @@ const viewport = {
   yEnd: 175_000_000,
 };
 
+describe("advanceContactBoundaryMountViewport", () => {
+  it("keeps the mounted window stable for small pointer samples", () => {
+    const current = { xStart: 100, xEnd: 300, yStart: 200, yEnd: 400 };
+
+    expect(advanceContactBoundaryMountViewport(current, {
+      xStart: 180,
+      xEnd: 380,
+      yStart: 120,
+      yEnd: 320,
+    })).toBe(current);
+  });
+
+  it("recenters before a directional preview consumes the full overscan", () => {
+    const current = { xStart: 100, xEnd: 300, yStart: 200, yEnd: 400 };
+    const candidate = { xStart: 240, xEnd: 440, yStart: 200, yEnd: 400 };
+
+    expect(advanceContactBoundaryMountViewport(current, candidate)).toBe(candidate);
+    expect(advanceContactBoundaryMountViewport(null, candidate)).toBe(candidate);
+  });
+});
+
 describe("sameAssemblyOverlayPresentation", () => {
   it("keeps boundaries mounted across unrelated parent and contact-tile refreshes", () => {
     const model = {};
@@ -97,6 +119,7 @@ describe("sameAssemblyOverlayPresentation", () => {
     const pointerState = { kind: "select" };
     const base = {
       model,
+      boundaryMountViewport: { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 },
       viewportXStart: 0,
       viewportXEnd: 100,
       viewportYStart: 0,

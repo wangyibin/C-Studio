@@ -261,6 +261,28 @@ export function contactPanPreviewTileSignature(
   );
 }
 
+/**
+ * Recenter the lightweight chromosome-boundary mount window only after the
+ * directional preview consumes half of its current one-viewport overscan.
+ * This keeps future boxes mounted before they enter the clipped stage without
+ * forcing a React overlay update for every pointer sample.
+ */
+export function advanceContactBoundaryMountViewport(
+  current: ContactViewport | null,
+  candidate: ContactViewport,
+): ContactViewport {
+  if (!current) {
+    return candidate;
+  }
+  const xGuard = Math.max(1, current.xEnd - current.xStart) * 0.5;
+  const yGuard = Math.max(1, current.yEnd - current.yStart) * 0.5;
+  const remainsInsideGuard = candidate.xStart >= current.xStart - xGuard
+    && candidate.xEnd <= current.xEnd + xGuard
+    && candidate.yStart >= current.yStart - yGuard
+    && candidate.yEnd <= current.yEnd + yGuard;
+  return remainsInsideGuard ? current : candidate;
+}
+
 interface ContactResolutionWheelInput {
   deltaX: number;
   deltaY: number;
@@ -863,6 +885,10 @@ export function ContactMapViewport({
   const panVelocitySampleRef = useRef<ContactViewportVelocitySample | null>(null);
   const wheelPanSessionRef = useRef<WheelPanSession | null>(null);
   const wheelPanCommitTimerRef = useRef<number | null>(null);
+  const [assemblyBoundaryPanViewport, setAssemblyBoundaryPanViewport] = useState<
+    ContactViewport | null
+  >(null);
+  const assemblyBoundaryPanViewportRef = useRef<ContactViewport | null>(null);
   const panAnimationFrameRef = useRef<number | null>(null);
   const redrawAnimationFrameRef = useRef<number | null>(null);
   const prepaintedCellContactMapRef = useRef<ContactMapView | null>(null);
@@ -1039,12 +1065,16 @@ export function ContactMapViewport({
     // a normal effect exposes one frame with both offsets applied and produces
     // the visible post-pan boundary wobble.
     resetPanAnnotationTransform();
+    if (!dragStateRef.current && !wheelPanSessionRef.current) {
+      clearAssemblyBoundaryPanViewport();
+    }
   }, [
     displayViewport.xEnd,
     displayViewport.xStart,
     displayViewport.yEnd,
     displayViewport.yStart,
   ]);
+  const assemblyBoundaryMountViewport = assemblyBoundaryPanViewport ?? displayViewport;
   const historyPreviewOperation = useMemo(
     () => uiState.historyPreviewOperationId === null
       ? null
@@ -1174,16 +1204,22 @@ export function ContactMapViewport({
   );
   const visibleAssemblyChromosomes = useMemo(
     () => {
-      const xSpan = displayViewport.xEnd - displayViewport.xStart;
-      const ySpan = displayViewport.yEnd - displayViewport.yStart;
+      const xSpan = assemblyBoundaryMountViewport.xEnd - assemblyBoundaryMountViewport.xStart;
+      const ySpan = assemblyBoundaryMountViewport.yEnd - assemblyBoundaryMountViewport.yStart;
       return assemblyModel.chromosomes.filter(
-        (chromosome) => chromosome.visualEnd > displayViewport.xStart - xSpan
-          && chromosome.visualStart < displayViewport.xEnd + xSpan
-          && chromosome.visualEnd > displayViewport.yStart - ySpan
-          && chromosome.visualStart < displayViewport.yEnd + ySpan,
+        (chromosome) => chromosome.visualEnd > assemblyBoundaryMountViewport.xStart - xSpan
+          && chromosome.visualStart < assemblyBoundaryMountViewport.xEnd + xSpan
+          && chromosome.visualEnd > assemblyBoundaryMountViewport.yStart - ySpan
+          && chromosome.visualStart < assemblyBoundaryMountViewport.yEnd + ySpan,
       );
     },
-    [assemblyModel, displayViewport],
+    [
+      assemblyBoundaryMountViewport.xEnd,
+      assemblyBoundaryMountViewport.xStart,
+      assemblyBoundaryMountViewport.yEnd,
+      assemblyBoundaryMountViewport.yStart,
+      assemblyModel,
+    ],
   );
   const totalSpanMb = Math.max(
     0.000001,
@@ -1806,6 +1842,10 @@ export function ContactMapViewport({
     });
     panPrefetchFrontierRef.current = frontier;
     const prefetchViewport = frontier.viewport;
+    // Boundary DOM follows the visible camera, not the velocity-shifted tile
+    // lead. A fast data lead can sit several tiles ahead and would otherwise
+    // evict boxes that are still on screen.
+    prefetchAssemblyBoundaryViewport(previewViewport);
     const urgentPrefetchTileCount = frontier.urgentPrefetchTileCount;
     const signature = contactPanPreviewTileSignature(
       previewViewport,
@@ -1908,6 +1948,9 @@ export function ContactMapViewport({
     }
     contactTilePanRendererRef.current?.resetPanOffset();
     resetPanAnnotationTransform();
+    if (!dragStateRef.current && !wheelPanSessionRef.current) {
+      clearAssemblyBoundaryPanViewport();
+    }
   }
 
   function resetPanAnnotationTransform() {
@@ -1920,6 +1963,24 @@ export function ContactMapViewport({
     if (assemblySelectionHorizontalBandRef.current) {
       assemblySelectionHorizontalBandRef.current.style.transform = "";
     }
+  }
+
+  function prefetchAssemblyBoundaryViewport(candidate: ContactViewport) {
+    const current = assemblyBoundaryPanViewportRef.current;
+    const next = advanceContactBoundaryMountViewport(current, candidate);
+    if (next === current) {
+      return;
+    }
+    assemblyBoundaryPanViewportRef.current = next;
+    setAssemblyBoundaryPanViewport(next);
+  }
+
+  function clearAssemblyBoundaryPanViewport() {
+    if (assemblyBoundaryPanViewportRef.current === null) {
+      return;
+    }
+    assemblyBoundaryPanViewportRef.current = null;
+    setAssemblyBoundaryPanViewport(null);
   }
 
   function previewAxisNavigator(axis: "x" | "y", centerRatio: number) {
@@ -2406,6 +2467,7 @@ export function ContactMapViewport({
             overlayLayerRef={assemblyOverlayLayerRef}
             selectionVerticalBandRef={assemblySelectionVerticalBandRef}
             selectionHorizontalBandRef={assemblySelectionHorizontalBandRef}
+            boundaryMountViewport={assemblyBoundaryMountViewport}
             model={assemblyModel}
             viewportXStart={displayViewport.xStart}
             viewportXEnd={displayViewport.xEnd}
@@ -2599,6 +2661,7 @@ interface AssemblyOverlayProps {
   overlayLayerRef: React.RefObject<HTMLDivElement>;
   selectionVerticalBandRef: React.RefObject<HTMLSpanElement>;
   selectionHorizontalBandRef: React.RefObject<HTMLSpanElement>;
+  boundaryMountViewport: ContactViewport;
   model: AssemblyEditModel;
   viewportXStart: number;
   viewportXEnd: number;
@@ -2627,6 +2690,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
   overlayLayerRef,
   selectionVerticalBandRef,
   selectionHorizontalBandRef,
+  boundaryMountViewport,
   model,
   viewportXStart,
   viewportXEnd,
@@ -2808,6 +2872,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
             viewportYStart,
             viewportYEnd,
             viewportYSpan,
+            boundaryMountViewport,
           );
           if (!boundary) {
             return null;
@@ -3004,6 +3069,10 @@ export function sameAssemblyOverlayPresentation(
   next: AssemblyOverlayProps,
 ) {
   return previous.model === next.model
+    && previous.boundaryMountViewport.xStart === next.boundaryMountViewport.xStart
+    && previous.boundaryMountViewport.xEnd === next.boundaryMountViewport.xEnd
+    && previous.boundaryMountViewport.yStart === next.boundaryMountViewport.yStart
+    && previous.boundaryMountViewport.yEnd === next.boundaryMountViewport.yEnd
     && previous.viewportXStart === next.viewportXStart
     && previous.viewportXEnd === next.viewportXEnd
     && previous.viewportYStart === next.viewportYStart
@@ -3078,11 +3147,14 @@ function overscannedBoundaryIntervalBox(
   viewportYStart: number,
   viewportYEnd: number,
   viewportYSpan: number,
+  mountViewport: ContactViewport,
 ) {
-  const overscanXStart = viewportXStart - viewportXSpan;
-  const overscanXEnd = viewportXEnd + viewportXSpan;
-  const overscanYStart = viewportYStart - viewportYSpan;
-  const overscanYEnd = viewportYEnd + viewportYSpan;
+  const mountXSpan = Math.max(1, mountViewport.xEnd - mountViewport.xStart);
+  const mountYSpan = Math.max(1, mountViewport.yEnd - mountViewport.yStart);
+  const overscanXStart = mountViewport.xStart - mountXSpan;
+  const overscanXEnd = mountViewport.xEnd + mountXSpan;
+  const overscanYStart = mountViewport.yStart - mountYSpan;
+  const overscanYEnd = mountViewport.yEnd + mountYSpan;
   const clippedXStart = Math.max(visualStart, overscanXStart);
   const clippedXEnd = Math.min(visualEnd, overscanXEnd);
   const clippedYStart = Math.max(visualStart, overscanYStart);
