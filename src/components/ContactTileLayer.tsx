@@ -18,6 +18,7 @@ import type {
   ContactTileDenseDeltaBuffer,
 } from "../state/contactTileDelta";
 import { contactTilesWithPreviewFallback } from "../state/contactMapView";
+import { rasterizeContactMapCells } from "../state/contactMapRaster";
 import {
   rasterizeContactTile,
   rasterizeContactTileDelta,
@@ -27,8 +28,11 @@ import { canonicalContactTile, contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
 import type { ContactColormap } from "../state/uiState";
 import {
+  contactOverviewFloatTextureData,
+  contactOverviewTextureBins,
   contactTileGpuTextureBudgetBytes,
   createContactTileGpuRenderer,
+  type ContactTileGpuOverview,
   type ContactTileGpuRenderer,
 } from "./contactTileGpu";
 
@@ -43,6 +47,7 @@ export interface ContactTileLayerPaintEvent {
 export interface ContactTileLayerProps {
   contactMap: ContactMapView | null;
   deltaStream?: ContactTileDeltaRenderStream | null;
+  overviewContactMap?: ContactMapView | null;
   viewport?: ContactViewport;
   renderStyle: ContactTileRenderStyle;
   /** One cached tile beyond the viewport, only on the active pan axes. */
@@ -546,11 +551,18 @@ export function ContactTileLayer({
   onPointerDown,
   onPointerMove,
   onPointerUp,
+  overviewContactMap,
   overscanDirection = "all",
   panRendererRef,
   renderStyle,
   viewport,
 }: ContactTileLayerProps) {
+  const overview = useMemo(
+    () => overviewContactMap
+      ? contactOverviewFloatTextureData(overviewContactMap)
+      : null,
+    [overviewContactMap],
+  );
   const incomingFrame = useMemo<ContactTileLayerFrame | null>(
     () => contactMap
       ? {
@@ -733,6 +745,12 @@ export function ContactTileLayer({
                 viewport,
               )
             : stagedDeltaStream!.viewport;
+          const frameAcceptsOverview = !frame || Boolean(
+            overviewContactMap
+            && frame.contactMap.layoutBlocks === overviewContactMap.layoutBlocks
+            && (frame.contactMap.normalization ?? "raw")
+              === (overviewContactMap.normalization ?? "raw"),
+          );
           return (
             <ContactTileSurface
               key={slot}
@@ -750,6 +768,8 @@ export function ContactTileLayer({
               onTileLayerPaintUnavailable={slot === 0
                 ? reportSlotZeroUnavailable
                 : reportSlotOneUnavailable}
+              overview={frameAcceptsOverview ? overview : null}
+              overviewContactMap={frameAcceptsOverview ? overviewContactMap ?? null : null}
               paintRevision={frame?.contactMap.renderGeneration ?? paintRevision}
               panRendererRef={phase === "presented" ? panRendererRef : undefined}
               phase={phase}
@@ -911,6 +931,8 @@ function ContactTileSurface({
   contactMap,
   deltaStream,
   layerRef,
+  overview,
+  overviewContactMap,
   paintRevision,
   onTileLayerCommit,
   onTileLayerPaintComplete,
@@ -928,6 +950,8 @@ function ContactTileSurface({
   onTileLayerCommit: (event: ContactTileLayerPaintEvent) => void;
   onTileLayerPaintComplete: (event: ContactTileLayerPaintEvent) => void;
   onTileLayerPaintUnavailable: (event: ContactTileLayerPaintEvent) => void;
+  overview: ContactTileGpuOverview | null;
+  overviewContactMap: ContactMapView | null;
   panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
   phase: "presented" | "staging";
   renderStyle: ContactTileRenderStyle;
@@ -1075,24 +1099,36 @@ function ContactTileSurface({
             paintCanvasKeys={paintCanvasKeys}
             paintCoordinator={paintCoordinator}
             panRendererRef={panRendererRef}
+            overview={overview}
             renderStyle={renderStyle}
             tileSizeBins={tileSizeBins}
             textureBudgetBytes={contactTileGpuSlotTextureBudgetBytes}
             viewport={viewport}
           />
-        ) : contactMap ? renderCanvases.map(({ key, tile, transpose }) => (
-            <ContactTileCanvas
-              key={key}
-              contactMap={contactMap}
-              tile={tile}
-              tileSizeBins={tileSizeBins}
-              transpose={transpose}
-              paintCanvasKey={key}
-              paintCoordinator={paintCoordinator}
-              renderStyle={renderStyle}
-              viewport={viewport}
-            />
-          )) : null}
+        ) : (
+          <>
+            {overviewContactMap ? (
+              <ContactOverviewCanvas
+                contactMap={overviewContactMap}
+                renderStyle={renderStyle}
+                viewport={viewport}
+              />
+            ) : null}
+            {contactMap ? renderCanvases.map(({ key, tile, transpose }) => (
+              <ContactTileCanvas
+                key={key}
+                contactMap={contactMap}
+                tile={tile}
+                tileSizeBins={tileSizeBins}
+                transpose={transpose}
+                paintCanvasKey={key}
+                paintCoordinator={paintCoordinator}
+                renderStyle={renderStyle}
+                viewport={viewport}
+              />
+            )) : null}
+          </>
+        )}
       </div>
     </div>
   );
@@ -1106,6 +1142,7 @@ function ContactTileGpuCanvas({
   paintCanvasKeys,
   paintCoordinator,
   panRendererRef,
+  overview,
   renderStyle,
   tileSizeBins,
   textureBudgetBytes,
@@ -1118,6 +1155,7 @@ function ContactTileGpuCanvas({
   paintCanvasKeys: readonly string[];
   paintCoordinator: ContactTilePaintCoordinator | null;
   panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
+  overview: ContactTileGpuOverview | null;
   renderStyle: ContactTileRenderStyle;
   tileSizeBins: number;
   textureBudgetBytes: number;
@@ -1199,6 +1237,7 @@ function ContactTileGpuCanvas({
     const painted = renderer.setScene({
       descriptors,
       generation: contactMap.renderGeneration,
+      overview,
       resolution: contactMap.resolution,
       tileSizeBins,
       viewport,
@@ -1215,6 +1254,7 @@ function ContactTileGpuCanvas({
     contactMap,
     descriptors,
     onUnavailable,
+    overview,
     paintCanvasKeys,
     paintCoordinator,
     renderStyle.colormap,
@@ -1266,6 +1306,7 @@ function ContactTileGpuCanvas({
       deferTextureUpdates,
       descriptors: deltaDescriptors,
       generation: deltaStream.generation,
+      overview,
       resolution: deltaStream.resolution,
       tileSizeBins: deltaStream.accumulator.tileSizeBins,
       viewport: deltaStream.viewport,
@@ -1300,6 +1341,7 @@ function ContactTileGpuCanvas({
     deltaDescriptors,
     deltaStream,
     onUnavailable,
+    overview,
     renderStyle.colormap,
     renderStyle.colorScale.log,
     renderStyle.colorScale.max,
@@ -1426,6 +1468,70 @@ export function contactTileCanvasBox({
   return { left, top, width, height };
 }
 
+function ContactOverviewCanvas({
+  contactMap,
+  renderStyle,
+  viewport,
+}: {
+  contactMap: ContactMapView;
+  renderStyle: ContactTileRenderStyle;
+  viewport: ContactViewport;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const viewportWidth = Math.max(1, viewport.xEnd - viewport.xStart);
+  const viewportHeight = Math.max(1, viewport.yEnd - viewport.yStart);
+  const box = {
+    left: ((contactMap.viewport.xStart - viewport.xStart) / viewportWidth) * 100,
+    top: ((contactMap.viewport.yStart - viewport.yStart) / viewportHeight) * 100,
+    width: ((contactMap.viewport.xEnd - contactMap.viewport.xStart) / viewportWidth) * 100,
+    height: ((contactMap.viewport.yEnd - contactMap.viewport.yStart) / viewportHeight) * 100,
+  };
+
+  usePrePaintEffect(() => {
+    const context = canvasRef.current?.getContext("2d");
+    if (!context) {
+      return;
+    }
+    const imageData = context.createImageData(
+      contactOverviewTextureBins,
+      contactOverviewTextureBins,
+    );
+    rasterizeContactMapCells({
+      cells: contactMap.cells,
+      resolution: contactMap.resolution,
+      viewport: contactMap.viewport,
+      width: contactOverviewTextureBins,
+      height: contactOverviewTextureBins,
+      colorScale: renderStyle.colorScale,
+      colormap: renderStyle.colormap,
+      colorLut: contactColorLut(renderStyle.colormap, 0.88),
+    }, imageData.data);
+    context.putImageData(imageData, 0, 0);
+  }, [
+    contactMap,
+    renderStyle.colormap,
+    renderStyle.colorScale.log,
+    renderStyle.colorScale.max,
+    renderStyle.colorScale.min,
+  ]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="contact-tile-canvas contact-overview-base-canvas"
+      aria-hidden="true"
+      width={contactOverviewTextureBins}
+      height={contactOverviewTextureBins}
+      style={{
+        left: `${box.left}%`,
+        top: `${box.top}%`,
+        width: `${box.width}%`,
+        height: `${box.height}%`,
+      }}
+    />
+  );
+}
+
 function ContactTileCanvas({
   contactMap,
   tile,
@@ -1486,7 +1592,7 @@ function ContactTileCanvas({
   return (
     <canvas
       ref={canvasRef}
-      className="contact-tile-canvas"
+      className="contact-tile-canvas contact-tile-exact-canvas"
       aria-hidden="true"
       width={tileSizeBins}
       height={tileSizeBins}

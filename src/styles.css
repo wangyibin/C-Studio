@@ -1207,6 +1207,16 @@ button {
   will-change: contents;
 }
 
+.contact-map canvas.contact-overview-base-canvas {
+  background: #ffffff;
+}
+
+/* Exact terminal tiles own their full rectangle. Their white backing prevents
+   sparse zero pixels from leaking the coarse overview through the exact LOD. */
+.contact-map canvas.contact-tile-exact-canvas {
+  background: #ffffff;
+}
+
 .contact-map canvas.contact-layout-raster-preview {
   position: absolute;
   inset: 0;

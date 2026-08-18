@@ -972,6 +972,7 @@ export function AppShell({
                   dataset={dataset}
                   contactMap={contactMap}
                   contactTileDeltaStream={contactTileDeltaStream}
+                  overviewContactMap={overviewContactMap}
                   coverageView={coverageView}
                   uiState={uiState}
                   homologPattern={gfaHomologPattern}

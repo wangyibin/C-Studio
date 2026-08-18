@@ -43,6 +43,7 @@ import {
 } from "../state/contactLayoutPreview";
 import { contactCellsForViewport } from "../state/contactMapView";
 import { rasterizeContactMapCells } from "../state/contactMapRaster";
+import { contactOverviewBaseIsCompatible } from "../state/contactOverviewTiles";
 import { contactResolutionToBasePairs } from "../state/contactResolution";
 import {
   advanceContactPanPrefetchFrontier,
@@ -105,6 +106,7 @@ interface ContactMapViewportProps {
   dataset: ExampleDatasetSummary | null;
   contactMap: ContactMapView | null;
   contactTileDeltaStream?: ContactTileDeltaRenderStream | null;
+  overviewContactMap?: ContactMapView | null;
   coverageView: CoverageView | null;
   uiState: UiState;
   homologPattern?: string;
@@ -800,6 +802,7 @@ function setShiftSelectionCursor(active: boolean) {
 export function ContactMapViewport({
   contactMap: incomingContactMap,
   contactTileDeltaStream,
+  overviewContactMap,
   coverageView: incomingCoverageView,
   dataset,
   onContactTileLayerCommit,
@@ -947,6 +950,16 @@ export function ContactMapViewport({
   const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
     ? uiState.assembly.blocks
     : dataset?.agp_layout.blocks ?? [];
+  const compatibleOverviewContactMap = useMemo(
+    () => contactOverviewBaseIsCompatible(
+      overviewContactMap ?? null,
+      activeAssemblyBlocks,
+      contactNormalizationForBackend(uiState.normalization),
+    )
+      ? overviewContactMap ?? null
+      : null,
+    [activeAssemblyBlocks, overviewContactMap, uiState.normalization],
+  );
   const activeAssemblyTotalBp = useMemo(
     () => activeAssemblyBlocks.reduce(
       (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
@@ -2425,6 +2438,7 @@ export function ContactMapViewport({
               <ContactTileLayer
                 contactMap={usesTiledRenderer ? contactMap : null}
                 deltaStream={contactTileDeltaStream}
+                overviewContactMap={compatibleOverviewContactMap}
                 freezePresentedStyle={freezePresentedTileStyle}
                 layerRef={contactTileLayerRef}
                 panRendererRef={contactTilePanRendererRef}

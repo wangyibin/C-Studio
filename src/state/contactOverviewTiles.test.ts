@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildContactOverviewTilePlan,
   closestContactResolution,
+  contactOverviewBaseIsCompatible,
   contactOverviewGenerationIsReady,
   contactOverviewRequestIsReady,
   overviewResolutionForSpan,
@@ -104,6 +105,35 @@ describe("contact overview request readiness", () => {
 });
 
 describe("contact overview reuse", () => {
+  it("admits only a complete overview from the active layout and normalization", () => {
+    const activeLayout = [{
+      id: "block-1",
+      objectId: "chr1",
+      sourceId: "ctg1",
+      visualStart: 0,
+      visualEnd: 1_000,
+      sourceStart: 0,
+      sourceEnd: 1_000,
+      orientation: "+" as const,
+    }];
+    const overview = {
+      resolution: 10,
+      normalization: "raw" as const,
+      viewport: { xStart: 0, xEnd: 1_000, yStart: 0, yEnd: 1_000 },
+      cells: [],
+      layoutBlocks: activeLayout,
+      visibleLayerComplete: true,
+    };
+
+    expect(contactOverviewBaseIsCompatible(overview, activeLayout, "raw")).toBe(true);
+    expect(contactOverviewBaseIsCompatible(overview, [...activeLayout], "raw")).toBe(false);
+    expect(contactOverviewBaseIsCompatible(overview, activeLayout, "ice")).toBe(false);
+    expect(contactOverviewBaseIsCompatible({
+      ...overview,
+      visibleLayerComplete: false,
+    }, activeLayout, "raw")).toBe(false);
+  });
+
   it("crops a covering rectangular main LOD without copying its cells", () => {
     const cells = [{ xBin: 1, yBin: 2, count: 3 }];
     const map = {

@@ -1,4 +1,4 @@
-import type { ContactMapTile } from "../App";
+import type { ContactMapTile, ContactMapView } from "../App";
 import { contactColorLut } from "../state/contactColor";
 import type { ContactTileDenseDeltaBuffer } from "../state/contactTileDelta";
 import { contactTileCellCount, validatedPackedContactTileCells } from "../state/contactTileData";
@@ -10,10 +10,19 @@ import type {
 } from "./ContactTileLayer";
 
 export const contactTileGpuTextureBudgetBytes = 96 * 1024 * 1024;
+export const contactOverviewTextureBins = 320;
+
+export interface ContactTileGpuOverview {
+  values: Float32Array;
+  width: number;
+  height: number;
+  viewport: ContactViewport;
+}
 
 export interface ContactTileGpuScene {
   descriptors: readonly ContactTileCanvasDescriptor[];
   generation?: number;
+  overview?: ContactTileGpuOverview | null;
   resolution: number;
   tileSizeBins: number;
   viewport: ContactViewport;
@@ -26,6 +35,7 @@ export interface ContactTileGpuDeltaScene {
   deferTextureUpdates?: boolean;
   descriptors: readonly ContactTileCanvasDescriptor[];
   generation: number;
+  overview?: ContactTileGpuOverview | null;
   resolution: number;
   tileSizeBins: number;
   viewport: ContactViewport;
@@ -59,9 +69,10 @@ export interface ContactTileGpuRenderer {
 export function contactTileGpuDrawCoverageIsComplete(
   descriptors: readonly ContactTileCanvasDescriptor[],
   drawnDescriptorKeys: ReadonlySet<string>,
+  requiresExplicitEmptyCoverage = false,
 ): boolean {
   return descriptors.every((descriptor) => (
-    contactTileCellCount(descriptor.tile) === 0
+    (!requiresExplicitEmptyCoverage && contactTileCellCount(descriptor.tile) === 0)
     || drawnDescriptorKeys.has(descriptor.key)
   ));
 }
@@ -74,6 +85,13 @@ interface GpuTextureEntry {
   generation?: number;
   bytes: number;
   lastUsed: number;
+}
+
+interface GpuOverviewTextureEntry {
+  texture: WebGLTexture;
+  values: Float32Array;
+  width: number;
+  height: number;
 }
 
 interface RendererResources {
@@ -205,6 +223,98 @@ export function contactTileFloatTextureData(
   return values;
 }
 
+/** Fixed-size R32F whole-assembly base texture used by the main viewport. */
+export function contactOverviewFloatTextureData(
+  map: Pick<ContactMapView, "cells" | "resolution" | "viewport">,
+  targetBins = contactOverviewTextureBins,
+): ContactTileGpuOverview {
+  if (!Number.isSafeInteger(targetBins) || targetBins <= 0) {
+    throw new RangeError("contact overview size must be a positive integer");
+  }
+  if (!Number.isFinite(map.resolution) || map.resolution <= 0) {
+    throw new RangeError("contact overview resolution must be positive");
+  }
+  const xSpan = map.viewport.xEnd - map.viewport.xStart;
+  const ySpan = map.viewport.yEnd - map.viewport.yStart;
+  if (!(xSpan > 0) || !(ySpan > 0)) {
+    throw new RangeError("contact overview viewport must have positive area");
+  }
+
+  const values = new Float32Array(targetBins * targetBins);
+  values.fill(-1);
+  const writeRectangle = (
+    xStartBp: number,
+    xEndBp: number,
+    yStartBp: number,
+    yEndBp: number,
+    value: number,
+  ) => {
+    const left = Math.max(0, Math.floor(
+      ((xStartBp - map.viewport.xStart) / xSpan) * targetBins,
+    ));
+    const right = Math.min(targetBins, Math.ceil(
+      ((xEndBp - map.viewport.xStart) / xSpan) * targetBins,
+    ));
+    const top = Math.max(0, Math.floor(
+      ((yStartBp - map.viewport.yStart) / ySpan) * targetBins,
+    ));
+    const bottom = Math.min(targetBins, Math.ceil(
+      ((yEndBp - map.viewport.yStart) / ySpan) * targetBins,
+    ));
+    for (let y = top; y < bottom; y += 1) {
+      for (let x = left; x < right; x += 1) {
+        const index = y * targetBins + x;
+        values[index] = values[index] < 0 ? value : Math.max(values[index], value);
+      }
+    }
+  };
+
+  for (const cell of map.cells) {
+    if (
+      !Number.isFinite(cell.xBin)
+      || !Number.isFinite(cell.yBin)
+      || !Number.isFinite(cell.count)
+    ) {
+      continue;
+    }
+    const xStartBp = cell.xBin * map.resolution;
+    const yStartBp = cell.yBin * map.resolution;
+    writeRectangle(
+      xStartBp,
+      xStartBp + map.resolution,
+      yStartBp,
+      yStartBp + map.resolution,
+      cell.count,
+    );
+    if (cell.xBin !== cell.yBin) {
+      writeRectangle(
+        yStartBp,
+        yStartBp + map.resolution,
+        xStartBp,
+        xStartBp + map.resolution,
+        cell.count,
+      );
+    }
+  }
+
+  return {
+    values,
+    width: targetBins,
+    height: targetBins,
+    viewport: map.viewport,
+  };
+}
+
+export function contactOverviewTextureBytes(
+  width = contactOverviewTextureBins,
+  height = contactOverviewTextureBins,
+) {
+  if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) {
+    throw new RangeError("contact overview dimensions must be positive integers");
+  }
+  return width * height * Float32Array.BYTES_PER_ELEMENT;
+}
+
 /** Convert the mutable streamed accumulator into the R32F texture layout. */
 export function contactTileDenseFloatTextureData(
   buffer: ContactTileDenseDeltaBuffer,
@@ -276,6 +386,7 @@ export function createContactTileGpuRenderer(
   let panOffsetX = 0;
   let panOffsetY = 0;
   const pendingAppendedDescriptors = new Map<string, ContactTileCanvasDescriptor>();
+  let overviewTextureEntry: GpuOverviewTextureEntry | null = null;
   let destroyed = false;
   let lutColormap: ContactTileRenderStyle["colormap"] | null = null;
   let presentedCssWidth = 1;
@@ -351,14 +462,78 @@ export function createContactTileGpuRenderer(
     const protectedKeys = panOnly ? null : new Set<string>();
     const validatesCompleteCoverage = !panOnly && descriptors === null;
     const drawnDescriptorKeys = validatesCompleteCoverage ? new Set<string>() : null;
+    const overview = activeScene.overview ?? null;
+
+    if (!preserveFramebuffer && overview) {
+      overviewTextureEntry = ensureOverviewTexture(gl, overviewTextureEntry, overview);
+      if (!overviewTextureEntry) {
+        return false;
+      }
+      const left = (
+        ((overview.viewport.xStart - activeScene.viewport.xStart) / viewportWidth) * cssWidth
+        + panOffsetX
+      ) * scaleX;
+      const top = (
+        ((overview.viewport.yStart - activeScene.viewport.yStart) / viewportHeight) * cssHeight
+        + panOffsetY
+      ) * scaleY;
+      const width = (
+        (overview.viewport.xEnd - overview.viewport.xStart) / viewportWidth
+      ) * canvas.width;
+      const height = (
+        (overview.viewport.yEnd - overview.viewport.yStart) / viewportHeight
+      ) * canvas.height;
+      drawTextureQuad(
+        gl,
+        resources,
+        overviewTextureEntry.texture,
+        left,
+        top,
+        width,
+        height,
+        false,
+      );
+    } else if (!overview && overviewTextureEntry) {
+      gl.deleteTexture(overviewTextureEntry.texture);
+      overviewTextureEntry = null;
+    }
 
     for (const descriptor of descriptors ?? activeScene.descriptors) {
       const deltaBuffer = deltaScene
         ? deltaBuffers.get(contactTileKey(descriptor.tile))
         : undefined;
+      const renderedTileX = descriptor.transpose ? descriptor.tile.tileY : descriptor.tile.tileX;
+      const renderedTileY = descriptor.transpose ? descriptor.tile.tileX : descriptor.tile.tileY;
+      const left = (
+        ((renderedTileX * tileSpanBp - activeScene.viewport.xStart) / viewportWidth) * cssWidth
+        + panOffsetX
+      ) * scaleX;
+      const top = (
+        ((renderedTileY * tileSpanBp - activeScene.viewport.yStart) / viewportHeight) * cssHeight
+        + panOffsetY
+      ) * scaleY;
+      const width = (tileSpanBp / viewportWidth) * canvas.width;
+      const height = (tileSpanBp / viewportHeight) * canvas.height;
+
+      // A terminal exact tile owns its full rectangle, including sparse zero
+      // pixels. Mask the coarse base before drawing it. Streamed partial tiles
+      // deliberately skip this mask so the overview remains visible where the
+      // current batch has not arrived yet.
+      const explicitlyMasksOverview = Boolean(
+        overview
+        && deltaScene === null
+        && !preserveFramebuffer,
+      );
+      if (explicitlyMasksOverview) {
+        clearCanvasRectToWhite(gl, canvas.width, canvas.height, left, top, width, height);
+      }
       if (deltaScene ? !deltaBuffer || deltaBuffer.occupiedCount === 0 : contactTileCellCount(descriptor.tile) === 0) {
+        if (explicitlyMasksOverview) {
+          drawnDescriptorKeys?.add(descriptor.key);
+        }
         continue;
       }
+
       const textureKey = gpuTextureKey(activeScene, descriptor.tile);
       protectedKeys?.add(textureKey);
       const cachedEntry = panOnly ? textureCache.get(textureKey) : undefined;
@@ -394,31 +569,19 @@ export function createContactTileGpuRenderer(
               activeScene.tileSizeBins,
               ++useCounter,
             );
-      if (!entry) {
+      if (!entry || !textureCache.has(textureKey)) {
         continue;
       }
-      if (!textureCache.has(textureKey)) {
-        continue;
-      }
-      const renderedTileX = descriptor.transpose ? descriptor.tile.tileY : descriptor.tile.tileX;
-      const renderedTileY = descriptor.transpose ? descriptor.tile.tileX : descriptor.tile.tileY;
-      const left = (
-        ((renderedTileX * tileSpanBp - activeScene.viewport.xStart) / viewportWidth) * cssWidth
-        + panOffsetX
-      ) * scaleX;
-      const top = (
-        ((renderedTileY * tileSpanBp - activeScene.viewport.yStart) / viewportHeight) * cssHeight
-        + panOffsetY
-      ) * scaleY;
-      const width = (tileSpanBp / viewportWidth) * canvas.width;
-      const height = (tileSpanBp / viewportHeight) * canvas.height;
-
-      gl.uniform4f(resources.rectLocation, left, top, width, height);
-      gl.uniform1i(resources.transposeLocation, descriptor.transpose ? 1 : 0);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, entry.texture);
-      gl.uniform1i(resources.tileTextureLocation, 0);
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      drawTextureQuad(
+        gl,
+        resources,
+        entry.texture,
+        left,
+        top,
+        width,
+        height,
+        descriptor.transpose,
+      );
       drawnDescriptorKeys?.add(descriptor.key);
     }
 
@@ -447,7 +610,11 @@ export function createContactTileGpuRenderer(
     return glSucceeded && (
       deltaScene !== null
       || !validatesCompleteCoverage
-      || contactTileGpuDrawCoverageIsComplete(activeScene.descriptors, drawnDescriptorKeys!)
+      || contactTileGpuDrawCoverageIsComplete(
+        activeScene.descriptors,
+        drawnDescriptorKeys!,
+        overview !== null,
+      )
     );
   };
 
@@ -738,12 +905,118 @@ export function createContactTileGpuRenderer(
         gl.deleteTexture(entry.texture);
       }
       textureCache.clear();
+      if (overviewTextureEntry) {
+        gl.deleteTexture(overviewTextureEntry.texture);
+        overviewTextureEntry = null;
+      }
       pendingAppendedDescriptors.clear();
       gl.deleteTexture(resources.lutTexture);
       gl.deleteBuffer(resources.quadBuffer);
       gl.deleteProgram(resources.program);
     },
   };
+}
+
+function ensureOverviewTexture(
+  gl: WebGL2RenderingContext,
+  current: GpuOverviewTextureEntry | null,
+  overview: ContactTileGpuOverview,
+): GpuOverviewTextureEntry | null {
+  if (
+    current
+    && current.values === overview.values
+    && current.width === overview.width
+    && current.height === overview.height
+  ) {
+    return current;
+  }
+  if (
+    overview.values.length !== overview.width * overview.height
+    || overview.width <= 0
+    || overview.height <= 0
+  ) {
+    return null;
+  }
+  if (current) {
+    gl.deleteTexture(current.texture);
+  }
+  const texture = gl.createTexture();
+  if (!texture) {
+    return null;
+  }
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.R32F,
+    overview.width,
+    overview.height,
+    0,
+    gl.RED,
+    gl.FLOAT,
+    overview.values,
+  );
+  if (gl.getError() !== gl.NO_ERROR) {
+    gl.deleteTexture(texture);
+    return null;
+  }
+  return {
+    texture,
+    values: overview.values,
+    width: overview.width,
+    height: overview.height,
+  };
+}
+
+function drawTextureQuad(
+  gl: WebGL2RenderingContext,
+  resources: RendererResources,
+  texture: WebGLTexture,
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+  transpose: boolean,
+) {
+  gl.uniform4f(resources.rectLocation, left, top, width, height);
+  gl.uniform1i(resources.transposeLocation, transpose ? 1 : 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.uniform1i(resources.tileTextureLocation, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+function clearCanvasRectToWhite(
+  gl: WebGL2RenderingContext,
+  canvasWidth: number,
+  canvasHeight: number,
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+) {
+  const xStart = Math.max(0, Math.floor(left));
+  const xEnd = Math.min(canvasWidth, Math.ceil(left + width));
+  const yStartFromTop = Math.max(0, Math.floor(top));
+  const yEndFromTop = Math.min(canvasHeight, Math.ceil(top + height));
+  if (xEnd <= xStart || yEndFromTop <= yStartFromTop) {
+    return;
+  }
+  gl.enable(gl.SCISSOR_TEST);
+  gl.scissor(
+    xStart,
+    canvasHeight - yEndFromTop,
+    xEnd - xStart,
+    yEndFromTop - yStartFromTop,
+  );
+  gl.clearColor(1, 1, 1, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.SCISSOR_TEST);
 }
 
 function createRendererResources(gl: WebGL2RenderingContext): RendererResources | null {

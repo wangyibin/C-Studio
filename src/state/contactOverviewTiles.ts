@@ -1,5 +1,7 @@
 import type { ContactMapView } from "../App";
+import type { ContactMapLayoutBlock } from "./importers";
 import type { ContactViewport } from "./contactViewport";
+import type { ContactNormalization } from "./uiState";
 
 export const overviewTargetBins = 320;
 const fallbackCoolResolution = 1_000;
@@ -17,6 +19,28 @@ export interface ContactOverviewRequestReadiness {
   paintedGeneration: number | null;
   completeLayerGeneration: number | null;
   documentHidden: boolean;
+}
+
+/**
+ * Keep the overview strictly inside the data semantics of the active main
+ * surface. Reference equality is intentional: it rejects an overview from the
+ * previous immutable layout snapshot immediately after an assembly edit.
+ */
+export function contactOverviewBaseIsCompatible(
+  overview: ContactMapView | null,
+  activeLayoutBlocks: readonly ContactMapLayoutBlock[],
+  normalization: ContactNormalization,
+): overview is ContactMapView {
+  return Boolean(
+    overview
+    && overview.visibleLayerComplete === true
+    && overview.layoutBlocks === activeLayoutBlocks
+    && (overview.normalization ?? "raw") === normalization
+    && Number.isFinite(overview.resolution)
+    && overview.resolution > 0
+    && overview.viewport.xEnd > overview.viewport.xStart
+    && overview.viewport.yEnd > overview.viewport.yStart,
+  );
 }
 
 /**

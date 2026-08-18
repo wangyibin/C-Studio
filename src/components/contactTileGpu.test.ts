@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  contactOverviewFloatTextureData,
+  contactOverviewTextureBytes,
   contactTileDenseFloatTextureData,
   contactTileFloatTextureData,
   contactTileGpuDrawCoverageIsComplete,
@@ -12,6 +14,7 @@ function mockWebGlCanvas() {
   const getError = vi.fn(() => 0);
   const drawArrays = vi.fn();
   const clear = vi.fn();
+  const scissor = vi.fn();
   const clientWidthRead = vi.fn(() => 256);
   const clientHeightRead = vi.fn(() => 256);
   const gl = {
@@ -25,6 +28,7 @@ function mockWebGlCanvas() {
     DEPTH_TEST: 8,
     CULL_FACE: 9,
     BLEND: 10,
+    SCISSOR_TEST: 28,
     UNPACK_ALIGNMENT: 11,
     TEXTURE0: 12,
     TEXTURE1: 13,
@@ -62,11 +66,13 @@ function mockWebGlCanvas() {
     deleteBuffer: vi.fn(),
     deleteTexture: vi.fn(),
     disable: vi.fn(),
+    enable: vi.fn(),
     pixelStorei: vi.fn(),
     isContextLost: vi.fn(() => false),
     viewport: vi.fn(),
     clearColor: vi.fn(),
     clear,
+    scissor,
     useProgram: vi.fn(),
     enableVertexAttribArray: vi.fn(),
     vertexAttribPointer: vi.fn(),
@@ -96,12 +102,65 @@ function mockWebGlCanvas() {
     clientWidthRead,
     drawArrays,
     getError,
+    scissor,
     texImage2D,
     texSubImage2D,
   };
 }
 
 describe("contactTileFloatTextureData", () => {
+  it("builds one fixed R32F overview and mirrors upper-triangle cells", () => {
+    const overview = contactOverviewFloatTextureData({
+      resolution: 100,
+      viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
+      cells: [{ xBin: 0, yBin: 1, count: 7 }],
+    }, 4);
+
+    expect(overview.width).toBe(4);
+    expect(overview.height).toBe(4);
+    expect(overview.values[4]).toBe(7);
+    expect(overview.values[1]).toBe(7);
+    expect(overview.values[0]).toBe(-1);
+    expect(contactOverviewTextureBytes()).toBe(320 * 320 * 4);
+  });
+
+  it("draws the overview first, masks terminal exact tiles, and reuses its texture", () => {
+    const { canvas, drawArrays, scissor, texImage2D } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const overview = contactOverviewFloatTextureData({
+      resolution: 100,
+      viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
+      cells: [{ xBin: 0, yBin: 1, count: 7 }],
+    }, 4);
+
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }, {
+        key: "1:0:source",
+        tile: { tileX: 1, tileY: 0, cells: [] },
+        transpose: false,
+      }],
+      overview,
+      resolution: 100,
+      tileSizeBins: 2,
+      viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    expect(drawArrays).toHaveBeenCalledTimes(2);
+    expect(scissor).toHaveBeenCalledTimes(2);
+    const uploadsAfterFirstDraw = texImage2D.mock.calls.length;
+    renderer?.setPanOffset(1, 0);
+    expect(drawArrays).toHaveBeenCalledTimes(4);
+    expect(texImage2D).toHaveBeenCalledTimes(uploadsAfterFirstDraw);
+  });
+
   it("keeps pointer-only pans off layout, upload, and GL validation paths", () => {
     const {
       canvas,
@@ -483,10 +542,17 @@ describe("contactTileFloatTextureData", () => {
   });
 
   it("allows explicit empty tiles to use the white framebuffer clear", () => {
-    expect(contactTileGpuDrawCoverageIsComplete([{
+    const descriptors = [{
       key: "empty:source",
       tile: { tileX: 0, tileY: 0, cells: [] },
       transpose: false,
-    }], new Set())).toBe(true);
+    }];
+    expect(contactTileGpuDrawCoverageIsComplete(descriptors, new Set())).toBe(true);
+    expect(contactTileGpuDrawCoverageIsComplete(descriptors, new Set(), true)).toBe(false);
+    expect(contactTileGpuDrawCoverageIsComplete(
+      descriptors,
+      new Set(["empty:source"]),
+      true,
+    )).toBe(true);
   });
 });
