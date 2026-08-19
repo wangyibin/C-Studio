@@ -49,6 +49,7 @@ pub fn run() {
             commands::prewarm_contact_normalizations,
             commands::cancel_contact_normalization_prewarm,
             commands::get_contact_map_tiles_from_cool,
+            commands::prefetch_contact_map_tiles_from_cool,
             commands::get_contact_map_tiles_from_cool_binary_v1,
             commands::stream_contact_map_tiles_from_cool_binary_v1,
             commands::stream_contact_map_tile_deltas_from_cool_binary_v1,

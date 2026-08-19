@@ -109,6 +109,7 @@ interface ContactMapViewportProps {
   onClosePanel?: () => void;
   onExpandPanel?: () => void;
   onContactPanGestureStart?: () => void;
+  onContactPanTilePrefetch?: (viewport: ContactViewport) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
@@ -928,6 +929,7 @@ export function ContactMapViewport({
   onContactTileLayerPaintComplete,
   onUiAction,
   onContactPanGestureStart,
+  onContactPanTilePrefetch,
   onContactViewportPreview,
   contactPanPrefetchBridge,
   useStoredResolutionOptions = false,
@@ -1003,6 +1005,7 @@ export function ContactMapViewport({
   const [dragState, setDragState] = useState<DragState | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
   const panLoadingSuspendedRef = useRef(false);
+  const panTilePrefetchSignatureRef = useRef<string | null>(null);
   const wheelPanSessionRef = useRef<WheelPanSession | null>(null);
   const wheelPanCommitTimerRef = useRef<number | null>(null);
   const [assemblyBoundaryPanViewport, setAssemblyBoundaryPanViewport] = useState<
@@ -1496,6 +1499,7 @@ export function ContactMapViewport({
           onUiAction({ type: "clearAssemblySelection" });
           dragStateRef.current = null;
           panLoadingSuspendedRef.current = false;
+          panTilePrefetchSignatureRef.current = null;
           onContactViewportPreview?.(null);
           resetPanTransform();
           setDragState(null);
@@ -1519,6 +1523,7 @@ export function ContactMapViewport({
       onUiAction({ type: "clearAssemblySelection" });
       dragStateRef.current = null;
       panLoadingSuspendedRef.current = false;
+      panTilePrefetchSignatureRef.current = null;
       onContactViewportPreview?.(null);
       resetPanTransform();
       setDragState(null);
@@ -1539,6 +1544,7 @@ export function ContactMapViewport({
       if (dragStateRef.current) {
         dragStateRef.current = null;
         panLoadingSuspendedRef.current = false;
+        panTilePrefetchSignatureRef.current = null;
         setDragState(null);
         resetPanTransform();
         onContactViewportPreview?.(null);
@@ -1558,6 +1564,7 @@ export function ContactMapViewport({
       }
       wheelPanSessionRef.current = null;
       panLoadingSuspendedRef.current = false;
+      panTilePrefetchSignatureRef.current = null;
       window.removeEventListener("click", closeContextMenu);
       window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("keyup", handleKeyUp, true);
@@ -1660,6 +1667,14 @@ export function ContactMapViewport({
           width: Math.max(1, bounds.width),
           height: Math.max(1, bounds.height),
         };
+        panTilePrefetchSignatureRef.current = contactTileViewportRequestKey(
+          startViewport,
+          startViewport,
+          sourceContactMap.resolution,
+          sourceContactMap.tileSizeBins ?? 256,
+          totalSpanMb * 1_000_000,
+          0,
+        );
         wheelPanSessionRef.current = wheelSession;
       }
       const currentViewport = wheelSession.previewViewport;
@@ -1674,6 +1689,7 @@ export function ContactMapViewport({
       if (!intent) {
         if (startsWheelSession) {
           wheelPanSessionRef.current = null;
+          panTilePrefetchSignatureRef.current = null;
         }
         return;
       }
@@ -1697,6 +1713,7 @@ export function ContactMapViewport({
       if (deltaXMb === 0 && deltaYMb === 0) {
         if (startsWheelSession) {
           wheelPanSessionRef.current = null;
+          panTilePrefetchSignatureRef.current = null;
         }
         return;
       }
@@ -1730,6 +1747,7 @@ export function ContactMapViewport({
   }, [
     availableResolutionBasePairs,
     onContactPanGestureStart,
+    onContactPanTilePrefetch,
     onUiAction,
     useStoredResolutionOptions,
     onContactViewportPreview,
@@ -1830,6 +1848,7 @@ export function ContactMapViewport({
     const session = wheelPanSessionRef.current;
     wheelPanSessionRef.current = null;
     panLoadingSuspendedRef.current = false;
+    panTilePrefetchSignatureRef.current = null;
     if (!session) {
       return;
     }
@@ -1878,6 +1897,14 @@ export function ContactMapViewport({
     };
     dragStateRef.current = nextDragState;
     panLoadingSuspendedRef.current = false;
+    panTilePrefetchSignatureRef.current = contactTileViewportRequestKey(
+      liveViewport,
+      liveViewport,
+      liveContactMap.resolution,
+      liveContactMap.tileSizeBins ?? 256,
+      totalSpanMb * 1_000_000,
+      0,
+    );
     setDragState(nextDragState);
   }
 
@@ -1954,6 +1981,7 @@ export function ContactMapViewport({
     );
     dragStateRef.current = null;
     panLoadingSuspendedRef.current = false;
+    panTilePrefetchSignatureRef.current = null;
     setDragState(null);
     if (commitAction) {
       onUiAction(commitAction);
@@ -1965,18 +1993,31 @@ export function ContactMapViewport({
   }
 
   function preparePanViewport(previewViewport: ContactViewport) {
-    // Keep pointer motion as a pure camera operation. Starting HDF5 work here
-    // also starts IPC decoding, cumulative sparse snapshots, and texture
-    // uploads on the WebView main thread. That competes with pointer frames and
-    // is the source of the Juicebox/PretextView smoothness gap. The committed
-    // viewport starts one background generation after the gesture ends; until
-    // its atomic swap, the retained front surface and whole-map overview stay
-    // visible.
+    // Keep pointer motion as a pure camera operation in the WebView. The only
+    // work started here is a Rust-side cache fill that returns no cell payload,
+    // so IPC decoding, React updates, and texture uploads cannot compete with
+    // pointer frames. The committed viewport consumes that cache and swaps the
+    // completed layer atomically; the retained front surface stays visible in
+    // the meantime.
     //
     // Legacy DOM boundaries still need bounded pre-mounting. GPU boundaries
     // already live in the retained scene and require no React update here.
     if (usesDomAssemblyBoundaries) {
       prefetchAssemblyBoundaryViewport(previewViewport);
+    }
+    if (onContactPanTilePrefetch && liveContactMap) {
+      const signature = contactTileViewportRequestKey(
+        previewViewport,
+        previewViewport,
+        liveContactMap.resolution,
+        liveContactMap.tileSizeBins ?? 256,
+        totalSpanMb * 1_000_000,
+        0,
+      );
+      if (signature !== panTilePrefetchSignatureRef.current) {
+        panTilePrefetchSignatureRef.current = signature;
+        onContactPanTilePrefetch(previewViewport);
+      }
     }
   }
 
@@ -2108,6 +2149,10 @@ export function ContactMapViewport({
       centerXMb: uiState.contact.viewportCenterXMb,
       centerYMb: uiState.contact.viewportCenterYMb,
     });
+    if (!panLoadingSuspendedRef.current) {
+      panLoadingSuspendedRef.current = true;
+      onContactPanGestureStart?.();
+    }
     preparePanViewport(previewViewport);
     schedulePanTransform(
       liveContactMap,
@@ -2120,6 +2165,8 @@ export function ContactMapViewport({
   function cancelAxisNavigatorPreview() {
     cancelScheduledPanFrame();
     resetPanTransform();
+    panLoadingSuspendedRef.current = false;
+    panTilePrefetchSignatureRef.current = null;
     onContactViewportPreview?.(null);
   }
 
@@ -2134,6 +2181,8 @@ export function ContactMapViewport({
       ratio: centerRatio,
       totalSpanMb,
     });
+    panLoadingSuspendedRef.current = false;
+    panTilePrefetchSignatureRef.current = null;
     onContactViewportPreview?.(null);
   }
 
@@ -2425,6 +2474,7 @@ export function ContactMapViewport({
       if (moved < 6) {
         dragStateRef.current = null;
         panLoadingSuspendedRef.current = false;
+        panTilePrefetchSignatureRef.current = null;
         setDragState(null);
         cancelScheduledPanFrame();
         resetPanTransform();

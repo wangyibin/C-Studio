@@ -1052,6 +1052,12 @@ pub struct PrewarmContactNormalizationsResponse {
     pub cancelled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactTilePrefetchResponse {
+    pub cached_tiles: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactMapTileKeyRequest {
@@ -2240,6 +2246,47 @@ pub async fn get_contact_map_tiles_from_cool(
         );
     }
     Ok(tiles)
+}
+
+/// Populate the process-level visual tile cache without serializing the tile
+/// payload back into the WebView. Pan gestures use this command so HDF5 and
+/// projection can overlap pointer movement without IPC decoding or GPU uploads
+/// competing with animation frames.
+#[tauri::command]
+pub async fn prefetch_contact_map_tiles_from_cool(
+    request: ContactMapTilesFromCoolRequest,
+    layout_registry_state: tauri::State<'_, ContactLayoutRegistryState>,
+    source_cache_state: tauri::State<'_, SourceContactCacheState>,
+    tile_cache_state: tauri::State<'_, ContactTileCacheState>,
+    request_state: tauri::State<'_, ContactTileRequestState>,
+) -> Result<ContactTilePrefetchResponse, String> {
+    let request = resolve_contact_tile_request(request, Some(layout_registry_state.inner()))?;
+    if request.purpose != ContactTileRequestPurpose::SpatialPrefetch {
+        return Err("pan tile prefetch requires spatial_prefetch purpose".to_string());
+    }
+    let request_id = request.request_id;
+    let generation = request.generation;
+    request_state.register_current_generation(request_id, generation)?;
+    let _request_guard = ContactTileRequestGuard {
+        state: request_state.inner().clone(),
+        request_id,
+    };
+    let source_cache = Arc::clone(&source_cache_state.inner().cache);
+    let tile_cache = Arc::clone(&tile_cache_state.inner().cache);
+    let task_request_state = request_state.inner().clone();
+    let cached_tiles = tauri::async_runtime::spawn_blocking(move || {
+        let should_cancel = || task_request_state.is_cancelled(request_id);
+        get_contact_map_tiles_from_cool_with_cache_cancellable(
+            request,
+            source_cache.as_ref(),
+            tile_cache.as_ref(),
+            &should_cancel,
+        )
+        .map(|tiles| tiles.len())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(ContactTilePrefetchResponse { cached_tiles })
 }
 
 #[tauri::command]
@@ -6941,7 +6988,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_requested_contact_tiles_including_empty_tiles() {
+    fn spatial_prefetch_populates_visual_cache_for_visible_request() {
         let summary = super::load_example_dataset().expect("example dataset should load");
         let source_cache = Mutex::new(SourceContactCache::new(16 * 1024 * 1024));
         let tile_cache = Mutex::new(HashMap::new());
@@ -6963,7 +7010,7 @@ mod tests {
             ContactMapTilesFromCoolRequest {
                 request_id: 1,
                 generation: 1,
-                purpose: ContactTileRequestPurpose::Visible,
+                purpose: ContactTileRequestPurpose::SpatialPrefetch,
                 cool_path: summary.cool_path.clone(),
                 base_resolution: 1_000,
                 source_resolution: None,

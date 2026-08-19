@@ -3,10 +3,12 @@
 C-Studio is a desktop application for inspecting and editing genome assemblies,
 built with Tauri 2, React, and Rust.
 
+![overview](docs/C-Studio_Figure1_overview.png)
+
 ## Documentation
 
 - [English documentation](https://wangyibin.github.io/C-Studio/latest/)
-- [简体中文文档](https://wangyibin.github.io/C-Studio/zh/latest/)
+- [中文文档](https://wangyibin.github.io/C-Studio/zh/latest/)
 
 The documentation follows the bilingual, versioned C-Phasing layout. Zensical
 builds the English and Chinese sources separately, while Mike retains released
@@ -134,47 +136,3 @@ distribution. Use the GitHub workflow below when an MSI installer or a native
 Windows build is required. `cargo-xwin` caches the downloaded Windows SDK under
 `src-tauri/target/xwin-cache`. If a stale local proxy causes an error mentioning
 `127.0.0.1`, disable or correct that proxy and rerun the task.
-
-## GitHub Actions packaging
-
-The [desktop packaging workflow](.github/workflows/package-desktop.yml) uses the
-same locked Pixi environment and the same platform-aware `package-macos` and
-`package-windows` tasks as the manual commands above. GitHub builds each package
-on its native runner:
-
-- `macos-15` builds the Apple Silicon `.app` and `.dmg` packages.
-- `windows-latest` builds the x64 NSIS `.exe` and WiX `.msi` installers.
-
-To start a build manually:
-
-1. Open the repository on GitHub.
-2. Select **Actions → Package desktop apps**.
-3. Select **Run workflow**, choose the branch, and confirm the run.
-4. When both jobs finish, open the workflow run and download the macOS and
-   Windows archives from the **Artifacts** section.
-
-The workflow also runs when a version tag beginning with `v` is pushed:
-
-```bash
-git tag v0.1.3
-git push origin v0.1.3
-```
-
-The workflow installs Pixi 0.75.0, checks `pixi.toml` against the committed
-`pixi.lock`, restores the Pixi and Rust build caches, and then invokes:
-
-```text
-pixi run --locked -e package package-macos
-pixi run --locked -e package package-windows
-```
-
-GitHub Actions stores the packages as workflow artifacts for seven days. This
-workflow does not create a GitHub Release or publish the installers
-automatically.
-
-### Distribution limitations
-
-- The macOS packages are not notarized with an Apple Developer ID certificate.
-- The Windows installers are unsigned and may trigger Microsoft SmartScreen.
-- Code signing and notarization should be configured before distributing the
-  packages publicly.

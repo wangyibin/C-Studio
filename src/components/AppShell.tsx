@@ -32,7 +32,10 @@ import type {
   GfaEndpointHiCLoader,
 } from "../state/gfaEndpointHiC";
 import { classifyGfaScaffolds } from "../state/gfaHomologLayout";
-import { buildCenteredContactViewport } from "../state/contactViewport";
+import {
+  buildCenteredContactViewport,
+  type ContactViewport,
+} from "../state/contactViewport";
 import {
   gfaContigsForHeatmapViewport,
   gfaPrimaryHomologScaffoldsForHeatmapViewport,
@@ -110,6 +113,7 @@ interface AppShellProps {
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   onContactPanGestureStart?: () => void;
+  onContactPanTilePrefetch?: (viewport: ContactViewport) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
@@ -198,6 +202,7 @@ export function AppShell({
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
   onContactPanGestureStart,
+  onContactPanTilePrefetch,
   onContactViewportPreview,
   contactPanPrefetchBridge,
   onUiAction,
@@ -984,6 +989,7 @@ export function AppShell({
                   onExpandPanel={expandHeatmapPanel}
                   onUiAction={onUiAction}
                   onContactPanGestureStart={onContactPanGestureStart}
+                  onContactPanTilePrefetch={onContactPanTilePrefetch}
                   onContactViewportPreview={onContactViewportPreview}
                   contactPanPrefetchBridge={contactPanPrefetchBridge}
                   onContactTileLayerCommit={onContactTileLayerCommit}
