@@ -930,6 +930,16 @@ export function ContactMapViewport({
     }
   }, [onContactTileLayerCommit]);
   const reportTileLayerPaintComplete = useCallback((event: ContactTileLayerPaintEvent) => {
+    const target = targetContactPresentationFrameRef.current?.contactMap;
+    if (
+      event.paintRevision !== undefined
+      && target?.renderGeneration === event.paintRevision
+    ) {
+      // The old front canvas remains camera-shifted while this target paints in
+      // the hidden slot. Rebase overlays and the newly revealed renderer only
+      // after the atomic swap; resetting earlier exposes the old viewport.
+      resetPanTransform();
+    }
     setPaintedContactPresentationFrame((current) => advancePaintedContactPresentationFrame(
       current,
       targetContactPresentationFrameRef.current,

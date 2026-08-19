@@ -255,6 +255,36 @@ describe("contact tile presentation buffer", () => {
     expect(staged.slots).toEqual([fineChoice, coarseChoice]);
   });
 
+  it("keeps a translated pan frame visible until the target viewport is fully staged", () => {
+    const presented = contactTileFrame(1, 1_000);
+    const partial = contactTileFrame(2, 1_000, 10, false);
+    partial.contactMap.viewport = {
+      xStart: 128_000,
+      xEnd: 384_000,
+      yStart: 64_000,
+      yEnd: 320_000,
+    };
+    const initial = createContactTileLayerBufferState(presented);
+
+    expect(syncContactTileLayerBuffer(initial, partial, false)).toBe(initial);
+
+    const complete: ContactTileLayerFrame = {
+      ...partial,
+      contactMap: { ...partial.contactMap, visibleLayerComplete: true },
+    };
+    const staged = syncContactTileLayerBuffer(initial, complete, false);
+
+    expect(staged.frontSlot).toBe(0);
+    expect(staged.stagingSlot).toBe(1);
+    expect(staged.slots).toEqual([presented, complete]);
+    expect(contactTileViewportForBufferedSurface(
+      "presented",
+      presented,
+      complete,
+      complete.contactMap.viewport,
+    )).toBe(presented.contactMap.viewport);
+  });
+
   it("keeps the presented frame and its color scale frozen while a target is loading", () => {
     const presented = contactTileFrame(1, 1_000, 10);
     const initial = createContactTileLayerBufferState(presented);

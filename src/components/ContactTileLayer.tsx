@@ -419,11 +419,19 @@ function requiresAtomicContactTileSwap(
   current: ContactTileLayerFrame,
   incoming: ContactTileLayerFrame,
 ) {
-  return current.contactMap.resolution !== incoming.contactMap.resolution
+  return !sameContactTileViewport(current.contactMap.viewport, incoming.contactMap.viewport)
+    || current.contactMap.resolution !== incoming.contactMap.resolution
     || current.contactMap.requestedResolution !== incoming.contactMap.requestedResolution
     || (current.contactMap.tileSizeBins ?? 256) !== (incoming.contactMap.tileSizeBins ?? 256)
     || current.contactMap.normalization !== incoming.contactMap.normalization
     || !sameContactTileRenderStyle(current.renderStyle, incoming.renderStyle);
+}
+
+function sameContactTileViewport(left: ContactViewport, right: ContactViewport) {
+  return left.xStart === right.xStart
+    && left.xEnd === right.xEnd
+    && left.yStart === right.yStart
+    && left.yEnd === right.yEnd;
 }
 
 /**
