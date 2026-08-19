@@ -34,6 +34,23 @@ const RUNTIME_NORMALIZATION_MEMORY_DENOMINATOR: usize = 5;
 const FALLBACK_RUNTIME_NORMALIZATION_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const MAX_COOL_READER_CACHE_ENTRIES: usize = 8;
 const MAX_ADAPTIVE_CHILD_CACHE_BYTES: usize = 128 * 1024 * 1024;
+// Cooler pixel columns are commonly stored in 1-2 MiB compressed HDF5 chunks.
+// HDF5's 1 MiB default raw chunk cache cannot retain even one bin2 chunk, so
+// the many disjoint AGP source ranges in a visual tile repeatedly decompress
+// the same chunks. Keep enough chunks resident for one viewport working set.
+// The budget is per opened pixel dataset and allocated lazily by HDF5.
+const COOL_PIXEL_CHUNK_CACHE_SLOTS: usize = 521;
+const COOL_PIXEL_CHUNK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const COOL_PIXEL_CHUNK_CACHE_PREEMPTION: f64 = 0.75;
+// A compact resident bin2 column is a bounded, in-memory secondary index. It
+// lets viewport reads identify the exact 2D pixel runs before touching the
+// count dataset instead of decompressing every off-axis bin2 value again.
+const MAX_COOL_RESIDENT_BIN2_ENTRY_BYTES: usize = 128 * 1024 * 1024;
+const MAX_COOL_RESIDENT_BIN2_CACHE_BYTES: usize = 160 * 1024 * 1024;
+const MAX_COOL_RESIDENT_COUNT_ENTRY_BYTES: usize = 128 * 1024 * 1024;
+const MAX_COOL_RESIDENT_COUNT_CACHE_BYTES: usize = 160 * 1024 * 1024;
+const COOL_RESIDENT_BIN2_READ_CHUNK: usize = 500_000;
+const COOL_RESIDENT_PIXEL_BATCH_GAP: usize = 256;
 const ADAPTIVE_TARGET_RESOLUTION: u64 = 2_500_000;
 const ADAPTIVE_RESOLUTION_CHAIN: [u64; 5] = [2_500_000, 500_000, 100_000, 10_000, 1_000];
 // bin1 is derived from the Cooler CSR bin1_offset index, so each chunk only
@@ -228,6 +245,42 @@ struct CoolReaderCache {
     entries: VecDeque<(CoolIndexCacheKey, Arc<CoolReader>)>,
 }
 
+#[derive(Debug, Default)]
+struct CoolResidentBin2Flight {
+    result: Mutex<Option<CStudioResult<Arc<Vec<u32>>>>>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct CoolResidentBin2Cache {
+    entries: VecDeque<(CoolIndexCacheKey, Arc<Vec<u32>>)>,
+    used_bytes: usize,
+    in_flight: HashMap<CoolIndexCacheKey, Arc<CoolResidentBin2Flight>>,
+}
+
+#[derive(Debug)]
+enum CoolResidentCounts {
+    F64(Vec<f64>),
+    F32(Vec<f32>),
+    I64(Vec<i64>),
+    I32(Vec<i32>),
+    U64(Vec<u64>),
+    U32(Vec<u32>),
+}
+
+#[derive(Debug, Default)]
+struct CoolResidentCountFlight {
+    result: Mutex<Option<CStudioResult<Arc<CoolResidentCounts>>>>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct CoolResidentCountCache {
+    entries: VecDeque<(CoolIndexCacheKey, Arc<CoolResidentCounts>)>,
+    used_bytes: usize,
+    in_flight: HashMap<CoolIndexCacheKey, Arc<CoolResidentCountFlight>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct AdaptivePixel {
     bin1: u64,
@@ -347,6 +400,8 @@ enum CoolCountDataset {
 static COOL_INDEX_CACHE: OnceLock<Mutex<CoolIndexCache>> = OnceLock::new();
 static COOL_NORMALIZATION_CACHE: OnceLock<Mutex<CoolNormalizationCache>> = OnceLock::new();
 static COOL_READER_CACHE: OnceLock<Mutex<CoolReaderCache>> = OnceLock::new();
+static COOL_RESIDENT_BIN2_CACHE: OnceLock<Mutex<CoolResidentBin2Cache>> = OnceLock::new();
+static COOL_RESIDENT_COUNT_CACHE: OnceLock<Mutex<CoolResidentCountCache>> = OnceLock::new();
 static ADAPTIVE_CHILD_CACHE: OnceLock<Mutex<AdaptiveChildCache>> = OnceLock::new();
 
 pub fn list_mcool_resolutions(path: &str) -> CStudioResult<Vec<u64>> {
@@ -433,6 +488,25 @@ pub fn prewarm_contact_normalization_at_resolution_cancellable(
         should_cancel,
     )?;
     ensure_not_cancelled(should_cancel)
+}
+
+/// Build the bounded resident secondary index for one displayed Cooler level.
+/// The app schedules this only after the first visible layer has painted, so
+/// later pans can select bin2 and count values without touching HDF5 again.
+/// Returns false for levels that exceed the configured resident-memory caps.
+pub fn prewarm_contact_pixels_at_resolution_cancellable(
+    path: &str,
+    resolution: Option<u64>,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<bool> {
+    ensure_not_cancelled(should_cancel)?;
+    let reader = cached_cool_reader(path, resolution, should_cancel)?;
+    let bin2_ready =
+        cached_resident_bin2(path, resolution, reader.as_ref(), should_cancel)?.is_some();
+    let counts_ready =
+        cached_resident_counts(path, resolution, reader.as_ref(), should_cancel)?.is_some();
+    ensure_not_cancelled(should_cancel)?;
+    Ok(bin2_ready && counts_ready)
 }
 
 impl CoolUnsignedDataset {
@@ -541,6 +615,99 @@ impl CoolCountDataset {
             Self::U32(dataset) => read_counts!(dataset, u32),
         }
     }
+
+    fn resident_value_bytes(&self) -> usize {
+        match self {
+            Self::F64(_) | Self::I64(_) | Self::U64(_) => 8,
+            Self::F32(_) | Self::I32(_) | Self::U32(_) => 4,
+        }
+    }
+
+    fn resident_with_capacity(&self, capacity: usize) -> CoolResidentCounts {
+        match self {
+            Self::F64(_) => CoolResidentCounts::F64(Vec::with_capacity(capacity)),
+            Self::F32(_) => CoolResidentCounts::F32(Vec::with_capacity(capacity)),
+            Self::I64(_) => CoolResidentCounts::I64(Vec::with_capacity(capacity)),
+            Self::I32(_) => CoolResidentCounts::I32(Vec::with_capacity(capacity)),
+            Self::U64(_) => CoolResidentCounts::U64(Vec::with_capacity(capacity)),
+            Self::U32(_) => CoolResidentCounts::U32(Vec::with_capacity(capacity)),
+        }
+    }
+
+    fn append_resident_slice(
+        &self,
+        resident: &mut CoolResidentCounts,
+        start: usize,
+        end: usize,
+    ) -> CStudioResult<()> {
+        macro_rules! append_counts {
+            ($dataset:expr, $resident:expr, $value_type:ty) => {{
+                let values = $dataset
+                    .read_slice_1d::<$value_type, _>(start..end)
+                    .map_err(cool_error)?;
+                $resident.extend(values.iter().copied());
+                Ok(())
+            }};
+        }
+        match (self, resident) {
+            (Self::F64(dataset), CoolResidentCounts::F64(values)) => {
+                append_counts!(dataset, values, f64)
+            }
+            (Self::F32(dataset), CoolResidentCounts::F32(values)) => {
+                append_counts!(dataset, values, f32)
+            }
+            (Self::I64(dataset), CoolResidentCounts::I64(values)) => {
+                append_counts!(dataset, values, i64)
+            }
+            (Self::I32(dataset), CoolResidentCounts::I32(values)) => {
+                append_counts!(dataset, values, i32)
+            }
+            (Self::U64(dataset), CoolResidentCounts::U64(values)) => {
+                append_counts!(dataset, values, u64)
+            }
+            (Self::U32(dataset), CoolResidentCounts::U32(values)) => {
+                append_counts!(dataset, values, u32)
+            }
+            _ => Err(CStudioError::InvalidContactMapQuery(
+                ".cool resident count type changed while loading".to_string(),
+            )),
+        }
+    }
+}
+
+impl CoolResidentCounts {
+    fn len(&self) -> usize {
+        match self {
+            Self::F64(values) => values.len(),
+            Self::F32(values) => values.len(),
+            Self::I64(values) => values.len(),
+            Self::I32(values) => values.len(),
+            Self::U64(values) => values.len(),
+            Self::U32(values) => values.len(),
+        }
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        match self {
+            Self::F64(values) => values.capacity().saturating_mul(std::mem::size_of::<f64>()),
+            Self::F32(values) => values.capacity().saturating_mul(std::mem::size_of::<f32>()),
+            Self::I64(values) => values.capacity().saturating_mul(std::mem::size_of::<i64>()),
+            Self::I32(values) => values.capacity().saturating_mul(std::mem::size_of::<i32>()),
+            Self::U64(values) => values.capacity().saturating_mul(std::mem::size_of::<u64>()),
+            Self::U32(values) => values.capacity().saturating_mul(std::mem::size_of::<u32>()),
+        }
+    }
+
+    fn get_f64(&self, index: usize) -> Option<f64> {
+        match self {
+            Self::F64(values) => values.get(index).copied(),
+            Self::F32(values) => values.get(index).map(|value| f64::from(*value)),
+            Self::I64(values) => values.get(index).map(|value| *value as f64),
+            Self::I32(values) => values.get(index).map(|value| f64::from(*value)),
+            Self::U64(values) => values.get(index).map(|value| *value as f64),
+            Self::U32(values) => values.get(index).map(|value| f64::from(*value)),
+        }
+    }
 }
 
 impl CoolReader {
@@ -550,7 +717,15 @@ impl CoolReader {
         should_cancel: &dyn Fn() -> bool,
     ) -> CStudioResult<Self> {
         ensure_not_cancelled(should_cancel)?;
-        let file = File::open(path).map_err(cool_error)?;
+        let mut file_builder = File::with_options();
+        file_builder.with_fapl(|access| {
+            access.chunk_cache(
+                COOL_PIXEL_CHUNK_CACHE_SLOTS,
+                COOL_PIXEL_CHUNK_CACHE_BYTES,
+                COOL_PIXEL_CHUNK_CACHE_PREEMPTION,
+            )
+        });
+        let file = file_builder.open(path).map_err(cool_error)?;
         ensure_not_cancelled(should_cancel)?;
         let index = cached_cool_index(&file, path, resolution, should_cancel)?;
         let pixel_bin1 =
@@ -868,15 +1043,26 @@ where
     )?;
     let source_range_index = SourceRangeIndex::new(source_ranges);
     let selected_bins = SelectedBinIndex::new(&index, &source_range_index, should_cancel)?;
+    let resident_bin2 = cached_resident_bin2(path, resolution, reader.as_ref(), should_cancel)?;
+    let resident_counts = cached_resident_counts(path, resolution, reader.as_ref(), should_cancel)?;
 
     let mut visited_contacts = 0usize;
     ensure_not_cancelled(should_cancel)?;
-    let pixel_ranges = pixel_ranges_for_selected_bin_ranges_cancellable(
+    let bin1_pixel_ranges = pixel_ranges_for_selected_bin_ranges_cancellable(
         selected_bins.ranges(),
         &index.bin1_offsets,
         should_cancel,
     )?;
-    let pixel_ranges = batch_nearby_pixel_ranges(&pixel_ranges, MAX_COOL_PIXEL_BATCH_GAP);
+    let pixel_ranges = if let Some(resident_bin2) = resident_bin2.as_deref() {
+        selected_pixel_ranges_from_resident_bin2(
+            &bin1_pixel_ranges,
+            resident_bin2,
+            &selected_bins,
+            should_cancel,
+        )?
+    } else {
+        batch_nearby_pixel_ranges(&bin1_pixel_ranges, MAX_COOL_PIXEL_BATCH_GAP)
+    };
     if let Some(timings) = timings.as_deref_mut() {
         timings.prepare += prepare_started.elapsed();
     }
@@ -885,16 +1071,32 @@ where
         for chunk_start in (pixel_start..pixel_end).step_by(pixel_read_chunk) {
             ensure_not_cancelled(should_cancel)?;
             let chunk_end = chunk_start.saturating_add(pixel_read_chunk).min(pixel_end);
+            let expected_len = chunk_end.saturating_sub(chunk_start);
             let read_started = Instant::now();
-            let pixel_bin2 = reader.pixel_bin2.read_slice(chunk_start, chunk_end)?;
-            ensure_not_cancelled(should_cancel)?;
-            let pixel_counts = reader.pixel_counts.read_slice(chunk_start, chunk_end)?;
+            let pixel_bin2 = if resident_bin2.is_none() {
+                Some(reader.pixel_bin2.read_slice(chunk_start, chunk_end)?)
+            } else {
+                None
+            };
+            let pixel_counts = if resident_counts.is_none() {
+                Some(reader.pixel_counts.read_slice(chunk_start, chunk_end)?)
+            } else {
+                None
+            };
             if let Some(timings) = timings.as_deref_mut() {
                 timings.hdf5_read += read_started.elapsed();
-                timings.hdf5_chunks = timings.hdf5_chunks.saturating_add(1);
-                timings.scanned_pixels = timings.scanned_pixels.saturating_add(pixel_bin2.len());
+                if pixel_bin2.is_some() || pixel_counts.is_some() {
+                    timings.hdf5_chunks = timings.hdf5_chunks.saturating_add(1);
+                }
+                timings.scanned_pixels = timings.scanned_pixels.saturating_add(expected_len);
             }
-            if pixel_bin2.len() != pixel_counts.len() {
+            if pixel_counts
+                .as_ref()
+                .is_some_and(|values| values.len() != expected_len)
+                || pixel_bin2
+                    .as_ref()
+                    .is_some_and(|values| values.len() != expected_len)
+            {
                 return Err(CStudioError::InvalidContactMapQuery(
                     ".cool pixels/bin2_id and count have different lengths".to_string(),
                 ));
@@ -902,20 +1104,48 @@ where
             let mut bin1_index = bin1_for_pixel_offset(&index.bin1_offsets, chunk_start)?;
             let scan_project_started = Instant::now();
 
-            for (pixel_index, (bin2, count)) in pixel_bin2
-                .into_iter()
-                .zip(pixel_counts.into_iter())
-                .enumerate()
-            {
+            for pixel_index in 0..expected_len {
                 if pixel_index % 16_384 == 0 {
                     ensure_not_cancelled(should_cancel)?;
                 }
-                let pixel_offset =
-                    u64::try_from(chunk_start.saturating_add(pixel_index)).map_err(|_| {
-                        CStudioError::InvalidContactMapQuery(
-                            ".cool pixel offset exceeds u64".to_string(),
-                        )
-                    })?;
+                let absolute_pixel_index = chunk_start.saturating_add(pixel_index);
+                let bin2 = if let Some(resident_bin2) = resident_bin2.as_deref() {
+                    u64::from(resident_bin2[absolute_pixel_index])
+                } else {
+                    pixel_bin2
+                        .as_ref()
+                        .and_then(|values| values.get(pixel_index))
+                        .copied()
+                        .ok_or_else(|| {
+                            CStudioError::InvalidContactMapQuery(
+                                ".cool pixels/bin2_id ended before count".to_string(),
+                            )
+                        })?
+                };
+                let count = if let Some(resident_counts) = resident_counts.as_deref() {
+                    resident_counts
+                        .get_f64(absolute_pixel_index)
+                        .ok_or_else(|| {
+                            CStudioError::InvalidContactMapQuery(
+                                ".cool resident count index ended before bin2_id".to_string(),
+                            )
+                        })?
+                } else {
+                    pixel_counts
+                        .as_ref()
+                        .and_then(|values| values.get(pixel_index))
+                        .copied()
+                        .ok_or_else(|| {
+                            CStudioError::InvalidContactMapQuery(
+                                ".cool pixels/count ended before bin2_id".to_string(),
+                            )
+                        })?
+                };
+                let pixel_offset = u64::try_from(absolute_pixel_index).map_err(|_| {
+                    CStudioError::InvalidContactMapQuery(
+                        ".cool pixel offset exceeds u64".to_string(),
+                    )
+                })?;
                 while index
                     .bin1_offsets
                     .get(bin1_index + 1)
@@ -1024,6 +1254,324 @@ fn cached_cool_reader(
     }
     cache.entries.push_back((key, Arc::clone(&opened)));
     Ok(opened)
+}
+
+fn cached_resident_bin2(
+    path: &str,
+    resolution: Option<u64>,
+    reader: &CoolReader,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Option<Arc<Vec<u32>>>> {
+    ensure_not_cancelled(should_cancel)?;
+    let pixel_count: usize = reader
+        .index
+        .bin1_offsets
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .try_into()
+        .map_err(|_| {
+            CStudioError::InvalidContactMapQuery(
+                ".cool pixel count exceeds this platform's index range".to_string(),
+            )
+        })?;
+    let Some(entry_bytes) = pixel_count.checked_mul(std::mem::size_of::<u32>()) else {
+        return Ok(None);
+    };
+    if entry_bytes > MAX_COOL_RESIDENT_BIN2_ENTRY_BYTES {
+        return Ok(None);
+    }
+
+    let key = cool_index_cache_key(path, resolution);
+    let cache =
+        COOL_RESIDENT_BIN2_CACHE.get_or_init(|| Mutex::new(CoolResidentBin2Cache::default()));
+    let (flight, is_leader) = {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = cache
+            .entries
+            .iter()
+            .position(|(entry_key, _)| *entry_key == key)
+        {
+            let entry = cache
+                .entries
+                .remove(position)
+                .expect("cached resident bin2 position exists");
+            let result = Arc::clone(&entry.1);
+            cache.entries.push_back(entry);
+            return Ok(Some(result));
+        }
+        if let Some(flight) = cache.in_flight.get(&key) {
+            (Arc::clone(flight), false)
+        } else {
+            let flight = Arc::new(CoolResidentBin2Flight::default());
+            cache.in_flight.insert(key.clone(), Arc::clone(&flight));
+            (flight, true)
+        }
+    };
+
+    if !is_leader {
+        return match wait_for_resident_bin2_flight(&flight, should_cancel) {
+            // A low-priority prewarmer may lead the flight and yield as soon
+            // as this foreground request appears. Retry so the foreground
+            // becomes the next leader instead of inheriting idle cancellation.
+            Err(CStudioError::RequestCancelled) if !should_cancel() => {
+                cached_resident_bin2(path, resolution, reader, should_cancel)
+            }
+            result => result.map(Some),
+        };
+    }
+
+    let result = (|| {
+        let mut resident = Vec::<u32>::with_capacity(pixel_count);
+        for chunk_start in (0..pixel_count).step_by(COOL_RESIDENT_BIN2_READ_CHUNK) {
+            ensure_not_cancelled(should_cancel)?;
+            let chunk_end = chunk_start
+                .saturating_add(COOL_RESIDENT_BIN2_READ_CHUNK)
+                .min(pixel_count);
+            let values = reader.pixel_bin2.read_slice(chunk_start, chunk_end)?;
+            for (value_index, value) in values.into_iter().enumerate() {
+                if value_index % 16_384 == 0 {
+                    ensure_not_cancelled(should_cancel)?;
+                }
+                resident.push(u32::try_from(value).map_err(|_| {
+                    CStudioError::InvalidContactMapQuery(format!(
+                        ".cool pixels/bin2_id value {value} exceeds the compact secondary-index range"
+                    ))
+                })?);
+            }
+        }
+        if resident.len() != pixel_count {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool pixels/bin2_id contains {} values; expected {pixel_count}",
+                resident.len(),
+            )));
+        }
+        ensure_not_cancelled(should_cancel)?;
+        Ok(Arc::new(resident))
+    })();
+    complete_resident_bin2_flight(cache, &key, &flight, &result);
+    result.map(Some)
+}
+
+fn wait_for_resident_bin2_flight(
+    flight: &CoolResidentBin2Flight,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Arc<Vec<u32>>> {
+    loop {
+        ensure_not_cancelled(should_cancel)?;
+        let result = flight
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+        let (result, _) = flight
+            .ready
+            .wait_timeout(result, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+    }
+}
+
+fn complete_resident_bin2_flight(
+    cache: &Mutex<CoolResidentBin2Cache>,
+    key: &CoolIndexCacheKey,
+    flight: &Arc<CoolResidentBin2Flight>,
+    result: &CStudioResult<Arc<Vec<u32>>>,
+) {
+    {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Ok(values) = result {
+            let bytes = values.capacity().saturating_mul(std::mem::size_of::<u32>());
+            if bytes <= MAX_COOL_RESIDENT_BIN2_CACHE_BYTES {
+                while cache.used_bytes.saturating_add(bytes) > MAX_COOL_RESIDENT_BIN2_CACHE_BYTES {
+                    let Some((_, evicted)) = cache.entries.pop_front() else {
+                        break;
+                    };
+                    cache.used_bytes = cache.used_bytes.saturating_sub(
+                        evicted
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<u32>()),
+                    );
+                }
+                cache.used_bytes = cache.used_bytes.saturating_add(bytes);
+                cache.entries.push_back((key.clone(), Arc::clone(values)));
+            }
+        }
+        if cache
+            .in_flight
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            cache.in_flight.remove(key);
+        }
+    }
+
+    let mut completed = flight
+        .result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *completed = Some(result.clone());
+    flight.ready.notify_all();
+}
+
+fn cached_resident_counts(
+    path: &str,
+    resolution: Option<u64>,
+    reader: &CoolReader,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Option<Arc<CoolResidentCounts>>> {
+    ensure_not_cancelled(should_cancel)?;
+    let pixel_count: usize = reader
+        .index
+        .bin1_offsets
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .try_into()
+        .map_err(|_| {
+            CStudioError::InvalidContactMapQuery(
+                ".cool pixel count exceeds this platform's index range".to_string(),
+            )
+        })?;
+    let Some(entry_bytes) = pixel_count.checked_mul(reader.pixel_counts.resident_value_bytes())
+    else {
+        return Ok(None);
+    };
+    if entry_bytes > MAX_COOL_RESIDENT_COUNT_ENTRY_BYTES {
+        return Ok(None);
+    }
+
+    let key = cool_index_cache_key(path, resolution);
+    let cache =
+        COOL_RESIDENT_COUNT_CACHE.get_or_init(|| Mutex::new(CoolResidentCountCache::default()));
+    let (flight, is_leader) = {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = cache
+            .entries
+            .iter()
+            .position(|(entry_key, _)| *entry_key == key)
+        {
+            let entry = cache
+                .entries
+                .remove(position)
+                .expect("cached resident count position exists");
+            let result = Arc::clone(&entry.1);
+            cache.entries.push_back(entry);
+            return Ok(Some(result));
+        }
+        if let Some(flight) = cache.in_flight.get(&key) {
+            (Arc::clone(flight), false)
+        } else {
+            let flight = Arc::new(CoolResidentCountFlight::default());
+            cache.in_flight.insert(key.clone(), Arc::clone(&flight));
+            (flight, true)
+        }
+    };
+
+    if !is_leader {
+        return match wait_for_resident_count_flight(&flight, should_cancel) {
+            Err(CStudioError::RequestCancelled) if !should_cancel() => {
+                cached_resident_counts(path, resolution, reader, should_cancel)
+            }
+            result => result.map(Some),
+        };
+    }
+
+    let result = (|| {
+        let mut resident = reader.pixel_counts.resident_with_capacity(pixel_count);
+        for chunk_start in (0..pixel_count).step_by(COOL_RESIDENT_BIN2_READ_CHUNK) {
+            ensure_not_cancelled(should_cancel)?;
+            let chunk_end = chunk_start
+                .saturating_add(COOL_RESIDENT_BIN2_READ_CHUNK)
+                .min(pixel_count);
+            reader
+                .pixel_counts
+                .append_resident_slice(&mut resident, chunk_start, chunk_end)?;
+        }
+        if resident.len() != pixel_count {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool pixels/count contains {} values; expected {pixel_count}",
+                resident.len(),
+            )));
+        }
+        ensure_not_cancelled(should_cancel)?;
+        Ok(Arc::new(resident))
+    })();
+    complete_resident_count_flight(cache, &key, &flight, &result);
+    result.map(Some)
+}
+
+fn wait_for_resident_count_flight(
+    flight: &CoolResidentCountFlight,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Arc<CoolResidentCounts>> {
+    loop {
+        ensure_not_cancelled(should_cancel)?;
+        let result = flight
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+        let (result, _) = flight
+            .ready
+            .wait_timeout(result, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+    }
+}
+
+fn complete_resident_count_flight(
+    cache: &Mutex<CoolResidentCountCache>,
+    key: &CoolIndexCacheKey,
+    flight: &Arc<CoolResidentCountFlight>,
+    result: &CStudioResult<Arc<CoolResidentCounts>>,
+) {
+    {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Ok(values) = result {
+            let bytes = values.capacity_bytes();
+            if bytes <= MAX_COOL_RESIDENT_COUNT_CACHE_BYTES {
+                while cache.used_bytes.saturating_add(bytes) > MAX_COOL_RESIDENT_COUNT_CACHE_BYTES {
+                    let Some((_, evicted)) = cache.entries.pop_front() else {
+                        break;
+                    };
+                    cache.used_bytes = cache.used_bytes.saturating_sub(evicted.capacity_bytes());
+                }
+                cache.used_bytes = cache.used_bytes.saturating_add(bytes);
+                cache.entries.push_back((key.clone(), Arc::clone(values)));
+            }
+        }
+        if cache
+            .in_flight
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            cache.in_flight.remove(key);
+        }
+    }
+
+    let mut completed = flight
+        .result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *completed = Some(result.clone());
+    flight.ready.notify_all();
 }
 
 pub fn build_contact_map_view_from_mcool_adaptive_raw_cancellable(
@@ -2890,6 +3438,51 @@ fn pixel_ranges_for_selected_bin_ranges_cancellable(
     Ok(ranges)
 }
 
+fn selected_pixel_ranges_from_resident_bin2(
+    bin1_pixel_ranges: &[(usize, usize)],
+    resident_bin2: &[u32],
+    selected_bins: &SelectedBinIndex,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Vec<(usize, usize)>> {
+    ensure_not_cancelled(should_cancel)?;
+    let mut selected_ranges = Vec::<(usize, usize)>::new();
+    for (range_index, &(start, end)) in bin1_pixel_ranges.iter().enumerate() {
+        if range_index % 4_096 == 0 {
+            ensure_not_cancelled(should_cancel)?;
+        }
+        if start >= end {
+            continue;
+        }
+        if end > resident_bin2.len() {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool pixel range {start}..{end} exceeds the resident bin2 index length {}",
+                resident_bin2.len(),
+            )));
+        }
+
+        let mut run_start = None::<usize>;
+        for (relative_offset, bin2) in resident_bin2[start..end].iter().copied().enumerate() {
+            if relative_offset % 16_384 == 0 {
+                ensure_not_cancelled(should_cancel)?;
+            }
+            let pixel_offset = start + relative_offset;
+            if selected_bins.contains(u64::from(bin2)) {
+                run_start.get_or_insert(pixel_offset);
+            } else if let Some(selected_start) = run_start.take() {
+                selected_ranges.push((selected_start, pixel_offset));
+            }
+        }
+        if let Some(selected_start) = run_start {
+            selected_ranges.push((selected_start, end));
+        }
+    }
+    ensure_not_cancelled(should_cancel)?;
+    Ok(batch_nearby_pixel_ranges(
+        &selected_ranges,
+        COOL_RESIDENT_PIXEL_BATCH_GAP,
+    ))
+}
+
 fn batch_nearby_pixel_ranges(
     pixel_ranges: &[(usize, usize)],
     max_gap: usize,
@@ -3087,13 +3680,14 @@ mod tests {
         read_cool_contacts_for_source_ranges_at_resolution_cancellable,
         read_cool_contacts_for_sources,
         read_cool_contacts_for_sources_at_resolution_with_normalization, resolve_chrom_offsets,
-        runtime_normalization_memory_budget_bytes, validate_bin1_offsets,
+        runtime_normalization_memory_budget_bytes, selected_pixel_ranges_from_resident_bin2,
+        validate_bin1_offsets,
         visit_cool_contact_chunks_for_source_ranges_at_resolution_with_normalization_cancellable,
         visit_cool_contact_chunks_indexed_for_source_ranges_at_resolution_with_normalization_cancellable,
         visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
         visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
         CoolContactVisitTimings, CoolIndex, CoolIndexCacheKey, CoolNormalizationCacheKey,
-        SelectedBinIndex, SourceRangeIndex,
+        SelectedBinIndex, SelectedBinMembership, SourceRangeIndex,
     };
     use crate::{
         agp::Orientation,
@@ -3453,8 +4047,8 @@ mod tests {
     #[test]
     fn reads_contacts_from_example_1k_cool_file() {
         let contacts = read_cool_contacts_for_sources(
-            "../../examples/input.q1.1k.cool",
-            &["Chr2A.ctg30".to_string()],
+            "../../examples/input.1k.cool",
+            &["utg000001l".to_string()],
         )
         .expect("example .cool should read");
 
@@ -3573,7 +4167,7 @@ mod tests {
         .expect("profiled string visitor should work");
         assert_eq!(profiled_control_visited, expected.len());
         assert_eq!(profiled_control, expected_tuples);
-        assert_eq!(control_timings.hdf5_chunks, 1);
+        assert_eq!(control_timings.hdf5_chunks, 0);
         assert!(control_timings.scanned_pixels >= expected.len());
 
         let mut profiled_indexed = Vec::new();
@@ -3601,7 +4195,7 @@ mod tests {
         )
         .expect("profiled indexed visitor should work");
         assert_eq!(profiled_indexed_visited, expected.len());
-        assert_eq!(indexed_timings.hdf5_chunks, 1);
+        assert_eq!(indexed_timings.hdf5_chunks, 0);
         assert_eq!(
             indexed_timings.scanned_pixels,
             control_timings.scanned_pixels
@@ -3641,8 +4235,8 @@ mod tests {
     #[test]
     fn reads_contacts_from_source_ranges_only() {
         let contacts = read_cool_contacts_for_source_ranges_at_resolution(
-            "../../examples/input.q1.1k.cool",
-            &[("Chr2A.ctg30".to_string(), 0, 100_000)],
+            "../../examples/input.1k.cool",
+            &[("utg000001l".to_string(), 0, 100_000)],
             None,
         )
         .expect("example .cool range should read");
@@ -4275,6 +4869,33 @@ mod tests {
                 .expect("valid bin offsets");
 
         assert_eq!(ranges, vec![(5, 12), (20, 25)]);
+    }
+
+    #[test]
+    fn resident_bin2_index_prunes_distant_unselected_pixel_runs() {
+        let mut resident_bin2 = vec![0_u32; 700];
+        resident_bin2[10..20].fill(1);
+        resident_bin2[200..210].fill(3);
+        resident_bin2[500..510].fill(1);
+        let selected_bins = SelectedBinIndex {
+            ranges: vec![(1, 2), (3, 4)],
+            membership: SelectedBinMembership::Partial {
+                bin_count: 4,
+                words: vec![(1_u64 << 1) | (1_u64 << 3)],
+            },
+        };
+
+        let ranges = selected_pixel_ranges_from_resident_bin2(
+            &[(0, resident_bin2.len())],
+            &resident_bin2,
+            &selected_bins,
+            &|| false,
+        )
+        .expect("resident bin2 ranges");
+
+        // The first two selected runs are deliberately close enough to batch
+        // into one HDF5 count read; the distant third run stays independent.
+        assert_eq!(ranges, vec![(10, 210), (500, 510)]);
     }
 
     #[test]

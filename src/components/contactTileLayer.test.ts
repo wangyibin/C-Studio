@@ -255,7 +255,7 @@ describe("contact tile presentation buffer", () => {
     expect(staged.slots).toEqual([fineChoice, coarseChoice]);
   });
 
-  it("keeps a translated pan frame until complete, then promotes it on the same canvas", () => {
+  it("keeps a translated pan frame until complete, then stages an atomic reveal", () => {
     const presented = contactTileFrame(1, 1_000);
     const partial = contactTileFrame(2, 1_000, 10, false);
     partial.contactMap.viewport = {
@@ -272,13 +272,13 @@ describe("contact tile presentation buffer", () => {
       ...partial,
       contactMap: { ...partial.contactMap, visibleLayerComplete: true },
     };
-    const promoted = syncContactTileLayerBuffer(initial, complete, false);
+    const staged = syncContactTileLayerBuffer(initial, complete, false);
 
-    expect(promoted.frontSlot).toBe(0);
-    expect(promoted.stagingSlot).toBeNull();
-    expect(promoted.slots).toEqual([complete, null]);
+    expect(staged.frontSlot).toBe(0);
+    expect(staged.stagingSlot).toBe(1);
+    expect(staged.slots).toEqual([presented, complete]);
     expect(contactTileViewportForBufferedSurface(
-      "presented",
+      "staging",
       complete,
       complete,
       complete.contactMap.viewport,

@@ -314,6 +314,7 @@ interface ContactMapOverviewResponse {
 }
 
 interface PrewarmContactNormalizationsResponse {
+  pixelsPrepared: boolean;
   prepared: number;
   failed: number;
   cancelled: boolean;

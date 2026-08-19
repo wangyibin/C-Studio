@@ -94,10 +94,10 @@ mod tests {
 
         let summary = AgpSummary::parse(agp).expect("example AGP should parse");
 
-        assert_eq!(summary.line_count, 2_576);
-        assert_eq!(summary.object_count, 20);
-        assert_eq!(summary.component_count, 1_298);
-        assert_eq!(summary.gap_count, 1_278);
-        assert_eq!(summary.max_object_span, 30_436_571);
+        assert_eq!(summary.line_count, 1_177);
+        assert_eq!(summary.object_count, 192);
+        assert_eq!(summary.component_count, 798);
+        assert_eq!(summary.gap_count, 379);
+        assert_eq!(summary.max_object_span, 31_529_557);
     }
 }

@@ -17,6 +17,12 @@ export interface ContactTileGpuOverview {
   width: number;
   height: number;
   viewport: ContactViewport;
+  /**
+   * The whole-assembly overview is aggregated at a much coarser resolution
+   * than the exact surface. Reusing the exact scale saturates raw counts and
+   * exposes a solid-red sheet while new pan tiles are arriving.
+   */
+  colorScale?: ContactTileRenderStyle["colorScale"];
 }
 
 /** A diagonal assembly interval retained in world coordinates on the GPU. */
@@ -336,6 +342,7 @@ export function contactTileFloatTextureData(
 export function contactOverviewFloatTextureData(
   map: Pick<ContactMapView, "cells" | "resolution" | "viewport">,
   targetBins = contactOverviewTextureBins,
+  colorScale?: ContactTileRenderStyle["colorScale"],
 ): ContactTileGpuOverview {
   if (!Number.isSafeInteger(targetBins) || targetBins <= 0) {
     throw new RangeError("contact overview size must be a positive integer");
@@ -411,6 +418,7 @@ export function contactOverviewFloatTextureData(
     width: targetBins,
     height: targetBins,
     viewport: map.viewport,
+    colorScale,
   };
 }
 
@@ -547,15 +555,7 @@ export function createContactTileGpuRenderer(
     gl.vertexAttribPointer(resources.positionLocation, 2, gl.FLOAT, false, 0, 0);
     gl.uniform2f(resources.canvasSizeLocation, canvas.width, canvas.height);
 
-    const minimum = Math.max(0, activeScene.renderStyle.colorScale.min);
-    const maximum = Math.max(minimum, activeScene.renderStyle.colorScale.max);
-    gl.uniform4f(
-      resources.scaleLocation,
-      minimum,
-      maximum,
-      activeScene.renderStyle.colorScale.log ? 1 : 0,
-      0,
-    );
+    applyColorScaleUniforms(gl, resources, activeScene.renderStyle.colorScale);
     gl.uniform1f(
       resources.paletteStopCountLocation,
       paletteStopCount(activeScene.renderStyle.colormap),
@@ -588,6 +588,9 @@ export function createContactTileGpuRenderer(
       if (!overviewTextureEntry) {
         return false;
       }
+      if (overview.colorScale) {
+        applyColorScaleUniforms(gl, resources, overview.colorScale);
+      }
       const left = (
         ((overview.viewport.xStart - activeScene.viewport.xStart) / viewportWidth) * cssWidth
       ) * scaleX;
@@ -610,6 +613,9 @@ export function createContactTileGpuRenderer(
         height,
         false,
       );
+      if (overview.colorScale) {
+        applyColorScaleUniforms(gl, resources, activeScene.renderStyle.colorScale);
+      }
     } else if (!overview && overviewTextureEntry) {
       gl.deleteTexture(overviewTextureEntry.texture);
       overviewTextureEntry = null;
@@ -1322,6 +1328,22 @@ function clearCanvasRectToWhite(
   gl.clearColor(1, 1, 1, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.disable(gl.SCISSOR_TEST);
+}
+
+function applyColorScaleUniforms(
+  gl: WebGL2RenderingContext,
+  resources: RendererResources,
+  colorScale: ContactTileRenderStyle["colorScale"],
+) {
+  const minimum = Math.max(0, colorScale.min);
+  const maximum = Math.max(minimum, colorScale.max);
+  gl.uniform4f(
+    resources.scaleLocation,
+    minimum,
+    maximum,
+    colorScale.log ? 1 : 0,
+    0,
+  );
 }
 
 function createRendererResources(gl: WebGL2RenderingContext): RendererResources | null {

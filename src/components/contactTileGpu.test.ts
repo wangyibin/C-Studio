@@ -18,6 +18,7 @@ function mockWebGlCanvas() {
   const bufferData = vi.fn();
   const clear = vi.fn();
   const scissor = vi.fn();
+  const uniform4f = vi.fn();
   const clientWidthRead = vi.fn(() => 256);
   const clientHeightRead = vi.fn(() => 256);
   const gl = {
@@ -82,7 +83,7 @@ function mockWebGlCanvas() {
     vertexAttribPointer: vi.fn(),
     vertexAttribDivisor: vi.fn(),
     uniform2f: vi.fn(),
-    uniform4f: vi.fn(),
+    uniform4f,
     uniform1f: vi.fn(),
     uniform1i: vi.fn(),
     activeTexture: vi.fn(),
@@ -113,6 +114,7 @@ function mockWebGlCanvas() {
     scissor,
     texImage2D,
     texSubImage2D,
+    uniform4f,
   };
 }
 
@@ -168,6 +170,43 @@ describe("contactTileFloatTextureData", () => {
     renderer?.setPanViewport({ xStart: 100, xEnd: 500, yStart: 0, yEnd: 400 });
     expect(drawArrays).toHaveBeenCalledTimes(4);
     expect(texImage2D).toHaveBeenCalledTimes(uploadsAfterFirstDraw);
+  });
+
+  it("uses an independent coarse scale for the overview, then restores the exact scale", () => {
+    const { canvas, uniform4f } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const overview = contactOverviewFloatTextureData({
+      resolution: 10_000,
+      viewport: { xStart: 0, xEnd: 40_000, yStart: 0, yEnd: 40_000 },
+      cells: [{ xBin: 0, yBin: 1, count: 700 }],
+    }, 4, { log: false, min: 0, max: 1_000 });
+
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      overview,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    const scales = uniform4f.mock.calls
+      .filter((call) => call[3] === 0 && call[4] === 0)
+      .map((call) => call.slice(1));
+    expect(scales).toEqual([
+      [0, 10, 0, 0],
+      [0, 1_000, 0, 0],
+      [0, 10, 0, 0],
+    ]);
+    renderer?.destroy();
   });
 
   it("keeps the overview visible beneath an incomplete exact layer", () => {

@@ -10,7 +10,11 @@ import {
 import type { MutableRefObject } from "react";
 import type { ContactMapTile, ContactMapView } from "../App";
 import { contactColorLut } from "../state/contactColor";
-import type { ContactColorScale } from "../state/contactColorScale";
+import {
+  contactCountSampleForColorScale,
+  estimateContactColorScale,
+  type ContactColorScale,
+} from "../state/contactColorScale";
 import { contactTileCellCount } from "../state/contactTileData";
 import type {
   ContactTileDeltaBatch,
@@ -439,10 +443,12 @@ function requiresAtomicContactTileSwap(
   current: ContactTileLayerFrame,
   incoming: ContactTileLayerFrame,
 ) {
-  // Viewport-only changes use the same live GPU camera and canvas, matching
-  // Juicebox/Pretext navigation. Reserve the back surface for genuinely
-  // incompatible raster semantics.
-  return current.contactMap.resolution !== incoming.contactMap.resolution
+  // Pointer motion may keep using the live front camera, but the committed
+  // target must paint in the hidden slot. Replacing the visible scene in place
+  // exposes its overview/clear pass and makes a completed drag look like a
+  // refresh instead of one continuous sheet.
+  return !sameContactTileViewport(current.contactMap.viewport, incoming.contactMap.viewport)
+    || current.contactMap.resolution !== incoming.contactMap.resolution
     || current.contactMap.requestedResolution !== incoming.contactMap.requestedResolution
     || (current.contactMap.tileSizeBins ?? 256) !== (incoming.contactMap.tileSizeBins ?? 256)
     || current.contactMap.normalization !== incoming.contactMap.normalization
@@ -591,9 +597,16 @@ export function ContactTileLayer({
 }: ContactTileLayerProps) {
   const overview = useMemo(
     () => overviewContactMap
-      ? contactOverviewFloatTextureData(overviewContactMap)
+      ? contactOverviewFloatTextureData(
+          overviewContactMap,
+          contactOverviewTextureBins,
+          estimateContactColorScale(
+            contactCountSampleForColorScale(overviewContactMap),
+            renderStyle.colorScale.log,
+          ),
+        )
       : null,
-    [overviewContactMap],
+    [overviewContactMap, renderStyle.colorScale.log],
   );
   const incomingFrame = useMemo<ContactTileLayerFrame | null>(
     () => contactMap

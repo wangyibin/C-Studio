@@ -1006,6 +1006,7 @@ export function ContactMapViewport({
   const dragStateRef = useRef<DragState | null>(null);
   const panLoadingSuspendedRef = useRef(false);
   const panTilePrefetchSignatureRef = useRef<string | null>(null);
+  const panPreviewSequenceRef = useRef(0);
   const wheelPanSessionRef = useRef<WheelPanSession | null>(null);
   const wheelPanCommitTimerRef = useRef<number | null>(null);
   const [assemblyBoundaryPanViewport, setAssemblyBoundaryPanViewport] = useState<
@@ -1058,9 +1059,16 @@ export function ContactMapViewport({
     }
   }, [onContactTileLayerCommit]);
   const reportTileLayerPaintComplete = useCallback((event: ContactTileLayerPaintEvent) => {
-    // Advance the React presentation frame first. Its layout effect rebases the
-    // heatmap and annotations together after their target viewport is committed;
-    // clearing the imperative offset here would briefly expose old coordinates.
+    const target = targetContactPresentationFrameRef.current?.contactMap;
+    if (
+      event.paintRevision !== undefined
+      && target?.renderGeneration === event.paintRevision
+    ) {
+      // The translated front remains visible while this generation paints in
+      // the hidden slot. Rebase the heatmap and annotations only when that
+      // complete target is being atomically revealed.
+      resetPanTransform();
+    }
     setPaintedContactPresentationFrame((current) => advancePaintedContactPresentationFrame(
       current,
       targetContactPresentationFrameRef.current,
@@ -1993,19 +2001,17 @@ export function ContactMapViewport({
   }
 
   function preparePanViewport(previewViewport: ContactViewport) {
-    // Keep pointer motion as a pure camera operation in the WebView. The only
-    // work started here is a Rust-side cache fill that returns no cell payload,
-    // so IPC decoding, React updates, and texture uploads cannot compete with
-    // pointer frames. The committed viewport consumes that cache and swaps the
-    // completed layer atomically; the retained front surface stays visible in
-    // the meantime.
+    // Pointer samples only move the existing GPU camera. A new tile generation
+    // starts when the visible tile grid changes, not for every pixel; its
+    // center-first batches are appended imperatively to the retained scene and
+    // the completed target is revealed from the hidden slot.
     //
     // Legacy DOM boundaries still need bounded pre-mounting. GPU boundaries
     // already live in the retained scene and require no React update here.
     if (usesDomAssemblyBoundaries) {
       prefetchAssemblyBoundaryViewport(previewViewport);
     }
-    if (onContactPanTilePrefetch && liveContactMap) {
+    if ((onContactViewportPreview || onContactPanTilePrefetch) && liveContactMap) {
       const signature = contactTileViewportRequestKey(
         previewViewport,
         previewViewport,
@@ -2016,7 +2022,18 @@ export function ContactMapViewport({
       );
       if (signature !== panTilePrefetchSignatureRef.current) {
         panTilePrefetchSignatureRef.current = signature;
-        onContactPanTilePrefetch(previewViewport);
+        if (onContactViewportPreview) {
+          panPreviewSequenceRef.current += 1;
+          onContactViewportPreview({
+            viewport: previewViewport,
+            prefetchViewport: previewViewport,
+            urgentPrefetchTileCount: 0,
+            sequence: panPreviewSequenceRef.current,
+            pointerTimestamp: performance.now(),
+          });
+        } else {
+          onContactPanTilePrefetch?.(previewViewport);
+        }
       }
     }
   }

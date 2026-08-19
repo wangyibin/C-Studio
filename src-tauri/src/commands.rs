@@ -1047,6 +1047,7 @@ pub struct CancelContactNormalizationPrewarmRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrewarmContactNormalizationsResponse {
+    pub pixels_prepared: bool,
     pub prepared: usize,
     pub failed: usize,
     pub cancelled: bool,
@@ -2133,8 +2134,37 @@ pub async fn prewarm_contact_normalizations(
         let mut prepared = 0_usize;
         let mut failed = 0_usize;
         let mut cancelled = false;
+        let pixels_prepared = match resolutions.first().copied() {
+            Some(resolution) => {
+                match cstudio_core::cool::prewarm_contact_pixels_at_resolution_cancellable(
+                    &cool_path,
+                    Some(resolution),
+                    &should_cancel,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(cstudio_core::CStudioError::RequestCancelled) => {
+                        cancelled = true;
+                        false
+                    }
+                    Err(error) => {
+                        failed = failed.saturating_add(1);
+                        if contact_tile_perf_logging_enabled() {
+                            eprintln!(
+                                "CSTUDIO_PERF event=contact_pixel_prewarm status=error request_id={} generation={} resolution={} error={:?}",
+                                request_id, generation, resolution, error,
+                            );
+                        }
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
 
         'resolutions: for resolution in resolutions {
+            if cancelled {
+                break;
+            }
             for normalization in normalizations {
                 match cstudio_core::cool::prewarm_contact_normalization_at_resolution_cancellable(
                     &cool_path,
@@ -2166,16 +2196,18 @@ pub async fn prewarm_contact_normalizations(
 
         if contact_tile_perf_logging_enabled() {
             eprintln!(
-                "CSTUDIO_PERF event=normalization_prewarm status={} request_id={} generation={} prepared={} failed={} elapsed_ms={}",
+                "CSTUDIO_PERF event=normalization_prewarm status={} request_id={} generation={} pixels_prepared={} prepared={} failed={} elapsed_ms={}",
                 if cancelled { "cancelled" } else { "complete" },
                 request_id,
                 generation,
+                pixels_prepared,
                 prepared,
                 failed,
                 started.elapsed().as_millis(),
             );
         }
         PrewarmContactNormalizationsResponse {
+            pixels_prepared,
             prepared,
             failed,
             cancelled,
@@ -8097,7 +8129,7 @@ mod tests {
         let response = build_coverage_view_from_bedgraph_with_cache(
             CoverageViewFromBedGraphRequest {
                 bedgraph_path: root
-                    .join("examples/input.1000.coverage.bedgraph")
+                    .join("examples/hifi.asm.bp.p_utg.noseq.depth")
                     .to_string_lossy()
                     .to_string(),
                 display_resolution: 1_000,
@@ -8109,7 +8141,7 @@ mod tests {
                 },
                 layout_blocks: vec![ContactMapLayoutBlockRequest {
                     id: "first-window".to_string(),
-                    source_id: "Chr2A.ctg30".to_string(),
+                    source_id: "utg000001l".to_string(),
                     source_start: 0,
                     source_end: 2_000,
                     visual_start: 0,
@@ -8127,7 +8159,7 @@ mod tests {
         let second = build_coverage_view_from_bedgraph_with_cache(
             CoverageViewFromBedGraphRequest {
                 bedgraph_path: root
-                    .join("examples/input.1000.coverage.bedgraph")
+                    .join("examples/hifi.asm.bp.p_utg.noseq.depth")
                     .to_string_lossy()
                     .to_string(),
                 display_resolution: 1_000,
@@ -8139,7 +8171,7 @@ mod tests {
                 },
                 layout_blocks: vec![ContactMapLayoutBlockRequest {
                     id: "moved-window".to_string(),
-                    source_id: "Chr2A.ctg30".to_string(),
+                    source_id: "utg000001l".to_string(),
                     source_start: 0,
                     source_end: 2_000,
                     visual_start: 2_000,
