@@ -13,7 +13,10 @@ import {
   assemblySelectionProjectionBands,
   assemblyShiftClickIntent,
   ContactMapViewport,
+  contactBoundaryMountInterval,
+  contactGpuAssemblyBoundaries,
   contactCoverageFramesMatch,
+  contactPanCommitAction,
   contactPanPreviewTileSignature,
   contactCanvasBackingSizeFromBounds,
   contactResolutionWheelIntent,
@@ -82,6 +85,68 @@ describe("assembly overlay screen-space LOD", () => {
     )).toHaveLength(maximumAssemblyOverlayIntervals);
   });
 });
+
+describe("GPU assembly boundary scene", () => {
+  const model = buildAssemblyEditModel([{
+    id: "Chr01:1:singleton",
+    objectId: "Chr01",
+    sourceId: "singleton",
+    sourceStart: 0,
+    sourceEnd: 100,
+    visualStart: 0,
+    visualEnd: 100,
+    orientation: "+" as const,
+  }, {
+    id: "Chr01:2:left",
+    objectId: "Chr01",
+    sourceId: "left",
+    sourceStart: 0,
+    sourceEnd: 100,
+    visualStart: 100,
+    visualEnd: 200,
+    orientation: "+" as const,
+    assemblyBlockId: "Chr01_block_1",
+  }, {
+    id: "Chr01:3:right",
+    objectId: "Chr01",
+    sourceId: "right",
+    sourceStart: 0,
+    sourceEnd: 100,
+    visualStart: 200,
+    visualEnd: 300,
+    orientation: "+" as const,
+    assemblyBlockId: "Chr01_block_1",
+  }]);
+
+  it("builds chromosome, block, and nested-contig outlines in immutable world coordinates", () => {
+    const boundaries = contactGpuAssemblyBoundaries({
+      model,
+      selection: { kind: "contigs", ids: ["Chr01:2:left"] },
+      showChromosomeBoxes: true,
+      showBlockBoxes: true,
+      showContigBoxes: true,
+    });
+
+    expect(boundaries).toHaveLength(5);
+    expect(boundaries[0]).toMatchObject({ visualStart: 0, visualEnd: 300 });
+    expect(boundaries[2]).toMatchObject({ color: [0, 0, 0], lineWidthCssPx: 2 });
+    expect(boundaries.slice(3).map(({ visualStart, visualEnd }) => [visualStart, visualEnd]))
+      .toEqual([[100, 200], [200, 300]]);
+  });
+
+  it("preserves the existing singleton and composite visibility semantics", () => {
+    const boundaries = contactGpuAssemblyBoundaries({
+      model,
+      selection: null,
+      showChromosomeBoxes: false,
+      showBlockBoxes: false,
+      showContigBoxes: true,
+    });
+
+    expect(boundaries.map(({ visualStart, visualEnd }) => [visualStart, visualEnd]))
+      .toEqual([[0, 100], [100, 200], [200, 300]]);
+  });
+});
 const viewport = {
   xStart: 50_000_000,
   xEnd: 250_000_000,
@@ -107,6 +172,15 @@ describe("advanceContactBoundaryMountViewport", () => {
 
     expect(advanceContactBoundaryMountViewport(current, candidate)).toBe(candidate);
     expect(advanceContactBoundaryMountViewport(null, candidate)).toBe(candidate);
+  });
+
+  it("keeps one shared overscan interval mounted on both map axes", () => {
+    expect(contactBoundaryMountInterval({
+      xStart: 100,
+      xEnd: 300,
+      yStart: 200,
+      yEnd: 400,
+    })).toEqual({ start: 0, end: 500 });
   });
 });
 
@@ -271,6 +345,38 @@ describe("shouldRetainPresentedContactViewport", () => {
       normalization: "raw",
       isTransientResolutionPreview: false,
     }, 1_000, "raw")).toBe(true);
+  });
+
+  it("holds the painted camera while a same-resolution pan target is loading", () => {
+    expect(shouldRetainPresentedContactViewport({
+      resolution: 100_000,
+      normalization: "raw",
+      viewport: {
+        xStart: 0,
+        xEnd: 10_000_000,
+        yStart: 0,
+        yEnd: 10_000_000,
+      },
+    }, 100_000, "raw", {
+      xStart: 2_000_000,
+      xEnd: 12_000_000,
+      yStart: 3_000_000,
+      yEnd: 13_000_000,
+    })).toBe(true);
+  });
+
+  it("releases the painted camera after the pan target catches up", () => {
+    const viewport = {
+      xStart: 2_000_000,
+      xEnd: 12_000_000,
+      yStart: 3_000_000,
+      yEnd: 13_000_000,
+    };
+    expect(shouldRetainPresentedContactViewport({
+      resolution: 100_000,
+      normalization: "raw",
+      viewport,
+    }, 100_000, "raw", viewport)).toBe(false);
   });
 });
 
@@ -525,6 +631,22 @@ describe("contactWheelPanIntent", () => {
       },
     )).toEqual({ deltaXMb: 25, deltaYMb: 15 });
     expect(contactWheelPanCommitDelta(viewport, viewport)).toBeNull();
+  });
+
+  it("commits the exact already-visible pan viewport instead of reintegrating a delta", () => {
+    const previewViewport = {
+      xStart: viewport.xStart + 25_000_000,
+      xEnd: viewport.xEnd + 25_000_000,
+      yStart: viewport.yStart + 15_000_000,
+      yEnd: viewport.yEnd + 15_000_000,
+    };
+
+    expect(contactPanCommitAction(viewport, previewViewport, 400)).toEqual({
+      type: "commitContactViewportPan",
+      viewport: previewViewport,
+      totalSpanMb: 400,
+    });
+    expect(contactPanCommitAction(viewport, viewport, 400)).toBeNull();
   });
 
   it("maps plain wheel to diagonal pan and Command/Ctrl-Shift wheel to vertical pan", () => {
@@ -1044,8 +1166,8 @@ describe("assembly overlay hierarchy", () => {
       onUiAction: () => undefined,
     }));
 
-    expect(markup).toContain('data-rendered-block-count="640"');
-    expect(markup.match(/singleton-contig-box/g)).toHaveLength(640);
+    expect(markup).toContain('data-rendered-block-count="1920"');
+    expect(markup.match(/singleton-contig-box/g)).toHaveLength(1_920);
   });
 
   it("renders atomic block boxes, child outlines only for composites, and a direct singleton", () => {

@@ -135,7 +135,10 @@ describe("confirmed contact map layout styles", () => {
       'stage.addEventListener("wheel", handleWheelPan, { passive: false });',
     );
     expect(viewportSource).toContain(
-      'onUiAction({ type: "panContactViewport", deltaXMb, deltaYMb });',
+      'const commitAction = contactPanCommitAction(',
+    );
+    expect(viewportSource).toContain(
+      'type: "commitContactViewportPan"',
     );
     expect(viewportSource).not.toContain("contactWheelZoomIntent");
     expect(viewportSource).not.toContain("onWheel={zoomWithWheel}");

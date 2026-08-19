@@ -255,7 +255,7 @@ describe("contact tile presentation buffer", () => {
     expect(staged.slots).toEqual([fineChoice, coarseChoice]);
   });
 
-  it("keeps a translated pan frame visible until the target viewport is fully staged", () => {
+  it("keeps a translated pan frame until complete, then promotes it on the same canvas", () => {
     const presented = contactTileFrame(1, 1_000);
     const partial = contactTileFrame(2, 1_000, 10, false);
     partial.contactMap.viewport = {
@@ -272,17 +272,17 @@ describe("contact tile presentation buffer", () => {
       ...partial,
       contactMap: { ...partial.contactMap, visibleLayerComplete: true },
     };
-    const staged = syncContactTileLayerBuffer(initial, complete, false);
+    const promoted = syncContactTileLayerBuffer(initial, complete, false);
 
-    expect(staged.frontSlot).toBe(0);
-    expect(staged.stagingSlot).toBe(1);
-    expect(staged.slots).toEqual([presented, complete]);
+    expect(promoted.frontSlot).toBe(0);
+    expect(promoted.stagingSlot).toBeNull();
+    expect(promoted.slots).toEqual([complete, null]);
     expect(contactTileViewportForBufferedSurface(
       "presented",
-      presented,
+      complete,
       complete,
       complete.contactMap.viewport,
-    )).toBe(presented.contactMap.viewport);
+    )).toBe(complete.contactMap.viewport);
   });
 
   it("keeps the presented frame and its color scale frozen while a target is loading", () => {

@@ -32,6 +32,7 @@ import {
   contactOverviewTextureBins,
   contactTileGpuTextureBudgetBytes,
   createContactTileGpuRenderer,
+  type ContactTileGpuBoundary,
   type ContactTileGpuOverview,
   type ContactTileGpuRenderer,
 } from "./contactTileGpu";
@@ -45,6 +46,7 @@ export interface ContactTileLayerPaintEvent {
 }
 
 export interface ContactTileLayerProps {
+  boundaries?: readonly ContactTileGpuBoundary[];
   contactMap: ContactMapView | null;
   deltaStream?: ContactTileDeltaRenderStream | null;
   overviewContactMap?: ContactMapView | null;
@@ -70,6 +72,8 @@ export interface ContactTileLayerProps {
   onTileLayerPaintComplete?: (event: ContactTileLayerPaintEvent) => void;
   /** Notifies ref consumers after presented canvas contents or identity change. */
   onPresentedSurfaceChange?: () => void;
+  /** Reports whether the presented surface owns assembly-boundary visuals. */
+  onGpuAvailabilityChange?: (available: boolean) => void;
 }
 
 export interface ContactTileRenderStyle {
@@ -324,6 +328,22 @@ export function syncContactTileLayerBuffer(
         };
   }
 
+  const viewportChanged = !sameContactTileViewport(
+    front.contactMap.viewport,
+    incoming.contactMap.viewport,
+  );
+  // A pan target may stream progressively, but the live camera must stay on
+  // the existing front surface until a complete replacement is available.
+  // Once complete, promote its descriptors in the same slot/canvas rather
+  // than swapping compositor surfaces.
+  if (
+    viewportChanged
+    && !requiresAtomicContactTileSwap(front, incoming)
+    && incoming.contactMap.visibleLayerComplete === false
+  ) {
+    return state;
+  }
+
   if (requiresAtomicContactTileSwap(front, incoming)) {
     if (incoming.contactMap.visibleLayerComplete === false) {
       return state;
@@ -419,8 +439,10 @@ function requiresAtomicContactTileSwap(
   current: ContactTileLayerFrame,
   incoming: ContactTileLayerFrame,
 ) {
-  return !sameContactTileViewport(current.contactMap.viewport, incoming.contactMap.viewport)
-    || current.contactMap.resolution !== incoming.contactMap.resolution
+  // Viewport-only changes use the same live GPU camera and canvas, matching
+  // Juicebox/Pretext navigation. Reserve the back surface for genuinely
+  // incompatible raster semantics.
+  return current.contactMap.resolution !== incoming.contactMap.resolution
     || current.contactMap.requestedResolution !== incoming.contactMap.requestedResolution
     || (current.contactMap.tileSizeBins ?? 256) !== (incoming.contactMap.tileSizeBins ?? 256)
     || current.contactMap.normalization !== incoming.contactMap.normalization
@@ -546,6 +568,7 @@ export function createContactTilePaintCoordinator({
 }
 
 export function ContactTileLayer({
+  boundaries = [],
   contactMap,
   deltaStream,
   freezePresentedStyle = false,
@@ -555,6 +578,7 @@ export function ContactTileLayer({
   onTileLayerCommit,
   onTileLayerPaintComplete,
   onPresentedSurfaceChange,
+  onGpuAvailabilityChange,
   onPointerCancel,
   onPointerDown,
   onPointerMove,
@@ -762,6 +786,7 @@ export function ContactTileLayer({
           return (
             <ContactTileSurface
               key={slot}
+              boundaries={boundaries}
               contactMap={frame?.contactMap ?? null}
               deltaStream={stagedDeltaStream}
               layerRef={phase === "presented"
@@ -776,6 +801,9 @@ export function ContactTileLayer({
               onTileLayerPaintUnavailable={slot === 0
                 ? reportSlotZeroUnavailable
                 : reportSlotOneUnavailable}
+              onGpuAvailabilityChange={phase === "presented"
+                ? onGpuAvailabilityChange
+                : undefined}
               overview={frameAcceptsOverview ? overview : null}
               overviewContactMap={frameAcceptsOverview ? overviewContactMap ?? null : null}
               paintRevision={frame?.contactMap.renderGeneration ?? paintRevision}
@@ -936,6 +964,7 @@ function ContactTileDeltaCanvas({
 }
 
 function ContactTileSurface({
+  boundaries,
   contactMap,
   deltaStream,
   layerRef,
@@ -945,12 +974,14 @@ function ContactTileSurface({
   onTileLayerCommit,
   onTileLayerPaintComplete,
   onTileLayerPaintUnavailable,
+  onGpuAvailabilityChange,
   panRendererRef,
   phase,
   renderStyle,
   overscanDirection,
   viewport,
 }: {
+  boundaries: readonly ContactTileGpuBoundary[];
   contactMap: ContactMapView | null;
   deltaStream?: ContactTileDeltaRenderStream | null;
   layerRef: React.RefObject<HTMLDivElement>;
@@ -958,6 +989,7 @@ function ContactTileSurface({
   onTileLayerCommit: (event: ContactTileLayerPaintEvent) => void;
   onTileLayerPaintComplete: (event: ContactTileLayerPaintEvent) => void;
   onTileLayerPaintUnavailable: (event: ContactTileLayerPaintEvent) => void;
+  onGpuAvailabilityChange?: (available: boolean) => void;
   overview: ContactTileGpuOverview | null;
   overviewContactMap: ContactMapView | null;
   panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
@@ -1087,7 +1119,10 @@ function ContactTileSurface({
   }, [paintCoordinator]);
 
   const [gpuAvailable, setGpuAvailable] = useState(() => typeof document !== "undefined");
-  const disableGpu = useCallback(() => setGpuAvailable(false), []);
+  const disableGpu = useCallback(() => {
+    setGpuAvailable(false);
+    onGpuAvailabilityChange?.(false);
+  }, [onGpuAvailabilityChange]);
 
   usePrePaintEffect(() => {
     if (!gpuAvailable && panRendererRef) {
@@ -1100,10 +1135,12 @@ function ContactTileSurface({
       <div ref={layerRef} className="contact-tile-layer">
         {gpuAvailable ? (
           <ContactTileGpuCanvas
+            boundaries={boundaries}
             contactMap={contactMap}
             deltaStream={deltaStream}
             descriptors={renderCanvases}
             onUnavailable={disableGpu}
+            onGpuAvailabilityChange={onGpuAvailabilityChange}
             paintCanvasKeys={paintCanvasKeys}
             paintCoordinator={paintCoordinator}
             panRendererRef={panRendererRef}
@@ -1143,10 +1180,12 @@ function ContactTileSurface({
 }
 
 function ContactTileGpuCanvas({
+  boundaries,
   contactMap,
   deltaStream,
   descriptors,
   onUnavailable,
+  onGpuAvailabilityChange,
   paintCanvasKeys,
   paintCoordinator,
   panRendererRef,
@@ -1156,10 +1195,12 @@ function ContactTileGpuCanvas({
   textureBudgetBytes,
   viewport,
 }: {
+  boundaries: readonly ContactTileGpuBoundary[];
   contactMap: ContactMapView | null;
   deltaStream?: ContactTileDeltaRenderStream | null;
   descriptors: readonly ContactTileCanvasDescriptor[];
   onUnavailable: () => void;
+  onGpuAvailabilityChange?: (available: boolean) => void;
   paintCanvasKeys: readonly string[];
   paintCoordinator: ContactTilePaintCoordinator | null;
   panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
@@ -1171,6 +1212,8 @@ function ContactTileGpuCanvas({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<ContactTileGpuRenderer | null>(null);
+  const gpuAvailabilityChangeRef = useRef(onGpuAvailabilityChange);
+  gpuAvailabilityChangeRef.current = onGpuAvailabilityChange;
   const deltaDescriptors = useMemo(
     () => deltaStream
       ? contactTileCanvasDescriptorsForViewport(
@@ -1200,6 +1243,7 @@ function ContactTileGpuCanvas({
       return;
     }
     rendererRef.current = renderer;
+    gpuAvailabilityChangeRef.current?.(true);
     const handleContextLost = (event: Event) => {
       event.preventDefault();
       onUnavailable();
@@ -1221,8 +1265,20 @@ function ContactTileGpuCanvas({
       }
       rendererRef.current = null;
       renderer.destroy();
+      gpuAvailabilityChangeRef.current?.(false);
     };
   }, [onUnavailable, textureBudgetBytes]);
+
+  usePrePaintEffect(() => {
+    if (!rendererRef.current || !onGpuAvailabilityChange) {
+      return;
+    }
+    onGpuAvailabilityChange(true);
+    // Losing the "presented" role does not destroy this GPU surface; it only
+    // becomes the staging slot. Reporting false from an effect cleanup would
+    // briefly remount every DOM boundary during an atomic front/back swap.
+    // Real renderer loss is reported by disableGpu or the destroy cleanup.
+  }, [onGpuAvailabilityChange]);
 
   usePrePaintEffect(() => {
     const renderer = rendererRef.current;
@@ -1243,6 +1299,7 @@ function ContactTileGpuCanvas({
       return;
     }
     const painted = renderer.setScene({
+      boundaries,
       descriptors,
       generation: contactMap.renderGeneration,
       overview,
@@ -1259,6 +1316,7 @@ function ContactTileGpuCanvas({
       paintCoordinator?.reportCanvasPaint(key);
     }
   }, [
+    boundaries,
     contactMap,
     descriptors,
     onUnavailable,
@@ -1310,6 +1368,7 @@ function ContactTileGpuCanvas({
       reportFirstPaint();
     };
     const painted = renderer.setDeltaScene({
+      boundaries,
       buffers: deltaStream.accumulator.denseBuffers(),
       deferTextureUpdates,
       descriptors: deltaDescriptors,
@@ -1345,6 +1404,7 @@ function ContactTileGpuCanvas({
       }
     };
   }, [
+    boundaries,
     contactMap?.renderGeneration,
     deltaDescriptors,
     deltaStream,

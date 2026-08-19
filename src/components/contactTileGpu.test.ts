@@ -4,6 +4,7 @@ import {
   contactOverviewTextureBytes,
   contactTileDenseFloatTextureData,
   contactTileFloatTextureData,
+  contactTileGpuBoundaryInstanceData,
   contactTileGpuDrawCoverageIsComplete,
   createContactTileGpuRenderer,
 } from "./contactTileGpu";
@@ -13,6 +14,8 @@ function mockWebGlCanvas() {
   const texSubImage2D = vi.fn();
   const getError = vi.fn(() => 0);
   const drawArrays = vi.fn();
+  const drawArraysInstanced = vi.fn();
+  const bufferData = vi.fn();
   const clear = vi.fn();
   const scissor = vi.fn();
   const clientWidthRead = vi.fn(() => 256);
@@ -60,7 +63,7 @@ function mockWebGlCanvas() {
     createBuffer: vi.fn(() => ({})),
     createTexture: vi.fn(() => ({})),
     bindBuffer: vi.fn(),
-    bufferData: vi.fn(),
+    bufferData,
     getAttribLocation: vi.fn(() => 0),
     getUniformLocation: vi.fn(() => ({})),
     deleteBuffer: vi.fn(),
@@ -75,7 +78,9 @@ function mockWebGlCanvas() {
     scissor,
     useProgram: vi.fn(),
     enableVertexAttribArray: vi.fn(),
+    disableVertexAttribArray: vi.fn(),
     vertexAttribPointer: vi.fn(),
+    vertexAttribDivisor: vi.fn(),
     uniform2f: vi.fn(),
     uniform4f: vi.fn(),
     uniform1f: vi.fn(),
@@ -86,6 +91,7 @@ function mockWebGlCanvas() {
     texImage2D,
     texSubImage2D,
     drawArrays,
+    drawArraysInstanced,
     getError,
   };
   const canvas = {
@@ -97,10 +103,12 @@ function mockWebGlCanvas() {
   Object.defineProperty(canvas, "clientHeight", { get: clientHeightRead });
   return {
     canvas,
+    bufferData,
     clear,
     clientHeightRead,
     clientWidthRead,
     drawArrays,
+    drawArraysInstanced,
     getError,
     scissor,
     texImage2D,
@@ -156,7 +164,7 @@ describe("contactTileFloatTextureData", () => {
     expect(drawArrays).toHaveBeenCalledTimes(2);
     expect(scissor).toHaveBeenCalledTimes(2);
     const uploadsAfterFirstDraw = texImage2D.mock.calls.length;
-    renderer?.setPanOffset(1, 0);
+    renderer?.setPanViewport({ xStart: 100, xEnd: 500, yStart: 0, yEnd: 400 });
     expect(drawArrays).toHaveBeenCalledTimes(4);
     expect(texImage2D).toHaveBeenCalledTimes(uploadsAfterFirstDraw);
   });
@@ -195,7 +203,12 @@ describe("contactTileFloatTextureData", () => {
     const validationsBeforePan = getError.mock.calls.length;
     const drawsBeforePan = drawArrays.mock.calls.length;
 
-    renderer?.setPanOffset(12, -8);
+    renderer?.setPanViewport({
+      xStart: 1_000,
+      xEnd: 5_000,
+      yStart: 2_000,
+      yEnd: 6_000,
+    });
 
     expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
       .toBe(layoutReadsBeforePan);
@@ -203,6 +216,73 @@ describe("contactTileFloatTextureData", () => {
     expect(getError).toHaveBeenCalledTimes(validationsBeforePan);
     expect(drawArrays.mock.calls.length).toBe(drawsBeforePan + 1);
     renderer?.destroy();
+  });
+
+  it("uploads world-space boundaries once and pans them with the live GPU camera", () => {
+    const {
+      bufferData,
+      canvas,
+      clientHeightRead,
+      clientWidthRead,
+      drawArraysInstanced,
+      texImage2D,
+    } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const bufferUploadsBeforeScene = bufferData.mock.calls.length;
+    const boundaries = [{
+      visualStart: 500,
+      visualEnd: 2_500,
+      color: [0.22, 0.65, 1] as const,
+      lineWidthCssPx: 1,
+      minimumSpanCssPx: 0,
+    }];
+
+    expect(renderer?.setScene({
+      boundaries,
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 1, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    expect(bufferData).toHaveBeenCalledTimes(bufferUploadsBeforeScene + 1);
+    expect(drawArraysInstanced).toHaveBeenCalledWith(27, 0, 24, 1);
+    const instancedDrawsBeforePan = drawArraysInstanced.mock.calls.length;
+    const textureUploadsBeforePan = texImage2D.mock.calls.length;
+    const layoutReadsBeforePan = clientWidthRead.mock.calls.length
+      + clientHeightRead.mock.calls.length;
+
+    renderer?.setPanViewport({ xStart: 1_000, xEnd: 5_000, yStart: 750, yEnd: 4_750 });
+
+    expect(bufferData).toHaveBeenCalledTimes(bufferUploadsBeforeScene + 1);
+    expect(drawArraysInstanced).toHaveBeenCalledTimes(instancedDrawsBeforePan + 1);
+    expect(texImage2D).toHaveBeenCalledTimes(textureUploadsBeforePan);
+    expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
+      .toBe(layoutReadsBeforePan);
+    renderer?.destroy();
+  });
+
+  it("packs boundary geometry into one immutable instance buffer", () => {
+    const packed = contactTileGpuBoundaryInstanceData([{
+      visualStart: 100,
+      visualEnd: 300,
+      color: [0.2, 0.4, 0.6],
+      lineWidthCssPx: 0,
+      minimumSpanCssPx: -1,
+    }]);
+    expect(Array.from(packed.slice(0, 2))).toEqual([100, 300]);
+    expect(packed[2]).toBeCloseTo(0.2);
+    expect(packed[3]).toBeCloseTo(0.4);
+    expect(packed[4]).toBeCloseTo(0.6);
+    expect(Array.from(packed.slice(5))).toEqual([0.5, 0]);
   });
 
   it("presents appended pan-prefetch textures without clearing or replacing the scene", () => {
@@ -239,9 +319,14 @@ describe("contactTileFloatTextureData", () => {
         colorScale: { log: false, min: 0, max: 10 },
       },
     })).toBe(true);
-    // Model the stopped-wheel frame: the authoritative scene is still in the
-    // old camera, while the framebuffer remains shifted to the preview camera.
-    renderer?.setPanOffset(24, -16);
+    // Model the stopped-wheel frame: the one live camera is already at the
+    // preview viewport while background tiles continue arriving.
+    renderer?.setPanViewport({
+      xStart: 500,
+      xEnd: 4_500,
+      yStart: 750,
+      yEnd: 4_750,
+    });
     const clearsBeforeAppend = clear.mock.calls.length;
     const drawsBeforeAppend = drawArrays.mock.calls.length;
     const uploadsBeforeAppend = texImage2D.mock.calls.length;

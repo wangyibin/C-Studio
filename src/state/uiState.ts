@@ -34,7 +34,7 @@ import {
   minimumContactViewportSpanMb,
   wholeGenomeContactResolutionForViewport,
 } from "./contactResolution";
-import { contactViewportAxisSpans } from "./contactViewport";
+import { contactViewportAxisSpans, type ContactViewport } from "./contactViewport";
 import type { ContactMapLayoutBlock } from "./importers";
 import type { GfaLinkEvidence } from "./gfa";
 
@@ -217,6 +217,11 @@ export type UiAction =
       label: string;
     }
   | { type: "panContactViewport"; deltaMb?: number; deltaXMb?: number; deltaYMb?: number }
+  | {
+      type: "commitContactViewportPan";
+      viewport: ContactViewport;
+      totalSpanMb: number;
+    }
   | {
       type: "zoomContactViewport";
       direction: "in" | "out";
@@ -944,6 +949,54 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         ...state,
         contact: {
           ...state.contact,
+          viewportCenterMb,
+          viewportCenterXMb,
+          viewportCenterYMb,
+          jumpTargetMb: viewportCenterXMb,
+        },
+      };
+    }
+    case "commitContactViewportPan": {
+      const totalSpanMb = sanitizeContactTotalSpanMb(action.totalSpanMb);
+      const axisSpans = contactViewportAxisSpansMb(
+        state.contact.viewportSpanMb,
+        totalSpanMb,
+        state.contact.viewportWidthPx,
+        state.contact.viewportHeightPx,
+      );
+      const requestedCenterXMb = (action.viewport.xStart + action.viewport.xEnd) / 2_000_000;
+      const requestedCenterYMb = (action.viewport.yStart + action.viewport.yEnd) / 2_000_000;
+      const viewportCenterXMb = clampContactViewportCenter(
+        Number.isFinite(requestedCenterXMb)
+          ? requestedCenterXMb
+          : state.contact.viewportCenterXMb,
+        axisSpans.xSpanMb,
+        totalSpanMb,
+      );
+      const viewportCenterYMb = clampContactViewportCenter(
+        Number.isFinite(requestedCenterYMb)
+          ? requestedCenterYMb
+          : state.contact.viewportCenterYMb,
+        axisSpans.ySpanMb,
+        totalSpanMb,
+      );
+      const viewportCenterMb = roundContactViewportMb(
+        (viewportCenterXMb + viewportCenterYMb) / 2,
+      );
+
+      if (
+        totalSpanMb === state.contact.totalSpanMb
+        && viewportCenterXMb === state.contact.viewportCenterXMb
+        && viewportCenterYMb === state.contact.viewportCenterYMb
+      ) {
+        return state;
+      }
+
+      return {
+        ...state,
+        contact: {
+          ...state.contact,
+          totalSpanMb,
           viewportCenterMb,
           viewportCenterXMb,
           viewportCenterYMb,

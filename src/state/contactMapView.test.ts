@@ -12,6 +12,7 @@ import {
   shouldHoldPreviousContactMapFrame,
   shouldPresentContactTileDeltaStream,
   shouldPublishContactMapLayer,
+  shouldRetainPreviousContactMapFrame,
 } from "./contactMapView";
 import type { ContactMapLayoutBlock } from "./importers";
 
@@ -397,6 +398,24 @@ describe("contact map layer publishing", () => {
     )).toBe(true);
   });
 
+  it("retains the complete front surface for a same-resolution viewport move", () => {
+    const translatedViewport = {
+      xStart: 1_000_000,
+      xEnd: 11_000_000,
+      yStart: 2_000_000,
+      yEnd: 12_000_000,
+    };
+
+    expect(shouldRetainPreviousContactMapFrame(
+      previousComplete,
+      100_000,
+      256,
+      previousComplete.layoutScope!,
+      translatedViewport,
+    )).toBe(true);
+    expect(contactTileDeltaStreamMode(true, true)).toBe("staging");
+  });
+
   it("preserves progressive publishing outside layout edits", () => {
     expect(shouldHoldPreviousContactMapFrame(
       previousComplete,
@@ -405,6 +424,13 @@ describe("contact map layer publishing", () => {
       previousComplete.layoutScope!,
     )).toBe(false);
     expect(shouldHoldPreviousContactMapFrame(null, 100_000, 256, "layout-a")).toBe(false);
+    expect(shouldRetainPreviousContactMapFrame(
+      previousComplete,
+      100_000,
+      256,
+      previousComplete.layoutScope!,
+      previousComplete.viewport,
+    )).toBe(false);
     expect(shouldPublishContactMapLayer(false, false)).toBe(true);
     expect(shouldPublishContactMapLayer(false, true)).toBe(true);
   });

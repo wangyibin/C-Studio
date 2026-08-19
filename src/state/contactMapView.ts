@@ -107,8 +107,36 @@ export function shouldHoldPreviousContactMapFrame(
 }
 
 /**
- * Resolution and layout transitions use double buffering: keep the previous
- * complete generation visible until every tile in the new viewport is ready.
+ * A committed viewport move is also a presentation transition. Keep the
+ * camera-shifted front surface visible while the target viewport is assembled;
+ * streamed partial tiles must stay in the hidden staging slot.
+ */
+export function shouldRetainPreviousContactMapFrame(
+  previousContactMap: ContactMapView | null,
+  nextResolution: number,
+  nextTileSizeBins: number,
+  nextLayoutScope: string,
+  nextViewport: ContactMapView["viewport"],
+): boolean {
+  return shouldHoldPreviousContactMapFrame(
+    previousContactMap,
+    nextResolution,
+    nextTileSizeBins,
+    nextLayoutScope,
+  ) || Boolean(
+    previousContactMap
+    && (
+      previousContactMap.viewport.xStart !== nextViewport.xStart
+      || previousContactMap.viewport.xEnd !== nextViewport.xEnd
+      || previousContactMap.viewport.yStart !== nextViewport.yStart
+      || previousContactMap.viewport.yEnd !== nextViewport.yEnd
+    ),
+  );
+}
+
+/**
+ * Presentation transitions use double buffering: keep the previous complete
+ * generation visible until every tile in the new viewport is ready.
  */
 export function shouldPublishContactMapLayer(
   holdsPreviousCompleteFrame: boolean,

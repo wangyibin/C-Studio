@@ -1081,6 +1081,42 @@ describe("reduceUiState", () => {
     expect(state.logEntries.length).toBe(logCount);
   });
 
+  it("commits an absolute dragged viewport without applying the movement twice", () => {
+    const initialState = createInitialUiState("Browser preview mode");
+    const state = reduceUiState(
+      {
+        ...initialState,
+        contact: {
+          ...initialState.contact,
+          totalSpanMb: 400,
+          viewportSpanMb: 100,
+          viewportWidthPx: 400,
+          viewportHeightPx: 200,
+          viewportCenterMb: 200,
+          viewportCenterXMb: 200,
+          viewportCenterYMb: 200,
+          jumpTargetMb: 200,
+        },
+      },
+      {
+        type: "commitContactViewportPan",
+        viewport: {
+          xStart: 123_456_789,
+          xEnd: 323_456_789,
+          yStart: 80_123_456,
+          yEnd: 180_123_456,
+        },
+        totalSpanMb: 400,
+      },
+    );
+
+    expect(state.contact.viewportCenterXMb).toBe(223.456789);
+    expect(state.contact.viewportCenterYMb).toBe(130.123456);
+    expect(state.contact.viewportCenterMb).toBe(176.790122);
+    expect(state.contact.jumpTargetMb).toBe(223.456789);
+    expect(state.contact.viewportSpanMb).toBe(100);
+  });
+
   it("clamps wheel panning at each rectangular viewport edge without a reverse dead zone", () => {
     const initialState = createInitialUiState("Browser preview mode");
     let state = {

@@ -30,6 +30,7 @@ import {
   contactTileDeltaStreamMode,
   shouldHoldPreviousContactMapFrame,
   shouldPublishContactMapLayer,
+  shouldRetainPreviousContactMapFrame,
 } from "./state/contactMapView";
 import {
   createContactPanPerformanceTracker,
@@ -1543,15 +1544,16 @@ export function App() {
         ]),
       );
       const previousCompleteMap = lastCompleteContactMapRef.current;
-      const holdsPreviousCompleteFrame = shouldHoldPreviousContactMapFrame(
+      const retainsPreviousCompleteFrame = shouldRetainPreviousContactMapFrame(
         previousCompleteMap,
         mainLodPlan.targetResolution,
         lodTileSizeBins,
         mainLodScope,
+        viewport,
       );
       const mainLodDirectDeltaStreamMode = contactTileDeltaStreamMode(
         contactTileDirectDeltaEnabled && !panPreviewActive,
-        holdsPreviousCompleteFrame,
+        retainsPreviousCompleteFrame,
       );
       const presentsMainLodDirectDeltaStream = mainLodDirectDeltaStreamMode === "overlay";
       const mainLodLoadPriority = contactPanTileLoadPriority({
@@ -1656,7 +1658,7 @@ export function App() {
         );
         if (
           !panPreviewActive
-          && shouldPublishContactMapLayer(holdsPreviousCompleteFrame, false)
+          && shouldPublishContactMapLayer(retainsPreviousCompleteFrame, false)
         ) {
           setContactMap(displayedMainLod);
         }
@@ -1756,7 +1758,7 @@ export function App() {
           }
           if (
             !panPreviewActive
-            && shouldPublishContactMapLayer(holdsPreviousCompleteFrame, layerComplete)
+            && shouldPublishContactMapLayer(retainsPreviousCompleteFrame, layerComplete)
           ) {
             if (kind === "visible" && layerComplete) {
               applyMainLodAutoColorScale(updatedMainLodMap);
@@ -2024,16 +2026,15 @@ export function App() {
       tileSizeBins,
       tileScope,
     );
-    const streamsCompatiblePan = Boolean(
-      previousCompleteMap
-      && !holdsPreviousCompleteFrame
-      && (
-        previousCompleteMap.viewport.xStart !== viewport.xStart
-        || previousCompleteMap.viewport.xEnd !== viewport.xEnd
-        || previousCompleteMap.viewport.yStart !== viewport.yStart
-        || previousCompleteMap.viewport.yEnd !== viewport.yEnd
-      ),
+    const retainsPreviousCompleteFrame = shouldRetainPreviousContactMapFrame(
+      previousCompleteMap,
+      targetResolution,
+      tileSizeBins,
+      tileScope,
+      viewport,
     );
+    const streamsCompatiblePan = retainsPreviousCompleteFrame
+      && !holdsPreviousCompleteFrame;
     const normalVisibleBatchSize = holdsPreviousCompleteFrame
       ? Math.max(1, tileWorld.missingVisibleTiles.length)
       : streamsCompatiblePan
@@ -2105,7 +2106,7 @@ export function App() {
     );
     if (
       !panPreviewActive
-      && holdsPreviousCompleteFrame
+      && retainsPreviousCompleteFrame
       && previousCompleteMap
       && tileWorld.missingVisibleTiles.length > 0
     ) {
@@ -2415,7 +2416,7 @@ export function App() {
       }
 
       if (!panPreviewActive && shouldPublishContactMapLayer(
-        holdsPreviousCompleteFrame,
+        retainsPreviousCompleteFrame,
         tileWorld.missingVisibleTiles.length === 0,
       )) {
         if (tileWorld.missingVisibleTiles.length === 0) {
@@ -2485,7 +2486,7 @@ export function App() {
           lastCompleteContactMapRef.current = updatedContactMap;
         }
         if (!panPreviewActive && shouldPublishContactMapLayer(
-          holdsPreviousCompleteFrame,
+          retainsPreviousCompleteFrame,
           updatedTileWorld.missingVisibleTiles.length === 0,
         )) {
           if (kind === "visible" && updatedTileWorld.missingVisibleTiles.length === 0) {
@@ -2559,7 +2560,7 @@ export function App() {
           && tileWorld.visibleTiles.length <= maxExactMainContactTiles;
         const directDeltaStreamMode = contactTileDeltaStreamMode(
           contactTileDirectDeltaEnabled && !panPreviewActive,
-          holdsPreviousCompleteFrame,
+          retainsPreviousCompleteFrame,
         );
         const presentsDirectDeltaStream = directDeltaStreamMode === "overlay";
         const visibleTilesForGeneration = loadPlan.visibleBatches.flat();
@@ -2933,7 +2934,7 @@ export function App() {
           message: `${visibleReady ? "Contact prefetch" : "Contact map render"} failed: ${String(error)}`,
         });
       });
-    }, holdsPreviousCompleteFrame || contactTilePreviewViewport
+    }, retainsPreviousCompleteFrame || contactTilePreviewViewport
       ? 0
       : contactViewportRequestDelayMs);
 

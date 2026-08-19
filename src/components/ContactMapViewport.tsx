@@ -96,7 +96,10 @@ import {
   type ContactTileOverscanAxisDirection,
   type ContactTileOverscanDirection,
 } from "./ContactTileLayer";
-import type { ContactTileGpuRenderer } from "./contactTileGpu";
+import type {
+  ContactTileGpuBoundary,
+  ContactTileGpuRenderer,
+} from "./contactTileGpu";
 import { GenomeAxisNavigator } from "./GenomeAxisNavigator";
 import { TrackPanel } from "./TrackPanel";
 
@@ -123,6 +126,7 @@ interface ContactMapViewportProps {
 
 interface DragState {
   pointerId: number;
+  startViewport: ContactViewport;
   startX: number;
   startY: number;
   currentX: number;
@@ -245,6 +249,20 @@ export function contactWheelPanCommitDelta(
   return deltaXMb === 0 && deltaYMb === 0 ? null : { deltaXMb, deltaYMb };
 }
 
+export function contactPanCommitAction(
+  startViewport: ContactViewport,
+  previewViewport: ContactViewport,
+  totalSpanMb: number,
+): UiAction | null {
+  return contactWheelPanCommitDelta(startViewport, previewViewport) === null
+    ? null
+    : {
+        type: "commitContactViewportPan",
+        viewport: previewViewport,
+        totalSpanMb,
+      };
+}
+
 export function contactPanPreviewTileSignature(
   viewport: ContactViewport,
   prefetchViewport: ContactViewport,
@@ -283,6 +301,102 @@ export function advanceContactBoundaryMountViewport(
     && candidate.yStart >= current.yStart - yGuard
     && candidate.yEnd <= current.yEnd + yGuard;
   return remainsInsideGuard ? current : candidate;
+}
+
+/**
+ * Keep diagonal annotations mounted for one viewport beyond every visible
+ * edge. The X/Y intersection is the only interval that can produce a square
+ * on both axes, so unrelated off-axis blocks never become DOM nodes.
+ */
+export function contactBoundaryMountInterval(viewport: ContactViewport) {
+  const xSpan = Math.max(1, viewport.xEnd - viewport.xStart);
+  const ySpan = Math.max(1, viewport.yEnd - viewport.yStart);
+  return {
+    start: Math.max(viewport.xStart - xSpan, viewport.yStart - ySpan),
+    end: Math.min(viewport.xEnd + xSpan, viewport.yEnd + ySpan),
+  };
+}
+
+export function contactGpuAssemblyBoundaries({
+  model,
+  selection,
+  showChromosomeBoxes,
+  showBlockBoxes,
+  showContigBoxes,
+}: {
+  model: AssemblyEditModel;
+  selection: UiState["assembly"]["selection"];
+  showChromosomeBoxes: boolean;
+  showBlockBoxes: boolean;
+  showContigBoxes: boolean;
+}): ContactTileGpuBoundary[] {
+  const selectedContigIds = new Set(selectedBlockIds(model.blocks, selection));
+  const selectedUnitIds = new Set(
+    model.assemblyBlocks
+      .filter((block) => block.contigIds.some((id) => selectedContigIds.has(id)))
+      .map((block) => block.id),
+  );
+  const compositeContigIds = new Set(
+    model.assemblyBlocks
+      .filter((block) => block.isComposite)
+      .flatMap((block) => block.contigIds),
+  );
+  const boundaries: ContactTileGpuBoundary[] = [];
+  const append = (
+    visualStart: number,
+    visualEnd: number,
+    color: ContactTileGpuBoundary["color"],
+    lineWidthCssPx: number,
+    minimumSpanCssPx: number,
+  ) => {
+    if (Number.isFinite(visualStart) && Number.isFinite(visualEnd) && visualEnd > visualStart) {
+      boundaries.push({
+        visualStart,
+        visualEnd,
+        color,
+        lineWidthCssPx,
+        minimumSpanCssPx,
+      });
+    }
+  };
+
+  if (showChromosomeBoxes) {
+    for (const chromosome of model.chromosomes) {
+      const selected = selection?.kind === "chromosome" && selection.id === chromosome.id;
+      append(
+        chromosome.visualStart,
+        chromosome.visualEnd,
+        selected ? [0.98, 0.8, 0.08] : [0.22, 0.65, 1],
+        1,
+        0,
+      );
+    }
+  }
+  for (const block of model.assemblyBlocks) {
+    const visible = block.isComposite
+      ? showBlockBoxes
+      : showBlockBoxes || showContigBoxes;
+    if (!visible) {
+      continue;
+    }
+    const selected = selectedUnitIds.has(block.id);
+    append(
+      block.visualStart,
+      block.visualEnd,
+      selected ? [0, 0, 0] : [0.13, 0.77, 0.37],
+      selected ? 2 : block.isComposite ? 1 : 0.5,
+      selected ? 0 : 1,
+    );
+  }
+  if (showContigBoxes) {
+    for (const contig of model.blocks) {
+      if (!compositeContigIds.has(contig.id)) {
+        continue;
+      }
+      append(contig.visualStart, contig.visualEnd, [0, 0, 0], 0.5, 1);
+    }
+  }
+  return boundaries;
 }
 
 interface ContactResolutionWheelInput {
@@ -431,34 +545,49 @@ export function contactTileOverscanDirectionForViewports(
 }
 
 /**
- * Keep the fully painted layer in its own camera while a selected resolution
- * or normalization is still loading. Reprojecting an old fine-resolution tile
- * set into a newly expanded whole-genome viewport can make the surface appear
- * blank and can force the renderer to reconsider a much larger cached set.
+ * Keep the fully painted layer in its own camera while a selected viewport,
+ * resolution, or normalization is still loading. Reprojecting an old tile set
+ * into a newly committed pan viewport exposes the coarse overview underneath;
+ * expanding it into a whole-genome viewport can also make the surface blank
+ * and force the renderer to reconsider a much larger cached set.
  * A terminal screen LOD opts out only while it still fulfills the current
  * selection; on the next resolution change it becomes the retained old frame.
  */
 export function shouldRetainPresentedContactViewport(
-  contactMap: Pick<
+  contactMap: (Pick<
     ContactMapView,
     "isTransientResolutionPreview" | "normalization" | "requestedResolution" | "resolution"
-  > | null,
+  > & Partial<Pick<ContactMapView, "viewport">>) | null,
   selectedResolution: number,
   selectedNormalization: ContactNormalization,
+  selectedViewport?: ContactViewport,
 ): boolean {
   if (!contactMap) {
     return false;
   }
+  const viewportChanged = Boolean(
+    selectedViewport
+    && contactMap.viewport
+    && (
+      contactMap.viewport.xStart !== selectedViewport.xStart
+      || contactMap.viewport.xEnd !== selectedViewport.xEnd
+      || contactMap.viewport.yStart !== selectedViewport.yStart
+      || contactMap.viewport.yEnd !== selectedViewport.yEnd
+    ),
+  );
   const normalizationChanged = contactMap.normalization !== undefined
     && contactMap.normalization !== selectedNormalization;
   if (contactMap.isTransientResolutionPreview === false) {
-    return contactMap.requestedResolution !== undefined
+    return viewportChanged || (
+      contactMap.requestedResolution !== undefined
       && (
         contactMap.requestedResolution !== selectedResolution
         || normalizationChanged
-      );
+      )
+    );
   }
-  return contactMap.resolution !== selectedResolution
+  return viewportChanged
+    || contactMap.resolution !== selectedResolution
     || normalizationChanged;
 }
 
@@ -892,6 +1021,14 @@ export function ContactMapViewport({
     ContactViewport | null
   >(null);
   const assemblyBoundaryPanViewportRef = useRef<ContactViewport | null>(null);
+  const [gpuAssemblyBoundariesActive, setGpuAssemblyBoundariesActive] = useState(() => (
+    typeof document !== "undefined"
+    && Boolean(
+      incomingContactMap?.tiles
+      || incomingContactMap?.cachedTiles
+      || incomingContactMap?.previewTiles
+    )
+  ));
   const panAnimationFrameRef = useRef<number | null>(null);
   const redrawAnimationFrameRef = useRef<number | null>(null);
   const prepaintedCellContactMapRef = useRef<ContactMapView | null>(null);
@@ -930,16 +1067,9 @@ export function ContactMapViewport({
     }
   }, [onContactTileLayerCommit]);
   const reportTileLayerPaintComplete = useCallback((event: ContactTileLayerPaintEvent) => {
-    const target = targetContactPresentationFrameRef.current?.contactMap;
-    if (
-      event.paintRevision !== undefined
-      && target?.renderGeneration === event.paintRevision
-    ) {
-      // The old front canvas remains camera-shifted while this target paints in
-      // the hidden slot. Rebase overlays and the newly revealed renderer only
-      // after the atomic swap; resetting earlier exposes the old viewport.
-      resetPanTransform();
-    }
+    // Advance the React presentation frame first. Its layout effect rebases the
+    // heatmap and annotations together after their target viewport is committed;
+    // clearing the imperative offset here would briefly expose old coordinates.
     setPaintedContactPresentationFrame((current) => advancePaintedContactPresentationFrame(
       current,
       targetContactPresentationFrameRef.current,
@@ -1032,6 +1162,7 @@ export function ContactMapViewport({
     contactMap,
     contactResolutionToBasePairs(uiState.contact.resolution),
     contactNormalizationForBackend(uiState.normalization),
+    liveViewport,
   );
   const usesTiledRenderer = Boolean(
     contactMap?.tiles || contactMap?.cachedTiles || contactMap?.previewTiles,
@@ -1075,29 +1206,34 @@ export function ContactMapViewport({
     presentationContactMap,
     contactResolutionToBasePairs(uiState.contact.resolution),
     contactNormalizationForBackend(uiState.normalization),
+    liveViewport,
   );
   const presentedLiveViewport = freezePresentedAnnotationViewport && presentationContactMap
     ? presentationContactMap.viewport
     : liveViewport;
   const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
   usePrePaintEffect(() => {
-    // During pointer movement the annotation layer follows the retained heatmap
-    // through an imperative transform. Once React commits the new viewport its
-    // boxes are already projected into target coordinates, so remove that old
-    // transform before the browser can paint the new positions. Clearing it in
-    // a normal effect exposes one frame with both offsets applied and produces
-    // the visible post-pan boundary wobble.
-    resetPanAnnotationTransform();
-    if (!dragStateRef.current && !wheelPanSessionRef.current) {
-      clearAssemblyBoundaryPanViewport();
-    }
+    // The retained front, axes, and annotations stay in the source camera until
+    // the painted presentation frame reaches this target viewport. React has now
+    // projected every layer into target coordinates, so clear the imperative pan
+    // offset once, before the browser can paint either coordinate system alone.
+    resetPanTransform();
   }, [
     displayViewport.xEnd,
     displayViewport.xStart,
     displayViewport.yEnd,
     displayViewport.yStart,
   ]);
-  const assemblyBoundaryMountViewport = assemblyBoundaryPanViewport ?? displayViewport;
+  // Keep the same overscanned boundary population across pointer release.
+  // Falling back to the committed viewport only when it leaves the guard
+  // avoids the old release-time unmount/remount pass.
+  const assemblyBoundaryMountViewport = assemblyBoundaryPanViewport
+    && advanceContactBoundaryMountViewport(
+      assemblyBoundaryPanViewport,
+      displayViewport,
+    ) === assemblyBoundaryPanViewport
+    ? assemblyBoundaryPanViewport
+    : displayViewport;
   const historyPreviewOperation = useMemo(
     () => uiState.historyPreviewOperationId === null
       ? null
@@ -1153,7 +1289,27 @@ export function ContactMapViewport({
   )
     ? activeAssemblyBlocks
     : presentationContactMap?.layoutBlocks ?? activeAssemblyBlocks;
+  // The raster preview is a temporary 2D surface layered above WebGL. Keep the
+  // DOM outline fallback only for that short edit preview (or when WebGL is
+  // unavailable); ordinary navigation leaves every visual boundary on the GPU.
+  const usesDomAssemblyBoundaries = !gpuAssemblyBoundariesActive || showsLayoutRasterPreview;
   const assemblyModel = useMemo(() => buildAssemblyEditModel(assemblyBlocks), [assemblyBlocks]);
+  const gpuAssemblyBoundaries = useMemo(
+    () => contactGpuAssemblyBoundaries({
+      model: assemblyModel,
+      selection: uiState.assembly.selection,
+      showChromosomeBoxes: uiState.assembly.showChromosomeBoxes,
+      showBlockBoxes: uiState.assembly.showBlockBoxes,
+      showContigBoxes: uiState.assembly.showContigBoxes,
+    }),
+    [
+      assemblyModel,
+      uiState.assembly.selection,
+      uiState.assembly.showBlockBoxes,
+      uiState.assembly.showChromosomeBoxes,
+      uiState.assembly.showContigBoxes,
+    ],
+  );
   const selectedAssemblyBlockIds = useMemo(
     () => new Set(selectedBlockIds(assemblyModel.blocks, uiState.assembly.selection)),
     [assemblyModel, uiState.assembly.selection],
@@ -1176,6 +1332,8 @@ export function ContactMapViewport({
   );
   const showsCompositeContigLayer = uiState.assembly.showContigBoxes
     && compositeAssemblyContigIds.size > 0;
+  const boundaryMountInterval = contactBoundaryMountInterval(assemblyBoundaryMountViewport);
+  const boundaryMountWidthPx = Math.max(1, uiState.contact.viewportWidthPx * 3);
   const overlayLayerCount = (
     uiState.assembly.showBlockBoxes || uiState.assembly.showContigBoxes ? 1 : 0
   ) + (showsCompositeContigLayer ? 1 : 0);
@@ -1184,49 +1342,54 @@ export function ContactMapViewport({
     Math.floor(
       Math.min(
         maximumAssemblyOverlayIntervals,
-        Math.max(1, uiState.contact.viewportWidthPx),
+        boundaryMountWidthPx,
       ) / Math.max(1, overlayLayerCount),
     ),
   );
   const visibleAssemblyContigs = useMemo(
-    () => limitAssemblyOverlayIntervals(
+    () => !usesDomAssemblyBoundaries ? [] : limitAssemblyOverlayIntervals(
       assemblyModel.blocks.filter((block) => compositeAssemblyContigIds.has(block.id)),
-      displayViewport.xStart,
-      displayViewport.xEnd,
-      uiState.contact.viewportWidthPx,
+      boundaryMountInterval.start,
+      boundaryMountInterval.end,
+      boundaryMountWidthPx,
       selectedAssemblyBlockIds,
       overlayIntervalBudget,
     ),
     [
       assemblyModel,
+      boundaryMountInterval.end,
+      boundaryMountInterval.start,
+      boundaryMountWidthPx,
       compositeAssemblyContigIds,
-      displayViewport.xEnd,
-      displayViewport.xStart,
       overlayIntervalBudget,
       selectedAssemblyBlockIds,
-      uiState.contact.viewportWidthPx,
+      usesDomAssemblyBoundaries,
     ],
   );
   const visibleAssemblyBlocks = useMemo(
-    () => limitAssemblyOverlayIntervals(
+    () => !usesDomAssemblyBoundaries ? [] : limitAssemblyOverlayIntervals(
       assemblyModel.assemblyBlocks,
-      displayViewport.xStart,
-      displayViewport.xEnd,
-      uiState.contact.viewportWidthPx,
+      boundaryMountInterval.start,
+      boundaryMountInterval.end,
+      boundaryMountWidthPx,
       selectedAssemblyUnitIds,
       overlayIntervalBudget,
     ),
     [
       assemblyModel,
-      displayViewport.xEnd,
-      displayViewport.xStart,
+      boundaryMountInterval.end,
+      boundaryMountInterval.start,
+      boundaryMountWidthPx,
       overlayIntervalBudget,
       selectedAssemblyUnitIds,
-      uiState.contact.viewportWidthPx,
+      usesDomAssemblyBoundaries,
     ],
   );
   const visibleAssemblyChromosomes = useMemo(
     () => {
+      if (!usesDomAssemblyBoundaries) {
+        return [];
+      }
       const xSpan = assemblyBoundaryMountViewport.xEnd - assemblyBoundaryMountViewport.xStart;
       const ySpan = assemblyBoundaryMountViewport.yEnd - assemblyBoundaryMountViewport.yStart;
       return assemblyModel.chromosomes.filter(
@@ -1242,6 +1405,7 @@ export function ContactMapViewport({
       assemblyBoundaryMountViewport.yEnd,
       assemblyBoundaryMountViewport.yStart,
       assemblyModel,
+      usesDomAssemblyBoundaries,
     ],
   );
   const totalSpanMb = Math.max(
@@ -1703,12 +1867,13 @@ export function ContactMapViewport({
       session.width,
       session.height,
     );
-    const commitDelta = contactWheelPanCommitDelta(
+    const commitAction = contactPanCommitAction(
       session.startViewport,
       session.previewViewport,
+      totalSpanMb,
     );
-    if (commitDelta) {
-      onUiAction({ type: "panContactViewport", ...commitDelta });
+    if (commitAction) {
+      onUiAction(commitAction);
     } else {
       resetPanTransform();
     }
@@ -1731,6 +1896,7 @@ export function ContactMapViewport({
       ?? event.currentTarget.getBoundingClientRect();
     const nextDragState = {
       pointerId: event.pointerId,
+      startViewport: liveViewport,
       startX: event.clientX,
       startY: event.clientY,
       currentX: event.clientX,
@@ -1803,18 +1969,23 @@ export function ContactMapViewport({
       return;
     }
 
-    const deltaX = event.clientX - currentDragState.startX;
-    const deltaY = event.clientY - currentDragState.startY;
-    const finalContactMap = contactMapWithPannedViewport(
+    // The last pointer-move preview is already what the user sees. Pointer-up
+    // coordinates can lag by one WebView event, so recomputing here produces a
+    // visible snap backwards. Commit that exact visible camera instead.
+    const finalViewport = currentDragState.previewViewport ?? contactMapWithPannedViewport(
       liveContactMap,
-      deltaX,
-      deltaY,
+      event.clientX - currentDragState.startX,
+      event.clientY - currentDragState.startY,
       currentDragState.width,
       currentDragState.height,
       totalSpanMb * 1_000_000,
+    ).viewport;
+    const finalContactMap = { ...liveContactMap, viewport: finalViewport };
+    const commitAction = contactPanCommitAction(
+      currentDragState.startViewport,
+      finalViewport,
+      totalSpanMb,
     );
-    const deltaXMb = ((finalContactMap.viewport.xStart - liveViewport.xStart) / 1_000_000);
-    const deltaYMb = ((finalContactMap.viewport.yStart - liveViewport.yStart) / 1_000_000);
     cancelScheduledPanFrame();
     applyPanTransform(
       liveContactMap,
@@ -1825,8 +1996,8 @@ export function ContactMapViewport({
     dragStateRef.current = null;
     panVelocitySampleRef.current = null;
     setDragState(null);
-    if (Math.hypot(deltaXMb, deltaYMb) >= 0.05) {
-      onUiAction({ type: "panContactViewport", deltaXMb, deltaYMb });
+    if (commitAction) {
+      onUiAction(commitAction);
     } else {
       resetPanTransform();
       drawContactMapBuffer(canvasRef.current, liveContactMap, uiState);
@@ -1868,7 +2039,9 @@ export function ContactMapViewport({
     // Boundary DOM follows the visible camera, not the velocity-shifted tile
     // lead. A fast data lead can sit several tiles ahead and would otherwise
     // evict boxes that are still on screen.
-    prefetchAssemblyBoundaryViewport(previewViewport);
+    if (usesDomAssemblyBoundaries) {
+      prefetchAssemblyBoundaryViewport(previewViewport);
+    }
     const urgentPrefetchTileCount = frontier.urgentPrefetchTileCount;
     const signature = contactPanPreviewTileSignature(
       previewViewport,
@@ -1902,9 +2075,11 @@ export function ContactMapViewport({
     const viewportHeight = Math.max(1, sourceContactMap.viewport.yEnd - sourceContactMap.viewport.yStart);
     const rawOffsetX = -((previewContactMap.viewport.xStart - sourceContactMap.viewport.xStart) / viewportWidth) * width;
     const rawOffsetY = -((previewContactMap.viewport.yStart - sourceContactMap.viewport.yStart) / viewportHeight) * height;
-    const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
-    const offsetX = Math.round(rawOffsetX * pixelRatio) / pixelRatio;
-    const offsetY = Math.round(rawOffsetY * pixelRatio) / pixelRatio;
+    // Keep the same floating-point camera on both sides of pointer release.
+    // Device-pixel rounding here created a different final position from the
+    // viewport projection used by the settled frame.
+    const offsetX = rawOffsetX;
+    const offsetY = rawOffsetY;
     const transform = `translate(${offsetX}px, ${offsetY}px)`;
 
     if (canvasRef.current) {
@@ -1913,7 +2088,7 @@ export function ContactMapViewport({
     if (contactTileTransformRef.current) {
       if (contactTilePanRendererRef.current) {
         contactTileTransformRef.current.style.transform = "";
-        contactTilePanRendererRef.current.setPanOffset(offsetX, offsetY);
+        contactTilePanRendererRef.current.setPanViewport(previewContactMap.viewport);
       } else {
         contactTileTransformRef.current.style.transform = transform;
       }
@@ -1969,11 +2144,11 @@ export function ContactMapViewport({
     if (contactTileTransformRef.current) {
       contactTileTransformRef.current.style.transform = "";
     }
-    contactTilePanRendererRef.current?.resetPanOffset();
-    resetPanAnnotationTransform();
-    if (!dragStateRef.current && !wheelPanSessionRef.current) {
-      clearAssemblyBoundaryPanViewport();
+    const authoritativeViewport = latestContactMapRef.current?.viewport;
+    if (authoritativeViewport) {
+      contactTilePanRendererRef.current?.setPanViewport(authoritativeViewport);
     }
+    resetPanAnnotationTransform();
   }
 
   function resetPanAnnotationTransform() {
@@ -1996,14 +2171,6 @@ export function ContactMapViewport({
     }
     assemblyBoundaryPanViewportRef.current = next;
     setAssemblyBoundaryPanViewport(next);
-  }
-
-  function clearAssemblyBoundaryPanViewport() {
-    if (assemblyBoundaryPanViewportRef.current === null) {
-      return;
-    }
-    assemblyBoundaryPanViewportRef.current = null;
-    setAssemblyBoundaryPanViewport(null);
   }
 
   function previewAxisNavigator(axis: "x" | "y", centerRatio: number) {
@@ -2446,6 +2613,7 @@ export function ContactMapViewport({
             ) : null}
             {usesTiledRenderer || contactTileDeltaStream ? (
               <ContactTileLayer
+                boundaries={gpuAssemblyBoundaries}
                 contactMap={usesTiledRenderer ? contactMap : null}
                 deltaStream={contactTileDeltaStream}
                 overviewContactMap={compatibleOverviewContactMap}
@@ -2466,6 +2634,7 @@ export function ContactMapViewport({
                   ? undefined
                   : reportTileLayerPaintComplete}
                 onPresentedSurfaceChange={reportPresentedSurfaceChange}
+                onGpuAvailabilityChange={setGpuAssemblyBoundariesActive}
                 renderStyle={tileRenderStyle}
                 viewport={tileDisplayViewport}
               />
@@ -2492,6 +2661,7 @@ export function ContactMapViewport({
             selectionVerticalBandRef={assemblySelectionVerticalBandRef}
             selectionHorizontalBandRef={assemblySelectionHorizontalBandRef}
             boundaryMountViewport={assemblyBoundaryMountViewport}
+            renderVisualBoundaries={usesDomAssemblyBoundaries}
             model={assemblyModel}
             viewportXStart={displayViewport.xStart}
             viewportXEnd={displayViewport.xEnd}
@@ -2686,6 +2856,7 @@ interface AssemblyOverlayProps {
   selectionVerticalBandRef: React.RefObject<HTMLSpanElement>;
   selectionHorizontalBandRef: React.RefObject<HTMLSpanElement>;
   boundaryMountViewport: ContactViewport;
+  renderVisualBoundaries: boolean;
   model: AssemblyEditModel;
   viewportXStart: number;
   viewportXEnd: number;
@@ -2715,6 +2886,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
   selectionVerticalBandRef,
   selectionHorizontalBandRef,
   boundaryMountViewport,
+  renderVisualBoundaries,
   model,
   viewportXStart,
   viewportXEnd,
@@ -2848,8 +3020,8 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
   return (
     <div
       className={`assembly-overlay ${pointerState.kind === "cut" ? "cut-preview-active" : ""}`.trim()}
-      data-rendered-block-count={visibleBlocks.length}
-      data-rendered-contig-count={visibleContigs.length}
+      data-rendered-block-count={renderVisualBoundaries ? visibleBlocks.length : 0}
+      data-rendered-contig-count={renderVisualBoundaries ? visibleContigs.length : 0}
       onDoubleClick={onDoubleClick}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -2885,7 +3057,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
         />
       ) : null}
       <div ref={overlayLayerRef} className="assembly-overlay-layer">
-        {showChromosomeBoxes
+        {renderVisualBoundaries && showChromosomeBoxes
           ? visibleChromosomes.map((chromosome) => {
           const boundary = overscannedBoundaryIntervalBox(
             chromosome.visualStart,
@@ -2914,14 +3086,14 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
           );
         })
           : null}
-        {visibleBlocks.map((block) => {
+        {renderVisualBoundaries ? visibleBlocks.map((block) => {
         const showPrimaryBox = block.isComposite
           ? showBlockBoxes
           : showBlockBoxes || showContigBoxes;
         if (!showPrimaryBox) {
           return null;
         }
-        const box = intervalBox(
+        const box = overscannedBoundaryIntervalBox(
           block.visualStart,
           block.visualEnd,
           viewportXStart,
@@ -2930,6 +3102,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
           viewportYStart,
           viewportYEnd,
           viewportYSpan,
+          boundaryMountViewport,
         );
         if (!box) {
           return null;
@@ -2941,7 +3114,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
             key={block.id}
             className={`assembly-box block-box ${block.isComposite ? "composite-block-box" : "singleton-contig-box"} ${selected ? "selected" : ""}`}
             data-block-id={block.id}
-            style={box}
+            style={box.style}
             title={block.isComposite
               ? `${block.id} · ${block.contigIds.length} contigs`
               : `${singletonContig ? assemblyContigDisplayName(singletonContig) : block.id} ${singletonContig?.orientation ?? ""}`.trim()}
@@ -2949,13 +3122,13 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
             {selected ? <span className="block-frame" /> : null}
           </span>
         );
-      })}
-        {showContigBoxes ? visibleContigs.map((contig) => {
+      }) : null}
+        {renderVisualBoundaries && showContigBoxes ? visibleContigs.map((contig) => {
           const unit = unitByContigId.get(contig.id);
           if (!unit?.isComposite) {
             return null;
           }
-          const box = intervalBox(
+          const box = overscannedBoundaryIntervalBox(
             contig.visualStart,
             contig.visualEnd,
             viewportXStart,
@@ -2964,6 +3137,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
             viewportYStart,
             viewportYEnd,
             viewportYSpan,
+            boundaryMountViewport,
           );
           if (!box) {
             return null;
@@ -2974,7 +3148,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
               key={contig.id}
               className="assembly-box contig-child-box"
               data-contig-id={contig.id}
-              style={box}
+              style={box.style}
               title={`${assemblyContigDisplayName(contig)} ${contig.orientation}`}
             >
             </span>
@@ -3097,6 +3271,7 @@ export function sameAssemblyOverlayPresentation(
     && previous.boundaryMountViewport.xEnd === next.boundaryMountViewport.xEnd
     && previous.boundaryMountViewport.yStart === next.boundaryMountViewport.yStart
     && previous.boundaryMountViewport.yEnd === next.boundaryMountViewport.yEnd
+    && previous.renderVisualBoundaries === next.renderVisualBoundaries
     && previous.viewportXStart === next.viewportXStart
     && previous.viewportXEnd === next.viewportXEnd
     && previous.viewportYStart === next.viewportYStart

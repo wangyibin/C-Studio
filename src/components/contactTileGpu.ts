@@ -19,7 +19,17 @@ export interface ContactTileGpuOverview {
   viewport: ContactViewport;
 }
 
+/** A diagonal assembly interval retained in world coordinates on the GPU. */
+export interface ContactTileGpuBoundary {
+  visualStart: number;
+  visualEnd: number;
+  color: readonly [red: number, green: number, blue: number];
+  lineWidthCssPx: number;
+  minimumSpanCssPx: number;
+}
+
 export interface ContactTileGpuScene {
+  boundaries?: readonly ContactTileGpuBoundary[];
   descriptors: readonly ContactTileCanvasDescriptor[];
   generation?: number;
   overview?: ContactTileGpuOverview | null;
@@ -30,6 +40,7 @@ export interface ContactTileGpuScene {
 }
 
 export interface ContactTileGpuDeltaScene {
+  boundaries?: readonly ContactTileGpuBoundary[];
   buffers: readonly ContactTileDenseDeltaBuffer[];
   /** Accumulate into mutable CPU buffers and upload only during terminal promotion. */
   deferTextureUpdates?: boolean;
@@ -54,8 +65,8 @@ export interface ContactTileGpuRenderer {
   presentAppendedSceneDescriptors: () => boolean;
   setDeltaScene: (scene: ContactTileGpuDeltaScene) => boolean;
   updateDeltaTiles: (changedTileKeys: readonly string[]) => boolean;
-  setPanOffset: (x: number, y: number) => void;
-  resetPanOffset: () => void;
+  /** Move the one live GPU camera during pointer navigation. */
+  setPanViewport: (viewport: ContactViewport) => void;
   redraw: () => boolean;
   destroy: () => void;
 }
@@ -106,6 +117,20 @@ interface RendererResources {
   lutTextureLocation: WebGLUniformLocation;
   scaleLocation: WebGLUniformLocation;
   paletteStopCountLocation: WebGLUniformLocation;
+}
+
+interface BoundaryRendererResources {
+  program: WebGLProgram;
+  geometryBuffer: WebGLBuffer;
+  instanceBuffer: WebGLBuffer;
+  edgeLocation: number;
+  intervalLocation: number;
+  colorLocation: number;
+  styleLocation: number;
+  viewportLocation: WebGLUniformLocation;
+  canvasSizeLocation: WebGLUniformLocation;
+  cssSizeLocation: WebGLUniformLocation;
+  cssScaleLocation: WebGLUniformLocation;
 }
 
 const vertexShaderSource = `#version 300 es
@@ -172,6 +197,88 @@ void main() {
   out_color = vec4(mix(vec3(1.0), color.rgb, color.a), 1.0);
 }
 `;
+
+const boundaryVertexShaderSource = `#version 300 es
+in vec4 a_edge;
+in vec2 a_interval;
+in vec3 a_color;
+in vec2 a_style;
+uniform vec4 u_viewport;
+uniform vec2 u_canvas_size;
+uniform vec2 u_css_size;
+uniform vec2 u_css_scale;
+out vec3 v_color;
+
+void main() {
+  float axis = a_edge.x;
+  float side = a_edge.y;
+  float along = a_edge.z;
+  float across = a_edge.w;
+  float start = a_interval.x;
+  float end = a_interval.y;
+  float span = max(0.0, end - start);
+  float span_pixels = min(
+    (span / max(1.0, u_viewport.y)) * u_css_size.x,
+    (span / max(1.0, u_viewport.w)) * u_css_size.y
+  );
+  if (span <= 0.0 || span_pixels < a_style.y) {
+    gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+    v_color = a_color;
+    return;
+  }
+
+  float edge_coordinate = mix(start, end, side);
+  float along_coordinate = mix(start, end, along);
+  vec2 world = axis < 0.5
+    ? vec2(along_coordinate, edge_coordinate)
+    : vec2(edge_coordinate, along_coordinate);
+  vec2 normalized = vec2(
+    (world.x - u_viewport.x) / max(1.0, u_viewport.y),
+    (world.y - u_viewport.z) / max(1.0, u_viewport.w)
+  );
+  vec2 clip = normalized * 2.0 - 1.0;
+  vec2 pixel_offset = axis < 0.5
+    ? vec2(0.0, across * a_style.x * u_css_scale.y)
+    : vec2(across * a_style.x * u_css_scale.x, 0.0);
+  clip += vec2(
+    (pixel_offset.x / u_canvas_size.x) * 2.0,
+    (pixel_offset.y / u_canvas_size.y) * 2.0
+  );
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+  v_color = a_color;
+}
+`;
+
+const boundaryFragmentShaderSource = `#version 300 es
+precision highp float;
+in vec3 v_color;
+out vec4 out_color;
+
+void main() {
+  out_color = vec4(v_color, 1.0);
+}
+`;
+
+const boundaryInstanceStrideFloats = 7;
+
+/** Pack immutable world-space boundaries once; pointer pans reuse this buffer. */
+export function contactTileGpuBoundaryInstanceData(
+  boundaries: readonly ContactTileGpuBoundary[],
+): Float32Array {
+  const values = new Float32Array(boundaries.length * boundaryInstanceStrideFloats);
+  let offset = 0;
+  for (const boundary of boundaries) {
+    values[offset] = boundary.visualStart;
+    values[offset + 1] = boundary.visualEnd;
+    values[offset + 2] = boundary.color[0];
+    values[offset + 3] = boundary.color[1];
+    values[offset + 4] = boundary.color[2];
+    values[offset + 5] = Math.max(0.5, boundary.lineWidthCssPx);
+    values[offset + 6] = Math.max(0, boundary.minimumSpanCssPx);
+    offset += boundaryInstanceStrideFloats;
+  }
+  return values;
+}
 
 /**
  * Build a dense single-channel count texture. -1 marks a missing contact so
@@ -374,6 +481,13 @@ export function createContactTileGpuRenderer(
   if (!resources) {
     return null;
   }
+  const boundaryResources = createBoundaryRendererResources(gl);
+  if (!boundaryResources) {
+    gl.deleteTexture(resources.lutTexture);
+    gl.deleteBuffer(resources.quadBuffer);
+    gl.deleteProgram(resources.program);
+    return null;
+  }
 
   const textureCache = new Map<string, GpuTextureEntry>();
   const safeTextureBudget = Math.max(1, Math.floor(textureBudgetBytes));
@@ -383,14 +497,14 @@ export function createContactTileGpuRenderer(
   let deltaScene: ContactTileGpuDeltaScene | null = null;
   let deltaBuffers = new Map<string, ContactTileDenseDeltaBuffer>();
   let deltaScratch = new Float32Array(0);
-  let panOffsetX = 0;
-  let panOffsetY = 0;
   const pendingAppendedDescriptors = new Map<string, ContactTileCanvasDescriptor>();
   let overviewTextureEntry: GpuOverviewTextureEntry | null = null;
   let destroyed = false;
   let lutColormap: ContactTileRenderStyle["colormap"] | null = null;
   let presentedCssWidth = 1;
   let presentedCssHeight = 1;
+  let uploadedBoundaries: readonly ContactTileGpuBoundary[] | null = null;
+  let uploadedBoundaryCount = 0;
 
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.CULL_FACE);
@@ -471,11 +585,9 @@ export function createContactTileGpuRenderer(
       }
       const left = (
         ((overview.viewport.xStart - activeScene.viewport.xStart) / viewportWidth) * cssWidth
-        + panOffsetX
       ) * scaleX;
       const top = (
         ((overview.viewport.yStart - activeScene.viewport.yStart) / viewportHeight) * cssHeight
-        + panOffsetY
       ) * scaleY;
       const width = (
         (overview.viewport.xEnd - overview.viewport.xStart) / viewportWidth
@@ -506,11 +618,9 @@ export function createContactTileGpuRenderer(
       const renderedTileY = descriptor.transpose ? descriptor.tile.tileX : descriptor.tile.tileY;
       const left = (
         ((renderedTileX * tileSpanBp - activeScene.viewport.xStart) / viewportWidth) * cssWidth
-        + panOffsetX
       ) * scaleX;
       const top = (
         ((renderedTileY * tileSpanBp - activeScene.viewport.yStart) / viewportHeight) * cssHeight
-        + panOffsetY
       ) * scaleY;
       const width = (tileSpanBp / viewportWidth) * canvas.width;
       const height = (tileSpanBp / viewportHeight) * canvas.height;
@@ -601,6 +711,25 @@ export function createContactTileGpuRenderer(
         protectedKeys!,
       );
     }
+    const boundaries = activeScene.boundaries ?? [];
+    if (!drawBoundaryScene(
+      gl,
+      boundaryResources,
+      boundaries,
+      activeScene.viewport,
+      canvas.width,
+      canvas.height,
+      presentedCssWidth,
+      presentedCssHeight,
+      uploadedBoundaries,
+      uploadedBoundaryCount,
+    )) {
+      return false;
+    }
+    if (uploadedBoundaries !== boundaries) {
+      uploadedBoundaries = boundaries;
+      uploadedBoundaryCount = boundaries.length;
+    }
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
     if (panOnly) {
@@ -620,7 +749,6 @@ export function createContactTileGpuRenderer(
 
   return {
     setScene: (nextScene) => {
-      const viewportChanged = !scene || !sameViewport(scene.viewport, nextScene.viewport);
       if (
         deltaScene
         && nextScene.generation !== undefined
@@ -665,10 +793,6 @@ export function createContactTileGpuRenderer(
       deltaBuffers = new Map();
       pendingAppendedDescriptors.clear();
       scene = nextScene;
-      if (viewportChanged) {
-        panOffsetX = 0;
-        panOffsetY = 0;
-      }
       return draw();
     },
     appendSceneDescriptors: (input) => {
@@ -822,8 +946,6 @@ export function createContactTileGpuRenderer(
       return draw(true, descriptors, true);
     },
     setDeltaScene: (nextScene) => {
-      const previousViewport = deltaScene?.viewport ?? scene?.viewport;
-      const viewportChanged = !previousViewport || !sameViewport(previousViewport, nextScene.viewport);
       scene = null;
       pendingAppendedDescriptors.clear();
       deltaScene = nextScene;
@@ -833,10 +955,6 @@ export function createContactTileGpuRenderer(
       const requiredScratchLength = nextScene.tileSizeBins * nextScene.tileSizeBins;
       if (deltaScratch.length !== requiredScratchLength) {
         deltaScratch = new Float32Array(requiredScratchLength);
-      }
-      if (viewportChanged) {
-        panOffsetX = 0;
-        panOffsetY = 0;
       }
       return draw();
     },
@@ -878,19 +996,20 @@ export function createContactTileGpuRenderer(
       }
       return draw();
     },
-    setPanOffset: (x, y) => {
-      panOffsetX = Number.isFinite(x) ? x : 0;
-      panOffsetY = Number.isFinite(y) ? y : 0;
-      if (draw(true)) {
-        pendingAppendedDescriptors.clear();
-      }
-    },
-    resetPanOffset: () => {
-      if (panOffsetX === 0 && panOffsetY === 0) {
+    setPanViewport: (viewport) => {
+      if (destroyed || gl.isContextLost()) {
         return;
       }
-      panOffsetX = 0;
-      panOffsetY = 0;
+      if (deltaScene) {
+        deltaScene = { ...deltaScene, viewport };
+      } else if (scene) {
+        scene = { ...scene, viewport };
+      } else {
+        return;
+      }
+      // Pretext/Juicebox-style camera navigation: the visible textures are
+      // always projected by the current camera. There is no second pixel
+      // translation to clear when the pointer is released.
       if (draw(true)) {
         pendingAppendedDescriptors.clear();
       }
@@ -913,6 +1032,9 @@ export function createContactTileGpuRenderer(
       gl.deleteTexture(resources.lutTexture);
       gl.deleteBuffer(resources.quadBuffer);
       gl.deleteProgram(resources.program);
+      gl.deleteBuffer(boundaryResources.geometryBuffer);
+      gl.deleteBuffer(boundaryResources.instanceBuffer);
+      gl.deleteProgram(boundaryResources.program);
     },
   };
 }
@@ -970,6 +1092,183 @@ function ensureOverviewTexture(
     values: overview.values,
     width: overview.width,
     height: overview.height,
+  };
+}
+
+function drawBoundaryScene(
+  gl: WebGL2RenderingContext,
+  resources: BoundaryRendererResources,
+  boundaries: readonly ContactTileGpuBoundary[],
+  viewport: ContactViewport,
+  canvasWidth: number,
+  canvasHeight: number,
+  cssWidth: number,
+  cssHeight: number,
+  uploadedBoundaries: readonly ContactTileGpuBoundary[] | null,
+  uploadedBoundaryCount: number,
+) {
+  if (boundaries.length === 0) {
+    return true;
+  }
+  const uploadsNewBuffer = uploadedBoundaries !== boundaries;
+  if (uploadsNewBuffer) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, resources.instanceBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      contactTileGpuBoundaryInstanceData(boundaries),
+      gl.STATIC_DRAW,
+    );
+  }
+
+  gl.useProgram(resources.program);
+  gl.uniform4f(
+    resources.viewportLocation,
+    viewport.xStart,
+    Math.max(1, viewport.xEnd - viewport.xStart),
+    viewport.yStart,
+    Math.max(1, viewport.yEnd - viewport.yStart),
+  );
+  gl.uniform2f(resources.canvasSizeLocation, canvasWidth, canvasHeight);
+  gl.uniform2f(resources.cssSizeLocation, cssWidth, cssHeight);
+  gl.uniform2f(
+    resources.cssScaleLocation,
+    canvasWidth / Math.max(1, cssWidth),
+    canvasHeight / Math.max(1, cssHeight),
+  );
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, resources.geometryBuffer);
+  gl.enableVertexAttribArray(resources.edgeLocation);
+  gl.vertexAttribPointer(resources.edgeLocation, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(resources.edgeLocation, 0);
+
+  const stride = boundaryInstanceStrideFloats * Float32Array.BYTES_PER_ELEMENT;
+  gl.bindBuffer(gl.ARRAY_BUFFER, resources.instanceBuffer);
+  gl.enableVertexAttribArray(resources.intervalLocation);
+  gl.vertexAttribPointer(resources.intervalLocation, 2, gl.FLOAT, false, stride, 0);
+  gl.vertexAttribDivisor(resources.intervalLocation, 1);
+  gl.enableVertexAttribArray(resources.colorLocation);
+  gl.vertexAttribPointer(
+    resources.colorLocation,
+    3,
+    gl.FLOAT,
+    false,
+    stride,
+    2 * Float32Array.BYTES_PER_ELEMENT,
+  );
+  gl.vertexAttribDivisor(resources.colorLocation, 1);
+  gl.enableVertexAttribArray(resources.styleLocation);
+  gl.vertexAttribPointer(
+    resources.styleLocation,
+    2,
+    gl.FLOAT,
+    false,
+    stride,
+    5 * Float32Array.BYTES_PER_ELEMENT,
+  );
+  gl.vertexAttribDivisor(resources.styleLocation, 1);
+
+  gl.drawArraysInstanced(
+    gl.TRIANGLES,
+    0,
+    24,
+    uploadsNewBuffer ? boundaries.length : uploadedBoundaryCount,
+  );
+
+  gl.vertexAttribDivisor(resources.intervalLocation, 0);
+  gl.vertexAttribDivisor(resources.colorLocation, 0);
+  gl.vertexAttribDivisor(resources.styleLocation, 0);
+  gl.disableVertexAttribArray(resources.edgeLocation);
+  gl.disableVertexAttribArray(resources.intervalLocation);
+  gl.disableVertexAttribArray(resources.colorLocation);
+  gl.disableVertexAttribArray(resources.styleLocation);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  return true;
+}
+
+function createBoundaryRendererResources(
+  gl: WebGL2RenderingContext,
+): BoundaryRendererResources | null {
+  const vertexShader = compileShader(gl, gl.VERTEX_SHADER, boundaryVertexShaderSource);
+  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, boundaryFragmentShaderSource);
+  if (!vertexShader || !fragmentShader) {
+    if (vertexShader) gl.deleteShader(vertexShader);
+    if (fragmentShader) gl.deleteShader(fragmentShader);
+    return null;
+  }
+  const program = gl.createProgram();
+  if (!program) {
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    return null;
+  }
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    gl.deleteProgram(program);
+    return null;
+  }
+
+  const geometryBuffer = gl.createBuffer();
+  const instanceBuffer = gl.createBuffer();
+  if (!geometryBuffer || !instanceBuffer) {
+    if (geometryBuffer) gl.deleteBuffer(geometryBuffer);
+    if (instanceBuffer) gl.deleteBuffer(instanceBuffer);
+    gl.deleteProgram(program);
+    return null;
+  }
+  const edgeVertices: number[] = [];
+  const quad = [
+    [0, -0.5], [1, -0.5], [0, 0.5],
+    [0, 0.5], [1, -0.5], [1, 0.5],
+  ] as const;
+  for (const axis of [0, 1]) {
+    for (const side of [0, 1]) {
+      for (const [along, across] of quad) {
+        edgeVertices.push(axis, side, along, across);
+      }
+    }
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, geometryBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(edgeVertices), gl.STATIC_DRAW);
+
+  const edgeLocation = gl.getAttribLocation(program, "a_edge");
+  const intervalLocation = gl.getAttribLocation(program, "a_interval");
+  const colorLocation = gl.getAttribLocation(program, "a_color");
+  const styleLocation = gl.getAttribLocation(program, "a_style");
+  const viewportLocation = gl.getUniformLocation(program, "u_viewport");
+  const canvasSizeLocation = gl.getUniformLocation(program, "u_canvas_size");
+  const cssSizeLocation = gl.getUniformLocation(program, "u_css_size");
+  const cssScaleLocation = gl.getUniformLocation(program, "u_css_scale");
+  if (
+    edgeLocation < 0
+    || intervalLocation < 0
+    || colorLocation < 0
+    || styleLocation < 0
+    || !viewportLocation
+    || !canvasSizeLocation
+    || !cssSizeLocation
+    || !cssScaleLocation
+  ) {
+    gl.deleteBuffer(geometryBuffer);
+    gl.deleteBuffer(instanceBuffer);
+    gl.deleteProgram(program);
+    return null;
+  }
+  return {
+    program,
+    geometryBuffer,
+    instanceBuffer,
+    edgeLocation,
+    intervalLocation,
+    colorLocation,
+    styleLocation,
+    viewportLocation,
+    canvasSizeLocation,
+    cssSizeLocation,
+    cssScaleLocation,
   };
 }
 
@@ -1375,13 +1674,6 @@ function evictLeastRecentlyUsedTextures(
     bytes -= entry.bytes;
   }
   return bytes;
-}
-
-function sameViewport(left: ContactViewport, right: ContactViewport) {
-  return left.xStart === right.xStart
-    && left.xEnd === right.xEnd
-    && left.yStart === right.yStart
-    && left.yEnd === right.yEnd;
 }
 
 function paletteStopCount(colormap: ContactTileRenderStyle["colormap"]) {
