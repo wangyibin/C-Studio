@@ -85,8 +85,7 @@ import {
 import { contactNormalizationPrewarmResolutions } from "./state/contactNormalizationPrewarm";
 import {
   buildContactOverviewTilePlan,
-  contactOverviewGenerationIsReady,
-  contactOverviewRequestIsReady,
+  retainContactOverviewRequestId,
   shouldResumeContactBackgroundSchedulingAfterFailure,
   wholeAssemblyOverviewFromCoveringMap,
 } from "./state/contactOverviewTiles";
@@ -825,6 +824,11 @@ export function App() {
   // counters from a wall-clock epoch instead of resetting them to zero.
   const contactTileGenerationRef = useRef(Date.now() * 1_000);
   const contactTileBackendRequestIdRef = useRef(Date.now() * 1_000);
+  const activeContactOverviewRequestIdRef = useRef<number | null>(null);
+  const contactTileGenerationStartRef = useRef<{
+    generation: number;
+    promise: Promise<unknown | null>;
+  } | null>(null);
   const contactTileFlightsRef = useRef(new ContactTileFlightRegistry<ContactMapTile>());
   const contactMainLodTileFlightsRef = useRef(
     new ContactTileFlightRegistry<ContactMapTile>(),
@@ -919,6 +923,22 @@ export function App() {
     });
   }
   const contactPanPerformance = contactPanPerformanceRef.current;
+  const suspendContactTileLoadingForPan = useCallback(() => {
+    // A request that finishes after the next drag begins still decodes and
+    // merges its streamed payload on the WebView main thread. Advance the
+    // backend generation on the first real movement so obsolete foreground
+    // work is cancelled, while an in-flight whole-map fallback remains alive.
+    const generation = contactTileGenerationRef.current + 1;
+    contactTileGenerationRef.current = generation;
+    contactTilePerformance.supersedeBefore(generation);
+    const retainedRequestIds = retainContactOverviewRequestId(
+      [],
+      activeContactOverviewRequestIdRef.current,
+    );
+    void invoke<number[]>("begin_contact_tile_generation", {
+      request: { generation, retainedRequestIds },
+    }).catch(() => undefined);
+  }, [contactTilePerformance]);
   const handleContactViewportPreview = useCallback((preview: ContactPanPreview | null) => {
     if (preview) {
       pendingPanPerformancePreviewRef.current = preview;
@@ -1240,6 +1260,20 @@ export function App() {
     const panPreviewActive = contactTilePanPreviewActive;
     const generation = contactTileGenerationRef.current + 1;
     contactTileGenerationRef.current = generation;
+    const beginGeneration = (requestIds: readonly number[]) => {
+      const retainedRequestIds = retainContactOverviewRequestId(
+        requestIds,
+        activeContactOverviewRequestIdRef.current,
+      );
+      const promise = invoke<number[]>("begin_contact_tile_generation", {
+        request: { generation, retainedRequestIds },
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      contactTileGenerationStartRef.current = { generation, promise };
+      return promise;
+    };
     if (!panPreviewActive) {
       setContactTileDeltaStream((current) => (
         current?.generation === generation ? current : null
@@ -1282,9 +1316,7 @@ export function App() {
       contactMainLodTileCacheLru.clear();
       contactMainLodTileCacheRef.current = new Map();
       contactMainLodTileFlightsRef.current.clear();
-      void invoke("begin_contact_tile_generation", {
-        request: { generation, retainedRequestIds: [] },
-      }).catch(() => undefined);
+      void beginGeneration([]);
       return;
     }
 
@@ -1303,9 +1335,7 @@ export function App() {
       contactMainLodTileCacheLru.clear();
       contactMainLodTileCacheRef.current = new Map();
       contactMainLodTileFlightsRef.current.clear();
-      void invoke("begin_contact_tile_generation", {
-        request: { generation, retainedRequestIds: [] },
-      }).catch(() => undefined);
+      void beginGeneration([]);
       setStatusMessage(
         `Waiting to switch from unavailable ${uiState.contact.resolution} .mcool resolution`,
       );
@@ -1508,12 +1538,7 @@ export function App() {
           tileWorld.prefetchTiles,
           cacheKeyForTile,
         );
-    const generationStart = invoke<number[]>("begin_contact_tile_generation", {
-      request: { generation, retainedRequestIds },
-    }).then(
-      () => null,
-      (error: unknown) => error,
-    );
+    const generationStart = beginGeneration(retainedRequestIds);
     if (mainLodPlan) {
       const {
         lodTileSizeBins,
@@ -1916,13 +1941,11 @@ export function App() {
                     contactTilePerformance.markCacheMerge(generation);
                     contactPanPerformance.markCacheMerge(generation);
                   },
-                  onPreviewChunk: mainLodDirectDeltaStreamMode !== "disabled"
-                    ? undefined
-                    : (previewBatch) => publishPanPrefetchTiles(
-                        previewBatch.tiles,
-                        mainLodPlan.targetResolution,
-                        lodTileSizeBins,
-                      ),
+                  // Never materialize cumulative sparse bridge snapshots.
+                  // A hidden staging renderer reads the dense accumulator and
+                  // leaves the retained surface in front until the terminal
+                  // atomic swap.
+                  onPreviewChunk: undefined,
                 },
               )
             ),
@@ -2738,13 +2761,11 @@ export function App() {
                       contactTilePerformance.markCacheMerge(generation);
                       contactPanPerformance.markCacheMerge(generation);
                     },
-                    onPreviewChunk: directDeltaStreamMode !== "disabled"
-                      ? undefined
-                      : (previewBatch) => publishPanPrefetchTiles(
-                          previewBatch.tiles,
-                          targetResolution,
-                          tileSizeBins,
-                        ),
+                    // Never rebuild cumulative sparse bridge snapshots. A
+                    // first-load overlay can consume dense deltas directly;
+                    // replacement layers defer presentation to one terminal
+                    // atomic swap.
+                    onPreviewChunk: undefined,
                   },
                 )
               ),
@@ -2987,6 +3008,7 @@ export function App() {
       clearStaleOverview();
       return;
     }
+    const overviewCoolPath = contactCoolPath;
 
     const totalSpanBp = Math.max(1, assemblyLayout.totalSpan);
     const plan = buildContactOverviewTilePlan(
@@ -2995,7 +3017,7 @@ export function App() {
     );
     const normalization = contactNormalizationForBackend(uiState.normalization);
     const overviewScope = contactTileScope(
-      contactCoolPath,
+      overviewCoolPath,
       plan.targetResolution,
       plan.targetBins,
       normalization,
@@ -3022,38 +3044,62 @@ export function App() {
       return;
     }
 
-    const generation = contactTileGenerationRef.current;
-    const completeLayer = lastCompleteContactMapRef.current;
-    if (!contactOverviewGenerationIsReady({
-      currentGeneration: generation,
-      backendStartedGeneration: backendStartedContactTileGeneration,
-      paintedGeneration: paintedContactTileGeneration,
-      completeLayerGeneration: completeLayer?.visibleLayerComplete === true
-        ? completeLayer.renderGeneration ?? null
-        : null,
-    })) {
-      return;
-    }
-
     let cancelled = false;
     let requestStarted = false;
-    const requestIsCurrent = () => (
-      !cancelled
-      && generation === contactTileGenerationRef.current
-    );
+    let requestCompleted = false;
+    let retryTimer: number | null = null;
+    let activeRequestId: number | null = null;
+    const requestIsCurrent = () => !cancelled;
+    const scheduleRetry = () => {
+      if (cancelled || requestCompleted || retryTimer !== null) {
+        return;
+      }
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        void startOverviewRequest();
+      }, 32);
+    };
 
-    const loadOverview = async () => {
+    async function startOverviewRequest() {
+      if (
+        cancelled
+        || requestStarted
+        || requestCompleted
+        || document.visibilityState === "hidden"
+      ) {
+        return;
+      }
+      const generationStart = contactTileGenerationStartRef.current;
+      if (!generationStart) {
+        scheduleRetry();
+        return;
+      }
+      const generationStartError = await generationStart.promise;
+      if (cancelled) {
+        return;
+      }
+      if (
+        generationStartError !== null
+        || generationStart !== contactTileGenerationStartRef.current
+      ) {
+        scheduleRetry();
+        return;
+      }
+
       requestStarted = true;
+      const generation = generationStart.generation;
+      const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+      contactTileBackendRequestIdRef.current = nextRequestId;
+      activeRequestId = nextRequestId;
+      activeContactOverviewRequestIdRef.current = nextRequestId;
       try {
-        const nextRequestId = contactTileBackendRequestIdRef.current + 1;
-        contactTileBackendRequestIdRef.current = nextRequestId;
         const response = await loadContactOverviewWithLayoutHandle(
           contactLayoutHandleRegistry,
           assemblyLayout.blocks,
           {
             requestId: nextRequestId,
             generation,
-            coolPath: contactCoolPath,
+            coolPath: overviewCoolPath,
             sourceResolution: plan.sourceResolution,
             targetResolution: plan.targetResolution,
             normalization,
@@ -3074,56 +3120,55 @@ export function App() {
         };
         overviewContactMapRef.current = overviewMap;
         setOverviewContactMap(overviewMap);
+        requestCompleted = true;
       } catch (error) {
-        if (
-          !requestIsCurrent()
-          || isContactTileRequestCancelled(error)
-        ) {
+        if (!requestIsCurrent()) {
+          return;
+        }
+        if (isContactTileRequestCancelled(error)) {
+          scheduleRetry();
           return;
         }
         dispatchUi({
           type: "appendLog",
           message: `Overview heatmap load failed: ${String(error)}`,
         });
+      } finally {
+        if (activeContactOverviewRequestIdRef.current === nextRequestId) {
+          activeContactOverviewRequestIdRef.current = null;
+        }
+        if (activeRequestId === nextRequestId) {
+          activeRequestId = null;
+        }
+        requestStarted = false;
       }
-    };
+    }
 
-    const startOverviewRequest = () => {
-      if (cancelled || requestStarted || !requestIsCurrent()) {
-        return;
-      }
-      const currentCompleteLayer = lastCompleteContactMapRef.current;
-      if (!contactOverviewRequestIsReady({
-        currentGeneration: generation,
-        backendStartedGeneration: backendStartedContactTileGeneration,
-        paintedGeneration: paintedContactTileGeneration,
-        completeLayerGeneration: currentCompleteLayer?.visibleLayerComplete === true
-          ? currentCompleteLayer.renderGeneration ?? null
-          : null,
-        documentHidden: document.visibilityState === "hidden",
-      })) {
-        return;
-      }
-      void loadOverview();
-    };
     const handleVisibilityChange = () => {
       if (document.visibilityState !== "hidden") {
-        startOverviewRequest();
+        void startOverviewRequest();
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    startOverviewRequest();
+    void startOverviewRequest();
 
     return () => {
       cancelled = true;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
+      if (
+        activeRequestId !== null
+        && activeContactOverviewRequestIdRef.current === activeRequestId
+      ) {
+        activeContactOverviewRequestIdRef.current = null;
+      }
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [
     assemblyLayout,
-    backendStartedContactTileGeneration,
     contactAvailableResolutions,
     contactCoolPath,
-    paintedContactTileGeneration,
     uiState.normalization,
   ]);
 
@@ -4349,6 +4394,7 @@ export function App() {
       contactPanPerformanceLog={contactPanPerformanceLog}
       uiState={uiState}
       onUiAction={dispatchMeasuredUiAction}
+      onContactPanGestureStart={suspendContactTileLoadingForPan}
       onContactViewportPreview={handleContactViewportPreview}
       contactPanPrefetchBridge={contactPanPrefetchBridge}
       onContactTileLayerCommit={contactTilePerformance.enabled

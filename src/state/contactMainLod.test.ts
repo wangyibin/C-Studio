@@ -113,6 +113,28 @@ describe("main contact-map LOD planning", () => {
     expect(Math.ceil(wholePojViewport.xEnd / plan!.targetResolution)).toBe(591);
   });
 
+  it("never reads a stored level finer than the navigation pixel grid", () => {
+    const plan = buildContactMainLodPlan({
+      viewport: {
+        xStart: 0,
+        xEnd: 44_800_000,
+        yStart: 0,
+        yEnd: 44_800_000,
+      },
+      selectedResolution: 25_000,
+      viewportWidthPx: 640,
+      viewportHeightPx: 640,
+      visibleTileCount: 18,
+    }, [25_000, 50_000, 100_000, 250_000]);
+
+    // 70 kb per pixel sits closer to 50 kb, but 100 kb avoids reading and
+    // discarding four 50 kb cells for every displayed pixel.
+    expect(plan).toMatchObject({
+      sourceResolution: 100_000,
+      targetResolution: 100_000,
+    });
+  });
+
   it("uses the native cool resolution as the streaming source", () => {
     const plan = buildContactMainLodPlan({
       viewport: wholePojViewport,

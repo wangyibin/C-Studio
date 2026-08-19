@@ -1,5 +1,5 @@
 import type { ContactViewport } from "./contactViewport";
-import { closestContactResolution } from "./contactOverviewTiles";
+import { contactResolutionAtOrAbove } from "./contactOverviewTiles";
 
 export const maxExactMainContactTiles = 16;
 export const maxExactMainContactBinsPerPixel = 2;
@@ -87,7 +87,7 @@ export function buildContactMainLodPlan(
   const yResolution = Math.max(1, input.viewport.yEnd - input.viewport.yStart)
     / Math.max(1, input.viewportHeightPx);
   const displayResolution = Math.max(1, Math.ceil(Math.max(xResolution, yResolution)));
-  const sourceResolution = closestContactResolution(
+  const sourceResolution = contactResolutionAtOrAbove(
     displayResolution,
     availableResolutions,
   );

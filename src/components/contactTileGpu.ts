@@ -33,6 +33,8 @@ export interface ContactTileGpuScene {
   descriptors: readonly ContactTileCanvasDescriptor[];
   generation?: number;
   overview?: ContactTileGpuOverview | null;
+  /** Only a terminal visible layer may replace coarse overview pixels with exact zeros. */
+  visibleLayerComplete?: boolean;
   resolution: number;
   tileSizeBins: number;
   viewport: ContactViewport;
@@ -574,7 +576,10 @@ export function createContactTileGpuRenderer(
     const scaleX = canvas.width / cssWidth;
     const scaleY = canvas.height / cssHeight;
     const protectedKeys = panOnly ? null : new Set<string>();
-    const validatesCompleteCoverage = !panOnly && descriptors === null;
+    const validatesCompleteCoverage = !panOnly
+      && descriptors === null
+      && deltaScene === null
+      && scene?.visibleLayerComplete === true;
     const drawnDescriptorKeys = validatesCompleteCoverage ? new Set<string>() : null;
     const overview = activeScene.overview ?? null;
 
@@ -632,7 +637,8 @@ export function createContactTileGpuRenderer(
       const explicitlyMasksOverview = Boolean(
         overview
         && deltaScene === null
-        && !preserveFramebuffer,
+        && !preserveFramebuffer
+        && scene?.visibleLayerComplete === true,
       );
       if (explicitlyMasksOverview) {
         clearCanvasRectToWhite(gl, canvas.width, canvas.height, left, top, width, height);

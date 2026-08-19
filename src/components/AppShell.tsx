@@ -109,6 +109,7 @@ interface AppShellProps {
   contactPanPerformanceLog?: string | null;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
+  onContactPanGestureStart?: () => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
@@ -196,6 +197,7 @@ export function AppShell({
   onClearAllData,
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
+  onContactPanGestureStart,
   onContactViewportPreview,
   contactPanPrefetchBridge,
   onUiAction,
@@ -981,6 +983,7 @@ export function AppShell({
                   onClosePanel={closeHeatmapPanel}
                   onExpandPanel={expandHeatmapPanel}
                   onUiAction={onUiAction}
+                  onContactPanGestureStart={onContactPanGestureStart}
                   onContactViewportPreview={onContactViewportPreview}
                   contactPanPrefetchBridge={contactPanPrefetchBridge}
                   onContactTileLayerCommit={onContactTileLayerCommit}

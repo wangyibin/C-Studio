@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   buildContactOverviewTilePlan,
+  contactResolutionAtOrAbove,
   closestContactResolution,
   contactOverviewBaseIsCompatible,
   contactOverviewGenerationIsReady,
   contactOverviewRequestIsReady,
   overviewResolutionForSpan,
+  retainContactOverviewRequestId,
   shouldResumeContactBackgroundSchedulingAfterFailure,
   wholeAssemblyOverviewFromCoveringMap,
   type ContactOverviewRequestReadiness,
@@ -66,6 +68,13 @@ describe("contact overview tile planning", () => {
     expect(closestContactResolution(15_000_000, [10_000_000, 20_000_000]))
       .toBe(20_000_000);
   });
+
+  it("uses the first stored level at or above the navigation pixel scale", () => {
+    expect(contactResolutionAtOrAbove(70_000, [25_000, 50_000, 100_000]))
+      .toBe(100_000);
+    expect(contactResolutionAtOrAbove(20_000_000, [1_000, 2_500_000]))
+      .toBe(2_500_000);
+  });
 });
 
 describe("contact overview request readiness", () => {
@@ -101,6 +110,12 @@ describe("contact overview request readiness", () => {
   it("keeps the adjacent-to-overview chain alive after spatial prefetch fails", () => {
     expect(shouldResumeContactBackgroundSchedulingAfterFailure(true)).toBe(true);
     expect(shouldResumeContactBackgroundSchedulingAfterFailure(false)).toBe(false);
+  });
+
+  it("retains one active whole-map fallback across foreground pan generations", () => {
+    expect(retainContactOverviewRequestId([11, 12], 13)).toEqual([11, 12, 13]);
+    expect(retainContactOverviewRequestId([11, 13], 13)).toEqual([11, 13]);
+    expect(retainContactOverviewRequestId([11], null)).toEqual([11]);
   });
 });
 

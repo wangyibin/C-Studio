@@ -1305,6 +1305,7 @@ function ContactTileGpuCanvas({
       overview,
       resolution: contactMap.resolution,
       tileSizeBins,
+      visibleLayerComplete: contactMap.visibleLayerComplete === true,
       viewport,
       renderStyle,
     });

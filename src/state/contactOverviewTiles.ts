@@ -21,6 +21,20 @@ export interface ContactOverviewRequestReadiness {
   documentHidden: boolean;
 }
 
+/** Keep the whole-map fallback alive while pan generations replace foreground work. */
+export function retainContactOverviewRequestId(
+  retainedRequestIds: readonly number[],
+  activeOverviewRequestId: number | null,
+) {
+  if (
+    activeOverviewRequestId === null
+    || retainedRequestIds.includes(activeOverviewRequestId)
+  ) {
+    return [...retainedRequestIds];
+  }
+  return [...retainedRequestIds, activeOverviewRequestId];
+}
+
 /**
  * Keep the overview strictly inside the data semantics of the active main
  * surface. Reference equality is intentional: it rejects an overview from the
@@ -156,6 +170,35 @@ export function closestContactResolution(
       ? resolution
       : closest;
   });
+}
+
+/**
+ * Select the first stored level that is no finer than one output pixel. This
+ * is intentionally different from `closestContactResolution`: navigation
+ * rendering can safely be a little coarser, whereas reading a finer level
+ * multiplies HDF5 work only to immediately aggregate it away.
+ *
+ * When every stored level is finer than the display, use the coarsest one.
+ * Single-resolution `.cool` inputs therefore retain their current behavior.
+ */
+export function contactResolutionAtOrAbove(
+  targetResolution: number,
+  availableResolutions: readonly number[],
+) {
+  const target = Number.isFinite(targetResolution)
+    ? Math.max(1, Math.round(targetResolution))
+    : 1;
+  const available = [...new Set(
+    availableResolutions
+      .filter((resolution) => Number.isFinite(resolution) && resolution > 0)
+      .map((resolution) => Math.round(resolution)),
+  )].sort((left, right) => left - right);
+  if (available.length === 0) {
+    return fallbackCoolResolution;
+  }
+
+  return available.find((resolution) => resolution >= target)
+    ?? available[available.length - 1];
 }
 
 /**

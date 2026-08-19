@@ -154,6 +154,7 @@ describe("contactTileFloatTextureData", () => {
       overview,
       resolution: 100,
       tileSizeBins: 2,
+      visibleLayerComplete: true,
       viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
       renderStyle: {
         colormap: "Reds",
@@ -167,6 +168,35 @@ describe("contactTileFloatTextureData", () => {
     renderer?.setPanViewport({ xStart: 100, xEnd: 500, yStart: 0, yEnd: 400 });
     expect(drawArrays).toHaveBeenCalledTimes(4);
     expect(texImage2D).toHaveBeenCalledTimes(uploadsAfterFirstDraw);
+  });
+
+  it("keeps the overview visible beneath an incomplete exact layer", () => {
+    const { canvas, scissor } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const overview = contactOverviewFloatTextureData({
+      resolution: 100,
+      viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
+      cells: [{ xBin: 0, yBin: 0, count: 7 }],
+    }, 4);
+
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [] },
+        transpose: false,
+      }],
+      overview,
+      resolution: 100,
+      tileSizeBins: 2,
+      visibleLayerComplete: false,
+      viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    expect(scissor).not.toHaveBeenCalled();
   });
 
   it("keeps pointer-only pans off layout, upload, and GL validation paths", () => {

@@ -1792,14 +1792,19 @@ fn persistent_lod_cache_root(app_handle: &tauri::AppHandle, cool_path: &str) -> 
     if std::env::var("CSTUDIO_PERSISTENT_LOD_CACHE").as_deref() == Ok("0") {
         return None;
     }
-    let is_cool = Path::new(cool_path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("cool"));
-    is_cool
+    persistent_contact_lod_cache_enabled_for_path(cool_path)
         .then(|| app_handle.path().app_cache_dir().ok())
         .flatten()
         .map(|root| root.join("contact-lod-v1"))
+}
+
+fn persistent_contact_lod_cache_enabled_for_path(cool_path: &str) -> bool {
+    Path::new(cool_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cool") || extension.eq_ignore_ascii_case("mcool")
+        })
 }
 
 fn persistent_lod_cache_budget_bytes() -> u64 {
@@ -1819,7 +1824,7 @@ fn persistent_lod_cache_key(
         fs::canonicalize(&request.cool_path).unwrap_or_else(|_| PathBuf::from(&request.cool_path));
     let metadata = fs::metadata(&source_path).map_err(|error| {
         format!(
-            "failed to identify .cool file {} for persistent LOD cache: {error}",
+            "failed to identify .cool/.mcool file {} for persistent LOD cache: {error}",
             source_path.display()
         )
     })?;
@@ -4772,14 +4777,15 @@ mod tests {
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
         build_synteny_view, contact_overview_aggregate_cell_bound, get_app_status,
         history_sidecar_path, layout_gfa_bandage_response, load_agp_bundle, load_project_directory,
-        open_text_reader, persistent_lod_cache_key, sort_project_contact_candidates,
-        write_agp_bundle, write_agp_file, write_existing_agp_path, BedGraphRecordRequest,
-        ContactMapBinRequest, ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest,
-        ContactMapTileKeyRequest, ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest,
-        ContactMapViewRequest, ContactMapViewportRequest, ContactNormalizationRequest,
-        ContactTileRequestPurpose, CoverageViewFromBedGraphRequest, CoverageViewRequest,
-        GfaBandageLayoutEdgeRequest, GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest,
-        PafRecordRequest, SyntenyViewRequest, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
+        open_text_reader, persistent_contact_lod_cache_enabled_for_path, persistent_lod_cache_key,
+        sort_project_contact_candidates, write_agp_bundle, write_agp_file, write_existing_agp_path,
+        BedGraphRecordRequest, ContactMapBinRequest, ContactMapLayoutBlockRequest,
+        ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
+        ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
+        ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
+        CoverageViewFromBedGraphRequest, CoverageViewRequest, GfaBandageLayoutEdgeRequest,
+        GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest, PafRecordRequest, SyntenyViewRequest,
+        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
 
     #[test]
@@ -4945,6 +4951,17 @@ mod tests {
             candidates.map(|path| path.to_string_lossy().to_string()),
             ["b.mcool", "z.mcool", "a.cool", "z.cool"],
         );
+    }
+
+    #[test]
+    fn persistent_contact_lod_cache_accepts_cool_and_mcool_files() {
+        assert!(persistent_contact_lod_cache_enabled_for_path("input.cool"));
+        assert!(persistent_contact_lod_cache_enabled_for_path(
+            "input.q0.mcool"
+        ));
+        assert!(persistent_contact_lod_cache_enabled_for_path("INPUT.MCOOL"));
+        assert!(!persistent_contact_lod_cache_enabled_for_path("input.hic"));
+        assert!(!persistent_contact_lod_cache_enabled_for_path("input"));
     }
 
     fn test_layout_block(id: &str, visual_start: u64) -> ContactMapLayoutBlockRequest {
@@ -7172,14 +7189,14 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| benchmark_root.join("groups.final.agp"));
         let cool_path = match scenario.as_str() {
-            "overview_mcool" | "tiles_mcool" | "lod_tiles_mcool" | "delta_mcool_visible" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
+            "overview_mcool" | "overview_mcool_cache" | "tiles_mcool" | "lod_tiles_mcool" | "delta_mcool_visible" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| benchmark_root.join("input.q1.1k_allres.mcool")),
             "overview_cool" | "overview_cool_cache" | "tiles_cool" | "lod_tiles_cool" | "delta_cool" => std::env::var("CSTUDIO_POJ_BENCH_CONTACT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| benchmark_root.join("input.q1.1k.cool")),
             other => panic!(
-                "unknown CSTUDIO_POJ_BENCH_SCENARIO={other}; expected overview_mcool, overview_cool, overview_cool_cache, lod_tiles_mcool, lod_tiles_cool, tiles_mcool, delta_mcool_visible, delta_cool, or tiles_cool"
+                "unknown CSTUDIO_POJ_BENCH_SCENARIO={other}; expected overview_mcool, overview_mcool_cache, overview_cool, overview_cool_cache, lod_tiles_mcool, lod_tiles_cool, tiles_mcool, delta_mcool_visible, delta_cool, or tiles_cool"
             ),
         };
 
@@ -7209,7 +7226,11 @@ mod tests {
         };
         let source_resolution = if matches!(
             scenario.as_str(),
-            "overview_mcool" | "tiles_mcool" | "lod_tiles_mcool" | "delta_mcool_visible"
+            "overview_mcool"
+                | "overview_mcool_cache"
+                | "tiles_mcool"
+                | "lod_tiles_mcool"
+                | "delta_mcool_visible"
         ) {
             2_500_000
         } else {
@@ -7238,7 +7259,10 @@ mod tests {
         );
 
         if scenario.starts_with("overview_") {
-            if scenario == "overview_cool_cache" {
+            if matches!(
+                scenario.as_str(),
+                "overview_cool_cache" | "overview_mcool_cache"
+            ) {
                 let cache_root = std::env::temp_dir().join(format!(
                     "cstudio-poj-lod-cache-{}-{}",
                     std::process::id(),
