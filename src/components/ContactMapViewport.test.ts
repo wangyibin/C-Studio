@@ -17,6 +17,7 @@ import {
   contactGpuAssemblyBoundaries,
   contactCoverageFramesMatch,
   contactPanCommitAction,
+  contactPanPrefetchChannel,
   contactPanPreviewTileSignature,
   contactCanvasBackingSizeFromBounds,
   contactResolutionWheelIntent,
@@ -569,6 +570,13 @@ describe("lockedContactResolutionWheelZoomIntent", () => {
 });
 
 describe("contactWheelPanIntent", () => {
+  it("warms the backend cache instead of superseding React generations during a desktop pan", () => {
+    expect(contactPanPrefetchChannel(true, true)).toBe("backend");
+    expect(contactPanPrefetchChannel(true, false)).toBe("backend");
+    expect(contactPanPrefetchChannel(false, true)).toBe("preview");
+    expect(contactPanPrefetchChannel(false, false)).toBeNull();
+  });
+
   it("refreshes a wheel preview when the visible grid crosses after its lead grid", () => {
     const prefetchViewport = {
       xStart: 256_000,

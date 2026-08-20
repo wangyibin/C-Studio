@@ -273,6 +273,23 @@ export function contactPanPreviewTileSignature(
 }
 
 /**
+ * Pointer motion must not start a full React tile generation when the desktop
+ * backend can warm its process-local tile cache instead. Repeated preview
+ * generations are superseded at every crossed tile boundary and pointer-up
+ * then has to restart the authoritative load, which can leave the newly
+ * exposed viewport waiting on work that was just cancelled.
+ */
+export function contactPanPrefetchChannel(
+  hasBackendPrefetch: boolean,
+  hasViewportPreview: boolean,
+): "backend" | "preview" | null {
+  if (hasBackendPrefetch) {
+    return "backend";
+  }
+  return hasViewportPreview ? "preview" : null;
+}
+
+/**
  * Recenter the lightweight chromosome-boundary mount window only after the
  * directional preview consumes half of its current one-viewport overscan.
  * This keeps future boxes mounted before they enter the clipped stage without
@@ -1675,14 +1692,9 @@ export function ContactMapViewport({
           width: Math.max(1, bounds.width),
           height: Math.max(1, bounds.height),
         };
-        panTilePrefetchSignatureRef.current = contactTileViewportRequestKey(
-          startViewport,
-          startViewport,
-          sourceContactMap.resolution,
-          sourceContactMap.tileSizeBins ?? 256,
-          totalSpanMb * 1_000_000,
-          0,
-        );
+        // The first real wheel delta should immediately schedule diagonal
+        // warming, even if the visible viewport remains inside the same tile.
+        panTilePrefetchSignatureRef.current = null;
         wheelPanSessionRef.current = wheelSession;
       }
       const currentViewport = wheelSession.previewViewport;
@@ -1905,14 +1917,9 @@ export function ContactMapViewport({
     };
     dragStateRef.current = nextDragState;
     panLoadingSuspendedRef.current = false;
-    panTilePrefetchSignatureRef.current = contactTileViewportRequestKey(
-      liveViewport,
-      liveViewport,
-      liveContactMap.resolution,
-      liveContactMap.tileSizeBins ?? 256,
-      totalSpanMb * 1_000_000,
-      0,
-    );
+    // The first real pointer move should immediately schedule diagonal
+    // warming, even if it has not crossed a visible tile boundary yet.
+    panTilePrefetchSignatureRef.current = null;
     setDragState(nextDragState);
   }
 
@@ -2001,17 +2008,20 @@ export function ContactMapViewport({
   }
 
   function preparePanViewport(previewViewport: ContactViewport) {
-    // Pointer samples only move the existing GPU camera. A new tile generation
-    // starts when the visible tile grid changes, not for every pixel; its
-    // center-first batches are appended imperatively to the retained scene and
-    // the completed target is revealed from the hidden slot.
+    // Keep pointer motion as a pure camera operation in the WebView. The
+    // imperative prefetch channel reuses one pan generation, fills the frontend
+    // tile cache, and uploads completed diagonal layers without React renders.
     //
     // Legacy DOM boundaries still need bounded pre-mounting. GPU boundaries
     // already live in the retained scene and require no React update here.
     if (usesDomAssemblyBoundaries) {
       prefetchAssemblyBoundaryViewport(previewViewport);
     }
-    if ((onContactViewportPreview || onContactPanTilePrefetch) && liveContactMap) {
+    const prefetchChannel = contactPanPrefetchChannel(
+      Boolean(onContactPanTilePrefetch),
+      Boolean(onContactViewportPreview),
+    );
+    if (prefetchChannel && liveContactMap) {
       const signature = contactTileViewportRequestKey(
         previewViewport,
         previewViewport,
@@ -2022,7 +2032,9 @@ export function ContactMapViewport({
       );
       if (signature !== panTilePrefetchSignatureRef.current) {
         panTilePrefetchSignatureRef.current = signature;
-        if (onContactViewportPreview) {
+        if (prefetchChannel === "backend") {
+          onContactPanTilePrefetch?.(previewViewport);
+        } else if (onContactViewportPreview) {
           panPreviewSequenceRef.current += 1;
           onContactViewportPreview({
             viewport: previewViewport,
@@ -2031,8 +2043,6 @@ export function ContactMapViewport({
             sequence: panPreviewSequenceRef.current,
             pointerTimestamp: performance.now(),
           });
-        } else {
-          onContactPanTilePrefetch?.(previewViewport);
         }
       }
     }

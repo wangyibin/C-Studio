@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   ContactPanPrefetchBridge,
+  contactPanSettledGeneration,
   contactPanTileLoadPriority,
 } from "./contactPanPrefetch";
 
@@ -82,5 +83,41 @@ describe("contactPanTileLoadPriority", () => {
       visibleBatchSize: 8,
       urgentPrefetchTileCount: 0,
     });
+  });
+});
+
+describe("contactPanSettledGeneration", () => {
+  const settledViewport = {
+    xStart: 100,
+    xEnd: 500,
+    yStart: 200,
+    yEnd: 600,
+  };
+
+  it("reuses the pan generation when pointer release commits its prefetched viewport", () => {
+    expect(contactPanSettledGeneration(
+      12,
+      settledViewport,
+      { ...settledViewport, xStart: settledViewport.xStart + 0.5 },
+      12,
+    )).toEqual({ generation: 12, reusePanGeneration: true });
+  });
+
+  it("advances for an unrelated viewport instead of adopting stale pan work", () => {
+    expect(contactPanSettledGeneration(
+      12,
+      settledViewport,
+      { ...settledViewport, xStart: settledViewport.xStart + 10 },
+      12,
+    )).toEqual({ generation: 13, reusePanGeneration: false });
+  });
+
+  it("advances when another render already superseded the matching pan generation", () => {
+    expect(contactPanSettledGeneration(
+      13,
+      settledViewport,
+      settledViewport,
+      12,
+    )).toEqual({ generation: 14, reusePanGeneration: false });
   });
 });

@@ -12,6 +12,7 @@ import {
   contactTileViewportRequestKey,
   contactTileViewportSignature,
   contactTilesForViewport,
+  contactTilesWithPanPrefetch,
   createContactTileCacheKeyResolver,
   missingContactTiles,
 } from "./contactTiles";
@@ -103,6 +104,55 @@ describe("contact tile requests", () => {
       { tileX: 0, tileY: 0 },
       { tileX: 0, tileY: 1 },
       { tileX: 1, tileY: 1 },
+    ]);
+  });
+
+  it("prefetches two forward and backward layers along the diagonal and both axes", () => {
+    expect(contactTilesWithPanPrefetch(
+      [
+        { tileX: 3, tileY: 4 },
+        { tileX: 4, tileY: 4 },
+      ],
+      2,
+      1_000,
+      256,
+      2_560_000,
+    )).toEqual([
+      { tileX: 3, tileY: 4 },
+      { tileX: 4, tileY: 4 },
+      { tileX: 4, tileY: 5 },
+      { tileX: 5, tileY: 5 },
+      { tileX: 2, tileY: 3 },
+      { tileX: 3, tileY: 3 },
+      { tileX: 2, tileY: 4 },
+      { tileX: 3, tileY: 5 },
+      { tileX: 5, tileY: 6 },
+      { tileX: 6, tileY: 6 },
+      { tileX: 1, tileY: 2 },
+      { tileX: 2, tileY: 2 },
+      { tileX: 4, tileY: 6 },
+      { tileX: 1, tileY: 4 },
+      { tileX: 3, tileY: 6 },
+    ]);
+  });
+
+  it("clips directional prefetch layers at assembly edges and de-duplicates canonical tiles", () => {
+    expect(contactTilesWithPanPrefetch(
+      [
+        { tileX: 0, tileY: 0 },
+        { tileX: 1, tileY: 0 },
+      ],
+      2,
+      1_000,
+      256,
+      600_000,
+    )).toEqual([
+      { tileX: 0, tileY: 0 },
+      { tileX: 0, tileY: 1 },
+      { tileX: 1, tileY: 1 },
+      { tileX: 1, tileY: 2 },
+      { tileX: 0, tileY: 2 },
+      { tileX: 2, tileY: 2 },
     ]);
   });
 

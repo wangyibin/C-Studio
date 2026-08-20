@@ -236,6 +236,54 @@ export function contactTilesForViewport(
 }
 
 /**
+ * Extends the visible grid along the contact-map diagonal and both axes without
+ * expanding a full square ring. Visible tiles stay first, followed by
+ * forward/backward layers in distance order so a backend scan starts with
+ * display-critical work. Coordinates are clipped to the assembly and
+ * canonicalized for the symmetric upper triangle.
+ */
+export function contactTilesWithPanPrefetch(
+  visibleTiles: readonly ContactMapTileKey[],
+  layers: number,
+  resolution: number,
+  tileSizeBins: number,
+  totalSpanBp: number,
+): ContactMapTileKey[] {
+  const safeLayers = Number.isFinite(layers) ? Math.max(0, Math.floor(layers)) : 0;
+  const tileSpanBp = safePositiveInteger(resolution) * safePositiveInteger(tileSizeBins);
+  const safeTotalSpanBp = Math.max(1, safeCoordinate(totalSpanBp));
+  const maximumTileIndex = Math.max(0, Math.ceil(safeTotalSpanBp / tileSpanBp) - 1);
+  const tiles = new Map<string, ContactMapTileKey>();
+  const appendShifted = (deltaX: number, deltaY: number) => {
+    for (const visibleTile of visibleTiles) {
+      const tileX = Math.round(visibleTile.tileX) + deltaX;
+      const tileY = Math.round(visibleTile.tileY) + deltaY;
+      if (
+        tileX < 0
+        || tileY < 0
+        || tileX > maximumTileIndex
+        || tileY > maximumTileIndex
+      ) {
+        continue;
+      }
+      const tile = canonicalContactTile({ tileX, tileY });
+      tiles.set(contactTileKey(tile), tile);
+    }
+  };
+
+  appendShifted(0, 0);
+  for (let distance = 1; distance <= safeLayers; distance += 1) {
+    appendShifted(distance, distance);
+    appendShifted(-distance, -distance);
+    appendShifted(distance, 0);
+    appendShifted(-distance, 0);
+    appendShifted(0, distance);
+    appendShifted(0, -distance);
+  }
+  return [...tiles.values()];
+}
+
+/**
  * A compact identity for the tile coverage of a viewport. Pointer panning can
  * move every animation frame, but the backend only needs another request when
  * the set of intersecting tiles changes.

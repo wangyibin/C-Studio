@@ -27,6 +27,37 @@ export interface ContactPanTileLoadPriority {
   urgentPrefetchTileCount: number;
 }
 
+export interface ContactPanSettledGeneration {
+  generation: number;
+  reusePanGeneration: boolean;
+}
+
+/**
+ * A committed pan consumes the generation that already owns its diagonal
+ * flights. Unrelated viewport changes advance normally so stale pan work never
+ * becomes the owner of a later render.
+ */
+export function contactPanSettledGeneration(
+  currentGeneration: number,
+  settledViewport: ContactViewport,
+  pendingPanViewport: ContactViewport | null,
+  panGeneration: number | null,
+): ContactPanSettledGeneration {
+  const toleranceBp = 1;
+  const matchesPendingPan = pendingPanViewport !== null
+    && Math.abs(settledViewport.xStart - pendingPanViewport.xStart) <= toleranceBp
+    && Math.abs(settledViewport.xEnd - pendingPanViewport.xEnd) <= toleranceBp
+    && Math.abs(settledViewport.yStart - pendingPanViewport.yStart) <= toleranceBp
+    && Math.abs(settledViewport.yEnd - pendingPanViewport.yEnd) <= toleranceBp;
+  if (matchesPendingPan && panGeneration === currentGeneration) {
+    return { generation: panGeneration, reusePanGeneration: true };
+  }
+  return {
+    generation: currentGeneration + 1,
+    reusePanGeneration: false,
+  };
+}
+
 /**
  * While a pan is active, keep its small center-first batches and directional
  * lead. Once the wheel/pointer stops, the active viewport is authoritative:
