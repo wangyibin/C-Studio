@@ -4,8 +4,10 @@ import {
   contactOverviewTextureBytes,
   contactTileDenseFloatTextureData,
   contactTileFloatTextureData,
+  contactTileGpuFloatValuesFitR16f,
   contactTileGpuBoundaryInstanceData,
   contactTileGpuDrawCoverageIsComplete,
+  contactTileGpuTexturePreference,
   createContactTileGpuRenderer,
 } from "./contactTileGpu";
 
@@ -44,6 +46,7 @@ function mockWebGlCanvas() {
     NEAREST: 19,
     CLAMP_TO_EDGE: 20,
     R32F: 21,
+    R16F: 29,
     RED: 22,
     RGBA8: 23,
     RGBA: 24,
@@ -119,7 +122,7 @@ function mockWebGlCanvas() {
 }
 
 describe("contactTileFloatTextureData", () => {
-  it("builds one fixed R32F overview and mirrors upper-triangle cells", () => {
+  it("builds one fixed overview and accounts preferred R16F storage", () => {
     const overview = contactOverviewFloatTextureData({
       resolution: 100,
       viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
@@ -131,7 +134,239 @@ describe("contactTileFloatTextureData", () => {
     expect(overview.values[4]).toBe(7);
     expect(overview.values[1]).toBe(7);
     expect(overview.values[0]).toBe(-1);
-    expect(contactOverviewTextureBytes()).toBe(320 * 320 * 4);
+    expect(contactOverviewTextureBytes()).toBe(320 * 320 * 2);
+    expect(contactOverviewTextureBytes(320, 320, "r32f")).toBe(320 * 320 * 4);
+  });
+
+  it("selects R16F by default and allows an explicit R32F benchmark override", () => {
+    expect(contactTileGpuTexturePreference("")).toBe("r16f");
+    expect(contactTileGpuTexturePreference("?cstudioGpuTexture=r16f")).toBe("r16f");
+    expect(contactTileGpuTexturePreference("?cstudioGpuTexture=r32f")).toBe("r32f");
+  });
+
+  it("accepts finite half-float values and rejects overflow or non-finite values", () => {
+    expect(contactTileGpuFloatValuesFitR16f(new Float32Array([-1, 0, 65_504]))).toBe(true);
+    expect(contactTileGpuFloatValuesFitR16f(new Float32Array([65_505]))).toBe(false);
+    expect(contactTileGpuFloatValuesFitR16f(new Float32Array([Number.NaN]))).toBe(false);
+  });
+
+  it("uploads eligible tiles as R16F and accounts two bytes per texel", () => {
+    const { canvas, texImage2D } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      texturePreference: "r16f",
+      performanceEnabled: false,
+    });
+
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    expect(texImage2D.mock.calls.some((call) => call[2] === 29)).toBe(true);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      r16fUploads: 1,
+      r32fUploads: 0,
+      cacheEntries: 1,
+      cacheBytes: 4 * 4 * 2,
+    });
+    renderer?.destroy();
+  });
+
+  it("falls back to R32F when a tile exceeds the finite R16F range", () => {
+    const { canvas, texImage2D } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      texturePreference: "r16f",
+      performanceEnabled: false,
+    });
+
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 70_000 }] },
+        transpose: false,
+      }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 70_000 },
+      },
+    })).toBe(true);
+
+    expect(texImage2D.mock.calls.some((call) => call[2] === 21)).toBe(true);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      r16fUploads: 0,
+      r32fUploads: 1,
+      rangeFallbacks: 1,
+      cacheBytes: 4 * 4 * 4,
+    });
+    renderer?.destroy();
+  });
+
+  it("retries R32F when the driver rejects an eligible R16F upload", () => {
+    const { canvas, getError, texImage2D } = mockWebGlCanvas();
+    getError.mockImplementationOnce(() => 1).mockImplementation(() => 0);
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      texturePreference: "r16f",
+      performanceEnabled: false,
+    });
+
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    const scalarUploads = texImage2D.mock.calls.filter((call) => call[2] === 29 || call[2] === 21);
+    expect(scalarUploads.map((call) => call[2])).toEqual([29, 21]);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      r16fUploads: 0,
+      r32fUploads: 1,
+      uploadErrorFallbacks: 1,
+      cacheBytes: 4 * 4 * 4,
+    });
+    renderer?.destroy();
+  });
+
+  it("upgrades an existing R16F texture to R32F when refreshed values overflow", () => {
+    const { canvas, texImage2D, texSubImage2D } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      texturePreference: "r16f",
+      performanceEnabled: false,
+    });
+    const viewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 70_000 },
+    };
+    const tile = { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] };
+
+    expect(renderer?.setScene({
+      descriptors: [{ key: "0:0:source", tile, transpose: false }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport,
+      renderStyle,
+    })).toBe(true);
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { ...tile, cells: [{ xBin: 0, yBin: 0, count: 70_000 }] },
+        transpose: false,
+      }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+
+    const scalarUploads = texImage2D.mock.calls.filter((call) => call[2] === 29 || call[2] === 21);
+    expect(scalarUploads.map((call) => call[2])).toEqual([29, 21]);
+    expect(texSubImage2D).not.toHaveBeenCalled();
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      r16fUploads: 1,
+      r32fUploads: 1,
+      rangeFallbacks: 1,
+      cacheBytes: 4 * 4 * 4,
+    });
+    renderer?.destroy();
+  });
+
+  it("counts R16F LRU evictions using actual two-byte texture sizes", () => {
+    const { canvas } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 4 * 2, {
+      texturePreference: "r16f",
+      performanceEnabled: false,
+    });
+    const scene = (tileX: number) => ({
+      descriptors: [{
+        key: `${tileX}:0:source`,
+        tile: { tileX, tileY: 0, cells: [{ xBin: tileX * 4, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      generation: tileX + 1,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: {
+        xStart: tileX * 4_000,
+        xEnd: (tileX + 1) * 4_000,
+        yStart: 0,
+        yEnd: 4_000,
+      },
+      renderStyle: {
+        colormap: "Reds" as const,
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    });
+
+    expect(renderer?.setScene(scene(0))).toBe(true);
+    expect(renderer?.setScene(scene(1))).toBe(true);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      evictions: 1,
+      evictedBytes: 4 * 4 * 2,
+      cacheEntries: 1,
+      cacheBytes: 4 * 4 * 2,
+    });
+    renderer?.destroy();
+  });
+
+  it("emits cumulative upload, format, and cache diagnostics", () => {
+    const { canvas } = mockWebGlCanvas();
+    const emitPerformance = vi.fn();
+    const clock = vi.fn()
+      .mockReturnValueOnce(5)
+      .mockReturnValueOnce(7);
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      texturePreference: "r16f",
+      performanceEnabled: true,
+      emitPerformance,
+      clock,
+    });
+
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    const lastCall = emitPerformance.mock.calls[emitPerformance.mock.calls.length - 1];
+    const log = lastCall?.[0] as string;
+    expect(log).toContain("event=contact_gpu_texture");
+    expect(log).toContain("r16f_uploads=1");
+    expect(log).toContain("r32f_uploads=0");
+    expect(log).toContain("upload_ms=2");
+    expect(log).toContain("evictions=0");
+    expect(log).toContain("cache_bytes=32");
+    renderer?.destroy();
   });
 
   it("draws the overview first, masks terminal exact tiles, and reuses its texture", () => {
@@ -571,7 +806,7 @@ describe("contactTileFloatTextureData", () => {
       colorScale: { log: false, min: 0, max: 10 },
     };
     const viewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
-    const r32fUploads = () => texImage2D.mock.calls.filter((call) => call[2] === 21).length;
+    const r16fUploads = () => texImage2D.mock.calls.filter((call) => call[2] === 29).length;
 
     expect(renderer?.setDeltaScene({
       buffers: [buffer],
@@ -585,7 +820,7 @@ describe("contactTileFloatTextureData", () => {
     })).toBe(true);
     counts[1] = 9;
     expect(renderer?.updateDeltaTiles(["0:0"])).toBe(true);
-    expect(r32fUploads()).toBe(0);
+    expect(r16fUploads()).toBe(0);
     expect(texSubImage2D).not.toHaveBeenCalled();
 
     expect(renderer?.setScene({
@@ -603,7 +838,7 @@ describe("contactTileFloatTextureData", () => {
       viewport,
       renderStyle,
     })).toBe(true);
-    expect(r32fUploads()).toBe(1);
+    expect(r16fUploads()).toBe(1);
     expect(texSubImage2D).not.toHaveBeenCalled();
     renderer?.destroy();
   });

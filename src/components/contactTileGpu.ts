@@ -4,6 +4,7 @@ import type { ContactTileDenseDeltaBuffer } from "../state/contactTileDelta";
 import { contactTileCellCount, validatedPackedContactTileCells } from "../state/contactTileData";
 import { contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
+import { isContactTilePerformanceEnabled } from "../state/contactTilePerformance";
 import type {
   ContactTileCanvasDescriptor,
   ContactTileRenderStyle,
@@ -11,6 +12,33 @@ import type {
 
 export const contactTileGpuTextureBudgetBytes = 96 * 1024 * 1024;
 export const contactOverviewTextureBins = 320;
+export const contactTileGpuR16fMaximum = 65_504;
+
+export type ContactTileGpuTextureFormat = "r16f" | "r32f";
+export type ContactTileGpuTexturePreference = ContactTileGpuTextureFormat;
+
+export interface ContactTileGpuPerformanceSnapshot {
+  texturePreference: ContactTileGpuTexturePreference;
+  uploads: number;
+  fullUploads: number;
+  subUploads: number;
+  r16fUploads: number;
+  r32fUploads: number;
+  rangeFallbacks: number;
+  uploadErrorFallbacks: number;
+  uploadMilliseconds: number;
+  evictions: number;
+  evictedBytes: number;
+  cacheEntries: number;
+  cacheBytes: number;
+}
+
+export interface ContactTileGpuRendererOptions {
+  texturePreference?: ContactTileGpuTexturePreference;
+  performanceEnabled?: boolean;
+  emitPerformance?: (line: string) => void;
+  clock?: () => number;
+}
 
 export interface ContactTileGpuOverview {
   values: Float32Array;
@@ -76,6 +104,7 @@ export interface ContactTileGpuRenderer {
   /** Move the one live GPU camera during pointer navigation. */
   setPanViewport: (viewport: ContactViewport) => void;
   redraw: () => boolean;
+  performanceSnapshot: () => ContactTileGpuPerformanceSnapshot;
   destroy: () => void;
 }
 
@@ -98,6 +127,7 @@ export function contactTileGpuDrawCoverageIsComplete(
 
 interface GpuTextureEntry {
   texture: WebGLTexture;
+  format: ContactTileGpuTextureFormat;
   tile: ContactMapTile | null;
   deltaBuffer?: ContactTileDenseDeltaBuffer;
   panPrefetchSnapshot?: boolean;
@@ -108,6 +138,7 @@ interface GpuTextureEntry {
 
 interface GpuOverviewTextureEntry {
   texture: WebGLTexture;
+  format: ContactTileGpuTextureFormat;
   values: Float32Array;
   width: number;
   height: number;
@@ -338,7 +369,7 @@ export function contactTileFloatTextureData(
   return values;
 }
 
-/** Fixed-size R32F whole-assembly base texture used by the main viewport. */
+/** Fixed-size whole-assembly base texture used by the main viewport. */
 export function contactOverviewFloatTextureData(
   map: Pick<ContactMapView, "cells" | "resolution" | "viewport">,
   targetBins = contactOverviewTextureBins,
@@ -425,14 +456,36 @@ export function contactOverviewFloatTextureData(
 export function contactOverviewTextureBytes(
   width = contactOverviewTextureBins,
   height = contactOverviewTextureBins,
+  format: ContactTileGpuTextureFormat = "r16f",
 ) {
   if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) {
     throw new RangeError("contact overview dimensions must be positive integers");
   }
-  return width * height * Float32Array.BYTES_PER_ELEMENT;
+  return width * height * contactTileGpuBytesPerTexel(format);
 }
 
-/** Convert the mutable streamed accumulator into the R32F texture layout. */
+export function contactTileGpuBytesPerTexel(format: ContactTileGpuTextureFormat) {
+  return format === "r16f" ? 2 : Float32Array.BYTES_PER_ELEMENT;
+}
+
+export function contactTileGpuFloatValuesFitR16f(values: Float32Array) {
+  for (const value of values) {
+    if (!Number.isFinite(value) || Math.abs(value) > contactTileGpuR16fMaximum) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function contactTileGpuTexturePreference(
+  search = typeof location === "undefined" ? "" : location.search,
+): ContactTileGpuTexturePreference {
+  return new URLSearchParams(search).get("cstudioGpuTexture") === "r32f"
+    ? "r32f"
+    : "r16f";
+}
+
+/** Convert the mutable streamed accumulator into the single-channel texture layout. */
 export function contactTileDenseFloatTextureData(
   buffer: ContactTileDenseDeltaBuffer,
   tileSizeBins: number,
@@ -468,9 +521,77 @@ export function contactTileDenseFloatTextureData(
   return values;
 }
 
+interface ContactTileGpuMutablePerformance extends ContactTileGpuPerformanceSnapshot {
+  lastEmissionSignature: string;
+}
+
+interface ContactTileGpuUploadContext {
+  preference: ContactTileGpuTexturePreference;
+  performance: ContactTileGpuMutablePerformance;
+  clock: () => number;
+}
+
+interface ContactTileGpuUploadResult {
+  format: ContactTileGpuTextureFormat;
+  bytes: number;
+}
+
+function initialContactTileGpuPerformance(
+  texturePreference: ContactTileGpuTexturePreference,
+): ContactTileGpuMutablePerformance {
+  return {
+    texturePreference,
+    uploads: 0,
+    fullUploads: 0,
+    subUploads: 0,
+    r16fUploads: 0,
+    r32fUploads: 0,
+    rangeFallbacks: 0,
+    uploadErrorFallbacks: 0,
+    uploadMilliseconds: 0,
+    evictions: 0,
+    evictedBytes: 0,
+    cacheEntries: 0,
+    cacheBytes: 0,
+    lastEmissionSignature: "",
+  };
+}
+
+function contactTileGpuPerformanceSnapshot(
+  performance: ContactTileGpuMutablePerformance,
+): ContactTileGpuPerformanceSnapshot {
+  const { lastEmissionSignature: _lastEmissionSignature, ...snapshot } = performance;
+  return { ...snapshot };
+}
+
+function formatContactTileGpuPerformanceLog(snapshot: ContactTileGpuPerformanceSnapshot) {
+  return [
+    "CSTUDIO_PERF",
+    "event=contact_gpu_texture",
+    `texture_preference=${snapshot.texturePreference}`,
+    `uploads=${snapshot.uploads}`,
+    `full_uploads=${snapshot.fullUploads}`,
+    `sub_uploads=${snapshot.subUploads}`,
+    `r16f_uploads=${snapshot.r16fUploads}`,
+    `r32f_uploads=${snapshot.r32fUploads}`,
+    `range_fallbacks=${snapshot.rangeFallbacks}`,
+    `upload_error_fallbacks=${snapshot.uploadErrorFallbacks}`,
+    `upload_ms=${roundGpuMilliseconds(snapshot.uploadMilliseconds)}`,
+    `evictions=${snapshot.evictions}`,
+    `evicted_bytes=${snapshot.evictedBytes}`,
+    `cache_entries=${snapshot.cacheEntries}`,
+    `cache_bytes=${snapshot.cacheBytes}`,
+  ].join(" ");
+}
+
+function roundGpuMilliseconds(value: number) {
+  return Math.round(Math.max(0, value) * 1_000) / 1_000;
+}
+
 export function createContactTileGpuRenderer(
   canvas: HTMLCanvasElement,
   textureBudgetBytes = contactTileGpuTextureBudgetBytes,
+  options: ContactTileGpuRendererOptions = {},
 ): ContactTileGpuRenderer | null {
   const gl = canvas.getContext("webgl2", {
     alpha: false,
@@ -499,6 +620,16 @@ export function createContactTileGpuRenderer(
     return null;
   }
 
+  const texturePreference = options.texturePreference ?? contactTileGpuTexturePreference();
+  const performanceEnabled = options.performanceEnabled ?? isContactTilePerformanceEnabled();
+  const emitPerformance = options.emitPerformance ?? ((line: string) => console.info(line));
+  const uploadContext: ContactTileGpuUploadContext = {
+    preference: texturePreference,
+    performance: initialContactTileGpuPerformance(texturePreference),
+    clock: options.clock ?? (() => (
+      typeof performance === "undefined" ? Date.now() : performance.now()
+    )),
+  };
   const textureCache = new Map<string, GpuTextureEntry>();
   const safeTextureBudget = Math.max(1, Math.floor(textureBudgetBytes));
   let textureBytes = 0;
@@ -515,6 +646,29 @@ export function createContactTileGpuRenderer(
   let presentedCssHeight = 1;
   let uploadedBoundaries: readonly ContactTileGpuBoundary[] | null = null;
   let uploadedBoundaryCount = 0;
+
+  const updatePerformanceCacheState = () => {
+    uploadContext.performance.cacheEntries = textureCache.size;
+    uploadContext.performance.cacheBytes = textureBytes;
+  };
+  const emitPerformanceIfChanged = () => {
+    if (!performanceEnabled) {
+      return;
+    }
+    updatePerformanceCacheState();
+    const signature = `${uploadContext.performance.uploads}:${uploadContext.performance.evictions}:${textureCache.size}:${textureBytes}`;
+    if (signature === uploadContext.performance.lastEmissionSignature) {
+      return;
+    }
+    uploadContext.performance.lastEmissionSignature = signature;
+    try {
+      emitPerformance(formatContactTileGpuPerformanceLog(
+        contactTileGpuPerformanceSnapshot(uploadContext.performance),
+      ));
+    } catch {
+      // Diagnostics must never interrupt heatmap presentation.
+    }
+  };
 
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.CULL_FACE);
@@ -584,7 +738,12 @@ export function createContactTileGpuRenderer(
     const overview = activeScene.overview ?? null;
 
     if (!preserveFramebuffer && overview) {
-      overviewTextureEntry = ensureOverviewTexture(gl, overviewTextureEntry, overview);
+      overviewTextureEntry = ensureOverviewTexture(
+        gl,
+        overviewTextureEntry,
+        overview,
+        uploadContext,
+      );
       if (!overviewTextureEntry) {
         return false;
       }
@@ -681,6 +840,7 @@ export function createContactTileGpuRenderer(
               deltaScene.tileSizeBins,
               ++useCounter,
               deltaScratch,
+              uploadContext,
             )
           : ensureTileTexture(
               gl,
@@ -690,6 +850,7 @@ export function createContactTileGpuRenderer(
               activeScene.generation,
               activeScene.tileSizeBins,
               ++useCounter,
+              uploadContext,
             );
       if (!entry || !textureCache.has(textureKey)) {
         continue;
@@ -715,13 +876,16 @@ export function createContactTileGpuRenderer(
       textureBytes = cachedTextureBytes(textureCache);
     }
     if (!panOnly && textureBytes > safeTextureBudget) {
-      textureBytes = evictLeastRecentlyUsedTextures(
+      const eviction = evictLeastRecentlyUsedTextures(
         gl,
         textureCache,
         textureBytes,
         safeTextureBudget,
         protectedKeys!,
       );
+      textureBytes = eviction.bytes;
+      uploadContext.performance.evictions += eviction.count;
+      uploadContext.performance.evictedBytes += eviction.evictedBytes;
     }
     const boundaries = activeScene.boundaries ?? [];
     if (!drawBoundaryScene(
@@ -748,6 +912,7 @@ export function createContactTileGpuRenderer(
       return true;
     }
     const glSucceeded = gl.getError() === gl.NO_ERROR;
+    emitPerformanceIfChanged();
     return glSucceeded && (
       deltaScene !== null
       || !validatesCompleteCoverage
@@ -786,6 +951,7 @@ export function createContactTileGpuRenderer(
             deltaScene.tileSizeBins,
             ++useCounter,
             deltaScratch,
+            uploadContext,
           );
           if (
             !entry
@@ -795,6 +961,7 @@ export function createContactTileGpuRenderer(
               buffer,
               deltaScene.tileSizeBins,
               deltaScratch,
+              uploadContext,
             ))
           ) {
             return false;
@@ -822,7 +989,9 @@ export function createContactTileGpuRenderer(
 
       const bytesPerTile = Math.max(
         1,
-        currentScene.tileSizeBins * currentScene.tileSizeBins * Float32Array.BYTES_PER_ELEMENT,
+        currentScene.tileSizeBins
+          * currentScene.tileSizeBins
+          * contactTileGpuBytesPerTexel(texturePreference),
       );
       const maximumUniqueTiles = Math.max(1, Math.floor(safeTextureBudget / bytesPerTile));
       const retainedDescriptors = [...currentScene.descriptors];
@@ -851,6 +1020,7 @@ export function createContactTileGpuRenderer(
               input.generation,
               currentScene.tileSizeBins,
               ++useCounter,
+              uploadContext,
             )
           ) {
             return false;
@@ -876,6 +1046,7 @@ export function createContactTileGpuRenderer(
             input.generation,
             currentScene.tileSizeBins,
             ++useCounter,
+            uploadContext,
           );
           if (!entry) {
             return false;
@@ -927,15 +1098,19 @@ export function createContactTileGpuRenderer(
         const protectedKeys = new Set(
           retainedDescriptors.map((descriptor) => gpuTextureKey(currentScene, descriptor.tile)),
         );
-        textureBytes = evictLeastRecentlyUsedTextures(
+        const eviction = evictLeastRecentlyUsedTextures(
           gl,
           textureCache,
           textureBytes,
           safeTextureBudget,
           protectedKeys,
         );
+        textureBytes = eviction.bytes;
+        uploadContext.performance.evictions += eviction.count;
+        uploadContext.performance.evictedBytes += eviction.evictedBytes;
       }
       gl.bindTexture(gl.TEXTURE_2D, null);
+      emitPerformanceIfChanged();
       return true;
     },
     presentAppendedSceneDescriptors: () => {
@@ -995,6 +1170,7 @@ export function createContactTileGpuRenderer(
           deltaScene.tileSizeBins,
           ++useCounter,
           deltaScratch,
+          uploadContext,
         );
         if (!entry || !updateDeltaTileTexture(
           gl,
@@ -1002,6 +1178,7 @@ export function createContactTileGpuRenderer(
           buffer,
           deltaScene.tileSizeBins,
           deltaScratch,
+          uploadContext,
         )) {
           return false;
         }
@@ -1027,6 +1204,10 @@ export function createContactTileGpuRenderer(
       }
     },
     redraw: draw,
+    performanceSnapshot: () => {
+      updatePerformanceCacheState();
+      return contactTileGpuPerformanceSnapshot(uploadContext.performance);
+    },
     destroy: () => {
       if (destroyed) {
         return;
@@ -1051,10 +1232,146 @@ export function createContactTileGpuRenderer(
   };
 }
 
+function recordContactTileGpuUpload(
+  context: ContactTileGpuUploadContext,
+  format: ContactTileGpuTextureFormat,
+  fullUpload: boolean,
+  startedAt: number,
+) {
+  const performance = context.performance;
+  performance.uploads += 1;
+  if (fullUpload) {
+    performance.fullUploads += 1;
+  } else {
+    performance.subUploads += 1;
+  }
+  if (format === "r16f") {
+    performance.r16fUploads += 1;
+  } else {
+    performance.r32fUploads += 1;
+  }
+  performance.uploadMilliseconds += Math.max(0, context.clock() - startedAt);
+}
+
+function uploadContactTileGpuTextureImage(
+  gl: WebGL2RenderingContext,
+  width: number,
+  height: number,
+  values: Float32Array,
+  context: ContactTileGpuUploadContext,
+  startedAt = context.clock(),
+): ContactTileGpuUploadResult | null {
+  const wantsR16f = context.preference === "r16f";
+  const fitsR16f = !wantsR16f || contactTileGpuFloatValuesFitR16f(values);
+  if (wantsR16f && !fitsR16f) {
+    context.performance.rangeFallbacks += 1;
+  }
+
+  if (wantsR16f && fitsR16f) {
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.R16F,
+      width,
+      height,
+      0,
+      gl.RED,
+      gl.FLOAT,
+      values,
+    );
+    if (gl.getError() === gl.NO_ERROR) {
+      recordContactTileGpuUpload(context, "r16f", true, startedAt);
+      return { format: "r16f", bytes: values.length * contactTileGpuBytesPerTexel("r16f") };
+    }
+    context.performance.uploadErrorFallbacks += 1;
+  }
+
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.R32F,
+    width,
+    height,
+    0,
+    gl.RED,
+    gl.FLOAT,
+    values,
+  );
+  if (gl.getError() !== gl.NO_ERROR) {
+    return null;
+  }
+  recordContactTileGpuUpload(context, "r32f", true, startedAt);
+  return { format: "r32f", bytes: values.length * contactTileGpuBytesPerTexel("r32f") };
+}
+
+function updateContactTileGpuTextureImage(
+  gl: WebGL2RenderingContext,
+  entry: GpuTextureEntry,
+  width: number,
+  height: number,
+  values: Float32Array,
+  context: ContactTileGpuUploadContext,
+) {
+  const startedAt = context.clock();
+  if (entry.format === "r16f" && !contactTileGpuFloatValuesFitR16f(values)) {
+    context.performance.rangeFallbacks += 1;
+    const uploaded = uploadContactTileGpuTextureImage(
+      gl,
+      width,
+      height,
+      values,
+      { ...context, preference: "r32f" },
+      startedAt,
+    );
+    if (!uploaded) {
+      return false;
+    }
+    entry.format = uploaded.format;
+    entry.bytes = uploaded.bytes;
+    return true;
+  }
+
+  gl.texSubImage2D(
+    gl.TEXTURE_2D,
+    0,
+    0,
+    0,
+    width,
+    height,
+    gl.RED,
+    gl.FLOAT,
+    values,
+  );
+  if (gl.getError() === gl.NO_ERROR) {
+    recordContactTileGpuUpload(context, entry.format, false, startedAt);
+    return true;
+  }
+  if (entry.format !== "r16f") {
+    return false;
+  }
+
+  context.performance.uploadErrorFallbacks += 1;
+  const uploaded = uploadContactTileGpuTextureImage(
+    gl,
+    width,
+    height,
+    values,
+    { ...context, preference: "r32f" },
+    startedAt,
+  );
+  if (!uploaded) {
+    return false;
+  }
+  entry.format = uploaded.format;
+  entry.bytes = uploaded.bytes;
+  return true;
+}
+
 function ensureOverviewTexture(
   gl: WebGL2RenderingContext,
   current: GpuOverviewTextureEntry | null,
   overview: ContactTileGpuOverview,
+  uploadContext: ContactTileGpuUploadContext,
 ): GpuOverviewTextureEntry | null {
   if (
     current
@@ -1084,23 +1401,20 @@ function ensureOverviewTexture(
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texImage2D(
-    gl.TEXTURE_2D,
-    0,
-    gl.R32F,
+  const uploaded = uploadContactTileGpuTextureImage(
+    gl,
     overview.width,
     overview.height,
-    0,
-    gl.RED,
-    gl.FLOAT,
     overview.values,
+    uploadContext,
   );
-  if (gl.getError() !== gl.NO_ERROR) {
+  if (!uploaded) {
     gl.deleteTexture(texture);
     return null;
   }
   return {
     texture,
+    format: uploaded.format,
     values: overview.values,
     width: overview.width,
     height: overview.height,
@@ -1449,6 +1763,7 @@ function ensureTileTexture(
   generation: number | undefined,
   tileSizeBins: number,
   lastUsed: number,
+  uploadContext: ContactTileGpuUploadContext,
 ): GpuTextureEntry | null {
   // Tile textures exclusively occupy unit 0. Without this reset the first
   // upload can replace the LUT bound to unit 1, producing black texelFetch
@@ -1486,26 +1801,24 @@ function ensureTileTexture(
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texImage2D(
-    gl.TEXTURE_2D,
-    0,
-    gl.R32F,
+  const values = contactTileFloatTextureData(tile, tileSizeBins);
+  const uploaded = uploadContactTileGpuTextureImage(
+    gl,
     tileSizeBins,
     tileSizeBins,
-    0,
-    gl.RED,
-    gl.FLOAT,
-    contactTileFloatTextureData(tile, tileSizeBins),
+    values,
+    uploadContext,
   );
-  if (gl.getError() !== gl.NO_ERROR) {
+  if (!uploaded) {
     gl.deleteTexture(texture);
     return null;
   }
   const entry = {
     texture,
+    format: uploaded.format,
     tile,
     generation,
-    bytes: tileSizeBins * tileSizeBins * Float32Array.BYTES_PER_ELEMENT,
+    bytes: uploaded.bytes,
     lastUsed,
   };
   cache.set(key, entry);
@@ -1519,21 +1832,19 @@ function updateTileTexture(
   generation: number,
   tileSizeBins: number,
   lastUsed: number,
+  uploadContext: ContactTileGpuUploadContext,
 ) {
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, entry.texture);
-  gl.texSubImage2D(
-    gl.TEXTURE_2D,
-    0,
-    0,
-    0,
+  const values = contactTileFloatTextureData(tile, tileSizeBins);
+  if (!updateContactTileGpuTextureImage(
+    gl,
+    entry,
     tileSizeBins,
     tileSizeBins,
-    gl.RED,
-    gl.FLOAT,
-    contactTileFloatTextureData(tile, tileSizeBins),
-  );
-  if (gl.getError() !== gl.NO_ERROR) {
+    values,
+    uploadContext,
+  )) {
     return false;
   }
   entry.tile = tile;
@@ -1553,6 +1864,7 @@ function ensureDeltaTileTexture(
   tileSizeBins: number,
   lastUsed: number,
   scratch: Float32Array,
+  uploadContext: ContactTileGpuUploadContext,
 ): GpuTextureEntry | null {
   gl.activeTexture(gl.TEXTURE0);
   const cached = cache.get(key);
@@ -1576,27 +1888,25 @@ function ensureDeltaTileTexture(
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texImage2D(
-    gl.TEXTURE_2D,
-    0,
-    gl.R32F,
+  const values = contactTileDenseFloatTextureData(buffer, tileSizeBins, scratch);
+  const uploaded = uploadContactTileGpuTextureImage(
+    gl,
     tileSizeBins,
     tileSizeBins,
-    0,
-    gl.RED,
-    gl.FLOAT,
-    contactTileDenseFloatTextureData(buffer, tileSizeBins, scratch),
+    values,
+    uploadContext,
   );
-  if (gl.getError() !== gl.NO_ERROR) {
+  if (!uploaded) {
     gl.deleteTexture(texture);
     return null;
   }
   const entry: GpuTextureEntry = {
     texture,
+    format: uploaded.format,
     tile: null,
     deltaBuffer: buffer,
     generation,
-    bytes: tileSizeBins * tileSizeBins * Float32Array.BYTES_PER_ELEMENT,
+    bytes: uploaded.bytes,
     lastUsed,
   };
   cache.set(key, entry);
@@ -1609,21 +1919,19 @@ function updateDeltaTileTexture(
   buffer: ContactTileDenseDeltaBuffer,
   tileSizeBins: number,
   scratch: Float32Array,
+  uploadContext: ContactTileGpuUploadContext,
 ) {
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, entry.texture);
-  gl.texSubImage2D(
-    gl.TEXTURE_2D,
-    0,
-    0,
-    0,
+  const values = contactTileDenseFloatTextureData(buffer, tileSizeBins, scratch);
+  return updateContactTileGpuTextureImage(
+    gl,
+    entry,
     tileSizeBins,
     tileSizeBins,
-    gl.RED,
-    gl.FLOAT,
-    contactTileDenseFloatTextureData(buffer, tileSizeBins, scratch),
+    values,
+    uploadContext,
   );
-  return gl.getError() === gl.NO_ERROR;
 }
 
 function updateLutTexture(
@@ -1693,6 +2001,8 @@ function evictLeastRecentlyUsedTextures(
     .filter(([key]) => !protectedKeys.has(key))
     .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
   let bytes = currentBytes;
+  let count = 0;
+  let evictedBytes = 0;
   for (const [key, entry] of candidates) {
     if (bytes <= budgetBytes) {
       break;
@@ -1700,8 +2010,10 @@ function evictLeastRecentlyUsedTextures(
     gl.deleteTexture(entry.texture);
     cache.delete(key);
     bytes -= entry.bytes;
+    count += 1;
+    evictedBytes += entry.bytes;
   }
-  return bytes;
+  return { bytes, count, evictedBytes };
 }
 
 function paletteStopCount(colormap: ContactTileRenderStyle["colormap"]) {
