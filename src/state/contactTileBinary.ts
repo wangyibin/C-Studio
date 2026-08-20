@@ -6,6 +6,7 @@ const contactTileBinaryHeaderBytes = 16;
 const contactTileBinaryDirectoryEntryBytes = 24;
 const contactTileBinaryVersion = 1;
 const contactTileBinaryFlags = 0;
+const contactTileBinaryDenseFloat32Flags = 1;
 const maxContactTileSizeBins = 65_536;
 const maxSafeUnsignedInteger = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -22,8 +23,16 @@ export interface DecodedContactTileBatch {
     cells: [];
     packedCells: PackedContactTileCells;
   }>;
+  denseTiles?: DecodedDenseContactTile[];
   byteLength: number;
   transport: "array_buffer";
+}
+
+export interface DecodedDenseContactTile {
+  tileX: number;
+  tileY: number;
+  values: Float32Array;
+  occupiedCount: number;
 }
 
 interface ContactTileBinaryLayout {
@@ -69,9 +78,10 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
     invalidContactTileBinary(`unsupported version ${version}`);
   }
   const flags = view.getUint16(6, true);
-  if (flags !== contactTileBinaryFlags) {
+  if (flags !== contactTileBinaryFlags && flags !== contactTileBinaryDenseFloat32Flags) {
     invalidContactTileBinary(`unsupported flags ${flags}`);
   }
+  const denseFloat32 = flags === contactTileBinaryDenseFloat32Flags;
 
   const tileSizeBins = view.getUint32(8, true);
   if (tileSizeBins < 1 || tileSizeBins > maxContactTileSizeBins) {
@@ -95,15 +105,31 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
     if (dataOffset < directoryEnd || dataOffset > raw.byteLength) {
       invalidContactTileBinary(`tile ${directoryIndex} data offset is outside the payload`);
     }
-    if (dataOffset % 8 !== 0) {
-      invalidContactTileBinary(`tile ${directoryIndex} data offset is not 8-byte aligned`);
+    const requiredAlignment = denseFloat32
+      ? Float32Array.BYTES_PER_ELEMENT
+      : Float64Array.BYTES_PER_ELEMENT;
+    if (dataOffset % requiredAlignment !== 0) {
+      invalidContactTileBinary(
+        `tile ${directoryIndex} data offset is not ${requiredAlignment}-byte aligned`,
+      );
     }
 
+    if (denseFloat32 && count !== tileSizeBins * tileSizeBins) {
+      invalidContactTileBinary(
+        `dense tile ${directoryIndex} value count does not match tileSizeBins`,
+      );
+    }
     const xOffset = dataOffset;
-    const yOffset = xOffset + count * Uint16Array.BYTES_PER_ELEMENT;
-    const packedCoordinateEnd = yOffset + count * Uint16Array.BYTES_PER_ELEMENT;
-    const countsOffset = alignToEightBytes(packedCoordinateEnd);
-    const dataEnd = countsOffset + count * Float64Array.BYTES_PER_ELEMENT;
+    const yOffset = denseFloat32
+      ? dataOffset
+      : xOffset + count * Uint16Array.BYTES_PER_ELEMENT;
+    const packedCoordinateEnd = yOffset + (denseFloat32
+      ? 0
+      : count * Uint16Array.BYTES_PER_ELEMENT);
+    const countsOffset = denseFloat32 ? dataOffset : alignToEightBytes(packedCoordinateEnd);
+    const dataEnd = countsOffset + count * (denseFloat32
+      ? Float32Array.BYTES_PER_ELEMENT
+      : Float64Array.BYTES_PER_ELEMENT);
     if (dataEnd > raw.byteLength) {
       invalidContactTileBinary(`tile ${directoryIndex} payload is truncated`);
     }
@@ -123,7 +149,7 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
 
   validatePackedPayloadRanges(layouts, directoryEnd, raw.byteLength);
 
-  const tiles = layouts.map((layout) => {
+  const tiles = denseFloat32 ? [] : layouts.map((layout) => {
     const packedCells = packedCellsForLayout(raw, view, layout);
     for (let index = 0; index < layout.count; index += 1) {
       if (
@@ -143,11 +169,47 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
     };
   });
 
+  const denseTiles = denseFloat32
+    ? layouts.map((layout) => denseTileForLayout(raw, view, layout))
+    : undefined;
+
   return {
     tileSizeBins,
     tiles,
+    ...(denseTiles ? { denseTiles } : {}),
     byteLength: raw.byteLength,
     transport: "array_buffer",
+  };
+}
+
+function denseTileForLayout(
+  buffer: ArrayBuffer,
+  view: DataView,
+  layout: ContactTileBinaryLayout,
+): DecodedDenseContactTile {
+  const values = platformIsLittleEndian
+    ? new Float32Array(buffer, layout.countsOffset, layout.count).slice()
+    : Float32Array.from(
+      { length: layout.count },
+      (_, index) => view.getFloat32(
+        layout.countsOffset + index * Float32Array.BYTES_PER_ELEMENT,
+        true,
+      ),
+    );
+  let occupiedCount = 0;
+  for (const value of values) {
+    if (!Number.isFinite(value)) {
+      invalidContactTileBinary(`dense tile ${layout.directoryIndex} contains a non-finite value`);
+    }
+    if (value !== -1) {
+      occupiedCount += 1;
+    }
+  }
+  return {
+    tileX: layout.tileX,
+    tileY: layout.tileY,
+    values,
+    occupiedCount,
   };
 }
 

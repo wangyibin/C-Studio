@@ -48,6 +48,28 @@ describe("ContactTileDeltaAccumulator", () => {
     expect(accumulator.allocatedBytes).toBe(16 * 256 * 256 * 9);
   });
 
+  it("keeps completed display-cache tiles as Float32 through finish", () => {
+    const accumulator = new ContactTileDeltaAccumulator([{ tileX: 1, tileY: 2 }], 2);
+    const values = new Float32Array([-1, 1.5, 2.25, 0]);
+    const batches: string[][] = [];
+    accumulator.subscribe((batch) => batches.push([...(batch.denseCompleteTileKeys ?? [])]));
+
+    expect(accumulator.mergeDenseComplete([{
+      tileX: 1,
+      tileY: 2,
+      values,
+      occupiedCount: 3,
+    }])).toEqual(["1:2"]);
+
+    expect(accumulator.denseBuffer({ tileX: 1, tileY: 2 })!.completeValues).toBe(values);
+    expect(accumulator.allocatedBytes).toBe(values.byteLength);
+    expect(batches).toEqual([["1:2"]]);
+    const finished = accumulator.finish()[0]!;
+    expect(finished.denseValues).toBe(values);
+    expect(finished.denseOccupiedCount).toBe(3);
+    expect(finished.packedCells).toBeUndefined();
+  });
+
   it("rejects deltas for tiles outside the request", () => {
     const accumulator = new ContactTileDeltaAccumulator([{ tileX: 0, tileY: 0 }], 4);
     expect(() => accumulator.merge([{

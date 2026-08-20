@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "c-studio"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cstudio-core",
  "flate2",

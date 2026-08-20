@@ -51,6 +51,27 @@ describe("contact tile cell access", () => {
     ]);
   });
 
+  it("reads dense Float32 tiles without rebuilding sparse columns", () => {
+    const values = new Float32Array(16);
+    values.fill(-1);
+    values[9] = 4.5;
+    values[15] = 8;
+    const dense: ContactTileData = {
+      tileX: 2,
+      tileY: 3,
+      cells: [],
+      denseValues: values,
+      denseOccupiedCount: 2,
+    };
+
+    expect(contactTileCellCount(dense)).toBe(2);
+    expect(materializeContactTileCells(dense, 4)).toEqual([
+      { xBin: 9, yBin: 14, count: 4.5 },
+      { xBin: 11, yBin: 15, count: 8 },
+    ]);
+    expect(appendContactTileCounts(dense, [])).toEqual([4.5, 8]);
+  });
+
   it("uses packed arrays as the authority during a transitional mixed payload", () => {
     const mixed: ContactTileData = {
       ...packedTile,

@@ -5,6 +5,7 @@ import { createInitialUiState } from "../state/uiState";
 import { ContactTileDeltaAccumulator } from "../state/contactTileDelta";
 import {
   canonicalTilesForRendering,
+  canPromoteContactTilePanInPlace,
   ContactTileLayer,
   contactTileDeltaStagingSlot,
   contactTileGpuSlotTextureBudgetBytes,
@@ -283,6 +284,39 @@ describe("contact tile presentation buffer", () => {
       complete,
       complete.contactMap.viewport,
     )).toBe(complete.contactMap.viewport);
+  });
+
+  it("reuses the presented slot after a complete pure-pan target is promoted on its GPU", () => {
+    const presented = contactTileFrame(1, 1_000);
+    const target = contactTileFrame(2, 1_000);
+    target.contactMap.viewport = {
+      xStart: 128_000,
+      xEnd: 384_000,
+      yStart: 64_000,
+      yEnd: 320_000,
+    };
+    const initial = createContactTileLayerBufferState(presented);
+
+    expect(canPromoteContactTilePanInPlace(presented, target)).toBe(true);
+    const promoted = syncContactTileLayerBuffer(initial, target, false, true);
+    expect(promoted.frontSlot).toBe(0);
+    expect(promoted.stagingSlot).toBeNull();
+    expect(promoted.slots).toEqual([target, null]);
+  });
+
+  it("does not use the GPU pan fast path for a resolution change", () => {
+    const presented = contactTileFrame(1, 1_000);
+    const target = contactTileFrame(2, 2_000);
+
+    expect(canPromoteContactTilePanInPlace(presented, target)).toBe(false);
+    const staged = syncContactTileLayerBuffer(
+      createContactTileLayerBufferState(presented),
+      target,
+      false,
+      true,
+    );
+    expect(staged.frontSlot).toBe(0);
+    expect(staged.stagingSlot).toBe(1);
   });
 
   it("keeps the presented frame and its color scale frozen while a target is loading", () => {

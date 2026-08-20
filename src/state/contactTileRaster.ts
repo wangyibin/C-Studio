@@ -2,6 +2,7 @@ import { contactColorLutIndex, contactColorLutSize } from "./contactColor";
 import type { ContactColorScale } from "./contactColorScale";
 import {
   forEachContactTileCell,
+  validatedDenseContactTileValues,
   validatedPackedContactTileCells,
   type ContactTileData,
 } from "./contactTileData";
@@ -54,8 +55,6 @@ export function rasterizeContactTile(
   if (colorLut.length !== contactColorLutBytes) {
     throw new RangeError(`contact color LUT must contain ${contactColorLutBytes} bytes`);
   }
-  const packed = validatedPackedContactTileCells(tile);
-
   const requiredBytes = tileSizeBins * tileSizeBins * rgbaChannels;
   const pixels = target ?? new Uint8ClampedArray(requiredBytes);
   if (pixels.length !== requiredBytes) {
@@ -68,6 +67,30 @@ export function rasterizeContactTile(
   const tileStartY = tile.tileY * tileSizeBins;
   const mirrorsDiagonal = !transpose && tile.tileX === tile.tileY;
 
+  const dense = validatedDenseContactTileValues(tile);
+  if (dense) {
+    if (dense.values.length !== tileSizeBins * tileSizeBins) {
+      throw new RangeError("dense contact tile does not match tileSizeBins");
+    }
+    for (let index = 0; index < dense.values.length; index += 1) {
+      const value = dense.values[index];
+      if (value === -1) {
+        continue;
+      }
+      const sourceX = index % tileSizeBins;
+      const sourceY = Math.floor(index / tileSizeBins);
+      const xBin = transpose ? sourceY : sourceX;
+      const yBin = transpose ? sourceX : sourceY;
+      const colorOffset = contactColorLutIndex(colormap, normalize(value)) * rgbaChannels;
+      writeContactPixel(pixels, yBin * tileSizeBins + xBin, colorLut, colorOffset);
+      if (mirrorsDiagonal && xBin !== yBin) {
+        writeContactPixel(pixels, xBin * tileSizeBins + yBin, colorLut, colorOffset);
+      }
+    }
+    return pixels;
+  }
+
+  const packed = validatedPackedContactTileCells(tile);
   if (packed) {
     // Packed coordinates are already tile-local. Keep this loop separate from
     // the compatibility path so rasterization creates no per-cell objects.
@@ -126,6 +149,14 @@ export function rasterizeContactTileDenseBuffer(
   const pixels = validateDenseRasterInput(input, target);
   pixels.fill(0);
   const normalize = createContactValueNormalizer(input.colorScale);
+  if (input.buffer.completeValues) {
+    for (let index = 0; index < input.buffer.completeValues.length; index += 1) {
+      if (input.buffer.completeValues[index] !== -1) {
+        paintDenseContactValue(input, pixels, index, normalize);
+      }
+    }
+    return pixels;
+  }
   for (let index = 0; index < input.buffer.occupied.length; index += 1) {
     if (input.buffer.occupied[index] === 0) {
       continue;
@@ -182,7 +213,11 @@ function validateDenseRasterInput(
     throw new RangeError(`contact color LUT must contain ${contactColorLutBytes} bytes`);
   }
   const cellCapacity = tileSizeBins * tileSizeBins;
-  if (buffer.counts.length !== cellCapacity || buffer.occupied.length !== cellCapacity) {
+  if (buffer.completeValues) {
+    if (buffer.completeValues.length !== cellCapacity) {
+      throw new RangeError("completed dense contact tile does not match tileSizeBins");
+    }
+  } else if (buffer.counts.length !== cellCapacity || buffer.occupied.length !== cellCapacity) {
     throw new RangeError("contact tile dense buffer does not match tileSizeBins");
   }
   const requiredBytes = cellCapacity * rgbaChannels;
@@ -205,7 +240,7 @@ function paintDenseContactValue(
   const yBin = input.transpose ? sourceX : sourceY;
   const colorOffset = contactColorLutIndex(
     input.colormap,
-    normalize(input.buffer.counts[sourceIndex]),
+    normalize(input.buffer.completeValues?.[sourceIndex] ?? input.buffer.counts[sourceIndex]),
   ) * rgbaChannels;
   writeContactPixel(
     pixels,

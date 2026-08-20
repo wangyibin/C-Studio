@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import type { MutableRefObject } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { ContactMapTile, ContactMapView } from "../App";
 import { contactColorLut } from "../state/contactColor";
 import {
@@ -30,6 +31,7 @@ import {
 } from "../state/contactTileRaster";
 import { canonicalContactTile, contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
+import { isContactTilePerformanceEnabled } from "../state/contactTilePerformance";
 import type { ContactColormap } from "../state/uiState";
 import {
   contactOverviewFloatTextureData,
@@ -39,6 +41,7 @@ import {
   type ContactTileGpuBoundary,
   type ContactTileGpuOverview,
   type ContactTileGpuRenderer,
+  type ContactTileGpuScene,
 } from "./contactTileGpu";
 
 export interface ContactTileLayerPaintEvent {
@@ -185,6 +188,11 @@ const tileImageDataCache = new WeakMap<HTMLCanvasElement, ImageData>();
 const contactTileIdentityCache = new WeakMap<ContactMapTile, number>();
 let nextContactTileIdentity = 1;
 
+function emitContactTileGpuPerformance(line: string) {
+  console.info(line);
+  void invoke("log_contact_frontend_performance", { line }).catch(() => undefined);
+}
+
 /**
  * Keep canvas paint invalidation tied to pixel-affecting values. In particular,
  * cache merges may recreate the color-scale object without changing its values;
@@ -261,6 +269,7 @@ export function syncContactTileLayerBuffer(
   state: ContactTileLayerBufferState,
   incoming: ContactTileLayerFrame | null,
   freezePresentedStyle: boolean,
+  promoteViewportInPlace = false,
 ): ContactTileLayerBufferState {
   if (!incoming) {
     return state.frontSlot === null && state.stagingSlot === null
@@ -352,6 +361,20 @@ export function syncContactTileLayerBuffer(
     if (incoming.contactMap.visibleLayerComplete === false) {
       return state;
     }
+    if (
+      promoteViewportInPlace
+      && canPromoteContactTilePanInPlace(front, incoming)
+    ) {
+      const slots: ContactTileLayerBufferState["slots"] = state.frontSlot === 0
+        ? [incoming, null]
+        : [null, incoming];
+      return {
+        ...state,
+        slots,
+        stagingSlot: null,
+        revealEvent: null,
+      };
+    }
     const backSlot: ContactTileBufferSlot = state.frontSlot === 0 ? 1 : 0;
     if (
       state.stagingSlot === backSlot
@@ -379,6 +402,18 @@ export function syncContactTileLayerBuffer(
     stagingSlot: null,
     revealEvent: null,
   };
+}
+
+/** A pure viewport commit may reuse the live WebGL context after GPU prefetch. */
+export function canPromoteContactTilePanInPlace(
+  current: ContactTileLayerFrame,
+  incoming: ContactTileLayerFrame,
+) {
+  return incoming.contactMap.visibleLayerComplete === true
+    && !sameContactTileViewport(current.contactMap.viewport, incoming.contactMap.viewport)
+    && sameContactTileDataSurface(current.contactMap, incoming.contactMap)
+    && current.contactMap.requestedResolution === incoming.contactMap.requestedResolution
+    && sameContactTileRenderStyle(current.renderStyle, incoming.renderStyle);
 }
 
 export function discardContactTileStagingBuffer(
@@ -648,13 +683,65 @@ export function ContactTileLayer({
   const slotZeroLayerRef = useRef<HTMLDivElement>(null);
   const slotOneLayerRef = useRef<HTMLDivElement>(null);
 
+  const incomingGpuScene = useMemo<ContactTileGpuScene | null>(() => {
+    if (!incomingFrame) {
+      return null;
+    }
+    const map = incomingFrame.contactMap;
+    const tileSizeBins = map.tileSizeBins ?? 256;
+    const tiles = canonicalTilesForRendering(contactTilesWithPreviewFallback(
+      map.cachedTiles ?? map.tiles ?? [],
+      map.previewTiles ?? [],
+    ));
+    const acceptsOverview = Boolean(
+      overviewContactMap
+      && map.layoutBlocks === overviewContactMap.layoutBlocks
+      && (map.normalization ?? "raw") === (overviewContactMap.normalization ?? "raw"),
+    );
+    return {
+      boundaries,
+      descriptors: contactTileCanvasDescriptorsForViewport(
+        tiles,
+        map.resolution,
+        tileSizeBins,
+        map.viewport,
+        overscanDirection,
+      ),
+      generation: map.renderGeneration,
+      overview: acceptsOverview ? overview : null,
+      resolution: map.resolution,
+      tileSizeBins,
+      visibleLayerComplete: map.visibleLayerComplete === true,
+      viewport: viewport ?? map.viewport,
+      renderStyle: incomingFrame.renderStyle,
+    };
+  }, [
+    boundaries,
+    incomingFrame,
+    overview,
+    overviewContactMap,
+    overscanDirection,
+    viewport,
+  ]);
+
   usePrePaintEffect(() => {
+    const current = bufferRef.current;
+    const front = current.frontSlot === null ? null : current.slots[current.frontSlot];
+    const promoteViewportInPlace = Boolean(
+      front
+      && incomingFrame
+      && incomingGpuScene
+      && !freezePresentedStyle
+      && canPromoteContactTilePanInPlace(front, incomingFrame)
+      && panRendererRef?.current?.promoteScene(incomingGpuScene),
+    );
     setBuffer((current) => syncContactTileLayerBuffer(
       current,
       incomingFrame,
       freezePresentedStyle,
+      promoteViewportInPlace,
     ));
-  }, [freezePresentedStyle, incomingFrame]);
+  }, [freezePresentedStyle, incomingFrame, incomingGpuScene, panRendererRef]);
 
   const reportSlotCommit = useCallback((slot: ContactTileBufferSlot, event: ContactTileLayerPaintEvent) => {
     const current = bufferRef.current;
@@ -925,7 +1012,10 @@ function ContactTileDeltaCanvas({
       }
     };
     const scheduleBatch = (batch: ContactTileDeltaBatch) => {
-      let changed = false;
+      let changed = batch.denseCompleteTileKeys?.includes(contactTileKey(buffer.tile)) ?? false;
+      if (changed) {
+        rasterizeContactTileDenseBuffer(rasterInput, imageData.data);
+      }
       for (const delta of batch.deltas) {
         if (contactTileKey(delta) === contactTileKey(buffer.tile)) {
           rasterizeContactTileDelta({ ...rasterInput, delta }, imageData.data);
@@ -1250,7 +1340,10 @@ function ContactTileGpuCanvas({
       onUnavailable();
       return;
     }
-    const renderer = createContactTileGpuRenderer(canvas, textureBudgetBytes);
+    const renderer = createContactTileGpuRenderer(canvas, textureBudgetBytes, {
+      performanceEnabled: isContactTilePerformanceEnabled(),
+      emitPerformance: emitContactTileGpuPerformance,
+    });
     if (!renderer) {
       onUnavailable();
       return;
@@ -1460,6 +1553,10 @@ export function canonicalTilesForRendering(tiles: ContactMapTile[]): ContactMapT
                 counts: tile.packedCells.counts,
               }
             : undefined,
+          denseValues: tile.denseValues
+            ? transposeDenseContactTileValues(tile.denseValues)
+            : undefined,
+          denseOccupiedCount: tile.denseOccupiedCount,
         };
     const key = contactTileKey(canonical);
     const existing = unique.get(key);
@@ -1468,6 +1565,20 @@ export function canonicalTilesForRendering(tiles: ContactMapTile[]): ContactMapT
     }
   }
   return [...unique.values()];
+}
+
+function transposeDenseContactTileValues(values: Float32Array): Float32Array {
+  const tileSize = Math.sqrt(values.length);
+  if (!Number.isSafeInteger(tileSize)) {
+    throw new RangeError("dense contact tile must contain a square value grid");
+  }
+  const transposed = new Float32Array(values.length);
+  for (let y = 0; y < tileSize; y += 1) {
+    for (let x = 0; x < tileSize; x += 1) {
+      transposed[x * tileSize + y] = values[y * tileSize + x];
+    }
+  }
+  return transposed;
 }
 
 export function contactTileCanvasDescriptorsForViewport(

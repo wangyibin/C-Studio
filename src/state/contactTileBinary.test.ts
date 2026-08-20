@@ -55,6 +55,39 @@ function encodeContactTiles(tileSizeBins: number, tiles: BinaryTileInput[]): Arr
   return buffer;
 }
 
+function encodeDenseContactTiles(
+  tileSizeBins: number,
+  tiles: Array<{ tileX: bigint; tileY: bigint; values: number[] }>,
+): ArrayBuffer {
+  const directoryEnd = headerBytes + tiles.length * directoryEntryBytes;
+  const valuesPerTile = tileSizeBins * tileSizeBins;
+  const buffer = new ArrayBuffer(
+    directoryEnd + tiles.length * valuesPerTile * Float32Array.BYTES_PER_ELEMENT,
+  );
+  const view = new DataView(buffer);
+  new Uint8Array(buffer, 0, 4).set([0x43, 0x53, 0x54, 0x31]);
+  view.setUint16(4, 1, true);
+  view.setUint16(6, 1, true);
+  view.setUint32(8, tileSizeBins, true);
+  view.setUint32(12, tiles.length, true);
+  let dataOffset = directoryEnd;
+  tiles.forEach((tile, tileIndex) => {
+    if (tile.values.length !== valuesPerTile) {
+      throw new Error("dense test tile does not match tile size");
+    }
+    const directoryOffset = headerBytes + tileIndex * directoryEntryBytes;
+    view.setBigUint64(directoryOffset, tile.tileX, true);
+    view.setBigUint64(directoryOffset + 8, tile.tileY, true);
+    view.setUint32(directoryOffset + 16, tile.values.length, true);
+    view.setUint32(directoryOffset + 20, dataOffset, true);
+    tile.values.forEach((value, index) => {
+      view.setFloat32(dataOffset + index * Float32Array.BYTES_PER_ELEMENT, value, true);
+    });
+    dataOffset += tile.values.length * Float32Array.BYTES_PER_ELEMENT;
+  });
+  return buffer;
+}
+
 function copyAndMutate(buffer: ArrayBuffer, mutate: (view: DataView) => void): ArrayBuffer {
   const copy = buffer.slice(0);
   mutate(new DataView(copy));
@@ -112,6 +145,26 @@ describe("decodeContactTileBinaryV1", () => {
     expect(emptyTile.tiles[0]!.packedCells.counts).toHaveLength(0);
   });
 
+  it("decodes completed dense Float32 display tiles without sparse materialization", () => {
+    const buffer = encodeDenseContactTiles(2, [{
+      tileX: 3n,
+      tileY: 7n,
+      values: [-1, 1.5, 2.25, 0],
+    }]);
+
+    const decoded = decodeContactTileBinaryV1(buffer);
+
+    expect(decoded.tiles).toEqual([]);
+    expect(decoded.denseTiles).toHaveLength(1);
+    expect(decoded.denseTiles![0]).toMatchObject({
+      tileX: 3,
+      tileY: 7,
+      occupiedCount: 3,
+    });
+    expect(Array.from(decoded.denseTiles![0]!.values)).toEqual([-1, 1.5, 2.25, 0]);
+    expect(decoded.denseTiles![0]!.values.buffer).not.toBe(buffer);
+  });
+
   it("preserves directory order without assuming sorted tile coordinates", () => {
     const decoded = decodeContactTileBinaryV1(encodeContactTiles(8, [
       { tileX: 8n, tileY: 2n, xLocal: [7], yLocal: [0], counts: [1.25] },
@@ -140,8 +193,22 @@ describe("decodeContactTileBinaryV1", () => {
       copyAndMutate(encoded, (view) => view.setUint16(4, 2, true)),
     )).toThrow(/version 2/);
     expect(() => decodeContactTileBinaryV1(
-      copyAndMutate(encoded, (view) => view.setUint16(6, 1, true)),
-    )).toThrow(/flags 1/);
+      copyAndMutate(encoded, (view) => view.setUint16(6, 2, true)),
+    )).toThrow(/flags 2/);
+  });
+
+  it("rejects malformed dense Float32 tiles", () => {
+    const encoded = encodeDenseContactTiles(2, [{
+      tileX: 1n,
+      tileY: 2n,
+      values: [-1, 1, 2, 3],
+    }]);
+    expect(() => decodeContactTileBinaryV1(copyAndMutate(encoded, (view) => {
+      view.setUint32(headerBytes + 16, 3, true);
+    }))).toThrow(/value count/);
+    expect(() => decodeContactTileBinaryV1(copyAndMutate(encoded, (view) => {
+      view.setFloat32(headerBytes + directoryEntryBytes, Number.NaN, true);
+    }))).toThrow(/non-finite/);
   });
 
   it("rejects tile coordinates that cannot be represented safely as numbers", () => {

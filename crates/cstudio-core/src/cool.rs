@@ -404,6 +404,12 @@ static COOL_RESIDENT_BIN2_CACHE: OnceLock<Mutex<CoolResidentBin2Cache>> = OnceLo
 static COOL_RESIDENT_COUNT_CACHE: OnceLock<Mutex<CoolResidentCountCache>> = OnceLock::new();
 static ADAPTIVE_CHILD_CACHE: OnceLock<Mutex<AdaptiveChildCache>> = OnceLock::new();
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoolSourceMetadata {
+    pub name: String,
+    pub length: u64,
+}
+
 pub fn list_mcool_resolutions(path: &str) -> CStudioResult<Vec<u64>> {
     let file = File::open(path).map_err(cool_error)?;
     let group = file.group("resolutions").map_err(cool_error)?;
@@ -463,6 +469,28 @@ pub fn list_contact_resolutions(path: &str) -> CStudioResult<Vec<u64>> {
             )
         })?;
     Ok(vec![resolution])
+}
+
+pub fn list_contact_sources(path: &str) -> CStudioResult<Vec<CoolSourceMetadata>> {
+    let file = File::open(path).map_err(cool_error)?;
+    let resolution = if file.group("resolutions").is_ok() {
+        list_mcool_resolutions(path)?.into_iter().next()
+    } else {
+        None
+    };
+    let prefix = cool_dataset_prefix(&file, resolution)?;
+    let names = read_string_dataset(&file, &format!("{prefix}chroms/name"))?;
+    let lengths = read_u64_dataset(&file, &format!("{prefix}chroms/length"))?;
+    if names.len() != lengths.len() {
+        return Err(CStudioError::InvalidContactMapQuery(
+            ".cool chroms/name and chroms/length have different lengths".to_string(),
+        ));
+    }
+    Ok(names
+        .into_iter()
+        .zip(lengths)
+        .map(|(name, length)| CoolSourceMetadata { name, length })
+        .collect())
 }
 
 /// Resolve and cache one normalization vector without reading or projecting
@@ -3675,7 +3703,7 @@ mod tests {
     use super::{
         batch_nearby_pixel_ranges, bin1_for_pixel_offset, cached_cool_reader,
         cached_normalization_vector, cool_index_cache_key, list_contact_resolutions,
-        normalized_contact_count, pixel_ranges_for_selected_bin_ranges,
+        list_contact_sources, normalized_contact_count, pixel_ranges_for_selected_bin_ranges,
         read_cool_contacts_for_source_ranges_at_resolution,
         read_cool_contacts_for_source_ranges_at_resolution_cancellable,
         read_cool_contacts_for_sources,
@@ -3687,7 +3715,7 @@ mod tests {
         visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
         visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
         CoolContactVisitTimings, CoolIndex, CoolIndexCacheKey, CoolNormalizationCacheKey,
-        SelectedBinIndex, SelectedBinMembership, SourceRangeIndex,
+        CoolSourceMetadata, SelectedBinIndex, SelectedBinMembership, SourceRangeIndex,
     };
     use crate::{
         agp::Orientation,
@@ -4062,6 +4090,25 @@ mod tests {
         assert_eq!(
             list_contact_resolutions(file.path()).expect("read .cool resolution"),
             vec![1_000],
+        );
+    }
+
+    #[test]
+    fn lists_cooler_source_names_and_lengths() {
+        let file = TestCoolFile::with_two_chromosomes_and_strong_inter_contacts();
+
+        assert_eq!(
+            list_contact_sources(file.path()).expect("read .cool sources"),
+            vec![
+                CoolSourceMetadata {
+                    name: "chr1".to_string(),
+                    length: 2_000,
+                },
+                CoolSourceMetadata {
+                    name: "chr2".to_string(),
+                    length: 2_000,
+                },
+            ],
         );
     }
 

@@ -369,13 +369,6 @@ function thinContactTileCellsForDrawing(
   if (candidateCount <= maxCells) {
     const cells: ContactMapCell[] = [];
     for (const tile of tiles) {
-      const packed = validatedPackedContactTileCells(tile);
-      if (!packed) {
-        for (const cell of tile.cells) {
-          cells.push(cell);
-        }
-        continue;
-      }
       forEachContactTileCell(tile, tileSizeBins, (xBin, yBin, count) => {
         cells.push({ xBin, yBin, count });
       });
@@ -387,26 +380,14 @@ function thinContactTileCellsForDrawing(
   const threshold = Math.floor(keepRatio * 0x1_0000_0000);
   const sampled: ContactMapCell[] = [];
   for (const tile of tiles) {
-    const packed = validatedPackedContactTileCells(tile);
-    if (packed) {
-      forEachContactTileCell(tile, tileSizeBins, (xBin, yBin, count) => {
-        if (
-          sampled.length < maxCells
-          && contactCellCoordinateHash(xBin, yBin) < threshold
-        ) {
-          sampled.push({ xBin, yBin, count });
-        }
-      });
-    } else {
-      for (const cell of tile.cells) {
-        if (
-          sampled.length < maxCells
-          && contactCellHash(cell) < threshold
-        ) {
-          sampled.push(cell);
-        }
+    forEachContactTileCell(tile, tileSizeBins, (xBin, yBin, count) => {
+      if (
+        sampled.length < maxCells
+        && contactCellCoordinateHash(xBin, yBin) < threshold
+      ) {
+        sampled.push({ xBin, yBin, count });
       }
-    }
+    });
     if (sampled.length >= maxCells) {
       break;
     }

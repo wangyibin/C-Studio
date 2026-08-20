@@ -21,6 +21,7 @@ function mockWebGlCanvas() {
   const clear = vi.fn();
   const scissor = vi.fn();
   const uniform4f = vi.fn();
+  const blitFramebuffer = vi.fn();
   const clientWidthRead = vi.fn(() => 256);
   const clientHeightRead = vi.fn(() => 256);
   const gl = {
@@ -53,6 +54,11 @@ function mockWebGlCanvas() {
     UNSIGNED_BYTE: 25,
     COLOR_BUFFER_BIT: 26,
     TRIANGLES: 27,
+    FRAMEBUFFER: 30,
+    READ_FRAMEBUFFER: 31,
+    DRAW_FRAMEBUFFER: 32,
+    COLOR_ATTACHMENT0: 33,
+    FRAMEBUFFER_COMPLETE: 34,
     NO_ERROR: 0,
     createShader: vi.fn(() => ({})),
     shaderSource: vi.fn(),
@@ -66,12 +72,18 @@ function mockWebGlCanvas() {
     deleteProgram: vi.fn(),
     createBuffer: vi.fn(() => ({})),
     createTexture: vi.fn(() => ({})),
+    createFramebuffer: vi.fn(() => ({})),
     bindBuffer: vi.fn(),
     bufferData,
     getAttribLocation: vi.fn(() => 0),
     getUniformLocation: vi.fn(() => ({})),
     deleteBuffer: vi.fn(),
     deleteTexture: vi.fn(),
+    deleteFramebuffer: vi.fn(),
+    bindFramebuffer: vi.fn(),
+    framebufferTexture2D: vi.fn(),
+    checkFramebufferStatus: vi.fn(() => 34),
+    blitFramebuffer,
     disable: vi.fn(),
     enable: vi.fn(),
     pixelStorei: vi.fn(),
@@ -107,6 +119,7 @@ function mockWebGlCanvas() {
   Object.defineProperty(canvas, "clientHeight", { get: clientHeightRead });
   return {
     canvas,
+    blitFramebuffer,
     bufferData,
     clear,
     clientHeightRead,
@@ -344,6 +357,7 @@ describe("contactTileFloatTextureData", () => {
     });
 
     expect(renderer?.setScene({
+      generation: 42,
       descriptors: [{
         key: "0:0:source",
         tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
@@ -361,6 +375,7 @@ describe("contactTileFloatTextureData", () => {
     const lastCall = emitPerformance.mock.calls[emitPerformance.mock.calls.length - 1];
     const log = lastCall?.[0] as string;
     expect(log).toContain("event=contact_gpu_texture");
+    expect(log).toContain("generation=42");
     expect(log).toContain("r16f_uploads=1");
     expect(log).toContain("r32f_uploads=0");
     expect(log).toContain("upload_ms=2");
@@ -725,6 +740,136 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
+  it("atomically promotes a fully prefetched pan scene with zero new tile uploads", () => {
+    const { canvas, blitFramebuffer, texImage2D } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+    });
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 10 },
+    };
+    const firstTile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 0, yBin: 0, count: 9 }],
+    };
+    const prefetchedTile = {
+      tileX: 1,
+      tileY: 0,
+      cells: [{ xBin: 4, yBin: 0, count: 7 }],
+    };
+    expect(renderer?.setScene({
+      descriptors: [{ key: "0:0:source", tile: firstTile, transpose: false }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle,
+    })).toBe(true);
+    renderer?.setPanViewport({ xStart: 4_000, xEnd: 8_000, yStart: 0, yEnd: 4_000 });
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [{ key: "1:0:source", tile: prefetchedTile, transpose: false }],
+      generation: 8,
+      resolution: 1_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
+
+    const targetTile = { ...prefetchedTile, cells: [...prefetchedTile.cells] };
+    const targetScene = {
+      descriptors: [{ key: "1:0:source", tile: targetTile, transpose: false }],
+      generation: 8,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 4_000, xEnd: 8_000, yStart: 0, yEnd: 4_000 },
+      renderStyle,
+    };
+    const uploadsBeforePromotion = renderer?.performanceSnapshot().fullUploads;
+    const imageUploadsBeforePromotion = texImage2D.mock.calls.length;
+    const presentationsBeforePromotion = blitFramebuffer.mock.calls.length;
+
+    expect(renderer?.promoteScene(targetScene)).toBe(true);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      fullUploads: uploadsBeforePromotion,
+      scenePromotions: 1,
+      scenePromotionMisses: 0,
+    });
+    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePromotion);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
+
+    // React publishes the promoted frame after the imperative commit. The
+    // child setScene call recognizes it and performs no second GPU paint.
+    expect(renderer?.setScene(targetScene)).toBe(true);
+    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePromotion);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
+    renderer?.destroy();
+  });
+
+  it("keeps the current presentation untouched when GPU cache has only a partial target", () => {
+    const { canvas, blitFramebuffer } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+    });
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 10 },
+    };
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle,
+    })).toBe(true);
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [{
+        key: "1:0:source",
+        tile: { tileX: 1, tileY: 0, cells: [{ xBin: 4, yBin: 0, count: 5 }] },
+        transpose: false,
+      }],
+      generation: 8,
+      resolution: 1_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    const presentationsBeforeMiss = blitFramebuffer.mock.calls.length;
+
+    expect(renderer?.promoteScene({
+      descriptors: [{
+        key: "1:0:source",
+        tile: {
+          tileX: 1,
+          tileY: 0,
+          cells: [
+            { xBin: 4, yBin: 0, count: 5 },
+            { xBin: 5, yBin: 0, count: 3 },
+          ],
+        },
+        transpose: false,
+      }],
+      generation: 8,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 4_000, xEnd: 8_000, yStart: 0, yEnd: 4_000 },
+      renderStyle,
+    })).toBe(false);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforeMiss);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      scenePromotions: 0,
+      scenePromotionMisses: 1,
+    });
+    renderer?.destroy();
+  });
+
   it("updates a visible delta texture with texSubImage2D and promotes it without texImage2D", () => {
     const { canvas, texImage2D, texSubImage2D } = mockWebGlCanvas();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
@@ -891,6 +1036,27 @@ describe("contactTileFloatTextureData", () => {
     expect(values[1 * 4 + 2]).toBe(7.5);
     expect(values[3 * 4 + 3]).toBe(11);
     expect(values[0]).toBe(-1);
+  });
+
+  it("uploads completed off-diagonal Float32 cache tiles without re-densifying", () => {
+    const denseValues = new Float32Array(16);
+    denseValues.fill(-1);
+    denseValues[9] = 7.5;
+
+    expect(contactTileFloatTextureData({
+      tileX: 1,
+      tileY: 2,
+      cells: [],
+      denseValues,
+      denseOccupiedCount: 1,
+    }, 4)).toBe(denseValues);
+    expect(contactTileDenseFloatTextureData({
+      tile: { tileX: 1, tileY: 2 },
+      counts: new Float64Array(16),
+      occupied: new Uint8Array(16),
+      occupiedCount: 1,
+      completeValues: denseValues,
+    }, 4, new Float32Array(16))).toBe(denseValues);
   });
 
   it("keeps an off-diagonal source texture canonical for UV mirror reuse", () => {

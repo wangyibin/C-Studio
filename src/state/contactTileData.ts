@@ -7,15 +7,17 @@ export interface PackedContactTileCells {
 }
 
 /**
- * Structural tile shape shared by legacy JSON cells and packed IPC responses.
- * Packed data is authoritative when present; producers should leave `cells`
- * empty so the same payload is not retained twice.
+ * Structural tile shape shared by legacy JSON cells, sparse packed IPC, and
+ * completed dense Float32 display-cache responses. Dense data is authoritative
+ * when present; producers should leave `cells` empty so data is not retained twice.
  */
 export interface ContactTileData {
   tileX: number;
   tileY: number;
   cells: readonly ContactMapCell[];
   packedCells?: PackedContactTileCells;
+  denseValues?: Float32Array;
+  denseOccupiedCount?: number;
 }
 
 export type ContactTileCellVisitor = (
@@ -26,6 +28,10 @@ export type ContactTileCellVisitor = (
 ) => void;
 
 export function contactTileCellCount(tile: ContactTileData): number {
+  const dense = validatedDenseContactTileValues(tile);
+  if (dense) {
+    return dense.occupiedCount;
+  }
   const packed = validatedPackedContactTileCells(tile);
   return packed?.counts.length ?? tile.cells.length;
 }
@@ -37,6 +43,27 @@ export function forEachContactTileCell(
   visitor: ContactTileCellVisitor,
 ): void {
   const safeTileSizeBins = validateTileSizeBins(tileSizeBins);
+  const dense = validatedDenseContactTileValues(tile);
+  if (dense) {
+    if (dense.values.length !== safeTileSizeBins * safeTileSizeBins) {
+      throw new RangeError("dense contact tile does not match tileSizeBins");
+    }
+    const tileStartX = tile.tileX * safeTileSizeBins;
+    const tileStartY = tile.tileY * safeTileSizeBins;
+    for (let index = 0; index < dense.values.length; index += 1) {
+      const count = dense.values[index];
+      if (count === -1) {
+        continue;
+      }
+      visitor(
+        tileStartX + index % safeTileSizeBins,
+        tileStartY + Math.floor(index / safeTileSizeBins),
+        count,
+        index,
+      );
+    }
+    return;
+  }
   const packed = validatedPackedContactTileCells(tile);
   if (packed) {
     const tileStartX = tile.tileX * safeTileSizeBins;
@@ -70,11 +97,24 @@ export function materializeContactTileCells(
   const safeLimit = validateMaterializeLimit(limit);
   const safeTileSizeBins = validateTileSizeBins(tileSizeBins);
   if (safeLimit === 0) {
-    // Validate packed shape even when the caller asks for no output.
+    // Validate compact shapes even when the caller asks for no output.
+    if (validatedDenseContactTileValues(tile)) {
+      return [];
+    }
     validatedPackedContactTileCells(tile);
     return [];
   }
 
+  const dense = validatedDenseContactTileValues(tile);
+  if (dense) {
+    const cells: ContactMapCell[] = [];
+    forEachContactTileCell(tile, safeTileSizeBins, (xBin, yBin, count) => {
+      if (cells.length < safeLimit) {
+        cells.push({ xBin, yBin, count });
+      }
+    });
+    return cells;
+  }
   const packed = validatedPackedContactTileCells(tile);
   const cells: ContactMapCell[] = [];
   if (packed) {
@@ -100,6 +140,15 @@ export function materializeContactTileCells(
 }
 
 export function appendContactTileCounts(tile: ContactTileData, out: number[]): number[] {
+  const dense = validatedDenseContactTileValues(tile);
+  if (dense) {
+    for (const count of dense.values) {
+      if (count !== -1) {
+        out.push(count);
+      }
+    }
+    return out;
+  }
   const packed = validatedPackedContactTileCells(tile);
   if (packed) {
     for (let index = 0; index < packed.counts.length; index += 1) {
@@ -112,6 +161,27 @@ export function appendContactTileCounts(tile: ContactTileData, out: number[]): n
     out.push(cell.count);
   }
   return out;
+}
+
+export function validatedDenseContactTileValues(
+  tile: ContactTileData,
+): { values: Float32Array; occupiedCount: number } | undefined {
+  const values = tile.denseValues;
+  const occupiedCount = tile.denseOccupiedCount;
+  if (!values) {
+    if (occupiedCount !== undefined) {
+      throw new RangeError("dense contact tile count requires dense values");
+    }
+    return undefined;
+  }
+  if (
+    !Number.isSafeInteger(occupiedCount)
+    || occupiedCount! < 0
+    || occupiedCount! > values.length
+  ) {
+    throw new RangeError("dense contact tile occupied count is invalid");
+  }
+  return { values, occupiedCount: occupiedCount! };
 }
 
 /** Validate once before a packed hot loop and return the authoritative arrays. */

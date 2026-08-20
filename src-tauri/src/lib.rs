@@ -1,4 +1,5 @@
 mod commands;
+mod contact_display_cache;
 mod contact_lod_cache;
 
 use tauri::Manager;

@@ -115,6 +115,10 @@ import {
   summarizeAgpText,
 } from "./state/importers";
 import {
+  resolveContactLayoutSources,
+  type ContactSourceMetadata,
+} from "./state/contactSourceResolution";
+import {
   operationHistoryFilename,
   parseOperationHistory,
   serializeOperationHistory,
@@ -174,6 +178,7 @@ export interface ExampleDatasetSummary {
   agp_layout: AgpLayout;
   cool_path: string;
   available_resolutions?: number[];
+  contact_sources?: ContactSourceMetadata[];
 }
 
 export interface ContactMapCell {
@@ -217,6 +222,9 @@ export interface ContactMapTile {
   cells: ContactMapCell[];
   /** Compact backend payload. Coordinates are local to this tile. */
   packedCells?: PackedContactTileCells;
+  /** Completed display-cache tile. `-1` marks an empty pixel. */
+  denseValues?: Float32Array;
+  denseOccupiedCount?: number;
 }
 
 export interface ContactMapTileKey {
@@ -229,6 +237,7 @@ interface ImportedContactFile {
   name: string;
   size_bytes: number;
   available_resolutions?: number[];
+  sources?: ContactSourceMetadata[];
 }
 
 interface ImportedProjectTextFile {
@@ -513,6 +522,21 @@ function logContactTileFrontendIpcPerformance(
   void invoke("log_contact_tile_frontend_ipc", { request }).catch(() => undefined);
 }
 
+function contactMapTilesFromDecodedBinary(
+  decoded: ReturnType<typeof decodeContactTileBinaryV1>,
+): ContactMapTile[] {
+  return [
+    ...decoded.tiles,
+    ...(decoded.denseTiles ?? []).map((tile) => ({
+      tileX: tile.tileX,
+      tileY: tile.tileY,
+      cells: [] as [],
+      denseValues: tile.values,
+      denseOccupiedCount: tile.occupiedCount,
+    })),
+  ];
+}
+
 function loadContactTilesWithLayoutHandle(
   registry: ContactLayoutHandleRegistry,
   layoutBlocks: ContactMapLayoutBlock[],
@@ -586,7 +610,7 @@ function loadContactTilesWithLayoutHandle(
             `contact tile binary size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
           );
         }
-        return decoded.tiles;
+        return contactMapTilesFromDecodedBinary(decoded);
       }
 
       const startedAt = performance.now();
@@ -611,7 +635,7 @@ function loadContactTilesWithLayoutHandle(
             `contact tile binary size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
           );
         }
-        const tiles = decoded.tiles;
+        const tiles = contactMapTilesFromDecodedBinary(decoded);
         logContactTileFrontendIpcPerformance({
           requestId: request.requestId,
           generation: request.generation,
@@ -810,11 +834,14 @@ function streamContactTileDeltasWithLayoutHandle(
               `contact tile delta size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
             );
           }
-          if (decoded.tiles.length === 0) {
+          if (decoded.tiles.length === 0 && (decoded.denseTiles?.length ?? 0) === 0) {
             resolveFinished();
             return;
           }
-          const changedTileKeys = accumulator.merge(decoded.tiles);
+          const changedTileKeys = [
+            ...accumulator.merge(decoded.tiles),
+            ...accumulator.mergeDenseComplete(decoded.denseTiles ?? []),
+          ];
           if (changedTileKeys.length > 0) {
             callbacks.onDelta?.();
             if (callbacks.onPreviewChunk) {
@@ -869,6 +896,7 @@ export function App() {
   const [status, setStatus] = useState<AppStatus>(browserFallbackStatus);
   const [dataset, setDataset] = useState<ExampleDatasetSummary | null>(null);
   const [contactAvailableResolutions, setContactAvailableResolutions] = useState<number[]>([]);
+  const [contactSources, setContactSources] = useState<ContactSourceMetadata[]>([]);
   const [contactMap, setContactMap] = useState<ContactMapView | null>(null);
   const [contactTileDeltaStream, setContactTileDeltaStream] = useState<
     ContactTileDeltaRenderStream | null
@@ -1193,6 +1221,39 @@ export function App() {
         : emptyLayout,
     [assemblyBlocks, datasetAgpLayout],
   );
+  const contactSourceResolution = useMemo(
+    () => resolveContactLayoutSources(assemblyLayout.blocks, contactSources),
+    [assemblyLayout.blocks, contactSources],
+  );
+  const contactLayoutBlocks = contactSourceResolution.blocks;
+  const reportedContactSourceResolutionRef = useRef("");
+  useEffect(() => {
+    if (!contactCoolPath || contactSources.length === 0) {
+      reportedContactSourceResolutionRef.current = "";
+      return;
+    }
+    const reportKey = [
+      contactCoolPath,
+      contactSourceResolution.remappedSourceIds.join("\u0000"),
+      contactSourceResolution.unresolvedSourceIds.join("\u0000"),
+    ].join("\u0001");
+    if (reportedContactSourceResolutionRef.current === reportKey) {
+      return;
+    }
+    reportedContactSourceResolutionRef.current = reportKey;
+    if (contactSourceResolution.remappedSourceIds.length > 0) {
+      dispatchUi({
+        type: "appendLog",
+        message: `Contact map resolved split AGP sources through their unsplit COOL source: ${summarizeSourceIds(contactSourceResolution.remappedSourceIds)}`,
+      });
+    }
+    if (contactSourceResolution.unresolvedSourceIds.length > 0) {
+      dispatchUi({
+        type: "appendLog",
+        message: `Contact map has no verified source mapping for ${contactSourceResolution.unresolvedSourceIds.length.toLocaleString()} AGP source${contactSourceResolution.unresolvedSourceIds.length === 1 ? "" : "s"}: ${summarizeSourceIds(contactSourceResolution.unresolvedSourceIds)}`,
+      });
+    }
+  }, [contactCoolPath, contactSourceResolution, contactSources.length]);
   const currentAgpText = useMemo(
     () => exportAgpText(assemblyLayout.blocks),
     [assemblyLayout.blocks],
@@ -1321,7 +1382,7 @@ export function App() {
         }
         return loadContactTilesWithLayoutHandle(
           contactLayoutHandleRegistry,
-          assemblyLayout.blocks,
+          contactLayoutBlocks,
           {
             requestId,
             generation: generationStart.generation,
@@ -1379,6 +1440,7 @@ export function App() {
     beginContactPanGeneration,
     contactAvailableResolutions,
     contactCoolPath,
+    contactLayoutBlocks,
     contactLayoutHandleRegistry,
     contactMainLodTileCacheLru,
     contactPanPrefetchBridge,
@@ -1653,7 +1715,7 @@ export function App() {
     // it immediately so the first visible tile request normally sees a warm
     // handle; failures are removed from the registry and surface on actual use.
     void contactLayoutHandleRegistry
-      .prepare(assemblyLayout.blocks, registerContactMapLayout)
+      .prepare(contactLayoutBlocks, registerContactMapLayout)
       .catch(() => undefined);
 
     let cancelled = false;
@@ -2123,7 +2185,7 @@ export function App() {
             },
             load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
               contactLayoutHandleRegistry,
-              assemblyLayout.blocks,
+              contactLayoutBlocks,
               {
                 requestId: backendRequestId,
                 generation,
@@ -2192,7 +2254,7 @@ export function App() {
             load: (backendRequestId, requestedTiles) => (
               streamContactTileDeltasWithLayoutHandle(
                 contactLayoutHandleRegistry,
-                assemblyLayout.blocks,
+                contactLayoutBlocks,
                 {
                   requestId: backendRequestId,
                   generation,
@@ -2660,7 +2722,7 @@ export function App() {
                   load: (backendRequestId, requestedTiles) =>
                     loadContactTilesWithLayoutHandle(
                       contactLayoutHandleRegistry,
-                      assemblyLayout.blocks,
+                      contactLayoutBlocks,
                       {
                         requestId: backendRequestId,
                         generation,
@@ -2945,7 +3007,7 @@ export function App() {
             },
             load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
               contactLayoutHandleRegistry,
-              assemblyLayout.blocks,
+              contactLayoutBlocks,
               {
                 requestId: backendRequestId,
                 generation,
@@ -3013,7 +3075,7 @@ export function App() {
               load: (backendRequestId, requestedTiles) => (
                 streamContactTileDeltasWithLayoutHandle(
                   contactLayoutHandleRegistry,
-                  assemblyLayout.blocks,
+                  contactLayoutBlocks,
                   {
                     requestId: backendRequestId,
                     generation,
@@ -3182,7 +3244,7 @@ export function App() {
             },
             load: (backendRequestId, tiles) => loadContactTilesWithLayoutHandle(
               contactLayoutHandleRegistry,
-              assemblyLayout.blocks,
+              contactLayoutBlocks,
               {
                 requestId: backendRequestId,
                 generation,
@@ -3291,6 +3353,7 @@ export function App() {
     contactCoolPath,
     contactAvailableResolutions,
     assemblyLayout,
+    contactLayoutBlocks,
     uiState.contact.resolution,
     uiState.contact.viewportSpanMb,
     uiState.contact.viewportWidthPx,
@@ -3402,7 +3465,7 @@ export function App() {
       try {
         const response = await loadContactOverviewWithLayoutHandle(
           contactLayoutHandleRegistry,
-          assemblyLayout.blocks,
+          contactLayoutBlocks,
           {
             requestId: nextRequestId,
             generation,
@@ -3476,6 +3539,7 @@ export function App() {
     assemblyLayout,
     contactAvailableResolutions,
     contactCoolPath,
+    contactLayoutBlocks,
     uiState.normalization,
   ]);
 
@@ -3764,6 +3828,7 @@ export function App() {
       setSavedHistoryIdentity(emptyOperationHistoryIdentity());
       setDataset(importedDataset);
       setContactAvailableResolutions(importedDataset.available_resolutions ?? []);
+      setContactSources(importedDataset.contact_sources ?? []);
       setCoverageRecords([]);
       setPafPath(importedDataset.paf_path);
       setPafText("");
@@ -3793,6 +3858,7 @@ export function App() {
       setSavedHistoryIdentity(emptyOperationHistoryIdentity());
       setDataset(example.dataset);
       setContactAvailableResolutions(example.dataset.available_resolutions ?? [1_000]);
+      setContactSources(example.dataset.contact_sources ?? []);
       setCoverageRecords(example.coverageRecords);
       setPafPath(null);
       setPafText(example.pafText);
@@ -3871,6 +3937,7 @@ export function App() {
         coveragePath: current?.coverage_path ?? null,
         agpLayout,
         availableResolutions: current?.available_resolutions,
+        contactSources: current?.contact_sources,
       }),
     }));
     dispatchUi({ type: "setAssemblyBlocks", blocks: agpLayout.blocks });
@@ -3928,6 +3995,7 @@ export function App() {
         coveragePath: current?.coverage_path ?? null,
         agpLayout,
         availableResolutions: current?.available_resolutions,
+        contactSources: current?.contact_sources,
       }));
       dispatchAssemblyImport(agpLayout.blocks, restoredHistory);
       dispatchUi({ type: "fitContactViewport", totalSpanMb: agpLayout.totalSpan / 1_000_000 });
@@ -3995,9 +4063,11 @@ export function App() {
           coveragePath: current?.coverage_path ?? null,
           agpLayout: current?.agp_layout ?? emptyAgpLayout(),
           availableResolutions: selected.available_resolutions,
+          contactSources: selected.sources,
         }),
       }));
       setContactAvailableResolutions(selected.available_resolutions ?? []);
+      setContactSources(selected.sources ?? []);
       setStatusMessage(`Contact map imported: ${selected.name}`);
       dispatchUi({ type: "appendLog", message: `Contact map imported: ${selected.name}` });
     } catch (error) {
@@ -4078,8 +4148,10 @@ export function App() {
         coveragePath: project.coverage?.path ?? null,
         agpLayout,
         availableResolutions: contact?.available_resolutions ?? [],
+        contactSources: contact?.sources ?? [],
       }));
       setContactAvailableResolutions(contact?.available_resolutions ?? []);
+      setContactSources(contact?.sources ?? []);
 
       const loaded = [project.agp, project.history, project.gfa, project.paf, project.coverage, project.contact]
         .filter((file): file is ImportedProjectTextFile | ImportedContactFile => file !== null)
@@ -4184,6 +4256,7 @@ export function App() {
           coveragePath: selected.path,
           agpLayout: current?.agp_layout ?? emptyAgpLayout(),
           availableResolutions: current?.available_resolutions,
+          contactSources: current?.contact_sources,
         }),
       }));
       setStatusMessage(`Coverage imported: ${selected.name}`);
@@ -4214,6 +4287,7 @@ export function App() {
           coveragePath: file.name,
           agpLayout: current?.agp_layout ?? emptyAgpLayout(),
           availableResolutions: current?.available_resolutions,
+          contactSources: current?.contact_sources,
         }),
       }));
       setStatusMessage(`Coverage imported: ${file.name}`);
@@ -4258,6 +4332,7 @@ export function App() {
     setSavedHistoryIdentity("");
     setDataset(null);
     setContactAvailableResolutions([]);
+    setContactSources([]);
     setContactMap(null);
     setOverviewContactMap(null);
     setContactTilePreviewViewport(null);
@@ -4560,7 +4635,7 @@ export function App() {
             },
             load: (requestId, tiles) => loadContactTilesWithLayoutHandle(
               contactLayoutHandleRegistry,
-              assemblyLayout.blocks,
+              contactLayoutBlocks,
               {
                 requestId,
                 generation,
@@ -4640,6 +4715,7 @@ export function App() {
     assemblyLayout.blocks,
     contactAvailableResolutions,
     contactCoolPath,
+    contactLayoutBlocks,
     contactLayoutHandleRegistry,
     uiState.normalization,
   ]);
@@ -4796,6 +4872,7 @@ interface DatasetSummaryInput {
   coveragePath: string | null;
   agpLayout: AgpLayout;
   availableResolutions?: number[];
+  contactSources?: ContactSourceMetadata[];
 }
 
 function buildDatasetSummary(input: DatasetSummaryInput): ExampleDatasetSummary {
@@ -4813,6 +4890,7 @@ function buildDatasetSummary(input: DatasetSummaryInput): ExampleDatasetSummary 
     coverage_path: input.coveragePath,
     agp_layout: input.agpLayout,
     available_resolutions: input.availableResolutions,
+    contact_sources: input.contactSources,
   };
 }
 
@@ -4831,7 +4909,14 @@ function ensureImportedDataset(summary: ExampleDatasetSummary): ExampleDatasetSu
     coveragePath: summary.coverage_path,
     agpLayout: normalizeImportedAgpLayout(summary.agp_layout ?? emptyAgpLayout()),
     availableResolutions: summary.available_resolutions,
+    contactSources: summary.contact_sources,
   });
+}
+
+function summarizeSourceIds(sourceIds: ReadonlyArray<string>, limit = 8) {
+  const shown = sourceIds.slice(0, limit).join(", ");
+  const remaining = sourceIds.length - Math.min(sourceIds.length, limit);
+  return remaining > 0 ? `${shown} (+${remaining.toLocaleString()} more)` : shown;
 }
 
 function emptyAgpLayout(): AgpLayout {

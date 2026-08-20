@@ -1,7 +1,11 @@
 import type { ContactMapTile, ContactMapView } from "../App";
 import { contactColorLut } from "../state/contactColor";
 import type { ContactTileDenseDeltaBuffer } from "../state/contactTileDelta";
-import { contactTileCellCount, validatedPackedContactTileCells } from "../state/contactTileData";
+import {
+  contactTileCellCount,
+  validatedDenseContactTileValues,
+  validatedPackedContactTileCells,
+} from "../state/contactTileData";
 import { contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
 import { isContactTilePerformanceEnabled } from "../state/contactTilePerformance";
@@ -31,6 +35,9 @@ export interface ContactTileGpuPerformanceSnapshot {
   evictedBytes: number;
   cacheEntries: number;
   cacheBytes: number;
+  scenePromotions: number;
+  scenePromotionMisses: number;
+  scenePromotionMilliseconds: number;
 }
 
 export interface ContactTileGpuRendererOptions {
@@ -91,6 +98,12 @@ export interface ContactTileGpuDeltaScene {
 
 export interface ContactTileGpuRenderer {
   setScene: (scene: ContactTileGpuScene) => boolean;
+  /**
+   * Atomically replace the current scene only when every populated target tile
+   * is already resident in this WebGL context. A miss leaves the visible frame
+   * untouched so the caller can retain the DOM back-buffer fallback.
+   */
+  promoteScene: (scene: ContactTileGpuScene) => boolean;
   appendSceneDescriptors: (input: {
     descriptors: readonly ContactTileCanvasDescriptor[];
     generation: number;
@@ -170,6 +183,13 @@ interface BoundaryRendererResources {
   canvasSizeLocation: WebGLUniformLocation;
   cssSizeLocation: WebGLUniformLocation;
   cssScaleLocation: WebGLUniformLocation;
+}
+
+interface FramePresentationResources {
+  framebuffer: WebGLFramebuffer;
+  texture: WebGLTexture;
+  width: number;
+  height: number;
 }
 
 const vertexShaderSource = `#version 300 es
@@ -332,7 +352,30 @@ export function contactTileFloatTextureData(
   if (!Number.isSafeInteger(tileSizeBins) || tileSizeBins <= 0) {
     throw new RangeError("contact tile size must be a positive integer");
   }
-  const values = new Float32Array(tileSizeBins * tileSizeBins);
+  const cellCount = tileSizeBins * tileSizeBins;
+  const dense = validatedDenseContactTileValues(tile);
+  if (dense) {
+    if (dense.values.length !== cellCount) {
+      throw new RangeError("dense contact tile does not match tile size");
+    }
+    if (tile.tileX !== tile.tileY) {
+      return dense.values;
+    }
+    const mirrored = dense.values.slice();
+    for (let index = 0; index < cellCount; index += 1) {
+      const value = dense.values[index];
+      if (value === -1) {
+        continue;
+      }
+      const x = index % tileSizeBins;
+      const y = Math.floor(index / tileSizeBins);
+      if (x !== y) {
+        mirrored[x * tileSizeBins + y] = value;
+      }
+    }
+    return mirrored;
+  }
+  const values = new Float32Array(cellCount);
   values.fill(-1);
   const packed = validatedPackedContactTileCells(tile);
   const mirrorsDiagonal = tile.tileX === tile.tileY;
@@ -495,6 +538,28 @@ export function contactTileDenseFloatTextureData(
     throw new RangeError("contact tile size must be a positive integer");
   }
   const cellCount = tileSizeBins * tileSizeBins;
+  if (buffer.completeValues) {
+    if (buffer.completeValues.length !== cellCount) {
+      throw new RangeError("completed dense contact tile does not match tile size");
+    }
+    if (buffer.tile.tileX !== buffer.tile.tileY) {
+      return buffer.completeValues;
+    }
+    const values = target ?? new Float32Array(cellCount);
+    values.set(buffer.completeValues);
+    for (let index = 0; index < cellCount; index += 1) {
+      const value = buffer.completeValues[index];
+      if (value === -1) {
+        continue;
+      }
+      const x = index % tileSizeBins;
+      const y = Math.floor(index / tileSizeBins);
+      if (x !== y) {
+        values[x * tileSizeBins + y] = value;
+      }
+    }
+    return values;
+  }
   if (buffer.counts.length !== cellCount || buffer.occupied.length !== cellCount) {
     throw new RangeError("contact delta buffer does not match tile size");
   }
@@ -553,6 +618,9 @@ function initialContactTileGpuPerformance(
     evictedBytes: 0,
     cacheEntries: 0,
     cacheBytes: 0,
+    scenePromotions: 0,
+    scenePromotionMisses: 0,
+    scenePromotionMilliseconds: 0,
     lastEmissionSignature: "",
   };
 }
@@ -564,10 +632,14 @@ function contactTileGpuPerformanceSnapshot(
   return { ...snapshot };
 }
 
-function formatContactTileGpuPerformanceLog(snapshot: ContactTileGpuPerformanceSnapshot) {
+function formatContactTileGpuPerformanceLog(
+  snapshot: ContactTileGpuPerformanceSnapshot,
+  generation: number | null,
+) {
   return [
     "CSTUDIO_PERF",
     "event=contact_gpu_texture",
+    `generation=${generation ?? "null"}`,
     `texture_preference=${snapshot.texturePreference}`,
     `uploads=${snapshot.uploads}`,
     `full_uploads=${snapshot.fullUploads}`,
@@ -581,6 +653,9 @@ function formatContactTileGpuPerformanceLog(snapshot: ContactTileGpuPerformanceS
     `evicted_bytes=${snapshot.evictedBytes}`,
     `cache_entries=${snapshot.cacheEntries}`,
     `cache_bytes=${snapshot.cacheBytes}`,
+    `scene_promotions=${snapshot.scenePromotions}`,
+    `scene_promotion_misses=${snapshot.scenePromotionMisses}`,
+    `scene_promotion_ms=${roundGpuMilliseconds(snapshot.scenePromotionMilliseconds)}`,
   ].join(" ");
 }
 
@@ -599,8 +674,11 @@ export function createContactTileGpuRenderer(
     depth: false,
     desynchronized: true,
     failIfMajorPerformanceCaveat: false,
-    powerPreference: "low-power",
+    powerPreference: "high-performance",
     premultipliedAlpha: true,
+    // ContactLayoutRasterPreview reads the last complete authoritative frame
+    // during AGP edits. The default buffer therefore remains readable, while
+    // the offscreen framebuffer below prevents partial scene presentation.
     preserveDrawingBuffer: true,
     stencil: false,
   });
@@ -646,6 +724,7 @@ export function createContactTileGpuRenderer(
   let presentedCssHeight = 1;
   let uploadedBoundaries: readonly ContactTileGpuBoundary[] | null = null;
   let uploadedBoundaryCount = 0;
+  let framePresentation: FramePresentationResources | null = null;
 
   const updatePerformanceCacheState = () => {
     uploadContext.performance.cacheEntries = textureCache.size;
@@ -656,7 +735,7 @@ export function createContactTileGpuRenderer(
       return;
     }
     updatePerformanceCacheState();
-    const signature = `${uploadContext.performance.uploads}:${uploadContext.performance.evictions}:${textureCache.size}:${textureBytes}`;
+    const signature = `${uploadContext.performance.uploads}:${uploadContext.performance.evictions}:${uploadContext.performance.scenePromotions}:${uploadContext.performance.scenePromotionMisses}:${textureCache.size}:${textureBytes}`;
     if (signature === uploadContext.performance.lastEmissionSignature) {
       return;
     }
@@ -664,6 +743,7 @@ export function createContactTileGpuRenderer(
     try {
       emitPerformance(formatContactTileGpuPerformanceLog(
         contactTileGpuPerformanceSnapshot(uploadContext.performance),
+        (deltaScene ?? scene)?.generation ?? null,
       ));
     } catch {
       // Diagnostics must never interrupt heatmap presentation.
@@ -697,6 +777,21 @@ export function createContactTileGpuRenderer(
       updateLutTexture(gl, resources.lutTexture, activeScene.renderStyle, lutColormap);
       lutColormap = activeScene.renderStyle.colormap;
     }
+
+    framePresentation = ensureFramePresentationResources(
+      gl,
+      framePresentation,
+      canvas.width,
+      canvas.height,
+    );
+    if (!framePresentation) {
+      return false;
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framePresentation.framebuffer);
+    const abandonFrame = () => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return false;
+    };
 
     gl.viewport(0, 0, canvas.width, canvas.height);
     if (!preserveFramebuffer) {
@@ -745,7 +840,7 @@ export function createContactTileGpuRenderer(
         uploadContext,
       );
       if (!overviewTextureEntry) {
-        return false;
+        return abandonFrame();
       }
       if (overview.colorScale) {
         applyColorScaleUniforms(gl, resources, overview.colorScale);
@@ -826,6 +921,7 @@ export function createContactTileGpuRenderer(
         // Scene changes normally run a complete draw before pointer input can
         // reach this path. Fall back defensively if that ordering is ever
         // broken instead of presenting a partially translated surface.
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         return draw();
       }
       const entry = cachedEntryMatches
@@ -900,7 +996,7 @@ export function createContactTileGpuRenderer(
       uploadedBoundaries,
       uploadedBoundaryCount,
     )) {
-      return false;
+      return abandonFrame();
     }
     if (uploadedBoundaries !== boundaries) {
       uploadedBoundaries = boundaries;
@@ -909,11 +1005,14 @@ export function createContactTileGpuRenderer(
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
     if (panOnly) {
+      presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
       return true;
     }
-    const glSucceeded = gl.getError() === gl.NO_ERROR;
     emitPerformanceIfChanged();
-    return glSucceeded && (
+    // Texture uploads and framebuffer creation validate their own failures.
+    // Avoid a scene-wide getError() here: ANGLE may flush the command stream,
+    // which turns an otherwise cache-only pan commit into a CPU/GPU sync point.
+    const complete = !gl.isContextLost() && (
       deltaScene !== null
       || !validatesCompleteCoverage
       || contactTileGpuDrawCoverageIsComplete(
@@ -922,10 +1021,26 @@ export function createContactTileGpuRenderer(
         overview !== null,
       )
     );
+    if (!complete) {
+      return abandonFrame();
+    }
+    presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+    return true;
   };
 
   return {
     setScene: (nextScene) => {
+      if (
+        !deltaScene
+        && scene
+        && sameContactTileGpuScene(scene, nextScene)
+      ) {
+        // ContactTileLayer publishes the already-promoted frame through React
+        // immediately after promoteScene(). Do not clear, upload, or draw the
+        // same pixels a second time in the child layout effect.
+        scene = nextScene;
+        return true;
+      }
       if (
         deltaScene
         && nextScene.generation !== undefined
@@ -973,6 +1088,97 @@ export function createContactTileGpuRenderer(
       pendingAppendedDescriptors.clear();
       scene = nextScene;
       return draw();
+    },
+    promoteScene: (nextScene) => {
+      const startedAt = uploadContext.clock();
+      const fail = () => {
+        uploadContext.performance.scenePromotionMisses += 1;
+        emitPerformanceIfChanged();
+        return false;
+      };
+      if (
+        destroyed
+        || !scene
+        || deltaScene
+        || gl.isContextLost()
+        || scene.resolution !== nextScene.resolution
+        || scene.tileSizeBins !== nextScene.tileSizeBins
+        || nextScene.visibleLayerComplete !== true
+        || !sameContactTileGpuOverview(scene.overview ?? null, nextScene.overview ?? null)
+      ) {
+        return fail();
+      }
+
+      const promotableEntries: Array<{
+        entry: GpuTextureEntry;
+        tile: ContactMapTile;
+      }> = [];
+      for (const descriptor of nextScene.descriptors) {
+        if (contactTileCellCount(descriptor.tile) === 0) {
+          continue;
+        }
+        const entry = textureCache.get(gpuTextureKey(nextScene, descriptor.tile));
+        const exactTile = entry?.tile === descriptor.tile;
+        const residentCellCount = entry?.tile
+          ? contactTileCellCount(entry.tile)
+          : entry?.deltaBuffer?.occupiedCount;
+        const matchingPrefetch = Boolean(
+          entry
+          && nextScene.generation !== undefined
+          && entry.generation === nextScene.generation
+          && (entry.panPrefetchSnapshot || entry.deltaBuffer)
+          && residentCellCount === contactTileCellCount(descriptor.tile)
+        );
+        if (!entry || (!exactTile && !matchingPrefetch)) {
+          return fail();
+        }
+        promotableEntries.push({ entry, tile: descriptor.tile });
+      }
+
+      const previousScene = scene;
+      const previousPendingDescriptors = new Map(pendingAppendedDescriptors);
+      const previousEntryState = promotableEntries.map(({ entry }) => ({
+        entry,
+        tile: entry.tile,
+        deltaBuffer: entry.deltaBuffer,
+        panPrefetchSnapshot: entry.panPrefetchSnapshot,
+        generation: entry.generation,
+        lastUsed: entry.lastUsed,
+      }));
+      for (const { entry, tile } of promotableEntries) {
+        entry.tile = tile;
+        entry.deltaBuffer = undefined;
+        entry.panPrefetchSnapshot = false;
+        entry.generation = nextScene.generation;
+        entry.lastUsed = ++useCounter;
+      }
+      pendingAppendedDescriptors.clear();
+      scene = nextScene;
+      const uploadsBeforePromotion = uploadContext.performance.uploads;
+      const promoted = draw();
+      if (!promoted || uploadContext.performance.uploads !== uploadsBeforePromotion) {
+        scene = previousScene;
+        pendingAppendedDescriptors.clear();
+        for (const [key, descriptor] of previousPendingDescriptors) {
+          pendingAppendedDescriptors.set(key, descriptor);
+        }
+        for (const previous of previousEntryState) {
+          previous.entry.tile = previous.tile;
+          previous.entry.deltaBuffer = previous.deltaBuffer;
+          previous.entry.panPrefetchSnapshot = previous.panPrefetchSnapshot;
+          previous.entry.generation = previous.generation;
+          previous.entry.lastUsed = previous.lastUsed;
+        }
+        return fail();
+      }
+
+      uploadContext.performance.scenePromotions += 1;
+      uploadContext.performance.scenePromotionMilliseconds += Math.max(
+        0,
+        uploadContext.clock() - startedAt,
+      );
+      emitPerformanceIfChanged();
+      return true;
     },
     appendSceneDescriptors: (input) => {
       if (
@@ -1222,6 +1428,11 @@ export function createContactTileGpuRenderer(
         overviewTextureEntry = null;
       }
       pendingAppendedDescriptors.clear();
+      if (framePresentation) {
+        gl.deleteFramebuffer(framePresentation.framebuffer);
+        gl.deleteTexture(framePresentation.texture);
+        framePresentation = null;
+      }
       gl.deleteTexture(resources.lutTexture);
       gl.deleteBuffer(resources.quadBuffer);
       gl.deleteProgram(resources.program);
@@ -1973,6 +2184,125 @@ function resizeCanvasToDisplaySize(canvas: HTMLCanvasElement, gl: WebGL2Renderin
     canvas.height = height;
     gl.viewport(0, 0, width, height);
   }
+}
+
+function ensureFramePresentationResources(
+  gl: WebGL2RenderingContext,
+  current: FramePresentationResources | null,
+  width: number,
+  height: number,
+): FramePresentationResources | null {
+  if (current?.width === width && current.height === height) {
+    return current;
+  }
+  if (current) {
+    gl.deleteFramebuffer(current.framebuffer);
+    gl.deleteTexture(current.texture);
+  }
+
+  const texture = gl.createTexture();
+  const framebuffer = gl.createFramebuffer();
+  if (!texture || !framebuffer) {
+    if (texture) gl.deleteTexture(texture);
+    if (framebuffer) gl.deleteFramebuffer(framebuffer);
+    return null;
+  }
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA8,
+    width,
+    height,
+    0,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    null,
+  );
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+  gl.framebufferTexture2D(
+    gl.FRAMEBUFFER,
+    gl.COLOR_ATTACHMENT0,
+    gl.TEXTURE_2D,
+    texture,
+    0,
+  );
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(framebuffer);
+    gl.deleteTexture(texture);
+    return null;
+  }
+  return { framebuffer, texture, width, height };
+}
+
+function presentFramePresentation(
+  gl: WebGL2RenderingContext,
+  frame: FramePresentationResources,
+  width: number,
+  height: number,
+) {
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, frame.framebuffer);
+  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+  gl.blitFramebuffer(
+    0,
+    0,
+    width,
+    height,
+    0,
+    0,
+    width,
+    height,
+    gl.COLOR_BUFFER_BIT,
+    gl.NEAREST,
+  );
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+function sameContactTileGpuOverview(
+  left: ContactTileGpuOverview | null,
+  right: ContactTileGpuOverview | null,
+) {
+  return left === right || Boolean(
+    left
+    && right
+    && left.values === right.values
+    && left.width === right.width
+    && left.height === right.height,
+  );
+}
+
+function sameContactTileGpuScene(left: ContactTileGpuScene, right: ContactTileGpuScene) {
+  if (
+    left.generation !== right.generation
+    || left.resolution !== right.resolution
+    || left.tileSizeBins !== right.tileSizeBins
+    || left.visibleLayerComplete !== right.visibleLayerComplete
+    || !sameContactTileGpuOverview(left.overview ?? null, right.overview ?? null)
+    || left.viewport.xStart !== right.viewport.xStart
+    || left.viewport.xEnd !== right.viewport.xEnd
+    || left.viewport.yStart !== right.viewport.yStart
+    || left.viewport.yEnd !== right.viewport.yEnd
+    || left.renderStyle.colormap !== right.renderStyle.colormap
+    || left.renderStyle.colorScale.log !== right.renderStyle.colorScale.log
+    || left.renderStyle.colorScale.min !== right.renderStyle.colorScale.min
+    || left.renderStyle.colorScale.max !== right.renderStyle.colorScale.max
+    || left.boundaries !== right.boundaries
+    || left.descriptors.length !== right.descriptors.length
+  ) {
+    return false;
+  }
+  return left.descriptors.every((descriptor, index) => {
+    const candidate = right.descriptors[index];
+    return candidate?.key === descriptor.key
+      && candidate.transpose === descriptor.transpose
+      && candidate.tile === descriptor.tile;
+  });
 }
 
 function gpuTextureKey(
