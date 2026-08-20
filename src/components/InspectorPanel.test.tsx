@@ -153,6 +153,46 @@ describe("InspectorPanel", () => {
     expect(markup).toContain('<span class="overview-end">5 Mb</span>');
   });
 
+  it("matches the overview window to the main viewport aspect ratio", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.contact.viewportSpanMb = 100;
+    uiState.contact.viewportCenterMb = 50;
+    uiState.contact.viewportCenterXMb = 50;
+    uiState.contact.viewportCenterYMb = 50;
+    uiState.contact.viewportWidthPx = 1_000;
+    uiState.contact.viewportHeightPx = 500;
+    const wholeGenomeOverview = {
+      ...contactMap,
+      viewport: {
+        xStart: 0,
+        xEnd: 1_000_000_000,
+        yStart: 0,
+        yEnd: 1_000_000_000,
+      },
+    };
+
+    const markup = renderToStaticMarkup(
+      <InspectorPanel
+        dataset={dataset}
+        contactMap={wholeGenomeOverview}
+        overviewContactMap={wholeGenomeOverview}
+        status={status}
+        statusMessage="ready"
+        uiState={uiState}
+        onUiAction={() => undefined}
+        syntenyView={null}
+        assemblyBlocks={[]}
+        selectedAssemblyBlockIds={[]}
+        pafText=""
+        onPafTextChange={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain(
+      'class="overview-window" style="left:0%;top:0%;width:20%;height:10%"',
+    );
+  });
+
   it("marks the synteny preview to fill the inspector overview area", () => {
     const uiState = createInitialUiState("ready");
     uiState.activeOverviewMode = "synteny";

@@ -22,6 +22,7 @@ import {
 } from "../state/assemblyEditing";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import type { GfaEvidenceDocument } from "../state/gfa";
+import { buildCenteredContactViewport } from "../state/contactViewport";
 import {
   SyntenyDotplot,
 } from "./SyntenyDotplot";
@@ -1015,14 +1016,19 @@ function ContactOverview({
   const totalSpanMb = Math.max(1, Math.round(displayedTotalSpanBp / 1_000_000));
   const [dragRatio, setDragRatio] = useState<{ x: number; y: number } | null>(null);
   const dragRatioRef = useRef<{ x: number; y: number } | null>(null);
-  const windowSpanRatio = Math.min(1, Math.max(0.001, uiState.contact.viewportSpanMb / totalSpanMb));
-  const maxWindowStartRatio = Math.max(0, 1 - windowSpanRatio);
-  const viewportXCenterRatio = Math.min(1, Math.max(0, uiState.contact.viewportCenterXMb / totalSpanMb));
-  const viewportYCenterRatio = Math.min(1, Math.max(0, uiState.contact.viewportCenterYMb / totalSpanMb));
-  const viewportXStartRatio = Math.min(maxWindowStartRatio, Math.max(0, viewportXCenterRatio - windowSpanRatio / 2));
-  const viewportXEndRatio = Math.min(1, viewportXStartRatio + windowSpanRatio);
-  const viewportYStartRatio = Math.min(maxWindowStartRatio, Math.max(0, viewportYCenterRatio - windowSpanRatio / 2));
-  const viewportYEndRatio = Math.min(1, viewportYStartRatio + windowSpanRatio);
+  const overviewWindowViewport = buildCenteredContactViewport({
+    centerMb: uiState.contact.viewportCenterMb,
+    centerXMb: uiState.contact.viewportCenterXMb,
+    centerYMb: uiState.contact.viewportCenterYMb,
+    totalSpanBp: displayedTotalSpanBp,
+    windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
+    viewportWidthPx: uiState.contact.viewportWidthPx,
+    viewportHeightPx: uiState.contact.viewportHeightPx,
+  });
+  const viewportXStartRatio = Math.min(1, Math.max(0, overviewWindowViewport.xStart / displayedTotalSpanBp));
+  const viewportXEndRatio = Math.min(1, Math.max(0, overviewWindowViewport.xEnd / displayedTotalSpanBp));
+  const viewportYStartRatio = Math.min(1, Math.max(0, overviewWindowViewport.yStart / displayedTotalSpanBp));
+  const viewportYEndRatio = Math.min(1, Math.max(0, overviewWindowViewport.yEnd / displayedTotalSpanBp));
   const committedCenterRatio = {
     x: (viewportXStartRatio + viewportXEndRatio) / 2,
     y: (viewportYStartRatio + viewportYEndRatio) / 2,
