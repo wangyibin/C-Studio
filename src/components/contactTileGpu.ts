@@ -15,6 +15,7 @@ import type {
 } from "./ContactTileLayer";
 
 export const contactTileGpuTextureBudgetBytes = 96 * 1024 * 1024;
+export const contactTileGpuVirtualTextureBudgetBytes = 32 * 1024 * 1024;
 export const contactOverviewTextureBins = 320;
 export const contactTileGpuR16fMaximum = 65_504;
 
@@ -38,10 +39,17 @@ export interface ContactTileGpuPerformanceSnapshot {
   scenePromotions: number;
   scenePromotionMisses: number;
   scenePromotionMilliseconds: number;
+  virtualTextureDraws: number;
+  virtualTextureFallbacks: number;
+  virtualTextureUploads: number;
+  virtualTexturePages: number;
+  virtualTextureLayers: number;
+  virtualTextureBytes: number;
 }
 
 export interface ContactTileGpuRendererOptions {
   texturePreference?: ContactTileGpuTexturePreference;
+  virtualTextureEnabled?: boolean;
   performanceEnabled?: boolean;
   emitPerformance?: (line: string) => void;
   clock?: () => number;
@@ -138,6 +146,131 @@ export function contactTileGpuDrawCoverageIsComplete(
   ));
 }
 
+export const contactTileVirtualPageTransposeFlag = 1;
+export const contactTileVirtualPageExactFlag = 2;
+
+export interface ContactTileVirtualPage {
+  pageX: number;
+  pageY: number;
+  tileKey: string;
+  tile: ContactMapTile;
+  transpose: boolean;
+}
+
+export interface ContactTileVirtualPagePlan {
+  originX: number;
+  originY: number;
+  width: number;
+  height: number;
+  pages: readonly ContactTileVirtualPage[];
+  populatedTiles: readonly { key: string; tile: ContactMapTile }[];
+}
+
+/** Build the compact world-page rectangle sampled by the pointer shader. */
+export function contactTileVirtualPagePlan(
+  descriptors: readonly ContactTileCanvasDescriptor[],
+): ContactTileVirtualPagePlan | null {
+  if (descriptors.length === 0) {
+    return null;
+  }
+  let minimumX = Number.POSITIVE_INFINITY;
+  let maximumX = Number.NEGATIVE_INFINITY;
+  let minimumY = Number.POSITIVE_INFINITY;
+  let maximumY = Number.NEGATIVE_INFINITY;
+  const pagesByCoordinate = new Map<string, ContactTileVirtualPage>();
+  const populatedTiles = new Map<string, ContactMapTile>();
+  for (const descriptor of descriptors) {
+    const pageX = descriptor.transpose ? descriptor.tile.tileY : descriptor.tile.tileX;
+    const pageY = descriptor.transpose ? descriptor.tile.tileX : descriptor.tile.tileY;
+    if (!Number.isSafeInteger(pageX) || !Number.isSafeInteger(pageY) || pageX < 0 || pageY < 0) {
+      return null;
+    }
+    const tileKey = contactTileKey(descriptor.tile);
+    pagesByCoordinate.set(`${pageX}:${pageY}`, {
+      pageX,
+      pageY,
+      tileKey,
+      tile: descriptor.tile,
+      transpose: descriptor.transpose,
+    });
+    if (contactTileCellCount(descriptor.tile) > 0) {
+      populatedTiles.set(tileKey, descriptor.tile);
+    }
+    minimumX = Math.min(minimumX, pageX);
+    maximumX = Math.max(maximumX, pageX);
+    minimumY = Math.min(minimumY, pageY);
+    maximumY = Math.max(maximumY, pageY);
+  }
+  const width = maximumX - minimumX + 1;
+  const height = maximumY - minimumY + 1;
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+  return {
+    originX: minimumX,
+    originY: minimumY,
+    width,
+    height,
+    pages: [...pagesByCoordinate.values()],
+    populatedTiles: [...populatedTiles].map(([key, tile]) => ({ key, tile })),
+  };
+}
+
+export function contactTileVirtualPageTableData(
+  plan: ContactTileVirtualPagePlan,
+  layerByTileKey: ReadonlyMap<string, number>,
+): Uint32Array | null {
+  const values = new Uint32Array(plan.width * plan.height * 2);
+  for (const page of plan.pages) {
+    const offset = (
+      (page.pageY - plan.originY) * plan.width
+      + page.pageX - plan.originX
+    ) * 2;
+    const populated = contactTileCellCount(page.tile) > 0;
+    const layer = populated ? layerByTileKey.get(page.tileKey) : undefined;
+    if (populated && layer === undefined) {
+      return null;
+    }
+    values[offset] = populated ? layer! + 1 : 0;
+    values[offset + 1] = (
+      (page.transpose ? contactTileVirtualPageTransposeFlag : 0)
+      | contactTileVirtualPageExactFlag
+    );
+  }
+  return values;
+}
+
+export interface ContactTileVirtualCamera {
+  pageX: number;
+  pageY: number;
+  localX: number;
+  localY: number;
+  spanX: number;
+  spanY: number;
+}
+
+/** Split large genome coordinates into exact integer pages and small shader floats. */
+export function contactTileVirtualCamera(
+  viewport: ContactViewport,
+  resolution: number,
+  tileSizeBins: number,
+): ContactTileVirtualCamera {
+  const tileSpan = resolution * tileSizeBins;
+  if (!Number.isSafeInteger(tileSpan) || tileSpan <= 0) {
+    throw new RangeError("virtual texture tile span must be a positive safe integer");
+  }
+  const pageX = Math.floor(viewport.xStart / tileSpan);
+  const pageY = Math.floor(viewport.yStart / tileSpan);
+  return {
+    pageX,
+    pageY,
+    localX: viewport.xStart / tileSpan - pageX,
+    localY: viewport.yStart / tileSpan - pageY,
+    spanX: (viewport.xEnd - viewport.xStart) / tileSpan,
+    spanY: (viewport.yEnd - viewport.yStart) / tileSpan,
+  };
+}
+
 interface GpuTextureEntry {
   texture: WebGLTexture;
   format: ContactTileGpuTextureFormat;
@@ -190,6 +323,37 @@ interface FramePresentationResources {
   texture: WebGLTexture;
   width: number;
   height: number;
+}
+
+interface VirtualTextureRendererResources {
+  program: WebGLProgram;
+  positionLocation: number;
+  tileArrayLocation: WebGLUniformLocation;
+  pageTableLocation: WebGLUniformLocation;
+  lutTextureLocation: WebGLUniformLocation;
+  overviewTextureLocation: WebGLUniformLocation;
+  cameraTilesLocation: WebGLUniformLocation;
+  cameraPageLocation: WebGLUniformLocation;
+  pageOriginLocation: WebGLUniformLocation;
+  pageSizeLocation: WebGLUniformLocation;
+  overviewUvRectLocation: WebGLUniformLocation;
+  hasOverviewLocation: WebGLUniformLocation;
+  scaleLocation: WebGLUniformLocation;
+  overviewScaleLocation: WebGLUniformLocation;
+  paletteStopCountLocation: WebGLUniformLocation;
+}
+
+interface VirtualTextureState {
+  tileArray: WebGLTexture;
+  pageTable: WebGLTexture;
+  capacity: number;
+  resolution: number;
+  tileSizeBins: number;
+  layerByTileKey: Map<string, number>;
+  tileByTileKey: Map<string, ContactMapTile>;
+  plan: ContactTileVirtualPagePlan;
+  pageTableData: Uint32Array;
+  bytes: number;
 }
 
 const vertexShaderSource = `#version 300 es
@@ -254,6 +418,119 @@ void main() {
   // relying on WKWebView to composite a transparent WebGL framebuffer; the
   // latter can expose black clear pixels and also applies alpha twice.
   out_color = vec4(mix(vec3(1.0), color.rgb, color.a), 1.0);
+}
+`;
+
+const virtualTextureVertexShaderSource = `#version 300 es
+in vec2 a_position;
+out vec2 v_uv;
+
+void main() {
+  vec2 clip = a_position * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+  v_uv = a_position;
+}
+`;
+
+const virtualTextureFragmentShaderSource = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp sampler2DArray;
+precision highp usampler2D;
+
+uniform sampler2DArray u_tile_array;
+uniform usampler2D u_page_table;
+uniform sampler2D u_lut;
+uniform sampler2D u_overview;
+uniform vec4 u_camera_tiles;
+uniform ivec2 u_camera_page;
+uniform ivec2 u_page_origin;
+uniform ivec2 u_page_size;
+uniform vec4 u_overview_uv_rect;
+uniform bool u_has_overview;
+uniform vec4 u_scale;
+uniform vec4 u_overview_scale;
+uniform float u_palette_stop_count;
+in vec2 v_uv;
+out vec4 out_color;
+
+float sample_overview(vec2 viewport_uv) {
+  if (!u_has_overview) {
+    return -1.0;
+  }
+  vec2 uv = vec2(
+    u_overview_uv_rect.x + viewport_uv.x * u_overview_uv_rect.y,
+    u_overview_uv_rect.z + viewport_uv.y * u_overview_uv_rect.w
+  );
+  if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) {
+    return -1.0;
+  }
+  return texture(u_overview, uv).r;
+}
+
+vec4 palette(float value, vec4 scale) {
+  float minimum = scale.x;
+  float maximum = scale.y;
+  float intensity;
+  if (maximum == minimum) {
+    intensity = value >= maximum ? 1.0 : 0.0;
+  } else if (scale.z > 0.5) {
+    float log_minimum = log(minimum + 1.0) / log(10.0);
+    float log_range = log(maximum + 1.0) / log(10.0) - log_minimum;
+    intensity = (log(value + 1.0) / log(10.0) - log_minimum) / log_range;
+  } else {
+    intensity = (value - minimum) / (maximum - minimum);
+  }
+  intensity = clamp(intensity, 0.0, 1.0);
+  float lut_index;
+  if (u_palette_stop_count > 0.5) {
+    float stop_index = min(
+      u_palette_stop_count - 1.0,
+      floor(intensity * u_palette_stop_count)
+    );
+    float representative = (stop_index + 0.5) / u_palette_stop_count;
+    lut_index = floor(representative * 255.0);
+  } else {
+    lut_index = floor(intensity * 255.0);
+  }
+  vec4 color = texelFetch(u_lut, ivec2(int(lut_index), 0), 0);
+  return vec4(mix(vec3(1.0), color.rgb, color.a), 1.0);
+}
+
+void main() {
+  vec2 relative_tile = vec2(
+    u_camera_tiles.x + v_uv.x * u_camera_tiles.y,
+    u_camera_tiles.z + v_uv.y * u_camera_tiles.w
+  );
+  ivec2 world_page = u_camera_page + ivec2(floor(relative_tile));
+  ivec2 page = world_page - u_page_origin;
+  bool page_in_range = all(greaterThanEqual(page, ivec2(0)))
+    && all(lessThan(page, u_page_size));
+  uvec2 entry = page_in_range
+    ? texelFetch(u_page_table, page, 0).rg
+    : uvec2(0u);
+  bool exact_page = (entry.g & 2u) != 0u;
+  float value = -1.0;
+  if (entry.r > 0u) {
+    vec2 local = fract(relative_tile);
+    if ((entry.g & 1u) != 0u) {
+      local = local.yx;
+    }
+    value = texture(u_tile_array, vec3(local, float(entry.r - 1u))).r;
+  }
+  if (value >= 0.0) {
+    out_color = palette(value, u_scale);
+    return;
+  }
+  if (exact_page) {
+    out_color = vec4(1.0);
+    return;
+  }
+  float overview_value = sample_overview(v_uv);
+  out_color = overview_value >= 0.0
+    ? palette(overview_value, u_overview_scale)
+    : vec4(1.0);
 }
 `;
 
@@ -528,6 +805,12 @@ export function contactTileGpuTexturePreference(
     : "r16f";
 }
 
+export function contactTileGpuVirtualTextureEnabled(
+  search = typeof location === "undefined" ? "" : location.search,
+) {
+  return new URLSearchParams(search).get("cstudioVirtualTexture") !== "0";
+}
+
 /** Convert the mutable streamed accumulator into the single-channel texture layout. */
 export function contactTileDenseFloatTextureData(
   buffer: ContactTileDenseDeltaBuffer,
@@ -621,6 +904,12 @@ function initialContactTileGpuPerformance(
     scenePromotions: 0,
     scenePromotionMisses: 0,
     scenePromotionMilliseconds: 0,
+    virtualTextureDraws: 0,
+    virtualTextureFallbacks: 0,
+    virtualTextureUploads: 0,
+    virtualTexturePages: 0,
+    virtualTextureLayers: 0,
+    virtualTextureBytes: 0,
     lastEmissionSignature: "",
   };
 }
@@ -656,6 +945,12 @@ function formatContactTileGpuPerformanceLog(
     `scene_promotions=${snapshot.scenePromotions}`,
     `scene_promotion_misses=${snapshot.scenePromotionMisses}`,
     `scene_promotion_ms=${roundGpuMilliseconds(snapshot.scenePromotionMilliseconds)}`,
+    `virtual_texture_draws=${snapshot.virtualTextureDraws}`,
+    `virtual_texture_fallbacks=${snapshot.virtualTextureFallbacks}`,
+    `virtual_texture_uploads=${snapshot.virtualTextureUploads}`,
+    `virtual_texture_pages=${snapshot.virtualTexturePages}`,
+    `virtual_texture_layers=${snapshot.virtualTextureLayers}`,
+    `virtual_texture_bytes=${snapshot.virtualTextureBytes}`,
   ].join(" ");
 }
 
@@ -697,6 +992,13 @@ export function createContactTileGpuRenderer(
     gl.deleteProgram(resources.program);
     return null;
   }
+  // The virtual-texture program is an optional WebGL2 acceleration path. A
+  // driver/compiler miss leaves the established per-tile renderer available.
+  const virtualTextureEnabled = options.virtualTextureEnabled
+    ?? contactTileGpuVirtualTextureEnabled();
+  const virtualResources = virtualTextureEnabled
+    ? createVirtualTextureRendererResources(gl)
+    : null;
 
   const texturePreference = options.texturePreference ?? contactTileGpuTexturePreference();
   const performanceEnabled = options.performanceEnabled ?? isContactTilePerformanceEnabled();
@@ -725,6 +1027,7 @@ export function createContactTileGpuRenderer(
   let uploadedBoundaries: readonly ContactTileGpuBoundary[] | null = null;
   let uploadedBoundaryCount = 0;
   let framePresentation: FramePresentationResources | null = null;
+  let virtualTextureState: VirtualTextureState | null = null;
 
   const updatePerformanceCacheState = () => {
     uploadContext.performance.cacheEntries = textureCache.size;
@@ -735,7 +1038,7 @@ export function createContactTileGpuRenderer(
       return;
     }
     updatePerformanceCacheState();
-    const signature = `${uploadContext.performance.uploads}:${uploadContext.performance.evictions}:${uploadContext.performance.scenePromotions}:${uploadContext.performance.scenePromotionMisses}:${textureCache.size}:${textureBytes}`;
+    const signature = `${uploadContext.performance.uploads}:${uploadContext.performance.evictions}:${uploadContext.performance.scenePromotions}:${uploadContext.performance.scenePromotionMisses}:${uploadContext.performance.virtualTextureUploads}:${uploadContext.performance.virtualTextureFallbacks}:${textureCache.size}:${textureBytes}`;
     if (signature === uploadContext.performance.lastEmissionSignature) {
       return;
     }
@@ -750,10 +1053,455 @@ export function createContactTileGpuRenderer(
     }
   };
 
+  const deleteVirtualTextureState = (state: VirtualTextureState | null) => {
+    if (!state) {
+      return;
+    }
+    gl.deleteTexture(state.tileArray);
+    gl.deleteTexture(state.pageTable);
+  };
+
+  const maximumVirtualTextureLayers = (tileSizeBins: number, pageBytes: number) => {
+    const driverMaximum = Number(gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS));
+    if (!Number.isFinite(driverMaximum) || driverMaximum < 1) {
+      return 0;
+    }
+    const bytesPerLayer = tileSizeBins * tileSizeBins * Float32Array.BYTES_PER_ELEMENT;
+    const budget = Math.max(
+      0,
+      Math.min(safeTextureBudget, contactTileGpuVirtualTextureBudgetBytes) - pageBytes,
+    );
+    return Math.max(0, Math.min(
+      Math.floor(driverMaximum),
+      Math.floor(budget / Math.max(1, bytesPerLayer)),
+    ));
+  };
+
+  const virtualPagePlanFits = (plan: ContactTileVirtualPagePlan) => {
+    const maximumTextureSize = Number(gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    const pageBytes = plan.width * plan.height * 2 * Uint32Array.BYTES_PER_ELEMENT;
+    return Number.isFinite(maximumTextureSize)
+      && plan.width <= maximumTextureSize
+      && plan.height <= maximumTextureSize
+      && Number.isSafeInteger(pageBytes)
+      && pageBytes <= Math.min(4 * 1024 * 1024, contactTileGpuVirtualTextureBudgetBytes / 4);
+  };
+
+  const virtualTextureCapacity = (required: number, maximum: number) => {
+    if (required > maximum || maximum <= 0) {
+      return 0;
+    }
+    let capacity = 1;
+    const target = Math.min(maximum, Math.max(required, required + 16));
+    while (capacity < target && capacity < maximum) {
+      capacity *= 2;
+    }
+    return Math.min(maximum, Math.max(required, capacity));
+  };
+
+  const rebuildVirtualTextureState = (activeScene: ContactTileGpuScene) => {
+    if (!virtualResources || activeScene.visibleLayerComplete !== true) {
+      return false;
+    }
+    const plan = contactTileVirtualPagePlan(activeScene.descriptors);
+    if (!plan || !virtualPagePlanFits(plan)) {
+      return false;
+    }
+    const pageBytes = plan.width * plan.height * 2 * Uint32Array.BYTES_PER_ELEMENT;
+    const maximumLayers = maximumVirtualTextureLayers(activeScene.tileSizeBins, pageBytes);
+    const capacity = virtualTextureCapacity(plan.populatedTiles.length, maximumLayers);
+    if (capacity === 0) {
+      return false;
+    }
+    const tileArray = gl.createTexture();
+    const pageTable = gl.createTexture();
+    if (!tileArray || !pageTable) {
+      if (tileArray) gl.deleteTexture(tileArray);
+      if (pageTable) gl.deleteTexture(pageTable);
+      return false;
+    }
+
+    const layerByTileKey = new Map<string, number>();
+    const tileByTileKey = new Map<string, ContactMapTile>();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tileArray);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    gl.texImage3D(
+      gl.TEXTURE_2D_ARRAY,
+      0,
+      gl.R32F,
+      activeScene.tileSizeBins,
+      activeScene.tileSizeBins,
+      capacity,
+      0,
+      gl.RED,
+      gl.FLOAT,
+      null,
+    );
+    if (gl.getError() !== gl.NO_ERROR) {
+      gl.deleteTexture(tileArray);
+      gl.deleteTexture(pageTable);
+      return false;
+    }
+    for (let layer = 0; layer < plan.populatedTiles.length; layer += 1) {
+      const { key, tile } = plan.populatedTiles[layer]!;
+      gl.texSubImage3D(
+        gl.TEXTURE_2D_ARRAY,
+        0,
+        0,
+        0,
+        layer,
+        activeScene.tileSizeBins,
+        activeScene.tileSizeBins,
+        1,
+        gl.RED,
+        gl.FLOAT,
+        contactTileFloatTextureData(tile, activeScene.tileSizeBins),
+      );
+      layerByTileKey.set(key, layer);
+      tileByTileKey.set(key, tile);
+    }
+    if (gl.getError() !== gl.NO_ERROR) {
+      gl.deleteTexture(tileArray);
+      gl.deleteTexture(pageTable);
+      return false;
+    }
+    const pageTableData = contactTileVirtualPageTableData(plan, layerByTileKey);
+    if (!pageTableData) {
+      gl.deleteTexture(tileArray);
+      gl.deleteTexture(pageTable);
+      return false;
+    }
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, pageTable);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RG32UI,
+      plan.width,
+      plan.height,
+      0,
+      gl.RG_INTEGER,
+      gl.UNSIGNED_INT,
+      pageTableData,
+    );
+    if (gl.getError() !== gl.NO_ERROR) {
+      gl.deleteTexture(tileArray);
+      gl.deleteTexture(pageTable);
+      return false;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+
+    const nextState: VirtualTextureState = {
+      tileArray,
+      pageTable,
+      capacity,
+      resolution: activeScene.resolution,
+      tileSizeBins: activeScene.tileSizeBins,
+      layerByTileKey,
+      tileByTileKey,
+      plan,
+      pageTableData,
+      bytes: (
+        capacity
+        * activeScene.tileSizeBins
+        * activeScene.tileSizeBins
+        * Float32Array.BYTES_PER_ELEMENT
+      ) + pageTableData.byteLength,
+    };
+    deleteVirtualTextureState(virtualTextureState);
+    virtualTextureState = nextState;
+    uploadContext.performance.virtualTextureUploads += plan.populatedTiles.length;
+    uploadContext.performance.virtualTexturePages = plan.pages.length;
+    uploadContext.performance.virtualTextureLayers = layerByTileKey.size;
+    uploadContext.performance.virtualTextureBytes = nextState.bytes;
+    return true;
+  };
+
+  const appendVirtualTextureScene = (activeScene: ContactTileGpuScene) => {
+    const current = virtualTextureState;
+    if (
+      !current
+      || current.resolution !== activeScene.resolution
+      || current.tileSizeBins !== activeScene.tileSizeBins
+      || activeScene.visibleLayerComplete !== true
+    ) {
+      return rebuildVirtualTextureState(activeScene);
+    }
+    const plan = contactTileVirtualPagePlan(activeScene.descriptors);
+    if (!plan || !virtualPagePlanFits(plan)) {
+      return false;
+    }
+    const missingLayerKeys = plan.populatedTiles.filter(
+      ({ key }) => !current.layerByTileKey.has(key),
+    );
+    if (current.layerByTileKey.size + missingLayerKeys.length > current.capacity) {
+      return rebuildVirtualTextureState(activeScene);
+    }
+    const pageBytes = plan.width * plan.height * 2 * Uint32Array.BYTES_PER_ELEMENT;
+    const layerBytes = current.capacity
+      * activeScene.tileSizeBins
+      * activeScene.tileSizeBins
+      * Float32Array.BYTES_PER_ELEMENT;
+    if (
+      layerBytes + pageBytes
+      > Math.min(safeTextureBudget, contactTileGpuVirtualTextureBudgetBytes)
+    ) {
+      return rebuildVirtualTextureState(activeScene);
+    }
+    const nextLayers = new Map(current.layerByTileKey);
+    const nextTiles = new Map(current.tileByTileKey);
+    let uploaded = 0;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, current.tileArray);
+    for (const { key, tile } of plan.populatedTiles) {
+      let layer = nextLayers.get(key);
+      if (layer === undefined) {
+        layer = nextLayers.size;
+        nextLayers.set(key, layer);
+      }
+      if (nextTiles.get(key) === tile) {
+        continue;
+      }
+      gl.texSubImage3D(
+        gl.TEXTURE_2D_ARRAY,
+        0,
+        0,
+        0,
+        layer,
+        activeScene.tileSizeBins,
+        activeScene.tileSizeBins,
+        1,
+        gl.RED,
+        gl.FLOAT,
+        contactTileFloatTextureData(tile, activeScene.tileSizeBins),
+      );
+      nextTiles.set(key, tile);
+      uploaded += 1;
+    }
+    if (uploaded > 0 && gl.getError() !== gl.NO_ERROR) {
+      return false;
+    }
+    const pageTableData = contactTileVirtualPageTableData(plan, nextLayers);
+    if (!pageTableData) {
+      return false;
+    }
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, current.pageTable);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RG32UI,
+      plan.width,
+      plan.height,
+      0,
+      gl.RG_INTEGER,
+      gl.UNSIGNED_INT,
+      pageTableData,
+    );
+    if (gl.getError() !== gl.NO_ERROR) {
+      return false;
+    }
+    current.layerByTileKey = nextLayers;
+    current.tileByTileKey = nextTiles;
+    current.plan = plan;
+    current.pageTableData = pageTableData;
+    current.bytes = (
+      current.capacity
+      * activeScene.tileSizeBins
+      * activeScene.tileSizeBins
+      * Float32Array.BYTES_PER_ELEMENT
+    ) + pageTableData.byteLength;
+    uploadContext.performance.virtualTextureUploads += uploaded;
+    uploadContext.performance.virtualTexturePages = plan.pages.length;
+    uploadContext.performance.virtualTextureLayers = nextLayers.size;
+    uploadContext.performance.virtualTextureBytes = current.bytes;
+    return true;
+  };
+
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.CULL_FACE);
   gl.disable(gl.BLEND);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+  const virtualTextureCoversViewport = (
+    state: VirtualTextureState,
+    viewport: ContactViewport,
+    overview: ContactTileGpuOverview | null,
+  ) => {
+    const tileSpan = state.resolution * state.tileSizeBins;
+    const firstX = Math.floor(viewport.xStart / tileSpan);
+    const lastX = Math.ceil(viewport.xEnd / tileSpan) - 1;
+    const firstY = Math.floor(viewport.yStart / tileSpan);
+    const lastY = Math.ceil(viewport.yEnd / tileSpan) - 1;
+    const overviewCoversViewport = Boolean(
+      overview
+      && overview.viewport.xStart <= viewport.xStart
+      && overview.viewport.xEnd >= viewport.xEnd
+      && overview.viewport.yStart <= viewport.yStart
+      && overview.viewport.yEnd >= viewport.yEnd,
+    );
+    for (let pageY = firstY; pageY <= lastY; pageY += 1) {
+      for (let pageX = firstX; pageX <= lastX; pageX += 1) {
+        const localX = pageX - state.plan.originX;
+        const localY = pageY - state.plan.originY;
+        const pageInRange = localX >= 0
+          && localX < state.plan.width
+          && localY >= 0
+          && localY < state.plan.height;
+        const flags = pageInRange
+          ? state.pageTableData[(localY * state.plan.width + localX) * 2 + 1]
+          : 0;
+        if ((flags & contactTileVirtualPageExactFlag) === 0 && !overviewCoversViewport) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
+  const drawVirtualTexturePan = (activeScene: ContactTileGpuScene) => {
+    const state = virtualTextureState;
+    if (
+      !virtualResources
+      || !state
+      || activeScene.visibleLayerComplete !== true
+      || state.resolution !== activeScene.resolution
+      || state.tileSizeBins !== activeScene.tileSizeBins
+      || !framePresentation
+      || !virtualTextureCoversViewport(state, activeScene.viewport, activeScene.overview ?? null)
+    ) {
+      uploadContext.performance.virtualTextureFallbacks += 1;
+      return false;
+    }
+    const overview = activeScene.overview ?? null;
+    if (overview && !overviewTextureEntry) {
+      uploadContext.performance.virtualTextureFallbacks += 1;
+      return false;
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framePresentation.framebuffer);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(virtualResources.program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, resources.quadBuffer);
+    gl.enableVertexAttribArray(virtualResources.positionLocation);
+    gl.vertexAttribPointer(virtualResources.positionLocation, 2, gl.FLOAT, false, 0, 0);
+    const camera = contactTileVirtualCamera(
+      activeScene.viewport,
+      activeScene.resolution,
+      activeScene.tileSizeBins,
+    );
+    gl.uniform4f(
+      virtualResources.cameraTilesLocation,
+      camera.localX,
+      camera.spanX,
+      camera.localY,
+      camera.spanY,
+    );
+    gl.uniform2i(
+      virtualResources.cameraPageLocation,
+      camera.pageX,
+      camera.pageY,
+    );
+    gl.uniform2i(
+      virtualResources.pageOriginLocation,
+      state.plan.originX,
+      state.plan.originY,
+    );
+    gl.uniform2i(
+      virtualResources.pageSizeLocation,
+      state.plan.width,
+      state.plan.height,
+    );
+    const exactScale = activeScene.renderStyle.colorScale;
+    const overviewScale = overview?.colorScale ?? exactScale;
+    gl.uniform4f(
+      virtualResources.scaleLocation,
+      Math.max(0, exactScale.min),
+      Math.max(Math.max(0, exactScale.min), exactScale.max),
+      exactScale.log ? 1 : 0,
+      0,
+    );
+    gl.uniform4f(
+      virtualResources.overviewScaleLocation,
+      Math.max(0, overviewScale.min),
+      Math.max(Math.max(0, overviewScale.min), overviewScale.max),
+      overviewScale.log ? 1 : 0,
+      0,
+    );
+    gl.uniform1f(
+      virtualResources.paletteStopCountLocation,
+      paletteStopCount(activeScene.renderStyle.colormap),
+    );
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, state.tileArray);
+    gl.uniform1i(virtualResources.tileArrayLocation, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, resources.lutTexture);
+    gl.uniform1i(virtualResources.lutTextureLocation, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, state.pageTable);
+    gl.uniform1i(virtualResources.pageTableLocation, 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, overviewTextureEntry?.texture ?? null);
+    gl.uniform1i(virtualResources.overviewTextureLocation, 3);
+    gl.uniform1i(virtualResources.hasOverviewLocation, overview ? 1 : 0);
+    const overviewXSpan = overview
+      ? Math.max(1, overview.viewport.xEnd - overview.viewport.xStart)
+      : 1;
+    const overviewYSpan = overview
+      ? Math.max(1, overview.viewport.yEnd - overview.viewport.yStart)
+      : 1;
+    gl.uniform4f(
+      virtualResources.overviewUvRectLocation,
+      overview ? (activeScene.viewport.xStart - overview.viewport.xStart) / overviewXSpan : 0,
+      overview
+        ? (activeScene.viewport.xEnd - activeScene.viewport.xStart) / overviewXSpan
+        : 1,
+      overview ? (activeScene.viewport.yStart - overview.viewport.yStart) / overviewYSpan : 0,
+      overview
+        ? (activeScene.viewport.yEnd - activeScene.viewport.yStart) / overviewYSpan
+        : 1,
+    );
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    const boundaries = activeScene.boundaries ?? [];
+    if (!drawBoundaryScene(
+      gl,
+      boundaryResources,
+      boundaries,
+      activeScene.viewport,
+      canvas.width,
+      canvas.height,
+      presentedCssWidth,
+      presentedCssHeight,
+      uploadedBoundaries,
+      uploadedBoundaryCount,
+    )) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      uploadContext.performance.virtualTextureFallbacks += 1;
+      return false;
+    }
+    if (uploadedBoundaries !== boundaries) {
+      uploadedBoundaries = boundaries;
+      uploadedBoundaryCount = boundaries.length;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+    uploadContext.performance.virtualTextureDraws += 1;
+    return true;
+  };
 
   const draw = (
     panOnly = false,
@@ -1087,7 +1835,11 @@ export function createContactTileGpuRenderer(
       deltaBuffers = new Map();
       pendingAppendedDescriptors.clear();
       scene = nextScene;
-      return draw();
+      const drawn = draw();
+      if (drawn) {
+        rebuildVirtualTextureState(nextScene);
+      }
+      return drawn;
     },
     promoteScene: (nextScene) => {
       const startedAt = uploadContext.clock();
@@ -1299,6 +2051,9 @@ export function createContactTileGpuRenderer(
       // framebuffer here; the next requestAnimationFrame pan uses the expanded
       // descriptor set, while a stationary pointer keeps the current frame.
       scene = { ...currentScene, descriptors: retainedDescriptors };
+      if (!appendVirtualTextureScene(scene)) {
+        uploadContext.performance.virtualTextureFallbacks += 1;
+      }
       textureBytes = cachedTextureBytes(textureCache);
       if (textureBytes > safeTextureBudget) {
         const protectedKeys = new Set(
@@ -1403,13 +2158,23 @@ export function createContactTileGpuRenderer(
         return;
       }
       // Pretext/Juicebox-style camera navigation: the visible textures are
-      // always projected by the current camera. There is no second pixel
-      // translation to clear when the pointer is released.
-      if (draw(true)) {
+      // sampled through one page-table draw. The established per-tile path is
+      // retained only for unsupported drivers or incomplete page coverage.
+      const activeScene = scene;
+      if (
+        (activeScene && drawVirtualTexturePan(activeScene))
+        || draw(true)
+      ) {
         pendingAppendedDescriptors.clear();
       }
     },
-    redraw: draw,
+    redraw: () => {
+      const drawn = draw();
+      if (drawn && scene) {
+        rebuildVirtualTextureState(scene);
+      }
+      return drawn;
+    },
     performanceSnapshot: () => {
       updatePerformanceCacheState();
       return contactTileGpuPerformanceSnapshot(uploadContext.performance);
@@ -1432,6 +2197,11 @@ export function createContactTileGpuRenderer(
         gl.deleteFramebuffer(framePresentation.framebuffer);
         gl.deleteTexture(framePresentation.texture);
         framePresentation = null;
+      }
+      deleteVirtualTextureState(virtualTextureState);
+      virtualTextureState = null;
+      if (virtualResources) {
+        gl.deleteProgram(virtualResources.program);
       }
       gl.deleteTexture(resources.lutTexture);
       gl.deleteBuffer(resources.quadBuffer);
@@ -1944,6 +2714,84 @@ function createRendererResources(gl: WebGL2RenderingContext): RendererResources 
     tileTextureLocation,
     lutTextureLocation,
     scaleLocation,
+    paletteStopCountLocation,
+  };
+}
+
+function createVirtualTextureRendererResources(
+  gl: WebGL2RenderingContext,
+): VirtualTextureRendererResources | null {
+  const vertexShader = compileShader(gl, gl.VERTEX_SHADER, virtualTextureVertexShaderSource);
+  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, virtualTextureFragmentShaderSource);
+  if (!vertexShader || !fragmentShader) {
+    if (vertexShader) gl.deleteShader(vertexShader);
+    if (fragmentShader) gl.deleteShader(fragmentShader);
+    return null;
+  }
+  const program = gl.createProgram();
+  if (!program) {
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    return null;
+  }
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    gl.deleteProgram(program);
+    return null;
+  }
+
+  const positionLocation = gl.getAttribLocation(program, "a_position");
+  const tileArrayLocation = gl.getUniformLocation(program, "u_tile_array");
+  const pageTableLocation = gl.getUniformLocation(program, "u_page_table");
+  const lutTextureLocation = gl.getUniformLocation(program, "u_lut");
+  const overviewTextureLocation = gl.getUniformLocation(program, "u_overview");
+  const cameraTilesLocation = gl.getUniformLocation(program, "u_camera_tiles");
+  const cameraPageLocation = gl.getUniformLocation(program, "u_camera_page");
+  const pageOriginLocation = gl.getUniformLocation(program, "u_page_origin");
+  const pageSizeLocation = gl.getUniformLocation(program, "u_page_size");
+  const overviewUvRectLocation = gl.getUniformLocation(program, "u_overview_uv_rect");
+  const hasOverviewLocation = gl.getUniformLocation(program, "u_has_overview");
+  const scaleLocation = gl.getUniformLocation(program, "u_scale");
+  const overviewScaleLocation = gl.getUniformLocation(program, "u_overview_scale");
+  const paletteStopCountLocation = gl.getUniformLocation(program, "u_palette_stop_count");
+  if (
+    positionLocation < 0
+    || !tileArrayLocation
+    || !pageTableLocation
+    || !lutTextureLocation
+    || !overviewTextureLocation
+    || !cameraTilesLocation
+    || !cameraPageLocation
+    || !pageOriginLocation
+    || !pageSizeLocation
+    || !overviewUvRectLocation
+    || !hasOverviewLocation
+    || !scaleLocation
+    || !overviewScaleLocation
+    || !paletteStopCountLocation
+  ) {
+    gl.deleteProgram(program);
+    return null;
+  }
+  return {
+    program,
+    positionLocation,
+    tileArrayLocation,
+    pageTableLocation,
+    lutTextureLocation,
+    overviewTextureLocation,
+    cameraTilesLocation,
+    cameraPageLocation,
+    pageOriginLocation,
+    pageSizeLocation,
+    overviewUvRectLocation,
+    hasOverviewLocation,
+    scaleLocation,
+    overviewScaleLocation,
     paletteStopCountLocation,
   };
 }

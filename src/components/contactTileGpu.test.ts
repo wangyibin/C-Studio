@@ -8,12 +8,21 @@ import {
   contactTileGpuBoundaryInstanceData,
   contactTileGpuDrawCoverageIsComplete,
   contactTileGpuTexturePreference,
+  contactTileGpuVirtualTextureBudgetBytes,
+  contactTileGpuVirtualTextureEnabled,
+  contactTileVirtualCamera,
+  contactTileVirtualPageExactFlag,
+  contactTileVirtualPagePlan,
+  contactTileVirtualPageTableData,
+  contactTileVirtualPageTransposeFlag,
   createContactTileGpuRenderer,
 } from "./contactTileGpu";
 
 function mockWebGlCanvas() {
   const texImage2D = vi.fn();
   const texSubImage2D = vi.fn();
+  const texImage3D = vi.fn();
+  const texSubImage3D = vi.fn();
   const getError = vi.fn(() => 0);
   const drawArrays = vi.fn();
   const drawArraysInstanced = vi.fn();
@@ -39,11 +48,15 @@ function mockWebGlCanvas() {
     UNPACK_ALIGNMENT: 11,
     TEXTURE0: 12,
     TEXTURE1: 13,
+    TEXTURE2: 35,
+    TEXTURE3: 36,
     TEXTURE_2D: 14,
+    TEXTURE_2D_ARRAY: 37,
     TEXTURE_MIN_FILTER: 15,
     TEXTURE_MAG_FILTER: 16,
     TEXTURE_WRAP_S: 17,
     TEXTURE_WRAP_T: 18,
+    TEXTURE_WRAP_R: 38,
     NEAREST: 19,
     CLAMP_TO_EDGE: 20,
     R32F: 21,
@@ -59,6 +72,11 @@ function mockWebGlCanvas() {
     DRAW_FRAMEBUFFER: 32,
     COLOR_ATTACHMENT0: 33,
     FRAMEBUFFER_COMPLETE: 34,
+    RG32UI: 39,
+    RG_INTEGER: 40,
+    UNSIGNED_INT: 41,
+    MAX_ARRAY_TEXTURE_LAYERS: 42,
+    MAX_TEXTURE_SIZE: 43,
     NO_ERROR: 0,
     createShader: vi.fn(() => ({})),
     shaderSource: vi.fn(),
@@ -77,6 +95,7 @@ function mockWebGlCanvas() {
     bufferData,
     getAttribLocation: vi.fn(() => 0),
     getUniformLocation: vi.fn(() => ({})),
+    getParameter: vi.fn(() => 256),
     deleteBuffer: vi.fn(),
     deleteTexture: vi.fn(),
     deleteFramebuffer: vi.fn(),
@@ -98,6 +117,7 @@ function mockWebGlCanvas() {
     vertexAttribPointer: vi.fn(),
     vertexAttribDivisor: vi.fn(),
     uniform2f: vi.fn(),
+    uniform2i: vi.fn(),
     uniform4f,
     uniform1f: vi.fn(),
     uniform1i: vi.fn(),
@@ -106,6 +126,8 @@ function mockWebGlCanvas() {
     texParameteri: vi.fn(),
     texImage2D,
     texSubImage2D,
+    texImage3D,
+    texSubImage3D,
     drawArrays,
     drawArraysInstanced,
     getError,
@@ -129,12 +151,129 @@ function mockWebGlCanvas() {
     getError,
     scissor,
     texImage2D,
+    texImage3D,
     texSubImage2D,
+    texSubImage3D,
     uniform4f,
   };
 }
 
 describe("contactTileFloatTextureData", () => {
+  it("builds a compact virtual page table with one shared layer for mirrors", () => {
+    const populatedTile = {
+      tileX: 2,
+      tileY: 3,
+      cells: [{ xBin: 8, yBin: 12, count: 5 }],
+    };
+    const emptyTile = { tileX: 4, tileY: 3, cells: [] };
+    const plan = contactTileVirtualPagePlan([
+      { key: "2:3", tile: populatedTile, transpose: false },
+      { key: "3:2", tile: populatedTile, transpose: true },
+      { key: "4:3", tile: emptyTile, transpose: false },
+    ]);
+    expect(plan).toMatchObject({
+      originX: 2,
+      originY: 2,
+      width: 3,
+      height: 2,
+    });
+    expect(plan?.populatedTiles).toHaveLength(1);
+    const table = contactTileVirtualPageTableData(
+      plan!,
+      new Map([["2:3", 6]]),
+    );
+    const entry = (x: number, y: number) => {
+      const offset = ((y - plan!.originY) * plan!.width + x - plan!.originX) * 2;
+      return [table![offset], table![offset + 1]];
+    };
+    expect(entry(2, 3)).toEqual([7, contactTileVirtualPageExactFlag]);
+    expect(entry(3, 2)).toEqual([
+      7,
+      contactTileVirtualPageExactFlag | contactTileVirtualPageTransposeFlag,
+    ]);
+    expect(entry(4, 3)).toEqual([0, contactTileVirtualPageExactFlag]);
+  });
+
+  it("rejects virtual pages outside the non-negative safe tile grid", () => {
+    expect(contactTileVirtualPagePlan([{
+      key: "invalid",
+      tile: { tileX: -1, tileY: 0, cells: [] },
+      transpose: false,
+    }])).toBeNull();
+  });
+
+  it("keeps 10 Gb cameras precise by sending only page-local floats to the shader", () => {
+    const viewport = {
+      xStart: 9_737_100_000,
+      xEnd: 9_911_600_000,
+      yStart: 9_737_100_000,
+      yEnd: 9_911_600_000,
+    };
+    const camera = contactTileVirtualCamera(viewport, 1_000, 256);
+    expect(camera.localX).toBeGreaterThanOrEqual(0);
+    expect(camera.localX).toBeLessThan(1);
+    expect(camera.localY).toBeGreaterThanOrEqual(0);
+    expect(camera.localY).toBeLessThan(1);
+    expect((camera.pageX + camera.localX) * 256_000).toBeCloseTo(viewport.xStart, 5);
+    expect((camera.pageY + camera.localY) * 256_000).toBeCloseTo(viewport.yStart, 5);
+    expect(camera.spanX * 256_000).toBeCloseTo(viewport.xEnd - viewport.xStart, 5);
+  });
+
+  it("reduces a multi-tile pointer frame to one draw with a legacy fallback switch", () => {
+    const descriptors = Array.from({ length: 8 }, (_, index) => {
+      const tileX = index % 4;
+      const tileY = Math.floor(index / 4);
+      return {
+        key: `${tileX}:${tileY}`,
+        tile: {
+          tileX,
+          tileY,
+          cells: [{ xBin: tileX * 4, yBin: tileY * 4, count: index + 1 }],
+        },
+        transpose: false,
+      };
+    });
+    const scene = {
+      descriptors,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 15_900, yStart: 0, yEnd: 7_900 },
+      renderStyle: {
+        colormap: "Reds" as const,
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    };
+
+    const virtualMock = mockWebGlCanvas();
+    const virtualRenderer = createContactTileGpuRenderer(
+      virtualMock.canvas,
+      4 * 1024 * 1024,
+      { performanceEnabled: false, virtualTextureEnabled: true },
+    );
+    expect(virtualRenderer?.setScene(scene)).toBe(true);
+    const virtualDrawsBeforePan = virtualMock.drawArrays.mock.calls.length;
+    virtualRenderer?.setPanViewport({ xStart: 100, xEnd: 16_000, yStart: 0, yEnd: 7_900 });
+    expect(virtualMock.drawArrays).toHaveBeenCalledTimes(virtualDrawsBeforePan + 1);
+    expect(virtualRenderer?.performanceSnapshot().virtualTextureDraws).toBe(1);
+    expect(virtualRenderer?.performanceSnapshot().virtualTextureBytes)
+      .toBeLessThanOrEqual(contactTileGpuVirtualTextureBudgetBytes);
+
+    const legacyMock = mockWebGlCanvas();
+    const legacyRenderer = createContactTileGpuRenderer(
+      legacyMock.canvas,
+      4 * 1024 * 1024,
+      { performanceEnabled: false, virtualTextureEnabled: false },
+    );
+    expect(legacyRenderer?.setScene(scene)).toBe(true);
+    const legacyDrawsBeforePan = legacyMock.drawArrays.mock.calls.length;
+    legacyRenderer?.setPanViewport({ xStart: 100, xEnd: 16_000, yStart: 0, yEnd: 7_900 });
+    expect(legacyMock.drawArrays).toHaveBeenCalledTimes(legacyDrawsBeforePan + 8);
+    expect(legacyRenderer?.performanceSnapshot().virtualTextureDraws).toBe(0);
+    virtualRenderer?.destroy();
+    legacyRenderer?.destroy();
+  });
+
   it("builds one fixed overview and accounts preferred R16F storage", () => {
     const overview = contactOverviewFloatTextureData({
       resolution: 100,
@@ -155,6 +294,12 @@ describe("contactTileFloatTextureData", () => {
     expect(contactTileGpuTexturePreference("")).toBe("r16f");
     expect(contactTileGpuTexturePreference("?cstudioGpuTexture=r16f")).toBe("r16f");
     expect(contactTileGpuTexturePreference("?cstudioGpuTexture=r32f")).toBe("r32f");
+  });
+
+  it("enables the virtual texture path by default with an explicit diagnostic opt-out", () => {
+    expect(contactTileGpuVirtualTextureEnabled("")).toBe(true);
+    expect(contactTileGpuVirtualTextureEnabled("?cstudioVirtualTexture=1")).toBe(true);
+    expect(contactTileGpuVirtualTextureEnabled("?cstudioVirtualTexture=0")).toBe(false);
   });
 
   it("accepts finite half-float values and rejects overflow or non-finite values", () => {
@@ -612,7 +757,9 @@ describe("contactTileFloatTextureData", () => {
       clientWidthRead,
       drawArrays,
       texImage2D,
+      texImage3D,
       texSubImage2D,
+      texSubImage3D,
     } = mockWebGlCanvas();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
     const firstTile = {
@@ -748,7 +895,9 @@ describe("contactTileFloatTextureData", () => {
       clientWidthRead,
       drawArrays,
       texImage2D,
+      texImage3D,
       texSubImage2D,
+      texSubImage3D,
     } = mockWebGlCanvas();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
       performanceEnabled: false,
@@ -808,16 +957,26 @@ describe("contactTileFloatTextureData", () => {
     // scene so the next pointer frame can draw the old front and new edge tile
     // together without waiting for the terminal target generation.
     const imageUploadsBeforePointer = texImage2D.mock.calls.length;
+    const arrayAllocationsBeforePointer = texImage3D.mock.calls.length;
     const subUploadsBeforePointer = texSubImage2D.mock.calls.length;
+    const arrayUploadsBeforePointer = texSubImage3D.mock.calls.length;
     const layoutReadsBeforePointer = clientWidthRead.mock.calls.length
       + clientHeightRead.mock.calls.length;
-    renderer?.setPanViewport({ xStart: 4_250, xEnd: 8_250, yStart: 0, yEnd: 4_000 });
-    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforePrefetch + 2);
+    renderer?.setPanViewport({ xStart: 4_000, xEnd: 8_000, yStart: 0, yEnd: 4_000 });
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforePrefetch + 1);
     expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePrefetch + 1);
     expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePointer);
     expect(texSubImage2D).toHaveBeenCalledTimes(subUploadsBeforePointer);
+    expect(texImage3D).toHaveBeenCalledTimes(arrayAllocationsBeforePointer);
+    expect(texSubImage3D).toHaveBeenCalledTimes(arrayUploadsBeforePointer);
     expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
       .toBe(layoutReadsBeforePointer);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      virtualTextureDraws: 1,
+      virtualTextureFallbacks: 1,
+      virtualTexturePages: 2,
+      virtualTextureLayers: 2,
+    });
 
     const targetTile = {
       ...completedPrefetchedTile,
