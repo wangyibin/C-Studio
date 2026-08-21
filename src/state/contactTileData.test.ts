@@ -72,6 +72,28 @@ describe("contact tile cell access", () => {
     expect(appendContactTileCounts(dense, [])).toEqual([4.5, 8]);
   });
 
+  it("reads dense R16F tiles without expanding their retained storage", () => {
+    const values = new Uint16Array(16);
+    values.fill(0xbc00);
+    values[9] = 0x4480;
+    values[15] = 0x4800;
+    const dense: ContactTileData = {
+      tileX: 2,
+      tileY: 3,
+      cells: [],
+      denseR16fValues: values,
+      denseOccupiedCount: 2,
+    };
+
+    expect(contactTileCellCount(dense)).toBe(2);
+    expect(materializeContactTileCells(dense, 4)).toEqual([
+      { xBin: 9, yBin: 14, count: 4.5 },
+      { xBin: 11, yBin: 15, count: 8 },
+    ]);
+    expect(appendContactTileCounts(dense, [])).toEqual([4.5, 8]);
+    expect(values.byteLength).toBe(16 * 2);
+  });
+
   it("uses packed arrays as the authority during a transitional mixed payload", () => {
     const mixed: ContactTileData = {
       ...packedTile,

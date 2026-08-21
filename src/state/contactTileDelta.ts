@@ -1,6 +1,10 @@
 import type { ContactMapTile } from "../App";
 import { forEachContactTileCell } from "./contactTileData";
 import {
+  contactTileR16fEmptySentinel,
+  contactTileR16fIsFinite,
+} from "./contactTileR16f";
+import {
   canonicalContactTile,
   contactTileKey,
   type ContactMapTileKey,
@@ -14,6 +18,8 @@ export interface ContactTileDenseDeltaBuffer {
   occupiedCount: number;
   /** Completed display-cache payload; authoritative `-1`-sentinel Float32 texture data. */
   completeValues?: Float32Array;
+  /** Completed GPU-ready display-cache payload; `0xbc00` is the empty sentinel. */
+  completeR16fValues?: Uint16Array;
 }
 
 export interface ContactTileDenseFloat32Payload {
@@ -21,7 +27,20 @@ export interface ContactTileDenseFloat32Payload {
   tileY: number;
   values: Float32Array;
   occupiedCount: number;
+  format?: "float32";
 }
+
+export interface ContactTileDenseR16fPayload {
+  tileX: number;
+  tileY: number;
+  values: Uint16Array;
+  occupiedCount: number;
+  format: "r16f";
+}
+
+export type ContactTileDenseCompletePayload =
+  | ContactTileDenseFloat32Payload
+  | ContactTileDenseR16fPayload;
 
 export interface ContactTileDeltaBatch {
   deltas: readonly ContactMapTile[];
@@ -69,7 +88,7 @@ export interface ContactTileDeltaRenderStream {
 /**
  * Frontend half of the additive single-scan protocol. Dense per-tile buffers
  * make repeated cell updates O(1). Final snapshots keep completed cache hits
- * as Float32 and pack only genuinely streamed sparse tiles for the LRU.
+ * in their Float32/R16F wire format and pack only genuinely streamed sparse tiles for the LRU.
  */
 export class ContactTileDeltaAccumulator {
   private readonly tiles = new Map<string, ContactTileDenseDeltaBuffer>();
@@ -111,7 +130,7 @@ export class ContactTileDeltaAccumulator {
       if (!target) {
         throw new Error(`contact tile delta contains unrequested tile ${key}`);
       }
-      if (target.completeValues) {
+      if (target.completeValues || target.completeR16fValues) {
         throw new Error(`contact tile delta follows a completed dense tile ${key}`);
       }
       forEachContactTileCell(delta, this.tileSizeBins, (xBin, yBin, count) => {
@@ -144,8 +163,8 @@ export class ContactTileDeltaAccumulator {
     return changedTileKeys;
   }
 
-  /** Install terminal Float32 display tiles without rebuilding sparse cells. */
-  mergeDenseComplete(tiles: readonly ContactTileDenseFloat32Payload[]): string[] {
+  /** Install terminal Float32/R16F display tiles without rebuilding sparse cells. */
+  mergeDenseComplete(tiles: readonly ContactTileDenseCompletePayload[]): string[] {
     const changedTileKeys: string[] = [];
     const expectedValues = this.tileSizeBins * this.tileSizeBins;
     for (const dense of tiles) {
@@ -158,25 +177,37 @@ export class ContactTileDeltaAccumulator {
       if (!target) {
         throw new Error(`dense contact tile contains unrequested tile ${key}`);
       }
-      if (target.occupiedCount !== 0 || target.completeValues) {
+      if (target.occupiedCount !== 0 || target.completeValues || target.completeR16fValues) {
         throw new Error(`dense contact tile replaces existing data ${key}`);
       }
       if (dense.values.length !== expectedValues) {
         throw new RangeError(`dense contact tile ${key} does not match tile size`);
       }
       let occupiedCount = 0;
-      for (const value of dense.values) {
-        if (!Number.isFinite(value)) {
-          throw new RangeError(`dense contact tile ${key} contains a non-finite value`);
+      if (dense.format === "r16f") {
+        for (const value of dense.values) {
+          if (!contactTileR16fIsFinite(value)) {
+            throw new RangeError(`dense R16F contact tile ${key} contains a non-finite value`);
+          }
+          if (value !== contactTileR16fEmptySentinel) {
+            occupiedCount += 1;
+          }
         }
-        if (value !== -1) {
-          occupiedCount += 1;
+        target.completeR16fValues = dense.values;
+      } else {
+        for (const value of dense.values) {
+          if (!Number.isFinite(value)) {
+            throw new RangeError(`dense contact tile ${key} contains a non-finite value`);
+          }
+          if (value !== -1) {
+            occupiedCount += 1;
+          }
         }
+        target.completeValues = dense.values;
       }
       if (occupiedCount !== dense.occupiedCount) {
         throw new RangeError(`dense contact tile ${key} occupied count mismatch`);
       }
-      target.completeValues = dense.values;
       target.occupiedCount = occupiedCount;
       // Completed cache hits no longer need the additive Float64/occupancy staging pair.
       target.counts = new Float64Array(0);
@@ -235,7 +266,8 @@ export class ContactTileDeltaAccumulator {
     for (const tile of this.tiles.values()) {
       bytes += tile.counts.byteLength
         + tile.occupied.byteLength
-        + (tile.completeValues?.byteLength ?? 0);
+        + (tile.completeValues?.byteLength ?? 0)
+        + (tile.completeR16fValues?.byteLength ?? 0);
     }
     return bytes;
   }
@@ -252,6 +284,15 @@ export class ContactTileDeltaAccumulator {
         tileY: tile.tile.tileY,
         cells: [],
         denseValues: tile.completeValues,
+        denseOccupiedCount: tile.occupiedCount,
+      };
+    }
+    if (tile.completeR16fValues) {
+      return {
+        tileX: tile.tile.tileX,
+        tileY: tile.tile.tileY,
+        cells: [],
+        denseR16fValues: tile.completeR16fValues,
         denseOccupiedCount: tile.occupiedCount,
       };
     }

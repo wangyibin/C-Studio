@@ -70,6 +70,26 @@ describe("ContactTileDeltaAccumulator", () => {
     expect(finished.packedCells).toBeUndefined();
   });
 
+  it("keeps GPU-ready display-cache tiles as R16F through finish", () => {
+    const accumulator = new ContactTileDeltaAccumulator([{ tileX: 1, tileY: 2 }], 2);
+    const values = new Uint16Array([0xbc00, 0x3e00, 0x4080, 0]);
+
+    expect(accumulator.mergeDenseComplete([{
+      tileX: 1,
+      tileY: 2,
+      format: "r16f",
+      values,
+      occupiedCount: 3,
+    }])).toEqual(["1:2"]);
+
+    expect(accumulator.denseBuffer({ tileX: 1, tileY: 2 })!.completeR16fValues).toBe(values);
+    expect(accumulator.allocatedBytes).toBe(values.byteLength);
+    const finished = accumulator.finish()[0]!;
+    expect(finished.denseR16fValues).toBe(values);
+    expect(finished.denseOccupiedCount).toBe(3);
+    expect(finished.denseValues).toBeUndefined();
+  });
+
   it("rejects deltas for tiles outside the request", () => {
     const accumulator = new ContactTileDeltaAccumulator([{ tileX: 0, tileY: 0 }], 4);
     expect(() => accumulator.merge([{

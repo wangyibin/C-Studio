@@ -50,6 +50,7 @@ function mockWebGlCanvas() {
     ARRAY_BUFFER: 5,
     STATIC_DRAW: 6,
     FLOAT: 7,
+    HALF_FLOAT: 55,
     DEPTH_TEST: 8,
     CULL_FACE: 9,
     BLEND: 10,
@@ -661,6 +662,7 @@ describe("contactTileFloatTextureData", () => {
     const renderer = createContactTileGpuRenderer(canvas, 256, {
       performanceEnabled: false,
       virtualTextureEnabled: true,
+      texturePreference: "r32f",
     });
     const renderStyle = {
       colormap: "Reds" as const,
@@ -766,6 +768,50 @@ describe("contactTileFloatTextureData", () => {
       r32fUploads: 0,
       cacheEntries: 1,
       cacheBytes: 4 * 4 * 2,
+    });
+    renderer?.destroy();
+  });
+
+  it("uploads cached R16F bits directly with HALF_FLOAT", () => {
+    const { canvas, texImage2D } = mockWebGlCanvas();
+    const values = new Uint16Array([
+      0x3c00, 0xbc00, 0xbc00, 0xbc00,
+      0xbc00, 0xbc00, 0xbc00, 0xbc00,
+      0xbc00, 0xbc00, 0xbc00, 0xbc00,
+      0xbc00, 0xbc00, 0xbc00, 0xbc00,
+    ]);
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      texturePreference: "r16f",
+      virtualTextureEnabled: false,
+      performanceEnabled: false,
+    });
+
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:1:source",
+        tile: {
+          tileX: 0,
+          tileY: 1,
+          cells: [],
+          denseR16fValues: values,
+          denseOccupiedCount: 1,
+        },
+        transpose: false,
+      }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 4_000, yEnd: 8_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+
+    const upload = texImage2D.mock.calls.find((call) => call[2] === 29 && call[8] === values);
+    expect(upload?.[7]).toBe(55);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      r16fUploads: 1,
+      cacheBytes: values.byteLength,
     });
     renderer?.destroy();
   });

@@ -10,6 +10,10 @@ import {
   validatedDenseContactTileValues,
   validatedPackedContactTileCells,
 } from "../state/contactTileData";
+import {
+  contactTileR16fEmptySentinel,
+  contactTileR16fValuesToFloat32,
+} from "../state/contactTileR16f";
 import { contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
 import { isContactTilePerformanceEnabled } from "../state/contactTilePerformance";
@@ -29,6 +33,9 @@ export const contactTileGpuUploadBudgetMilliseconds = 2;
 
 export type ContactTileGpuTextureFormat = "r16f" | "r32f";
 export type ContactTileGpuTexturePreference = ContactTileGpuTextureFormat;
+export type ContactTileGpuTextureData =
+  | { format: "float32"; values: Float32Array }
+  | { format: "r16f"; values: Uint16Array };
 
 export interface ContactTileGpuPerformanceSnapshot {
   texturePreference: ContactTileGpuTexturePreference;
@@ -238,6 +245,7 @@ export interface ContactTileGpuUploadCandidate {
  */
 export function contactTileGpuUploadPlan(
   scene: ContactTileGpuScene,
+  targetFormat: ContactTileGpuTextureFormat = "r32f",
 ): ContactTileGpuUploadCandidate[] {
   const tiles = new Map<string, ContactMapTile>();
   const descriptors = scene.sourceLayout?.descriptors ?? scene.descriptors;
@@ -246,7 +254,6 @@ export function contactTileGpuUploadPlan(
       tiles.set(contactTileKey(descriptor.tile), descriptor.tile);
     }
   }
-  const bytes = scene.tileSizeBins * scene.tileSizeBins * Float32Array.BYTES_PER_ELEMENT;
   const sourceRanks = scene.sourceLayout
     ? contactSourceTilePriorityRanks(scene)
     : null;
@@ -260,7 +267,11 @@ export function contactTileGpuUploadPlan(
       priority: uploadPriorityName(ranked.rank),
       priorityRank: ranked.rank,
       distance: ranked.distance,
-      bytes,
+      bytes: scene.tileSizeBins * scene.tileSizeBins * (
+        targetFormat === "r16f" && tile.denseR16fValues
+          ? Uint16Array.BYTES_PER_ELEMENT
+          : Float32Array.BYTES_PER_ELEMENT
+      ),
     };
   }).sort((left, right) => (
     left.priorityRank - right.priorityRank
@@ -667,6 +678,7 @@ interface VirtualTextureState {
   capacity: number;
   resolution: number;
   tileSizeBins: number;
+  format: ContactTileGpuTextureFormat;
   layerByTileKey: Map<string, number>;
   tileByTileKey: Map<string, ContactMapTile>;
   generationByTileKey: Map<string, number | undefined>;
@@ -1032,12 +1044,15 @@ export function contactTileFloatTextureData(
     if (dense.values.length !== cellCount) {
       throw new RangeError("dense contact tile does not match tile size");
     }
+    const source = dense.format === "r16f"
+      ? contactTileR16fValuesToFloat32(dense.values)
+      : dense.values;
     if (tile.tileX !== tile.tileY) {
-      return dense.values;
+      return source;
     }
-    const mirrored = dense.values.slice();
+    const mirrored = source.slice();
     for (let index = 0; index < cellCount; index += 1) {
-      const value = dense.values[index];
+      const value = source[index];
       if (value === -1) {
         continue;
       }
@@ -1084,6 +1099,37 @@ export function contactTileFloatTextureData(
     write(cell.xBin - tileStartX, cell.yBin - tileStartY, cell.count);
   }
   return values;
+}
+
+/** Preserve GPU-ready half bits when a completed display-cache tile provides them. */
+export function contactTileGpuTextureData(
+  tile: ContactMapTile,
+  tileSizeBins: number,
+): ContactTileGpuTextureData {
+  const dense = validatedDenseContactTileValues(tile);
+  if (dense?.format !== "r16f") {
+    return { format: "float32", values: contactTileFloatTextureData(tile, tileSizeBins) };
+  }
+  const cellCount = tileSizeBins * tileSizeBins;
+  if (dense.values.length !== cellCount) {
+    throw new RangeError("dense R16F contact tile does not match tile size");
+  }
+  if (tile.tileX !== tile.tileY) {
+    return { format: "r16f", values: dense.values };
+  }
+  const mirrored = dense.values.slice();
+  for (let index = 0; index < cellCount; index += 1) {
+    const value = dense.values[index];
+    if (value === contactTileR16fEmptySentinel) {
+      continue;
+    }
+    const x = index % tileSizeBins;
+    const y = Math.floor(index / tileSizeBins);
+    if (x !== y) {
+      mirrored[x * tileSizeBins + y] = value;
+    }
+  }
+  return { format: "r16f", values: mirrored };
 }
 
 /** Fixed-size whole-assembly base texture used by the main viewport. */
@@ -1218,6 +1264,27 @@ export function contactTileDenseFloatTextureData(
     throw new RangeError("contact tile size must be a positive integer");
   }
   const cellCount = tileSizeBins * tileSizeBins;
+  if (buffer.completeR16fValues) {
+    if (buffer.completeR16fValues.length !== cellCount) {
+      throw new RangeError("completed dense R16F contact tile does not match tile size");
+    }
+    const values = contactTileR16fValuesToFloat32(buffer.completeR16fValues, target);
+    if (buffer.tile.tileX !== buffer.tile.tileY) {
+      return values;
+    }
+    for (let index = 0; index < cellCount; index += 1) {
+      const value = values[index];
+      if (value === -1) {
+        continue;
+      }
+      const x = index % tileSizeBins;
+      const y = Math.floor(index / tileSizeBins);
+      if (x !== y) {
+        values[x * tileSizeBins + y] = value;
+      }
+    }
+    return values;
+  }
   if (buffer.completeValues) {
     if (buffer.completeValues.length !== cellCount) {
       throw new RangeError("completed dense contact tile does not match tile size");
@@ -1264,6 +1331,40 @@ export function contactTileDenseFloatTextureData(
     }
   }
   return values;
+}
+
+export function contactTileDenseGpuTextureData(
+  buffer: ContactTileDenseDeltaBuffer,
+  tileSizeBins: number,
+  floatTarget?: Float32Array,
+): ContactTileGpuTextureData {
+  const values = buffer.completeR16fValues;
+  if (!values) {
+    return {
+      format: "float32",
+      values: contactTileDenseFloatTextureData(buffer, tileSizeBins, floatTarget),
+    };
+  }
+  const cellCount = tileSizeBins * tileSizeBins;
+  if (values.length !== cellCount) {
+    throw new RangeError("completed dense R16F contact tile does not match tile size");
+  }
+  if (buffer.tile.tileX !== buffer.tile.tileY) {
+    return { format: "r16f", values };
+  }
+  const mirrored = values.slice();
+  for (let index = 0; index < cellCount; index += 1) {
+    const value = values[index];
+    if (value === contactTileR16fEmptySentinel) {
+      continue;
+    }
+    const x = index % tileSizeBins;
+    const y = Math.floor(index / tileSizeBins);
+    if (x !== y) {
+      mirrored[x * tileSizeBins + y] = value;
+    }
+  }
+  return { format: "r16f", values: mirrored };
 }
 
 interface ContactTileGpuMutablePerformance extends ContactTileGpuPerformanceSnapshot {
@@ -1666,12 +1767,15 @@ export function createContactTileGpuRenderer(
       : contactTileVirtualPagePlan(activeScene.descriptors)
   );
 
-  const maximumVirtualTextureLayers = (tileSizeBins: number) => {
+  const maximumVirtualTextureLayers = (
+    tileSizeBins: number,
+    format: ContactTileGpuTextureFormat,
+  ) => {
     const driverMaximum = Number(gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS));
     if (!Number.isFinite(driverMaximum) || driverMaximum < 1) {
       return 0;
     }
-    const bytesPerLayer = tileSizeBins * tileSizeBins * Float32Array.BYTES_PER_ELEMENT;
+    const bytesPerLayer = tileSizeBins * tileSizeBins * contactTileGpuBytesPerTexel(format);
     // Reserve the complete maximum page-table allowance up front. The array
     // can then remain allocated while the camera moves and only page-table
     // contents and LRU atlas slots change.
@@ -1708,7 +1812,8 @@ export function createContactTileGpuRenderer(
     if (!plan || !virtualPagePlanFits(plan)) {
       return false;
     }
-    const capacity = maximumVirtualTextureLayers(activeScene.tileSizeBins);
+    const format = uploadContext.preference;
+    const capacity = maximumVirtualTextureLayers(activeScene.tileSizeBins, format);
     if (capacity === 0 || plan.populatedTiles.length > capacity) {
       return false;
     }
@@ -1730,13 +1835,13 @@ export function createContactTileGpuRenderer(
     gl.texImage3D(
       gl.TEXTURE_2D_ARRAY,
       0,
-      gl.R32F,
+      format === "r16f" ? gl.R16F : gl.R32F,
       activeScene.tileSizeBins,
       activeScene.tileSizeBins,
       capacity,
       0,
       gl.RED,
-      gl.FLOAT,
+      format === "r16f" ? gl.HALF_FLOAT : gl.FLOAT,
       null,
     );
     if (gl.getError() !== gl.NO_ERROR) {
@@ -1777,6 +1882,7 @@ export function createContactTileGpuRenderer(
       capacity,
       resolution: activeScene.resolution,
       tileSizeBins: activeScene.tileSizeBins,
+      format,
       layerByTileKey: new Map(),
       tileByTileKey: new Map(),
       generationByTileKey: new Map(),
@@ -1794,7 +1900,7 @@ export function createContactTileGpuRenderer(
         capacity
         * activeScene.tileSizeBins
         * activeScene.tileSizeBins
-        * Float32Array.BYTES_PER_ELEMENT
+        * contactTileGpuBytesPerTexel(format)
       ) + pageTableData.byteLength,
     };
     deleteVirtualTextureState(virtualTextureState);
@@ -1820,6 +1926,7 @@ export function createContactTileGpuRenderer(
     if (
       !virtualTextureState
       || virtualTextureState.tileSizeBins !== activeScene.tileSizeBins
+      || virtualTextureState.format !== uploadContext.preference
     ) {
       if (!rebuildVirtualTextureState(activeScene)) {
         return "failed";
@@ -1838,7 +1945,7 @@ export function createContactTileGpuRenderer(
     const layerBytes = current.capacity
       * activeScene.tileSizeBins
       * activeScene.tileSizeBins
-      * Float32Array.BYTES_PER_ELEMENT;
+      * contactTileGpuBytesPerTexel(current.format);
     if (
       layerBytes + pageBytes
       > Math.min(safeTextureBudget, contactTileGpuVirtualTextureBudgetBytes)
@@ -1857,7 +1964,7 @@ export function createContactTileGpuRenderer(
       .sort((left, right) => (
         (nextLastUsed.get(left) ?? 0) - (nextLastUsed.get(right) ?? 0)
       ));
-    const candidates = contactTileGpuUploadPlan(activeScene).filter((candidate) => (
+    const candidates = contactTileGpuUploadPlan(activeScene, current.format).filter((candidate) => (
       nextTiles.get(virtualTextureAtlasKey(activeScene, candidate.key)) !== candidate.tile
     ));
     const selected = contactTileGpuUploadBatch(candidates, byteBudget);
@@ -1915,6 +2022,21 @@ export function createContactTileGpuRenderer(
         nextGenerations.set(atlasKey, generation);
         continue;
       }
+      const textureData = contactTileGpuTextureData(tile, activeScene.tileSizeBins);
+      if (
+        current.format === "r16f"
+        && textureData.format === "float32"
+        && !contactTileGpuFloatValuesFitR16f(textureData.values)
+      ) {
+        uploadContext.performance.rangeFallbacks += 1;
+        return "failed";
+      }
+      const uploadValues = current.format === "r32f" && textureData.format === "r16f"
+        ? contactTileR16fValuesToFloat32(textureData.values)
+        : textureData.values;
+      const uploadType = current.format === "r16f" && textureData.format === "r16f"
+        ? gl.HALF_FLOAT
+        : gl.FLOAT;
       gl.texSubImage3D(
         gl.TEXTURE_2D_ARRAY,
         0,
@@ -1925,8 +2047,8 @@ export function createContactTileGpuRenderer(
         activeScene.tileSizeBins,
         1,
         gl.RED,
-        gl.FLOAT,
-        contactTileFloatTextureData(tile, activeScene.tileSizeBins),
+        uploadType,
+        uploadValues,
       );
       nextTiles.set(atlasKey, tile);
       nextGenerations.set(atlasKey, generation);
@@ -1947,7 +2069,7 @@ export function createContactTileGpuRenderer(
     uploadContext.performance.evictedBytes += evicted
       * activeScene.tileSizeBins
       * activeScene.tileSizeBins
-      * Float32Array.BYTES_PER_ELEMENT;
+      * contactTileGpuBytesPerTexel(current.format);
     uploadContext.performance.uploadQueueBytes += uploadedBytes;
     if (trackQueueFrame) {
       const elapsed = Math.max(0, uploadContext.clock() - startedAt);
@@ -1997,7 +2119,7 @@ export function createContactTileGpuRenderer(
       current.capacity
       * activeScene.tileSizeBins
       * activeScene.tileSizeBins
-      * Float32Array.BYTES_PER_ELEMENT
+      * contactTileGpuBytesPerTexel(current.format)
     ) + pageTableData.byteLength;
     uploadContext.performance.virtualTexturePages = plan.pages.length;
     uploadContext.performance.virtualTextureBytes = current.bytes;
@@ -3517,12 +3639,17 @@ function uploadContactTileGpuTextureImage(
   gl: WebGL2RenderingContext,
   width: number,
   height: number,
-  values: Float32Array,
+  input: ContactTileGpuTextureData | Float32Array,
   context: ContactTileGpuUploadContext,
   startedAt = context.clock(),
 ): ContactTileGpuUploadResult | null {
+  const data: ContactTileGpuTextureData = input instanceof Float32Array
+    ? { format: "float32", values: input }
+    : input;
   const wantsR16f = context.preference === "r16f";
-  const fitsR16f = !wantsR16f || contactTileGpuFloatValuesFitR16f(values);
+  const fitsR16f = data.format === "r16f"
+    || !wantsR16f
+    || contactTileGpuFloatValuesFitR16f(data.values);
   if (wantsR16f && !fitsR16f) {
     context.performance.rangeFallbacks += 1;
   }
@@ -3536,16 +3663,22 @@ function uploadContactTileGpuTextureImage(
       height,
       0,
       gl.RED,
-      gl.FLOAT,
-      values,
+      data.format === "r16f" ? gl.HALF_FLOAT : gl.FLOAT,
+      data.values,
     );
     if (gl.getError() === gl.NO_ERROR) {
       recordContactTileGpuUpload(context, "r16f", true, startedAt);
-      return { format: "r16f", bytes: values.length * contactTileGpuBytesPerTexel("r16f") };
+      return {
+        format: "r16f",
+        bytes: data.values.length * contactTileGpuBytesPerTexel("r16f"),
+      };
     }
     context.performance.uploadErrorFallbacks += 1;
   }
 
+  const float32Values = data.format === "r16f"
+    ? contactTileR16fValuesToFloat32(data.values)
+    : data.values;
   gl.texImage2D(
     gl.TEXTURE_2D,
     0,
@@ -3555,13 +3688,16 @@ function uploadContactTileGpuTextureImage(
     0,
     gl.RED,
     gl.FLOAT,
-    values,
+    float32Values,
   );
   if (gl.getError() !== gl.NO_ERROR) {
     return null;
   }
   recordContactTileGpuUpload(context, "r32f", true, startedAt);
-  return { format: "r32f", bytes: values.length * contactTileGpuBytesPerTexel("r32f") };
+  return {
+    format: "r32f",
+    bytes: float32Values.length * contactTileGpuBytesPerTexel("r32f"),
+  };
 }
 
 function updateContactTileGpuTextureImage(
@@ -3569,17 +3705,24 @@ function updateContactTileGpuTextureImage(
   entry: GpuTextureEntry,
   width: number,
   height: number,
-  values: Float32Array,
+  input: ContactTileGpuTextureData | Float32Array,
   context: ContactTileGpuUploadContext,
 ) {
   const startedAt = context.clock();
-  if (entry.format === "r16f" && !contactTileGpuFloatValuesFitR16f(values)) {
+  const data: ContactTileGpuTextureData = input instanceof Float32Array
+    ? { format: "float32", values: input }
+    : input;
+  if (
+    entry.format === "r16f"
+    && data.format === "float32"
+    && !contactTileGpuFloatValuesFitR16f(data.values)
+  ) {
     context.performance.rangeFallbacks += 1;
     const uploaded = uploadContactTileGpuTextureImage(
       gl,
       width,
       height,
-      values,
+      data,
       { ...context, preference: "r32f" },
       startedAt,
     );
@@ -3591,6 +3734,12 @@ function updateContactTileGpuTextureImage(
     return true;
   }
 
+  const uploadValues = entry.format === "r32f" && data.format === "r16f"
+    ? contactTileR16fValuesToFloat32(data.values)
+    : data.values;
+  const uploadType = entry.format === "r16f" && data.format === "r16f"
+    ? gl.HALF_FLOAT
+    : gl.FLOAT;
   gl.texSubImage2D(
     gl.TEXTURE_2D,
     0,
@@ -3599,8 +3748,8 @@ function updateContactTileGpuTextureImage(
     width,
     height,
     gl.RED,
-    gl.FLOAT,
-    values,
+    uploadType,
+    uploadValues,
   );
   if (gl.getError() === gl.NO_ERROR) {
     recordContactTileGpuUpload(context, entry.format, false, startedAt);
@@ -3615,7 +3764,7 @@ function updateContactTileGpuTextureImage(
     gl,
     width,
     height,
-    values,
+    data,
     { ...context, preference: "r32f" },
     startedAt,
   );
@@ -4161,7 +4310,7 @@ function ensureTileTexture(
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  const values = contactTileFloatTextureData(tile, tileSizeBins);
+  const values = contactTileGpuTextureData(tile, tileSizeBins);
   const uploaded = uploadContactTileGpuTextureImage(
     gl,
     tileSizeBins,
@@ -4196,7 +4345,7 @@ function updateTileTexture(
 ) {
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, entry.texture);
-  const values = contactTileFloatTextureData(tile, tileSizeBins);
+  const values = contactTileGpuTextureData(tile, tileSizeBins);
   if (!updateContactTileGpuTextureImage(
     gl,
     entry,
@@ -4248,7 +4397,7 @@ function ensureDeltaTileTexture(
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  const values = contactTileDenseFloatTextureData(buffer, tileSizeBins, scratch);
+  const values = contactTileDenseGpuTextureData(buffer, tileSizeBins, scratch);
   const uploaded = uploadContactTileGpuTextureImage(
     gl,
     tileSizeBins,
@@ -4283,7 +4432,7 @@ function updateDeltaTileTexture(
 ) {
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, entry.texture);
-  const values = contactTileDenseFloatTextureData(buffer, tileSizeBins, scratch);
+  const values = contactTileDenseGpuTextureData(buffer, tileSizeBins, scratch);
   return updateContactTileGpuTextureImage(
     gl,
     entry,

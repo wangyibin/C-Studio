@@ -1,4 +1,8 @@
 import type { ContactMapCell } from "../App";
+import {
+  contactTileR16fEmptySentinel,
+  contactTileR16fToFloat32,
+} from "./contactTileR16f";
 
 export interface PackedContactTileCells {
   xLocal: Uint16Array;
@@ -8,7 +12,7 @@ export interface PackedContactTileCells {
 
 /**
  * Structural tile shape shared by legacy JSON cells, sparse packed IPC, and
- * completed dense Float32 display-cache responses. Dense data is authoritative
+ * completed dense Float32/R16F display-cache responses. Dense data is authoritative
  * when present; producers should leave `cells` empty so data is not retained twice.
  */
 export interface ContactTileData {
@@ -17,7 +21,21 @@ export interface ContactTileData {
   cells: readonly ContactMapCell[];
   packedCells?: PackedContactTileCells;
   denseValues?: Float32Array;
+  denseR16fValues?: Uint16Array;
   denseOccupiedCount?: number;
+}
+
+export type ValidatedDenseContactTileValues =
+  | { format: "float32"; values: Float32Array; occupiedCount: number }
+  | { format: "r16f"; values: Uint16Array; occupiedCount: number };
+
+export function contactTileDenseValueAt(
+  dense: ValidatedDenseContactTileValues,
+  index: number,
+): number {
+  return dense.format === "r16f"
+    ? contactTileR16fToFloat32(dense.values[index])
+    : dense.values[index];
 }
 
 export type ContactTileCellVisitor = (
@@ -51,8 +69,12 @@ export function forEachContactTileCell(
     const tileStartX = tile.tileX * safeTileSizeBins;
     const tileStartY = tile.tileY * safeTileSizeBins;
     for (let index = 0; index < dense.values.length; index += 1) {
-      const count = dense.values[index];
-      if (count === -1) {
+      const raw = dense.values[index];
+      if (dense.format === "r16f" && raw === contactTileR16fEmptySentinel) {
+        continue;
+      }
+      const count = contactTileDenseValueAt(dense, index);
+      if (dense.format === "float32" && count === -1) {
         continue;
       }
       visitor(
@@ -142,8 +164,13 @@ export function materializeContactTileCells(
 export function appendContactTileCounts(tile: ContactTileData, out: number[]): number[] {
   const dense = validatedDenseContactTileValues(tile);
   if (dense) {
-    for (const count of dense.values) {
-      if (count !== -1) {
+    for (let index = 0; index < dense.values.length; index += 1) {
+      const raw = dense.values[index];
+      if (dense.format === "r16f" && raw === contactTileR16fEmptySentinel) {
+        continue;
+      }
+      const count = contactTileDenseValueAt(dense, index);
+      if (dense.format === "r16f" || count !== -1) {
         out.push(count);
       }
     }
@@ -165,9 +192,14 @@ export function appendContactTileCounts(tile: ContactTileData, out: number[]): n
 
 export function validatedDenseContactTileValues(
   tile: ContactTileData,
-): { values: Float32Array; occupiedCount: number } | undefined {
-  const values = tile.denseValues;
+): ValidatedDenseContactTileValues | undefined {
+  const float32Values = tile.denseValues;
+  const r16fValues = tile.denseR16fValues;
   const occupiedCount = tile.denseOccupiedCount;
+  if (float32Values && r16fValues) {
+    throw new RangeError("dense contact tile cannot contain both Float32 and R16F values");
+  }
+  const values = float32Values ?? r16fValues;
   if (!values) {
     if (occupiedCount !== undefined) {
       throw new RangeError("dense contact tile count requires dense values");
@@ -181,7 +213,9 @@ export function validatedDenseContactTileValues(
   ) {
     throw new RangeError("dense contact tile occupied count is invalid");
   }
-  return { values, occupiedCount: occupiedCount! };
+  return float32Values
+    ? { format: "float32", values: float32Values, occupiedCount: occupiedCount! }
+    : { format: "r16f", values: r16fValues!, occupiedCount: occupiedCount! };
 }
 
 /** Validate once before a packed hot loop and return the authoritative arrays. */

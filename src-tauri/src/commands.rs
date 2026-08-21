@@ -23,7 +23,9 @@ use cstudio_core::synteny_cache::{SyntenyCache, SyntenyCacheKey};
 use tauri::Manager;
 
 use crate::{
-    contact_display_cache::{self, DisplayCacheTile},
+    contact_display_cache::{
+        self, DisplayCacheStorageFormat, DisplayCacheTile, DisplayCacheValues,
+    },
     contact_lod_cache::{self, LodCacheCell, LodCachePayload},
 };
 
@@ -1173,6 +1175,9 @@ const CONTACT_TILE_BINARY_MAGIC: [u8; 4] = *b"CST1";
 const CONTACT_TILE_BINARY_VERSION: u16 = 1;
 const CONTACT_TILE_BINARY_FLAGS: u16 = 0;
 const CONTACT_TILE_BINARY_DENSE_FLOAT32_FLAGS: u16 = 1;
+const CONTACT_TILE_BINARY_DENSE_R16F_FLAGS: u16 = 2;
+const CONTACT_TILE_BINARY_DENSE_MIXED_FLAGS: u16 = 3;
+const CONTACT_TILE_BINARY_DENSE_R16F_COUNT_FLAG: u32 = 1 << 31;
 const CONTACT_TILE_BINARY_HEADER_BYTES: usize = 16;
 const CONTACT_TILE_BINARY_DIRECTORY_BYTES: usize = 24;
 const CONTACT_TILE_BINARY_MAX_TILE_SIZE_BINS: u64 = u16::MAX as u64 + 1;
@@ -1330,14 +1335,33 @@ fn encode_contact_map_dense_tiles_binary_v1(
     let metadata_len = CONTACT_TILE_BINARY_HEADER_BYTES
         .checked_add(directory_len)
         .ok_or_else(|| "dense binary contact tile metadata size overflow".to_string())?;
-    let tile_bytes = value_count
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| "dense binary contact tile payload size overflow".to_string())?;
-    let response_len = tiles
-        .len()
-        .checked_mul(tile_bytes)
-        .and_then(|payload| metadata_len.checked_add(payload))
-        .ok_or_else(|| "dense binary contact tile response size overflow".to_string())?;
+    let r16f_tiles = tiles
+        .iter()
+        .filter(|tile| tile.r16f_values().is_some())
+        .count();
+    let dense_r16f = !tiles.is_empty() && r16f_tiles == tiles.len();
+    let dense_mixed = r16f_tiles > 0 && r16f_tiles < tiles.len();
+    let mut response_len = metadata_len;
+    for tile in tiles {
+        let value_bytes = if tile.r16f_values().is_some() {
+            std::mem::size_of::<u16>()
+        } else {
+            std::mem::size_of::<f32>()
+        };
+        let payload_bytes = value_count
+            .checked_mul(value_bytes)
+            .and_then(|payload| {
+                if dense_mixed && tile.r16f_values().is_some() {
+                    payload.checked_add(3).map(|bytes| bytes & !3)
+                } else {
+                    Some(payload)
+                }
+            })
+            .ok_or_else(|| "dense binary contact tile response size overflow".to_string())?;
+        response_len = response_len
+            .checked_add(payload_bytes)
+            .ok_or_else(|| "dense binary contact tile response size overflow".to_string())?;
+    }
     if response_len > u32::MAX as usize {
         return Err("dense binary contact tile response exceeds u32 offsets".to_string());
     }
@@ -1346,13 +1370,20 @@ fn encode_contact_map_dense_tiles_binary_v1(
     bytes.reserve(response_len.saturating_sub(metadata_len));
     bytes[0..4].copy_from_slice(&CONTACT_TILE_BINARY_MAGIC);
     bytes[4..6].copy_from_slice(&CONTACT_TILE_BINARY_VERSION.to_le_bytes());
-    bytes[6..8].copy_from_slice(&CONTACT_TILE_BINARY_DENSE_FLOAT32_FLAGS.to_le_bytes());
+    let flags = if dense_mixed {
+        CONTACT_TILE_BINARY_DENSE_MIXED_FLAGS
+    } else if dense_r16f {
+        CONTACT_TILE_BINARY_DENSE_R16F_FLAGS
+    } else {
+        CONTACT_TILE_BINARY_DENSE_FLOAT32_FLAGS
+    };
+    bytes[6..8].copy_from_slice(&flags.to_le_bytes());
     bytes[8..12].copy_from_slice(&(tile_size_bins as u32).to_le_bytes());
     bytes[12..16].copy_from_slice(&tile_count.to_le_bytes());
 
     for (tile_index, tile) in tiles.iter().enumerate() {
         ensure_contact_tile_request_active(should_cancel)?;
-        if u64::from(tile.tile_size_bins) != tile_size_bins || tile.values.len() != value_count {
+        if u64::from(tile.tile_size_bins) != tile_size_bins || tile.value_count() != value_count {
             return Err(format!(
                 "dense binary contact tile {}:{} does not match tile size",
                 tile.tile_x, tile.tile_y
@@ -1365,21 +1396,39 @@ fn encode_contact_map_dense_tiles_binary_v1(
         bytes[directory_offset..directory_offset + 8].copy_from_slice(&tile.tile_x.to_le_bytes());
         bytes[directory_offset + 8..directory_offset + 16]
             .copy_from_slice(&tile.tile_y.to_le_bytes());
+        let directory_value_count = if dense_mixed && tile.r16f_values().is_some() {
+            value_count_u32 | CONTACT_TILE_BINARY_DENSE_R16F_COUNT_FLAG
+        } else {
+            value_count_u32
+        };
         bytes[directory_offset + 16..directory_offset + 20]
-            .copy_from_slice(&value_count_u32.to_le_bytes());
+            .copy_from_slice(&directory_value_count.to_le_bytes());
         bytes[directory_offset + 20..directory_offset + 24]
             .copy_from_slice(&data_offset.to_le_bytes());
-        for (value_index, value) in tile.values.iter().enumerate() {
-            if value_index % 4_096 == 0 {
-                ensure_contact_tile_request_active(should_cancel)?;
+        if let Some(values) = tile.r16f_values() {
+            for (value_index, value) in values.iter().enumerate() {
+                if value_index % 4_096 == 0 {
+                    ensure_contact_tile_request_active(should_cancel)?;
+                }
+                bytes.extend_from_slice(&value.to_le_bytes());
             }
-            if !value.is_finite() {
-                return Err(format!(
-                    "dense binary contact tile {}:{} contains a non-finite value",
-                    tile.tile_x, tile.tile_y
-                ));
+            while dense_mixed && bytes.len() % std::mem::align_of::<f32>() != 0 {
+                bytes.push(0);
             }
-            bytes.extend_from_slice(&value.to_le_bytes());
+        } else {
+            let values = tile.float32_values();
+            for (value_index, value) in values.iter().enumerate() {
+                if value_index % 4_096 == 0 {
+                    ensure_contact_tile_request_active(should_cancel)?;
+                }
+                if !value.is_finite() {
+                    return Err(format!(
+                        "dense binary contact tile {}:{} contains a non-finite value",
+                        tile.tile_x, tile.tile_y
+                    ));
+                }
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
         }
     }
     ensure_contact_tile_request_active(should_cancel)?;
@@ -2088,6 +2137,14 @@ fn persistent_display_tile_plans(
         .map(|(tile_x, tile_y)| {
             let mut key = Vec::new();
             push_lod_key_bytes(&mut key, b"cstudio-display-tile-v2")?;
+            push_lod_key_bytes(
+                &mut key,
+                if persistent_display_cache_storage_format() == DisplayCacheStorageFormat::R16f {
+                    b"gpu-ready-r16f-v1"
+                } else {
+                    b"float32-v1"
+                },
+            )?;
             push_lod_key_bytes(&mut key, &context.file_fingerprint)?;
             key.extend_from_slice(&request.base_resolution.to_le_bytes());
             key.extend_from_slice(&source_resolution.to_le_bytes());
@@ -2119,6 +2176,14 @@ fn persistent_display_tile_plans(
             })
         })
         .collect()
+}
+
+fn persistent_display_cache_storage_format() -> DisplayCacheStorageFormat {
+    if std::env::var("CSTUDIO_DISPLAY_CACHE_R16F").as_deref() == Ok("0") {
+        DisplayCacheStorageFormat::Float32
+    } else {
+        DisplayCacheStorageFormat::R16f
+    }
 }
 
 fn persistent_display_cache_dataset_budget_bytes() -> u64 {
@@ -2941,7 +3006,7 @@ impl PersistentDisplayTileAccumulator {
                         tile_size_bins,
                         tile_x: plan.tile_x,
                         tile_y: plan.tile_y,
-                        values,
+                        values: DisplayCacheValues::Float32(values),
                     },
                 })
             })
@@ -2991,7 +3056,7 @@ fn ordered_persistent_display_tiles(
 }
 
 fn display_tile_occupied_cells(tile: &DisplayCacheTile) -> usize {
-    tile.values.iter().filter(|value| **value != -1.0).count()
+    tile.occupied_count()
 }
 
 fn load_persistent_display_tiles(
@@ -3059,7 +3124,12 @@ fn store_persistent_display_tiles(
     let mut stored_bytes = 0_u64;
     let mut failed = 0_usize;
     for entry in pending {
-        match contact_display_cache::store_atomic(&context.dataset_root, &entry.key, &entry.tile) {
+        match contact_display_cache::store_atomic_with_format(
+            &context.dataset_root,
+            &entry.key,
+            &entry.tile,
+            persistent_display_cache_storage_format(),
+        ) {
             Ok(path) => {
                 stored = stored.saturating_add(1);
                 stored_bytes = stored_bytes
@@ -3168,7 +3238,7 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
             if !cached_tiles.is_empty() {
                 cached_response_cells = cached_tiles
                     .iter()
-                    .map(|tile| tile.values.iter().filter(|value| **value != -1.0).count())
+                    .map(DisplayCacheTile::occupied_count)
                     .sum();
                 let emit_started = Instant::now();
                 let bytes = encode_contact_map_dense_tiles_binary_v1(
@@ -6208,14 +6278,18 @@ mod tests {
 
         let stored = accumulator.finish(&plans).unwrap();
         assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].tile.values[2 * 4 + 1], 3.5);
+        assert_eq!(stored[0].tile.float32_values()[2 * 4 + 1], 3.5);
         assert!(stored[0]
             .tile
-            .values
+            .float32_values()
             .iter()
             .enumerate()
             .all(|(index, value)| index == 2 * 4 + 1 || *value == -1.0));
-        assert!(stored[1].tile.values.iter().all(|value| *value == -1.0));
+        assert!(stored[1]
+            .tile
+            .float32_values()
+            .iter()
+            .all(|value| *value == -1.0));
     }
 
     #[test]
@@ -6236,7 +6310,9 @@ mod tests {
             tile_size_bins: 2,
             tile_x: 0,
             tile_y: 1,
-            values: vec![-1.0, 2.0, -1.0, -1.0],
+            values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![
+                -1.0, 2.0, -1.0, -1.0,
+            ]),
         }];
         let pending = vec![super::PendingDisplayCacheStore {
             key: plans[0].key.clone(),
@@ -6244,7 +6320,9 @@ mod tests {
                 tile_size_bins: 2,
                 tile_x: 0,
                 tile_y: 0,
-                values: vec![1.0, -1.0, -1.0, -1.0],
+                values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![
+                    1.0, -1.0, -1.0, -1.0,
+                ]),
             },
         }];
 
@@ -6304,7 +6382,7 @@ mod tests {
                 tile_size_bins: 4,
                 tile_x: plans[0].tile_x,
                 tile_y: plans[0].tile_y,
-                values: vec![-1.0; 16],
+                values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![-1.0; 16]),
             },
         )
         .unwrap();
@@ -6316,7 +6394,10 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.corrupt, 0);
         assert_eq!(cached.len(), 1);
-        assert!(cached[0].values.iter().all(|value| *value == -1.0));
+        assert!(cached[0]
+            .float32_values()
+            .iter()
+            .all(|value| *value == -1.0));
         assert_eq!(missing.len(), 1);
         assert_eq!((missing[0].tile_x, missing[0].tile_y), (0, 1));
         assert_eq!(
@@ -6728,7 +6809,9 @@ mod tests {
             tile_size_bins: 2,
             tile_x: 3,
             tile_y: 7,
-            values: vec![-1.0, 1.5, 2.25, 0.0],
+            values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![
+                -1.0, 1.5, 2.25, 0.0,
+            ]),
         }];
 
         let bytes = super::encode_contact_map_dense_tiles_binary_v1(&tiles, 2, &|| false).unwrap();
@@ -6747,6 +6830,87 @@ mod tests {
         assert_eq!(read_binary_f32(&bytes, 48), 2.25);
         assert_eq!(read_binary_f32(&bytes, 52), 0.0);
         assert_eq!(bytes.len(), 56);
+    }
+
+    #[test]
+    fn encodes_gpu_ready_dense_r16f_display_tiles() {
+        let tiles = vec![crate::contact_display_cache::DisplayCacheTile {
+            tile_size_bins: 2,
+            tile_x: 3,
+            tile_y: 7,
+            values: crate::contact_display_cache::DisplayCacheValues::R16f(vec![
+                crate::contact_display_cache::R16F_EMPTY_SENTINEL,
+                crate::contact_display_cache::f32_to_r16f_bits(1.5).unwrap(),
+                crate::contact_display_cache::f32_to_r16f_bits(2.25).unwrap(),
+                crate::contact_display_cache::f32_to_r16f_bits(0.0).unwrap(),
+            ]),
+        }];
+
+        let bytes = super::encode_contact_map_dense_tiles_binary_v1(&tiles, 2, &|| false).unwrap();
+
+        assert_eq!(&bytes[0..4], b"CST1");
+        assert_eq!(read_binary_u16(&bytes, 6), 2);
+        assert_eq!(read_binary_u32(&bytes, 32), 4);
+        assert_eq!(read_binary_u32(&bytes, 36), 40);
+        assert_eq!(read_binary_u16(&bytes, 40), 0xbc00);
+        assert_eq!(read_binary_u16(&bytes, 42), 0x3e00);
+        assert_eq!(read_binary_u16(&bytes, 44), 0x4080);
+        assert_eq!(read_binary_u16(&bytes, 46), 0);
+        assert_eq!(bytes.len(), 48);
+    }
+
+    #[test]
+    fn encodes_mixed_dense_tiles_without_expanding_r16f_tiles() {
+        let tiles = vec![
+            crate::contact_display_cache::DisplayCacheTile {
+                tile_size_bins: 2,
+                tile_x: 0,
+                tile_y: 0,
+                values: crate::contact_display_cache::DisplayCacheValues::R16f(vec![
+                    0xbc00, 0x3c00, 0x4000, 0,
+                ]),
+            },
+            crate::contact_display_cache::DisplayCacheTile {
+                tile_size_bins: 2,
+                tile_x: 0,
+                tile_y: 1,
+                values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![
+                    -1.0, 70_000.0, 2.0, 0.0,
+                ]),
+            },
+        ];
+
+        let bytes = super::encode_contact_map_dense_tiles_binary_v1(&tiles, 2, &|| false).unwrap();
+
+        assert_eq!(read_binary_u16(&bytes, 6), 3);
+        assert_eq!(read_binary_u32(&bytes, 32), 0x8000_0004);
+        assert_eq!(read_binary_u32(&bytes, 36), 64);
+        assert_eq!(read_binary_u32(&bytes, 56), 4);
+        assert_eq!(read_binary_u32(&bytes, 60), 72);
+        assert_eq!(read_binary_u16(&bytes, 64), 0xbc00);
+        assert_eq!(read_binary_f32(&bytes, 72), -1.0);
+        assert_eq!(read_binary_f32(&bytes, 76), 70_000.0);
+        assert_eq!(bytes.len(), 88);
+
+        let odd = vec![
+            crate::contact_display_cache::DisplayCacheTile {
+                tile_size_bins: 1,
+                tile_x: 0,
+                tile_y: 0,
+                values: crate::contact_display_cache::DisplayCacheValues::R16f(vec![0x3c00]),
+            },
+            crate::contact_display_cache::DisplayCacheTile {
+                tile_size_bins: 1,
+                tile_x: 0,
+                tile_y: 1,
+                values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![70_000.0]),
+            },
+        ];
+        let odd_bytes =
+            super::encode_contact_map_dense_tiles_binary_v1(&odd, 1, &|| false).unwrap();
+        assert_eq!(read_binary_u32(&odd_bytes, 36), 64);
+        assert_eq!(read_binary_u32(&odd_bytes, 60), 68);
+        assert_eq!(odd_bytes.len(), 72);
     }
 
     #[test]
@@ -8678,13 +8842,23 @@ mod tests {
             let pending = accumulator
                 .finish(&plans)
                 .expect("display cache terminal payloads");
+            let expected_values = pending
+                .iter()
+                .map(|entry| {
+                    (
+                        (entry.tile.tile_x, entry.tile.tile_y),
+                        entry.tile.float32_values().into_owned(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             let write_started = Instant::now();
             let mut cache_bytes = 0_u64;
             for entry in pending {
-                let path = crate::contact_display_cache::store_atomic(
+                let path = crate::contact_display_cache::store_atomic_with_format(
                     &context.dataset_root,
                     &entry.key,
                     &entry.tile,
+                    super::persistent_display_cache_storage_format(),
                 )
                 .expect("display cache benchmark store");
                 cache_bytes = cache_bytes
@@ -8711,6 +8885,31 @@ mod tests {
                 )
                 .expect("display cache benchmark warm load");
                 assert!(missing.is_empty());
+                let mut quantized_values = 0_usize;
+                let mut maximum_absolute_error = 0.0_f64;
+                let mut maximum_relative_error = 0.0_f64;
+                for tile in &cached {
+                    let expected = expected_values
+                        .get(&(tile.tile_x, tile.tile_y))
+                        .expect("display cache benchmark expected tile");
+                    let actual = tile.float32_values();
+                    assert_eq!(actual.len(), expected.len());
+                    for (actual, expected) in actual.iter().zip(expected.iter()) {
+                        if *expected == -1.0 {
+                            assert_eq!(*actual, -1.0);
+                            continue;
+                        }
+                        let absolute_error = f64::from((*actual - *expected).abs());
+                        if absolute_error > 0.0 {
+                            quantized_values = quantized_values.saturating_add(1);
+                            maximum_absolute_error = maximum_absolute_error.max(absolute_error);
+                            if *expected != 0.0 {
+                                maximum_relative_error = maximum_relative_error
+                                    .max(absolute_error / f64::from(expected.abs()));
+                            }
+                        }
+                    }
+                }
                 let bytes = super::encode_contact_map_dense_tiles_binary_v1(
                     &cached,
                     tile_size_bins,
@@ -8719,7 +8918,7 @@ mod tests {
                 .expect("display cache benchmark warm encode")
                 .len();
                 println!(
-                    "CSTUDIO_POJ_BENCH result scenario={} phase=hit sample={} total_us={} read_us={} hits={} response_cells={} response_bytes={}",
+                    "CSTUDIO_POJ_BENCH result scenario={} phase=hit sample={} total_us={} read_us={} hits={} response_cells={} response_bytes={} quantized_values={} max_abs_error={:.6} max_relative_error={:.9}",
                     scenario,
                     sample + 1,
                     hit_started.elapsed().as_micros(),
@@ -8727,9 +8926,12 @@ mod tests {
                     cache_stats.hits,
                     cached
                         .iter()
-                        .map(|tile| tile.values.iter().filter(|value| **value != -1.0).count())
+                        .map(crate::contact_display_cache::DisplayCacheTile::occupied_count)
                         .sum::<usize>(),
                     bytes,
+                    quantized_values,
+                    maximum_absolute_error,
+                    maximum_relative_error,
                 );
             }
             fs::remove_dir_all(cache_root).expect("remove display cache benchmark directory");

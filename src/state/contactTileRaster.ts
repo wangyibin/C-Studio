@@ -1,12 +1,17 @@
 import { contactColorLutIndex, contactColorLutSize } from "./contactColor";
 import type { ContactColorScale } from "./contactColorScale";
 import {
+  contactTileDenseValueAt,
   forEachContactTileCell,
   validatedDenseContactTileValues,
   validatedPackedContactTileCells,
   type ContactTileData,
 } from "./contactTileData";
 import type { ContactTileDenseDeltaBuffer } from "./contactTileDelta";
+import {
+  contactTileR16fEmptySentinel,
+  contactTileR16fToFloat32,
+} from "./contactTileR16f";
 import type { ContactColormap } from "./uiState";
 
 const rgbaChannels = 4;
@@ -73,10 +78,14 @@ export function rasterizeContactTile(
       throw new RangeError("dense contact tile does not match tileSizeBins");
     }
     for (let index = 0; index < dense.values.length; index += 1) {
-      const value = dense.values[index];
-      if (value === -1) {
+      const raw = dense.values[index];
+      if (
+        (dense.format === "float32" && raw === -1)
+        || (dense.format === "r16f" && raw === contactTileR16fEmptySentinel)
+      ) {
         continue;
       }
+      const value = contactTileDenseValueAt(dense, index);
       const sourceX = index % tileSizeBins;
       const sourceY = Math.floor(index / tileSizeBins);
       const xBin = transpose ? sourceY : sourceX;
@@ -149,9 +158,11 @@ export function rasterizeContactTileDenseBuffer(
   const pixels = validateDenseRasterInput(input, target);
   pixels.fill(0);
   const normalize = createContactValueNormalizer(input.colorScale);
-  if (input.buffer.completeValues) {
-    for (let index = 0; index < input.buffer.completeValues.length; index += 1) {
-      if (input.buffer.completeValues[index] !== -1) {
+  const completeValues = input.buffer.completeValues ?? input.buffer.completeR16fValues;
+  if (completeValues) {
+    const r16f = input.buffer.completeR16fValues !== undefined;
+    for (let index = 0; index < completeValues.length; index += 1) {
+      if (completeValues[index] !== (r16f ? contactTileR16fEmptySentinel : -1)) {
         paintDenseContactValue(input, pixels, index, normalize);
       }
     }
@@ -213,8 +224,9 @@ function validateDenseRasterInput(
     throw new RangeError(`contact color LUT must contain ${contactColorLutBytes} bytes`);
   }
   const cellCapacity = tileSizeBins * tileSizeBins;
-  if (buffer.completeValues) {
-    if (buffer.completeValues.length !== cellCapacity) {
+  const completeValues = buffer.completeValues ?? buffer.completeR16fValues;
+  if (completeValues) {
+    if (completeValues.length !== cellCapacity) {
       throw new RangeError("completed dense contact tile does not match tileSizeBins");
     }
   } else if (buffer.counts.length !== cellCapacity || buffer.occupied.length !== cellCapacity) {
@@ -240,7 +252,10 @@ function paintDenseContactValue(
   const yBin = input.transpose ? sourceX : sourceY;
   const colorOffset = contactColorLutIndex(
     input.colormap,
-    normalize(input.buffer.completeValues?.[sourceIndex] ?? input.buffer.counts[sourceIndex]),
+    normalize(input.buffer.completeValues?.[sourceIndex]
+      ?? (input.buffer.completeR16fValues
+        ? contactTileR16fToFloat32(input.buffer.completeR16fValues[sourceIndex])
+        : input.buffer.counts[sourceIndex])),
   ) * rgbaChannels;
   writeContactPixel(
     pixels,

@@ -1,4 +1,8 @@
 import type { PackedContactTileCells } from "./contactTileData";
+import {
+  contactTileR16fEmptySentinel,
+  contactTileR16fIsFinite,
+} from "./contactTileR16f";
 
 export type { PackedContactTileCells } from "./contactTileData";
 
@@ -7,6 +11,9 @@ const contactTileBinaryDirectoryEntryBytes = 24;
 const contactTileBinaryVersion = 1;
 const contactTileBinaryFlags = 0;
 const contactTileBinaryDenseFloat32Flags = 1;
+const contactTileBinaryDenseR16fFlags = 2;
+const contactTileBinaryDenseMixedFlags = 3;
+const contactTileBinaryDenseR16fCountFlag = 0x8000_0000;
 const maxContactTileSizeBins = 65_536;
 const maxSafeUnsignedInteger = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -28,12 +35,16 @@ export interface DecodedContactTileBatch {
   transport: "array_buffer";
 }
 
-export interface DecodedDenseContactTile {
+interface DecodedDenseContactTileBase {
   tileX: number;
   tileY: number;
-  values: Float32Array;
   occupiedCount: number;
 }
+
+export type DecodedDenseContactTile = DecodedDenseContactTileBase & (
+  | { format: "float32"; values: Float32Array }
+  | { format: "r16f"; values: Uint16Array }
+);
 
 interface ContactTileBinaryLayout {
   directoryIndex: number;
@@ -45,6 +56,7 @@ interface ContactTileBinaryLayout {
   yOffset: number;
   countsOffset: number;
   dataEnd: number;
+  r16f: boolean;
 }
 
 /** Decode the strict little-endian CST1 contact-tile binary response. */
@@ -78,10 +90,18 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
     invalidContactTileBinary(`unsupported version ${version}`);
   }
   const flags = view.getUint16(6, true);
-  if (flags !== contactTileBinaryFlags && flags !== contactTileBinaryDenseFloat32Flags) {
+  if (
+    flags !== contactTileBinaryFlags
+    && flags !== contactTileBinaryDenseFloat32Flags
+    && flags !== contactTileBinaryDenseR16fFlags
+    && flags !== contactTileBinaryDenseMixedFlags
+  ) {
     invalidContactTileBinary(`unsupported flags ${flags}`);
   }
   const denseFloat32 = flags === contactTileBinaryDenseFloat32Flags;
+  const denseR16f = flags === contactTileBinaryDenseR16fFlags;
+  const denseMixed = flags === contactTileBinaryDenseMixedFlags;
+  const dense = denseFloat32 || denseR16f || denseMixed;
 
   const tileSizeBins = view.getUint32(8, true);
   if (tileSizeBins < 1 || tileSizeBins > maxContactTileSizeBins) {
@@ -100,13 +120,20 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
       + directoryIndex * contactTileBinaryDirectoryEntryBytes;
     const tileX = readSafeUnsigned64(view, directoryOffset, `tile ${directoryIndex} tileX`);
     const tileY = readSafeUnsigned64(view, directoryOffset + 8, `tile ${directoryIndex} tileY`);
-    const count = view.getUint32(directoryOffset + 16, true);
+    const rawCount = view.getUint32(directoryOffset + 16, true);
+    const layoutR16f = denseR16f
+      || (denseMixed && (rawCount & contactTileBinaryDenseR16fCountFlag) !== 0);
+    const count = denseMixed
+      ? rawCount & ~contactTileBinaryDenseR16fCountFlag
+      : rawCount;
     const dataOffset = view.getUint32(directoryOffset + 20, true);
     if (dataOffset < directoryEnd || dataOffset > raw.byteLength) {
       invalidContactTileBinary(`tile ${directoryIndex} data offset is outside the payload`);
     }
-    const requiredAlignment = denseFloat32
-      ? Float32Array.BYTES_PER_ELEMENT
+    const requiredAlignment = dense
+      ? layoutR16f
+        ? Uint16Array.BYTES_PER_ELEMENT
+        : Float32Array.BYTES_PER_ELEMENT
       : Float64Array.BYTES_PER_ELEMENT;
     if (dataOffset % requiredAlignment !== 0) {
       invalidContactTileBinary(
@@ -114,22 +141,23 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
       );
     }
 
-    if (denseFloat32 && count !== tileSizeBins * tileSizeBins) {
+    if (dense && count !== tileSizeBins * tileSizeBins) {
       invalidContactTileBinary(
         `dense tile ${directoryIndex} value count does not match tileSizeBins`,
       );
     }
     const xOffset = dataOffset;
-    const yOffset = denseFloat32
+    const yOffset = dense
       ? dataOffset
       : xOffset + count * Uint16Array.BYTES_PER_ELEMENT;
-    const packedCoordinateEnd = yOffset + (denseFloat32
+    const packedCoordinateEnd = yOffset + (dense
       ? 0
       : count * Uint16Array.BYTES_PER_ELEMENT);
-    const countsOffset = denseFloat32 ? dataOffset : alignToEightBytes(packedCoordinateEnd);
-    const dataEnd = countsOffset + count * (denseFloat32
-      ? Float32Array.BYTES_PER_ELEMENT
+    const countsOffset = dense ? dataOffset : alignToEightBytes(packedCoordinateEnd);
+    const valueEnd = countsOffset + count * (dense
+      ? requiredAlignment
       : Float64Array.BYTES_PER_ELEMENT);
+    const dataEnd = denseMixed && layoutR16f ? alignToFourBytes(valueEnd) : valueEnd;
     if (dataEnd > raw.byteLength) {
       invalidContactTileBinary(`tile ${directoryIndex} payload is truncated`);
     }
@@ -144,12 +172,13 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
       yOffset,
       countsOffset,
       dataEnd,
+      r16f: layoutR16f,
     });
   }
 
   validatePackedPayloadRanges(layouts, directoryEnd, raw.byteLength);
 
-  const tiles = denseFloat32 ? [] : layouts.map((layout) => {
+  const tiles = dense ? [] : layouts.map((layout) => {
     const packedCells = packedCellsForLayout(raw, view, layout);
     for (let index = 0; index < layout.count; index += 1) {
       if (
@@ -169,8 +198,8 @@ export function decodeContactTileBinaryV1(raw: unknown): DecodedContactTileBatch
     };
   });
 
-  const denseTiles = denseFloat32
-    ? layouts.map((layout) => denseTileForLayout(raw, view, layout))
+  const denseTiles = dense
+    ? layouts.map((layout) => denseTileForLayout(raw, view, layout, layout.r16f))
     : undefined;
 
   return {
@@ -186,7 +215,37 @@ function denseTileForLayout(
   buffer: ArrayBuffer,
   view: DataView,
   layout: ContactTileBinaryLayout,
+  r16f: boolean,
 ): DecodedDenseContactTile {
+  if (r16f) {
+    const values = platformIsLittleEndian
+      ? new Uint16Array(buffer, layout.countsOffset, layout.count).slice()
+      : Uint16Array.from(
+        { length: layout.count },
+        (_, index) => view.getUint16(
+          layout.countsOffset + index * Uint16Array.BYTES_PER_ELEMENT,
+          true,
+        ),
+      );
+    let occupiedCount = 0;
+    for (const value of values) {
+      if (!contactTileR16fIsFinite(value)) {
+        invalidContactTileBinary(
+          `dense R16F tile ${layout.directoryIndex} contains a non-finite value`,
+        );
+      }
+      if (value !== contactTileR16fEmptySentinel) {
+        occupiedCount += 1;
+      }
+    }
+    return {
+      tileX: layout.tileX,
+      tileY: layout.tileY,
+      format: "r16f",
+      values,
+      occupiedCount,
+    };
+  }
   const values = platformIsLittleEndian
     ? new Float32Array(buffer, layout.countsOffset, layout.count).slice()
     : Float32Array.from(
@@ -208,6 +267,7 @@ function denseTileForLayout(
   return {
     tileX: layout.tileX,
     tileY: layout.tileY,
+    format: "float32",
     values,
     occupiedCount,
   };
@@ -280,6 +340,10 @@ function readSafeUnsigned64(view: DataView, offset: number, field: string): numb
 
 function alignToEightBytes(value: number): number {
   return Math.ceil(value / 8) * 8;
+}
+
+function alignToFourBytes(value: number): number {
+  return Math.ceil(value / 4) * 4;
 }
 
 function invalidContactTileBinary(reason: string): never {

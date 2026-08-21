@@ -253,6 +253,8 @@ export interface ContactMapTile {
   packedCells?: PackedContactTileCells;
   /** Completed display-cache tile. `-1` marks an empty pixel. */
   denseValues?: Float32Array;
+  /** GPU-ready completed display-cache tile. IEEE binary16 `0xbc00` is empty. */
+  denseR16fValues?: Uint16Array;
   denseOccupiedCount?: number;
 }
 
@@ -604,7 +606,9 @@ function contactMapTilesFromDecodedBinary(
       tileX: tile.tileX,
       tileY: tile.tileY,
       cells: [] as [],
-      denseValues: tile.values,
+      ...(tile.format === "r16f"
+        ? { denseR16fValues: tile.values }
+        : { denseValues: tile.values }),
       denseOccupiedCount: tile.occupiedCount,
     })),
   ];

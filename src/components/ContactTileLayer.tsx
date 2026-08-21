@@ -1857,6 +1857,9 @@ export function canonicalTilesForRendering(tiles: ContactMapTile[]): ContactMapT
           denseValues: tile.denseValues
             ? transposeDenseContactTileValues(tile.denseValues)
             : undefined,
+          denseR16fValues: tile.denseR16fValues
+            ? transposeDenseContactTileValues(tile.denseR16fValues)
+            : undefined,
           denseOccupiedCount: tile.denseOccupiedCount,
         };
     const key = contactTileKey(canonical);
@@ -1906,12 +1909,18 @@ function contactTileGpuSourceLayout(
   };
 }
 
-function transposeDenseContactTileValues(values: Float32Array): Float32Array {
+function transposeDenseContactTileValues(values: Float32Array): Float32Array;
+function transposeDenseContactTileValues(values: Uint16Array): Uint16Array;
+function transposeDenseContactTileValues(
+  values: Float32Array | Uint16Array,
+): Float32Array | Uint16Array {
   const tileSize = Math.sqrt(values.length);
   if (!Number.isSafeInteger(tileSize)) {
     throw new RangeError("dense contact tile must contain a square value grid");
   }
-  const transposed = new Float32Array(values.length);
+  const transposed = values instanceof Float32Array
+    ? new Float32Array(values.length)
+    : new Uint16Array(values.length);
   for (let y = 0; y < tileSize; y += 1) {
     for (let x = 0; x < tileSize; x += 1) {
       transposed[x * tileSize + y] = values[y * tileSize + x];
