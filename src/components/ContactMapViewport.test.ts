@@ -36,7 +36,10 @@ import {
   sameAssemblyOverlayPresentation,
   shouldRetainPresentedContactViewport,
 } from "./ContactMapViewport";
-import { buildAssemblyEditModel } from "../state/assemblyEditing";
+import {
+  buildAssemblyEditModel,
+  buildAssemblyInteractionIndex,
+} from "../state/assemblyEditing";
 
 const bounds = {
   width: 400,
@@ -1150,6 +1153,44 @@ describe("assemblyCutTargetAtScreenPoint", () => {
       lockedCutBlockId: selectedContig.id,
       point: { x: 20, y: 75 },
     })).toBeNull();
+  });
+
+  it("keeps indexed cut candidates identical to the full selected-contig scan", () => {
+    const manyContigs = Array.from({ length: 1_024 }, (_, index) => ({
+      id: `Chr01:${index}:ctg${index}`,
+      objectId: "Chr01",
+      sourceId: `ctg${index}`,
+      sourceStart: 0,
+      sourceEnd: 8,
+      visualStart: index * 10,
+      visualEnd: index * 10 + 8,
+      orientation: index % 2 === 0 ? "+" as const : "-" as const,
+    }));
+    const model = buildAssemblyEditModel(manyContigs);
+    const selectedIds = new Set(manyContigs.map((block) => block.id));
+    const interactionIndex = buildAssemblyInteractionIndex(model, selectedIds);
+    const baseInput = {
+      model,
+      selectedIds,
+      widthPx: 1_200,
+      heightPx: 700,
+      viewportXStart: 700,
+      viewportXEnd: 9_700,
+      viewportYStart: 200,
+      viewportYEnd: 10_000,
+    };
+
+    for (let sample = 0; sample < 500; sample += 1) {
+      const point = {
+        x: (sample * 313) % baseInput.widthPx,
+        y: (sample * 197) % baseInput.heightPx,
+      };
+      expect(assemblyCutTargetAtScreenPoint({
+        ...baseInput,
+        interactionIndex,
+        point,
+      })).toEqual(assemblyCutTargetAtScreenPoint({ ...baseInput, point }));
+    }
   });
 });
 

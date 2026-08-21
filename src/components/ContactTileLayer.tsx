@@ -1283,15 +1283,29 @@ function ContactTileSharedGpuCanvas({
       commitTimestamp: frontendPerformanceTimestamp(),
     };
     onSlotCommitRef.current(candidate.slot, event);
+    let active = true;
+    const onPresented = (painted: boolean) => {
+      if (!active) {
+        return;
+      }
+      if (!painted) {
+        onUnavailableRef.current();
+        return;
+      }
+      presentedRef.current = candidate;
+      onSlotPaintCompleteRef.current(candidate.slot, event);
+    };
     const painted = staging
-      ? renderer.stageScene(candidate.scene)
-      : renderer.setScene(candidate.scene);
+      ? renderer.stageScene(candidate.scene, onPresented)
+      : renderer.setScene(candidate.scene, onPresented);
     if (!painted) {
+      active = false;
       onUnavailableRef.current();
       return;
     }
-    presentedRef.current = candidate;
-    onSlotPaintCompleteRef.current(candidate.slot, event);
+    return () => {
+      active = false;
+    };
   }, [front, staging]);
 
   return (
@@ -1673,6 +1687,19 @@ function ContactTileGpuCanvas({
     if (!renderer || !contactMap) {
       return;
     }
+    let active = true;
+    const reportPainted = (painted: boolean) => {
+      if (!active) {
+        return;
+      }
+      if (!painted) {
+        onUnavailable();
+        return;
+      }
+      for (const key of paintCanvasKeys) {
+        paintCoordinator?.reportCanvasPaint(key);
+      }
+    };
     const painted = renderer.setScene({
       boundaries,
       dataScope: `${contactMap.layoutScope ?? ""}|${contactMap.normalization ?? "raw"}`,
@@ -1684,14 +1711,15 @@ function ContactTileGpuCanvas({
       visibleLayerComplete: contactMap.visibleLayerComplete === true,
       viewport,
       renderStyle,
-    });
+    }, reportPainted);
     if (!painted) {
+      active = false;
       onUnavailable();
       return;
     }
-    for (const key of paintCanvasKeys) {
-      paintCoordinator?.reportCanvasPaint(key);
-    }
+    return () => {
+      active = false;
+    };
   }, [
     boundaries,
     contactMap,

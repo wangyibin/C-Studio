@@ -5,6 +5,8 @@ import {
   assemblyRenameTarget,
   assemblyRenameValidationError,
   buildAssemblyEditModel,
+  buildAssemblyHitTestIndex,
+  buildAssemblyInteractionIndex,
   chromosomeEndInsertionTargets,
   createAssemblyBlockFromGfa,
   contigIdsInScreenSelection,
@@ -24,6 +26,7 @@ import {
   addChromosomeBoundariesToSelection,
   moveSelectionBefore,
   moveSelectionToDebris,
+  nearestAssemblyBlockIndex,
   planUnplacedGfaPlacement,
   planGfaBlockCreation,
   pointSelectsWholeChromosome,
@@ -1768,5 +1771,109 @@ describe("assemblyEditing", () => {
       { x: 0, y: 0 },
       { sizePx: 380, tolerancePx: 7, selectionKind: "chromosome" },
     )).toBeNull();
+  });
+
+  it("keeps indexed hit testing identical to the linear hierarchy scan", () => {
+    const syntheticBlocks: ContactMapLayoutBlock[] = Array.from({ length: 512 }, (_, index) => ({
+      id: `Chr${Math.floor(index / 32)}:${index}:ctg${index}`,
+      objectId: `Chr${Math.floor(index / 32)}`,
+      sourceId: `ctg${index}`,
+      sourceStart: 0,
+      sourceEnd: 10,
+      visualStart: index * 11,
+      visualEnd: index * 11 + 10,
+      orientation: "+" as const,
+      ...(index === 127 ? { isSourceSegment: true } : {}),
+    }));
+    const model = buildAssemblyEditModel(syntheticBlocks);
+    const index = buildAssemblyHitTestIndex(model);
+    const options = {
+      widthPx: 900,
+      heightPx: 540,
+      tolerancePx: 7,
+      viewportXStart: 173,
+      viewportXEnd: 4_813,
+      viewportYStart: 71,
+      viewportYEnd: 5_111,
+    };
+
+    for (let sample = 0; sample < 1_000; sample += 1) {
+      const point = {
+        x: (sample * 193) % options.widthPx,
+        y: (sample * 389) % options.heightPx,
+      };
+      expect(hitTestAssemblyLayout(model, point, options, index)).toEqual(
+        hitTestAssemblyLayout(model, point, options),
+      );
+    }
+  });
+
+  it("keeps indexed insertion targets identical after gaps, moves, and chromosome ends", () => {
+    const syntheticBlocks: ContactMapLayoutBlock[] = Array.from({ length: 240 }, (_, index) => ({
+      id: `Chr${Math.floor(index / 30)}:${index}:ctg${index}`,
+      objectId: `Chr${Math.floor(index / 30)}`,
+      sourceId: `ctg${index}`,
+      sourceStart: 0,
+      sourceEnd: 8,
+      visualStart: index * 10,
+      visualEnd: index * 10 + 8,
+      orientation: index % 3 === 0 ? "-" as const : "+" as const,
+    }));
+    const model = buildAssemblyEditModel(syntheticBlocks);
+    const selectedIds = new Set([syntheticBlocks[syntheticBlocks.length - 1].id]);
+    const hitIndex = buildAssemblyHitTestIndex(model);
+    const interactionIndex = buildAssemblyInteractionIndex(
+      model,
+      selectedIds,
+      "contigs",
+      hitIndex,
+    );
+    const options = { sizePx: model.totalSpan, tolerancePx: 7 };
+    const points = Array.from({ length: 480 }, (_, index) => ({
+      x: index * 5 - 9,
+      y: index * 5 - 9,
+    }));
+
+    for (const point of points) {
+      expect(insertionTargetAtScreenPoint(
+        model,
+        selectedIds,
+        point,
+        options,
+        interactionIndex,
+      )).toEqual(insertionTargetAtScreenPoint(model, selectedIds, point, options));
+    }
+  });
+
+  it("binary-searches the same nearest block as the previous ordered scan", () => {
+    const model = buildAssemblyEditModel([
+      { ...blocks[0], visualStart: 0, visualEnd: 80 },
+      { ...blocks[1], visualStart: 100, visualEnd: 200 },
+      { ...blocks[2], visualStart: 240, visualEnd: 330 },
+    ]);
+    const linearNearest = (visualPosition: number) => {
+      let nearestIndex = 0;
+      let nearestDistance = Number.POSITIVE_INFINITY;
+      model.assemblyBlocks.forEach((block, index) => {
+        if (visualPosition >= block.visualStart && visualPosition < block.visualEnd) {
+          nearestIndex = index;
+          nearestDistance = Number.NEGATIVE_INFINITY;
+          return;
+        }
+        const distance = Math.min(
+          Math.abs(visualPosition - block.visualStart),
+          Math.abs(visualPosition - block.visualEnd),
+        );
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestIndex = index;
+        }
+      });
+      return nearestIndex;
+    };
+
+    for (let position = -20; position <= 360; position += 1) {
+      expect(nearestAssemblyBlockIndex(model, position)).toBe(linearNearest(position));
+    }
   });
 });

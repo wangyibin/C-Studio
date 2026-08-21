@@ -25,7 +25,7 @@ export interface ContactSourceShaderBenchmarkResult {
   sourceLayoutBytes: number;
 }
 
-export function runContactSourceShaderBenchmark(): ContactSourceShaderBenchmarkResult {
+export async function runContactSourceShaderBenchmark(): Promise<ContactSourceShaderBenchmarkResult> {
   const canvas = document.createElement("canvas");
   canvas.width = canvasPixels;
   canvas.height = canvasPixels;
@@ -58,29 +58,29 @@ export function runContactSourceShaderBenchmark(): ContactSourceShaderBenchmarkR
     4, 7, 9, 10,
   ]);
   const forwardBlocks = [layoutBlock("forward", 0, 4_000, 0, "+")];
-  const forward = renderSourceScene(renderer, forwardBlocks, 4_000, matrix, "forward");
-  const reverse = renderSourceScene(
+  const forward = await renderSourceScene(renderer, forwardBlocks, 4_000, matrix, "forward");
+  const reverse = await renderSourceScene(
     renderer,
     [layoutBlock("reverse", 0, 4_000, 0, "-")],
     4_000,
     matrix,
     "reverse",
   );
-  const gap = renderSourceScene(renderer, [
+  const gap = await renderSourceScene(renderer, [
     layoutBlock("gap-left", 0, 1_000, 0, "+"),
     layoutBlock("gap-right", 1_000, 4_000, 2_000, "+"),
   ], 4_000, matrix, "gap");
-  const move = renderSourceScene(renderer, [
+  const move = await renderSourceScene(renderer, [
     layoutBlock("move-right", 2_000, 4_000, 0, "+"),
     layoutBlock("move-left", 0, 2_000, 2_000, "+"),
   ], 4_000, matrix, "move");
   const copyMatrix = new Float32Array(16).fill(8);
-  const copied = renderSourceScene(renderer, [
+  const copied = await renderSourceScene(renderer, [
     layoutBlock("copy-1", 0, 2_000, 0, "+"),
     layoutBlock("copy-2", 0, 2_000, 2_000, "+"),
   ], 2_000, copyMatrix, "copy");
   const referenceMatrix = new Float32Array(16).fill(2);
-  const copyReference = renderSourceScene(
+  const copyReference = await renderSourceScene(
     renderer,
     forwardBlocks,
     4_000,
@@ -88,7 +88,7 @@ export function runContactSourceShaderBenchmark(): ContactSourceShaderBenchmarkR
     "copy-reference",
   );
 
-  renderSourceScene(renderer, forwardBlocks, 4_000, matrix, "benchmark");
+  await renderSourceScene(renderer, forwardBlocks, 4_000, matrix, "benchmark");
   const redrawDurations: number[] = [];
   const viewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
   for (let iteration = 0; iteration < 120; iteration += 1) {
@@ -113,7 +113,7 @@ export function runContactSourceShaderBenchmark(): ContactSourceShaderBenchmarkR
   return result;
 }
 
-function renderSourceScene(
+async function renderSourceScene(
   renderer: NonNullable<ReturnType<typeof createContactTileGpuRenderer>>,
   blocks: ContactMapLayoutBlock[],
   sourceLength: number,
@@ -166,9 +166,18 @@ function renderSourceScene(
       yMap,
     },
   };
-  if (!renderer.setScene(scene)) {
-    throw new Error(`source shader scene failed: ${dataScope}`);
-  }
+  await new Promise<void>((resolve, reject) => {
+    const accepted = renderer.setScene(scene, (presented) => {
+      if (presented) {
+        resolve();
+      } else {
+        reject(new Error(`source shader scene failed: ${dataScope}`));
+      }
+    });
+    if (!accepted) {
+      reject(new Error(`source shader scene was rejected: ${dataScope}`));
+    }
+  });
   const gl = canvasContext(renderer);
   const pixels: number[][][] = [];
   for (let xBin = 0; xBin < tileSizeBins; xBin += 1) {

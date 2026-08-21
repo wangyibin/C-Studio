@@ -94,6 +94,47 @@ export interface HitTestOptions {
   selectionKind?: AssemblySelection["kind"];
 }
 
+interface IndexedVisualRange<T extends { visualStart: number; visualEnd: number }> {
+  value: T;
+  originalIndex: number;
+}
+
+interface VisualRangeIndex<T extends { visualStart: number; visualEnd: number }> {
+  entries: IndexedVisualRange<T>[];
+  prefixMaxEnd: number[];
+}
+
+interface IndexedInsertionPoint {
+  target: AssemblyInsertionTarget;
+  originalIndex: number;
+  offsetPx: number;
+}
+
+interface InsertionPointIndex {
+  entries: IndexedInsertionPoint[];
+  maximumAbsoluteOffsetPx: number;
+}
+
+export interface AssemblyHitTestIndex {
+  model: AssemblyEditModel;
+  sourceSegments: VisualRangeIndex<ContactMapLayoutBlock>;
+  assemblyBlocks: VisualRangeIndex<AssemblyBlockGroup>;
+  chromosomes: VisualRangeIndex<AssemblyChromosome>;
+}
+
+export interface AssemblyInteractionIndex {
+  model: AssemblyEditModel;
+  selectedIds: ReadonlySet<string>;
+  selectionKind: AssemblySelection["kind"];
+  hitTest: AssemblyHitTestIndex;
+  blocksById: ReadonlyMap<string, ContactMapLayoutBlock>;
+  selectedBlocks: VisualRangeIndex<ContactMapLayoutBlock>;
+  insertionDisabled: boolean;
+  chromosomeEnds: InsertionPointIndex;
+  insertionBoundaries: InsertionPointIndex;
+  terminalInsertionTarget: AssemblyInsertionTarget | null;
+}
+
 const DEBRIS_OBJECT_ID = "debris";
 export const DEFAULT_INSERTED_GAP = {
   componentType: "U" as const,
@@ -127,6 +168,98 @@ export function buildAssemblyEditModel(blocks: ContactMapLayoutBlock[]): Assembl
     gaps: buildAssemblyGapRanges(blocks, assemblyBlocks),
     chromosomes: [...chromosomes.values()].sort((left, right) => left.visualStart - right.visualStart),
     totalSpan: Math.max(0, ...blocks.map((block) => block.visualEnd)),
+  };
+}
+
+/** Build immutable lookup tables once per AGP layout instead of scanning it per pointer sample. */
+export function buildAssemblyHitTestIndex(model: AssemblyEditModel): AssemblyHitTestIndex {
+  return {
+    model,
+    sourceSegments: buildVisualRangeIndex(model.blocks.filter((block) => block.isSourceSegment)),
+    assemblyBlocks: buildVisualRangeIndex(model.assemblyBlocks),
+    chromosomes: buildVisualRangeIndex(model.chromosomes),
+  };
+}
+
+/**
+ * Add the selection-dependent cut and insertion tables. Rebuild this only when
+ * the layout or selection changes; pointer motion then stays on indexed reads.
+ */
+export function buildAssemblyInteractionIndex(
+  model: AssemblyEditModel,
+  selectedIds: ReadonlySet<string>,
+  selectionKind: AssemblySelection["kind"] = "contigs",
+  hitTest = buildAssemblyHitTestIndex(model),
+): AssemblyInteractionIndex {
+  const blockIsSelected = (block: AssemblyBlockGroup) => (
+    selectedIds.has(block.id) || block.contigIds.some((id) => selectedIds.has(id))
+  );
+  const selectedAssemblyBlocks = model.assemblyBlocks.filter(blockIsSelected);
+  const insertionDisabled = selectedIds.size === 0 || (
+    selectionKind === "chromosome"
+    && selectedAssemblyBlocks.length > 0
+    && selectedAssemblyBlocks.every((block) => block.objectId === DEBRIS_OBJECT_ID)
+  );
+  const chromosomeEnds = selectionKind === "chromosome" || insertionDisabled
+    ? []
+    : chromosomeEndInsertionTargets(model, selectedIds).map((target, originalIndex) => ({
+        target,
+        originalIndex,
+        offsetPx: target.chromosomeEnd === "start" ? 9 : -9,
+      }));
+  const insertionBoundaries: IndexedInsertionPoint[] = [];
+
+  if (!insertionDisabled) {
+    for (let index = 0; index < model.assemblyBlocks.length; index += 1) {
+      const target = model.assemblyBlocks[index];
+      const previous = index > 0 ? model.assemblyBlocks[index - 1] : null;
+      const isChromosomeBoundary = previous === null || previous.objectId !== target.objectId;
+      if (
+        (selectionKind !== "chromosome" && isChromosomeBoundary)
+        || (selectionKind === "chromosome"
+          && !isChromosomeBoundary
+          && target.objectId === DEBRIS_OBJECT_ID)
+        || (previous !== null && blockIsSelected(previous))
+        || blockIsSelected(target)
+      ) {
+        continue;
+      }
+      insertionBoundaries.push({
+        target: {
+          targetBlockId: target.id,
+          visualPosition: target.visualStart,
+          ...(selectionKind === "chromosome" && !isChromosomeBoundary
+            ? { targetObjectId: target.objectId }
+            : {}),
+        },
+        originalIndex: index,
+        offsetPx: 0,
+      });
+    }
+  }
+
+  const lastBlock = model.assemblyBlocks[model.assemblyBlocks.length - 1];
+  const terminalInsertionTarget = !insertionDisabled
+    && selectionKind === "chromosome"
+    && lastBlock
+    && lastBlock.objectId !== DEBRIS_OBJECT_ID
+    && !blockIsSelected(lastBlock)
+    ? { targetBlockId: null, visualPosition: model.totalSpan }
+    : null;
+
+  return {
+    model,
+    selectedIds,
+    selectionKind,
+    hitTest,
+    blocksById: new Map(model.blocks.map((block) => [block.id, block])),
+    selectedBlocks: buildVisualRangeIndex(
+      model.blocks.filter((block) => selectedIds.has(block.id)),
+    ),
+    insertionDisabled,
+    chromosomeEnds: buildInsertionPointIndex(chromosomeEnds),
+    insertionBoundaries: buildInsertionPointIndex(insertionBoundaries),
+    terminalInsertionTarget,
   };
 }
 
@@ -1367,6 +1500,7 @@ export function hitTestAssemblyLayout(
   model: AssemblyEditModel,
   point: MapPoint,
   options: HitTestOptions,
+  index?: AssemblyHitTestIndex,
 ): AssemblyHit | null {
   const viewportXStart = options.viewportXStart ?? options.viewportStart ?? 0;
   const viewportXEnd = options.viewportXEnd ?? options.viewportEnd ?? model.totalSpan;
@@ -1381,21 +1515,27 @@ export function hitTestAssemblyLayout(
 
   // A split segment is an independently selectable contig even when its left
   // half remains visually nested inside the original no-gap assembly block.
-  const sourceSegment = findLastInBox(
-    model.blocks.filter((block) => block.isSourceSegment),
-    visualX,
-    visualY,
-  );
+  const sourceSegment = index?.model === model
+    ? findLastInIndexedBox(index.sourceSegments, visualX, visualY)
+    : findLastInBox(
+        model.blocks.filter((block) => block.isSourceSegment),
+        visualX,
+        visualY,
+      );
   if (sourceSegment) {
     return { kind: "contig", id: sourceSegment.id };
   }
 
-  const block = findLastInBox(model.assemblyBlocks, visualX, visualY);
+  const block = index?.model === model
+    ? findLastInIndexedBox(index.assemblyBlocks, visualX, visualY)
+    : findLastInBox(model.assemblyBlocks, visualX, visualY);
   if (block) {
     return { kind: "contig", id: block.id };
   }
 
-  const chromosome = findLastInBox(model.chromosomes, visualX, visualY);
+  const chromosome = index?.model === model
+    ? findLastInIndexedBox(index.chromosomes, visualX, visualY)
+    : findLastInBox(model.chromosomes, visualX, visualY);
   if (chromosome && pointSelectsWholeChromosome(chromosome, visualX, visualY)) {
     return { kind: "chromosome-boundary", id: chromosome.id };
   }
@@ -1455,9 +1595,18 @@ export function insertionTargetAtScreenPoint(
   selectedIds: ReadonlySet<string>,
   point: MapPoint,
   options: HitTestOptions,
+  index?: AssemblyInteractionIndex,
 ): AssemblyInsertionTarget | null {
   if (selectedIds.size === 0) {
     return null;
+  }
+  const selectionKind = options.selectionKind ?? "contigs";
+  if (
+    index?.model === model
+    && index.selectedIds === selectedIds
+    && index.selectionKind === selectionKind
+  ) {
+    return insertionTargetFromIndex(index, point, options);
   }
   const selectedBlocks = model.assemblyBlocks.filter((block) => (
     block.contigIds.some((id) => selectedIds.has(id)) || selectedIds.has(block.id)
@@ -1478,7 +1627,6 @@ export function insertionTargetAtScreenPoint(
   const viewportXSpan = Math.max(1, viewportXEnd - viewportXStart);
   const viewportYSpan = Math.max(1, viewportYEnd - viewportYStart);
   const tolerancePx = Math.max(1, options.tolerancePx);
-  const selectionKind = options.selectionKind ?? "contigs";
 
   if (selectionKind !== "chromosome") {
     for (const target of chromosomeEndInsertionTargets(model, selectedIds)) {
@@ -1562,22 +1710,28 @@ export function chromosomeEndInsertionTargets(
     && (selectedIds.has(block!.id) || block!.contigIds.some((id) => selectedIds.has(id)))
   );
   const targets: AssemblyInsertionTarget[] = [];
+  const contiguousObjectRanges = new Map<string, { firstIndex: number; lastIndex: number }>();
+  for (let index = 0; index < model.assemblyBlocks.length; index += 1) {
+    const block = model.assemblyBlocks[index];
+    const existing = contiguousObjectRanges.get(block.objectId);
+    if (!existing) {
+      contiguousObjectRanges.set(block.objectId, { firstIndex: index, lastIndex: index });
+    } else if (existing.lastIndex === index - 1) {
+      existing.lastIndex = index;
+    }
+  }
 
   for (const chromosome of model.chromosomes) {
     if (chromosome.id === DEBRIS_OBJECT_ID) {
       continue;
     }
-    const firstIndex = model.assemblyBlocks.findIndex((block) => block.objectId === chromosome.id);
-    if (firstIndex < 0) {
+    const objectRange = contiguousObjectRanges.get(chromosome.id);
+    if (!objectRange) {
       continue;
     }
-    let lastIndex = firstIndex;
-    while (model.assemblyBlocks[lastIndex + 1]?.objectId === chromosome.id) {
-      lastIndex += 1;
-    }
 
-    const firstBlock = model.assemblyBlocks[firstIndex];
-    const nextBlock = model.assemblyBlocks[lastIndex + 1];
+    const firstBlock = model.assemblyBlocks[objectRange.firstIndex];
+    const nextBlock = model.assemblyBlocks[objectRange.lastIndex + 1];
     if (!blockIsSelected(firstBlock)) {
       targets.push({
         targetBlockId: firstBlock.id,
@@ -1597,6 +1751,276 @@ export function chromosomeEndInsertionTargets(
   }
 
   return targets;
+}
+
+/** Return only the selected contigs that can geometrically reach this cut corridor. */
+export function assemblyCutCandidateBlocks(
+  index: AssemblyInteractionIndex,
+  visualStart: number,
+  visualEnd: number,
+): ContactMapLayoutBlock[] {
+  return visualRangesOverlapping(index.selectedBlocks, visualStart, visualEnd);
+}
+
+/** Binary-search the ordered assembly blocks for selection-handle resizing. */
+export function nearestAssemblyBlockIndex(
+  model: AssemblyEditModel,
+  visualPosition: number,
+) {
+  const blocks = model.assemblyBlocks;
+  if (blocks.length === 0) {
+    return 0;
+  }
+
+  let low = 0;
+  let high = blocks.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (blocks[middle].visualStart <= visualPosition) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  const rightIndex = Math.min(blocks.length - 1, low);
+  const leftIndex = Math.max(0, low - 1);
+  const left = blocks[leftIndex];
+  if (visualPosition >= left.visualStart && visualPosition < left.visualEnd) {
+    return leftIndex;
+  }
+  const right = blocks[rightIndex];
+  const leftDistance = Math.min(
+    Math.abs(visualPosition - left.visualStart),
+    Math.abs(visualPosition - left.visualEnd),
+  );
+  const rightDistance = Math.min(
+    Math.abs(visualPosition - right.visualStart),
+    Math.abs(visualPosition - right.visualEnd),
+  );
+  return leftDistance <= rightDistance ? leftIndex : rightIndex;
+}
+
+function buildVisualRangeIndex<T extends { visualStart: number; visualEnd: number }>(
+  values: readonly T[],
+): VisualRangeIndex<T> {
+  const entries = values
+    .map((value, originalIndex) => ({ value, originalIndex }))
+    .sort((left, right) => (
+      left.value.visualStart - right.value.visualStart
+      || left.value.visualEnd - right.value.visualEnd
+      || left.originalIndex - right.originalIndex
+    ));
+  const prefixMaxEnd: number[] = [];
+  let maximumEnd = Number.NEGATIVE_INFINITY;
+  for (const entry of entries) {
+    maximumEnd = Math.max(maximumEnd, entry.value.visualEnd);
+    prefixMaxEnd.push(maximumEnd);
+  }
+  return { entries, prefixMaxEnd };
+}
+
+function upperBoundRangeStart<T extends { visualStart: number; visualEnd: number }>(
+  entries: readonly IndexedVisualRange<T>[],
+  value: number,
+) {
+  let low = 0;
+  let high = entries.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (entries[middle].value.visualStart <= value) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return low;
+}
+
+function findLastInIndexedBox<T extends { visualStart: number; visualEnd: number }>(
+  index: VisualRangeIndex<T>,
+  visualX: number,
+  visualY: number,
+): T | undefined {
+  const visualStart = Math.min(visualX, visualY);
+  const visualEnd = Math.max(visualX, visualY);
+  let candidateIndex = upperBoundRangeStart(index.entries, visualStart) - 1;
+  let match: IndexedVisualRange<T> | undefined;
+  while (candidateIndex >= 0 && index.prefixMaxEnd[candidateIndex] > visualEnd) {
+    const candidate = index.entries[candidateIndex];
+    if (
+      candidate.value.visualStart <= visualStart
+      && candidate.value.visualEnd > visualEnd
+      && (!match || candidate.originalIndex > match.originalIndex)
+    ) {
+      match = candidate;
+    }
+    candidateIndex -= 1;
+  }
+  return match?.value;
+}
+
+function visualRangesOverlapping<T extends { visualStart: number; visualEnd: number }>(
+  index: VisualRangeIndex<T>,
+  visualStart: number,
+  visualEnd: number,
+): T[] {
+  const lower = Math.min(visualStart, visualEnd);
+  const upper = Math.max(visualStart, visualEnd);
+  let candidateIndex = upperBoundRangeStart(index.entries, upper) - 1;
+  const matches: IndexedVisualRange<T>[] = [];
+  while (candidateIndex >= 0 && index.prefixMaxEnd[candidateIndex] >= lower) {
+    const candidate = index.entries[candidateIndex];
+    if (candidate.value.visualEnd >= lower && candidate.value.visualStart <= upper) {
+      matches.push(candidate);
+    }
+    candidateIndex -= 1;
+  }
+  return matches
+    .sort((left, right) => left.originalIndex - right.originalIndex)
+    .map((entry) => entry.value);
+}
+
+function buildInsertionPointIndex(entries: IndexedInsertionPoint[]): InsertionPointIndex {
+  return {
+    entries: [...entries].sort((left, right) => (
+      left.target.visualPosition - right.target.visualPosition
+      || left.originalIndex - right.originalIndex
+    )),
+    maximumAbsoluteOffsetPx: entries.reduce(
+      (maximum, entry) => Math.max(maximum, Math.abs(entry.offsetPx)),
+      0,
+    ),
+  };
+}
+
+function insertionTargetFromIndex(
+  index: AssemblyInteractionIndex,
+  point: MapPoint,
+  options: HitTestOptions,
+): AssemblyInsertionTarget | null {
+  if (index.insertionDisabled) {
+    return null;
+  }
+  const viewport = insertionViewportMetrics(index.model, options);
+  if (index.selectionKind !== "chromosome") {
+    const chromosomeEnd = insertionPointAtScreenPoint(
+      index.chromosomeEnds,
+      point,
+      viewport,
+    );
+    if (chromosomeEnd) {
+      return chromosomeEnd;
+    }
+  }
+  const boundary = insertionPointAtScreenPoint(
+    index.insertionBoundaries,
+    point,
+    viewport,
+  );
+  if (boundary) {
+    return boundary;
+  }
+  const terminal = index.terminalInsertionTarget;
+  if (terminal && insertionPointMatches(
+    { target: terminal, originalIndex: 0, offsetPx: 0 },
+    point,
+    viewport,
+  )) {
+    return terminal;
+  }
+  return null;
+}
+
+interface InsertionViewportMetrics {
+  widthPx: number;
+  heightPx: number;
+  tolerancePx: number;
+  viewportXStart: number;
+  viewportYStart: number;
+  viewportXSpan: number;
+  viewportYSpan: number;
+}
+
+function insertionViewportMetrics(
+  model: AssemblyEditModel,
+  options: HitTestOptions,
+): InsertionViewportMetrics {
+  const viewportXStart = options.viewportXStart ?? options.viewportStart ?? 0;
+  const viewportXEnd = options.viewportXEnd ?? options.viewportEnd ?? model.totalSpan;
+  const viewportYStart = options.viewportYStart ?? options.viewportStart ?? 0;
+  const viewportYEnd = options.viewportYEnd ?? options.viewportEnd ?? model.totalSpan;
+  return {
+    widthPx: Math.max(1, options.widthPx ?? options.sizePx ?? 1),
+    heightPx: Math.max(1, options.heightPx ?? options.sizePx ?? 1),
+    tolerancePx: Math.max(1, options.tolerancePx),
+    viewportXStart,
+    viewportYStart,
+    viewportXSpan: Math.max(1, viewportXEnd - viewportXStart),
+    viewportYSpan: Math.max(1, viewportYEnd - viewportYStart),
+  };
+}
+
+function insertionPointAtScreenPoint(
+  index: InsertionPointIndex,
+  point: MapPoint,
+  viewport: InsertionViewportMetrics,
+): AssemblyInsertionTarget | null {
+  if (index.entries.length === 0) {
+    return null;
+  }
+  const paddingPx = viewport.tolerancePx + index.maximumAbsoluteOffsetPx;
+  const xLower = viewport.viewportXStart
+    + ((point.x - paddingPx) / viewport.widthPx) * viewport.viewportXSpan;
+  const xUpper = viewport.viewportXStart
+    + ((point.x + paddingPx) / viewport.widthPx) * viewport.viewportXSpan;
+  const yLower = viewport.viewportYStart
+    + ((point.y - paddingPx) / viewport.heightPx) * viewport.viewportYSpan;
+  const yUpper = viewport.viewportYStart
+    + ((point.y + paddingPx) / viewport.heightPx) * viewport.viewportYSpan;
+  const lower = Math.max(Math.min(xLower, xUpper), Math.min(yLower, yUpper));
+  const upper = Math.min(Math.max(xLower, xUpper), Math.max(yLower, yUpper));
+  if (lower > upper) {
+    return null;
+  }
+
+  let low = 0;
+  let high = index.entries.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (index.entries[middle].target.visualPosition < lower) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  const matches: IndexedInsertionPoint[] = [];
+  for (let entryIndex = low; entryIndex < index.entries.length; entryIndex += 1) {
+    const entry = index.entries[entryIndex];
+    if (entry.target.visualPosition > upper) {
+      break;
+    }
+    if (insertionPointMatches(entry, point, viewport)) {
+      matches.push(entry);
+    }
+  }
+  matches.sort((left, right) => left.originalIndex - right.originalIndex);
+  return matches[0]?.target ?? null;
+}
+
+function insertionPointMatches(
+  entry: IndexedInsertionPoint,
+  point: MapPoint,
+  viewport: InsertionViewportMetrics,
+) {
+  const boundaryX = (
+    (entry.target.visualPosition - viewport.viewportXStart) / viewport.viewportXSpan
+  ) * viewport.widthPx;
+  const boundaryY = (
+    (entry.target.visualPosition - viewport.viewportYStart) / viewport.viewportYSpan
+  ) * viewport.heightPx;
+  return Math.abs(point.x - (boundaryX + entry.offsetPx)) <= viewport.tolerancePx
+    && Math.abs(point.y - (boundaryY + entry.offsetPx)) <= viewport.tolerancePx;
 }
 
 function findLastInBox<T extends { visualStart: number; visualEnd: number }>(

@@ -22,6 +22,10 @@ export const contactTileGpuTextureBudgetBytes = 96 * 1024 * 1024;
 export const contactTileGpuVirtualTextureBudgetBytes = 32 * 1024 * 1024;
 export const contactOverviewTextureBins = 320;
 export const contactTileGpuR16fMaximum = 65_504;
+/** Four 256x256 R32F atlas layers per frame. */
+export const contactTileGpuUploadBudgetBytes = 1024 * 1024;
+/** Keep texture submission below a small fraction of a 16.7 ms frame. */
+export const contactTileGpuUploadBudgetMilliseconds = 2;
 
 export type ContactTileGpuTextureFormat = "r16f" | "r32f";
 export type ContactTileGpuTexturePreference = ContactTileGpuTextureFormat;
@@ -55,6 +59,17 @@ export interface ContactTileGpuPerformanceSnapshot {
   sourceLayoutBytes: number;
   stagedSceneDraws: number;
   framebufferSwaps: number;
+  uploadQueueFrames: number;
+  uploadQueueDeferredFrames: number;
+  uploadQueueMaxDepth: number;
+  uploadQueueBytes: number;
+  uploadQueueMilliseconds: number;
+  uploadQueueMaxFrameBytes: number;
+  uploadQueueMaxFrameMilliseconds: number;
+  uploadFencePolls: number;
+  uploadFenceWaitFrames: number;
+  uploadFenceSignals: number;
+  uploadFenceFailures: number;
 }
 
 export interface ContactTileGpuRendererOptions {
@@ -63,6 +78,10 @@ export interface ContactTileGpuRendererOptions {
   performanceEnabled?: boolean;
   emitPerformance?: (line: string) => void;
   clock?: () => number;
+  uploadBudgetBytes?: number;
+  uploadBudgetMilliseconds?: number;
+  requestFrame?: (callback: FrameRequestCallback) => number;
+  cancelFrame?: (handle: number) => void;
 }
 
 export interface ContactTileGpuOverview {
@@ -128,13 +147,19 @@ export interface ContactTileGpuDeltaScene {
 }
 
 export interface ContactTileGpuRenderer {
-  setScene: (scene: ContactTileGpuScene) => boolean;
+  setScene: (
+    scene: ContactTileGpuScene,
+    onPresented?: (presented: boolean) => void,
+  ) => boolean;
   /**
    * Draw a replacement into the second presentation FBO, then swap it with
    * the retained front FBO in the same WebGL context. A failed staging draw
    * leaves the visible front framebuffer untouched.
    */
-  stageScene: (scene: ContactTileGpuScene) => boolean;
+  stageScene: (
+    scene: ContactTileGpuScene,
+    onPresented?: (presented: boolean) => void,
+  ) => boolean;
   /**
    * Atomically replace the current scene only when every populated target tile
    * is already resident in this WebGL context. A miss leaves the visible frame
@@ -193,6 +218,214 @@ export interface ContactTileVirtualPagePlan {
   height: number;
   pages: readonly ContactTileVirtualPage[];
   populatedTiles: readonly { key: string; tile: ContactMapTile }[];
+}
+
+export type ContactTileGpuUploadPriority = "center" | "edge" | "prefetch";
+
+export interface ContactTileGpuUploadCandidate {
+  key: string;
+  tile: ContactMapTile;
+  priority: ContactTileGpuUploadPriority;
+  priorityRank: 0 | 1 | 2;
+  distance: number;
+  bytes: number;
+}
+
+/**
+ * Order unique atlas uploads by what can affect the current camera. Source-space
+ * scenes use the AGP address maps rather than comparing source tile ids with a
+ * visual viewport.
+ */
+export function contactTileGpuUploadPlan(
+  scene: ContactTileGpuScene,
+): ContactTileGpuUploadCandidate[] {
+  const tiles = new Map<string, ContactMapTile>();
+  const descriptors = scene.sourceLayout?.descriptors ?? scene.descriptors;
+  for (const descriptor of descriptors) {
+    if (contactTileCellCount(descriptor.tile) > 0) {
+      tiles.set(contactTileKey(descriptor.tile), descriptor.tile);
+    }
+  }
+  const bytes = scene.tileSizeBins * scene.tileSizeBins * Float32Array.BYTES_PER_ELEMENT;
+  const sourceRanks = scene.sourceLayout
+    ? contactSourceTilePriorityRanks(scene)
+    : null;
+  return [...tiles].map(([key, tile]) => {
+    const ranked = sourceRanks
+      ? sourceTileUploadRank(tile, sourceRanks.x, sourceRanks.y)
+      : visualTileUploadRank(scene, key);
+    return {
+      key,
+      tile,
+      priority: uploadPriorityName(ranked.rank),
+      priorityRank: ranked.rank,
+      distance: ranked.distance,
+      bytes,
+    };
+  }).sort((left, right) => (
+    left.priorityRank - right.priorityRank
+    || left.distance - right.distance
+    || left.key.localeCompare(right.key)
+  ));
+}
+
+/** Select a byte-bounded prefix while guaranteeing progress for one oversized tile. */
+export function contactTileGpuUploadBatch(
+  candidates: readonly ContactTileGpuUploadCandidate[],
+  byteBudget: number,
+): ContactTileGpuUploadCandidate[] {
+  const safeBudget = Number.isFinite(byteBudget)
+    ? Math.max(1, Math.floor(byteBudget))
+    : Number.MAX_SAFE_INTEGER;
+  const selected: ContactTileGpuUploadCandidate[] = [];
+  let bytes = 0;
+  for (const candidate of candidates) {
+    if (selected.length > 0 && bytes + candidate.bytes > safeBudget) {
+      break;
+    }
+    selected.push(candidate);
+    bytes += candidate.bytes;
+    if (bytes >= safeBudget) {
+      break;
+    }
+  }
+  return selected;
+}
+
+/** Keep every explicit empty page, but defer populated pages outside the camera. */
+export function contactTileGpuVisibleUploadScene(
+  scene: ContactTileGpuScene,
+): ContactTileGpuScene {
+  const visiblePopulatedKeys = new Set(
+    contactTileGpuUploadPlan(scene)
+      .filter((candidate) => candidate.priorityRank < 2)
+      .map((candidate) => candidate.key),
+  );
+  const filter = (descriptors: readonly ContactTileCanvasDescriptor[]) => (
+    descriptors.filter((descriptor) => (
+      contactTileCellCount(descriptor.tile) === 0
+      || visiblePopulatedKeys.has(contactTileKey(descriptor.tile))
+    ))
+  );
+  if (!scene.sourceLayout) {
+    return { ...scene, descriptors: filter(scene.descriptors) };
+  }
+  return {
+    ...scene,
+    sourceLayout: {
+      ...scene.sourceLayout,
+      descriptors: filter(scene.sourceLayout.descriptors),
+    },
+  };
+}
+
+function uploadPriorityName(rank: 0 | 1 | 2): ContactTileGpuUploadPriority {
+  return rank === 0 ? "center" : rank === 1 ? "edge" : "prefetch";
+}
+
+function visualTileUploadRank(
+  scene: ContactTileGpuScene,
+  tileKey: string,
+): { rank: 0 | 1 | 2; distance: number } {
+  const tileSpan = scene.resolution * scene.tileSizeBins;
+  const viewport = scene.viewport;
+  const centerX = (viewport.xStart + viewport.xEnd) / 2;
+  const centerY = (viewport.yStart + viewport.yEnd) / 2;
+  const centerRect = {
+    xStart: viewport.xStart + (viewport.xEnd - viewport.xStart) * 0.25,
+    xEnd: viewport.xEnd - (viewport.xEnd - viewport.xStart) * 0.25,
+    yStart: viewport.yStart + (viewport.yEnd - viewport.yStart) * 0.25,
+    yEnd: viewport.yEnd - (viewport.yEnd - viewport.yStart) * 0.25,
+  };
+  let rank: 0 | 1 | 2 = 2;
+  let distance = Number.POSITIVE_INFINITY;
+  for (const descriptor of scene.descriptors) {
+    if (contactTileKey(descriptor.tile) !== tileKey) {
+      continue;
+    }
+    const tileX = descriptor.transpose ? descriptor.tile.tileY : descriptor.tile.tileX;
+    const tileY = descriptor.transpose ? descriptor.tile.tileX : descriptor.tile.tileY;
+    const xStart = tileX * tileSpan;
+    const xEnd = xStart + tileSpan;
+    const yStart = tileY * tileSpan;
+    const yEnd = yStart + tileSpan;
+    const intersectsViewport = xEnd > viewport.xStart
+      && xStart < viewport.xEnd
+      && yEnd > viewport.yStart
+      && yStart < viewport.yEnd;
+    const intersectsCenter = xEnd > centerRect.xStart
+      && xStart < centerRect.xEnd
+      && yEnd > centerRect.yStart
+      && yStart < centerRect.yEnd;
+    rank = Math.min(rank, intersectsCenter ? 0 : intersectsViewport ? 1 : 2) as 0 | 1 | 2;
+    const dx = (xStart + xEnd) / 2 - centerX;
+    const dy = (yStart + yEnd) / 2 - centerY;
+    distance = Math.min(distance, dx * dx + dy * dy);
+  }
+  return { rank, distance };
+}
+
+function contactSourceTilePriorityRanks(scene: ContactTileGpuScene) {
+  const sourceLayout = scene.sourceLayout!;
+  return {
+    x: sourceAxisPriorityRanks(
+      sourceLayout.xMap,
+      scene.viewport.xStart,
+      scene.viewport.xEnd,
+    ),
+    y: sourceAxisPriorityRanks(
+      sourceLayout.yMap,
+      scene.viewport.yStart,
+      scene.viewport.yEnd,
+    ),
+  };
+}
+
+function sourceAxisPriorityRanks(
+  map: ContactGpuLayoutMap,
+  viewportStart: number,
+  viewportEnd: number,
+) {
+  const ranks = new Map<number, 0 | 1 | 2>();
+  const centerStart = viewportStart + (viewportEnd - viewportStart) * 0.25;
+  const centerEnd = viewportEnd - (viewportEnd - viewportStart) * 0.25;
+  for (const entry of map.entries) {
+    if (!entry.valid) {
+      continue;
+    }
+    const start = entry.visualBin * map.resolution;
+    const end = start + map.resolution;
+    const rank: 0 | 1 | 2 = end > centerStart && start < centerEnd
+      ? 0
+      : end > viewportStart && start < viewportEnd
+        ? 1
+        : 2;
+    ranks.set(entry.sourceTile, Math.min(ranks.get(entry.sourceTile) ?? 2, rank) as 0 | 1 | 2);
+  }
+  return ranks;
+}
+
+function sourceTileUploadRank(
+  tile: ContactMapTile,
+  xRanks: ReadonlyMap<number, 0 | 1 | 2>,
+  yRanks: ReadonlyMap<number, 0 | 1 | 2>,
+): { rank: 0 | 1 | 2; distance: number } {
+  const direct = Math.max(
+    xRanks.get(tile.tileX) ?? 2,
+    yRanks.get(tile.tileY) ?? 2,
+  ) as 0 | 1 | 2;
+  const transpose = Math.max(
+    xRanks.get(tile.tileY) ?? 2,
+    yRanks.get(tile.tileX) ?? 2,
+  ) as 0 | 1 | 2;
+  const rank = Math.min(direct, transpose) as 0 | 1 | 2;
+  return {
+    rank,
+    distance: Math.min(
+      Math.abs(tile.tileX - tile.tileY),
+      Math.abs(tile.tileY - tile.tileX),
+    ),
+  };
 }
 
 /** Build the compact world-page rectangle sampled by the pointer shader. */
@@ -1080,6 +1313,17 @@ function initialContactTileGpuPerformance(
     sourceLayoutBytes: 0,
     stagedSceneDraws: 0,
     framebufferSwaps: 0,
+    uploadQueueFrames: 0,
+    uploadQueueDeferredFrames: 0,
+    uploadQueueMaxDepth: 0,
+    uploadQueueBytes: 0,
+    uploadQueueMilliseconds: 0,
+    uploadQueueMaxFrameBytes: 0,
+    uploadQueueMaxFrameMilliseconds: 0,
+    uploadFencePolls: 0,
+    uploadFenceWaitFrames: 0,
+    uploadFenceSignals: 0,
+    uploadFenceFailures: 0,
     lastEmissionSignature: "",
   };
 }
@@ -1127,6 +1371,17 @@ function formatContactTileGpuPerformanceLog(
     `source_layout_bytes=${snapshot.sourceLayoutBytes}`,
     `staged_scene_draws=${snapshot.stagedSceneDraws}`,
     `framebuffer_swaps=${snapshot.framebufferSwaps}`,
+    `upload_queue_frames=${snapshot.uploadQueueFrames}`,
+    `upload_queue_deferred_frames=${snapshot.uploadQueueDeferredFrames}`,
+    `upload_queue_max_depth=${snapshot.uploadQueueMaxDepth}`,
+    `upload_queue_bytes=${snapshot.uploadQueueBytes}`,
+    `upload_queue_ms=${roundGpuMilliseconds(snapshot.uploadQueueMilliseconds)}`,
+    `upload_queue_max_frame_bytes=${snapshot.uploadQueueMaxFrameBytes}`,
+    `upload_queue_max_frame_ms=${roundGpuMilliseconds(snapshot.uploadQueueMaxFrameMilliseconds)}`,
+    `upload_fence_polls=${snapshot.uploadFencePolls}`,
+    `upload_fence_wait_frames=${snapshot.uploadFenceWaitFrames}`,
+    `upload_fence_signals=${snapshot.uploadFenceSignals}`,
+    `upload_fence_failures=${snapshot.uploadFenceFailures}`,
   ].join(" ");
 }
 
@@ -1176,6 +1431,26 @@ export function createContactTileGpuRenderer(
   const texturePreference = options.texturePreference ?? contactTileGpuTexturePreference();
   const performanceEnabled = options.performanceEnabled ?? isContactTilePerformanceEnabled();
   const emitPerformance = options.emitPerformance ?? ((line: string) => console.info(line));
+  const uploadBudgetBytes = Math.max(
+    1,
+    Math.floor(options.uploadBudgetBytes ?? contactTileGpuUploadBudgetBytes),
+  );
+  const uploadBudgetMilliseconds = Math.max(
+    0.1,
+    options.uploadBudgetMilliseconds ?? contactTileGpuUploadBudgetMilliseconds,
+  );
+  const requestUploadFrame = options.requestFrame ?? ((callback: FrameRequestCallback) => (
+    typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame(callback)
+      : Number(globalThis.setTimeout(() => callback(Date.now()), 16))
+  ));
+  const cancelUploadFrame = options.cancelFrame ?? ((handle: number) => {
+    if (typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(handle);
+    } else {
+      globalThis.clearTimeout(handle);
+    }
+  });
   const uploadContext: ContactTileGpuUploadContext = {
     preference: texturePreference,
     performance: initialContactTileGpuPerformance(texturePreference),
@@ -1203,6 +1478,27 @@ export function createContactTileGpuRenderer(
   let stagingFramePresentation: FramePresentationResources | null = null;
   let virtualTextureState: VirtualTextureState | null = null;
   let sourceLayoutTextureState: SourceLayoutTextureState | null = null;
+  let scheduledUploadFrame: number | null = null;
+  let nextUploadRequestId = 1;
+
+  interface PendingVirtualPresentation {
+    id: number;
+    scene: ContactTileGpuScene;
+    visibleScene: ContactTileGpuScene;
+    target: "front" | "staging";
+    onPresented?: (presented: boolean) => void;
+  }
+
+  interface PendingPresentationFence extends PendingVirtualPresentation {
+    sync: WebGLSync;
+    presentation: FramePresentationResources;
+  }
+
+  let pendingVirtualPresentation: PendingVirtualPresentation | null = null;
+  let pendingPresentationFence: PendingPresentationFence | null = null;
+  let pendingPrefetchScene: ContactTileGpuScene | null = null;
+  let pendingPrefetchGeneration: number | undefined;
+  let pendingPrefetchPresentationRequested = false;
 
   const updatePerformanceCacheState = () => {
     uploadContext.performance.cacheEntries = textureCache.size;
@@ -1213,7 +1509,7 @@ export function createContactTileGpuRenderer(
       return;
     }
     updatePerformanceCacheState();
-    const signature = `${uploadContext.performance.uploads}:${uploadContext.performance.evictions}:${uploadContext.performance.scenePromotions}:${uploadContext.performance.scenePromotionMisses}:${uploadContext.performance.virtualTextureUploads}:${uploadContext.performance.virtualTextureFallbacks}:${uploadContext.performance.virtualTextureRebuilds}:${uploadContext.performance.sourceLayoutDraws}:${uploadContext.performance.sourceLayoutUploads}:${uploadContext.performance.framebufferSwaps}:${textureCache.size}:${textureBytes}`;
+    const signature = `${uploadContext.performance.uploads}:${uploadContext.performance.evictions}:${uploadContext.performance.scenePromotions}:${uploadContext.performance.scenePromotionMisses}:${uploadContext.performance.virtualTextureUploads}:${uploadContext.performance.virtualTextureFallbacks}:${uploadContext.performance.virtualTextureRebuilds}:${uploadContext.performance.sourceLayoutDraws}:${uploadContext.performance.sourceLayoutUploads}:${uploadContext.performance.framebufferSwaps}:${uploadContext.performance.uploadQueueFrames}:${uploadContext.performance.uploadQueueDeferredFrames}:${uploadContext.performance.uploadQueueBytes}:${uploadContext.performance.uploadQueueMaxFrameBytes}:${uploadContext.performance.uploadFenceSignals}:${uploadContext.performance.uploadFenceWaitFrames}:${textureCache.size}:${textureBytes}`;
     if (signature === uploadContext.performance.lastEmissionSignature) {
       return;
     }
@@ -1412,7 +1708,6 @@ export function createContactTileGpuRenderer(
     if (!plan || !virtualPagePlanFits(plan)) {
       return false;
     }
-    const pageBytes = plan.width * plan.height * 2 * Uint32Array.BYTES_PER_ELEMENT;
     const capacity = maximumVirtualTextureLayers(activeScene.tileSizeBins);
     if (capacity === 0 || plan.populatedTiles.length > capacity) {
       return false;
@@ -1425,10 +1720,6 @@ export function createContactTileGpuRenderer(
       return false;
     }
 
-    const layerByTileKey = new Map<string, number>();
-    const tileByTileKey = new Map<string, ContactMapTile>();
-    const generationByTileKey = new Map<string, number | undefined>();
-    const lastUsedByTileKey = new Map<string, number>();
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, tileArray);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -1453,44 +1744,7 @@ export function createContactTileGpuRenderer(
       gl.deleteTexture(pageTable);
       return false;
     }
-    for (let layer = 0; layer < plan.populatedTiles.length; layer += 1) {
-      const { key, tile } = plan.populatedTiles[layer]!;
-      const atlasKey = virtualTextureAtlasKey(activeScene, key);
-      gl.texSubImage3D(
-        gl.TEXTURE_2D_ARRAY,
-        0,
-        0,
-        0,
-        layer,
-        activeScene.tileSizeBins,
-        activeScene.tileSizeBins,
-        1,
-        gl.RED,
-        gl.FLOAT,
-        contactTileFloatTextureData(tile, activeScene.tileSizeBins),
-      );
-      layerByTileKey.set(atlasKey, layer);
-      tileByTileKey.set(atlasKey, tile);
-      generationByTileKey.set(
-        atlasKey,
-        activeScene.sourceLayout?.generation ?? activeScene.generation,
-      );
-      lastUsedByTileKey.set(atlasKey, ++useCounter);
-    }
-    if (gl.getError() !== gl.NO_ERROR) {
-      gl.deleteTexture(tileArray);
-      gl.deleteTexture(pageTable);
-      return false;
-    }
-    const pageTableData = contactTileVirtualPageTableData(
-      plan,
-      virtualTexturePageLayers(activeScene, plan, layerByTileKey),
-    );
-    if (!pageTableData) {
-      gl.deleteTexture(tileArray);
-      gl.deleteTexture(pageTable);
-      return false;
-    }
+    const pageTableData = new Uint32Array(2);
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, pageTable);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -1501,8 +1755,8 @@ export function createContactTileGpuRenderer(
       gl.TEXTURE_2D,
       0,
       gl.RG32UI,
-      plan.width,
-      plan.height,
+      1,
+      1,
       0,
       gl.RG_INTEGER,
       gl.UNSIGNED_INT,
@@ -1523,11 +1777,18 @@ export function createContactTileGpuRenderer(
       capacity,
       resolution: activeScene.resolution,
       tileSizeBins: activeScene.tileSizeBins,
-      layerByTileKey,
-      tileByTileKey,
-      generationByTileKey,
-      lastUsedByTileKey,
-      plan,
+      layerByTileKey: new Map(),
+      tileByTileKey: new Map(),
+      generationByTileKey: new Map(),
+      lastUsedByTileKey: new Map(),
+      plan: {
+        originX: 0,
+        originY: 0,
+        width: 1,
+        height: 1,
+        pages: [],
+        populatedTiles: [],
+      },
       pageTableData,
       bytes: (
         capacity
@@ -1538,36 +1799,40 @@ export function createContactTileGpuRenderer(
     };
     deleteVirtualTextureState(virtualTextureState);
     virtualTextureState = nextState;
-    if (!ensureSourceLayoutTextureState(activeScene)) {
-      deleteVirtualTextureState(virtualTextureState);
-      virtualTextureState = null;
-      deleteSourceLayoutTextureState(sourceLayoutTextureState);
-      sourceLayoutTextureState = null;
-      return false;
-    }
-    uploadContext.performance.virtualTextureUploads += plan.populatedTiles.length;
-    uploadContext.performance.virtualTexturePages = plan.pages.length;
-    uploadContext.performance.virtualTextureLayers = layerByTileKey.size;
+    uploadContext.performance.virtualTexturePages = 0;
+    uploadContext.performance.virtualTextureLayers = 0;
     uploadContext.performance.virtualTextureBytes = nextState.bytes;
     uploadContext.performance.virtualTextureRebuilds += 1;
     return true;
   };
 
-  const appendVirtualTextureScene = (
+  type VirtualTextureAppendResult = "ready" | "pending" | "failed";
+  const appendVirtualTextureScenePass = (
     activeScene: ContactTileGpuScene,
     generation = activeScene.sourceLayout?.generation ?? activeScene.generation,
-  ) => {
-    const current = virtualTextureState;
-    if (
-      !current
-      || current.tileSizeBins !== activeScene.tileSizeBins
-      || (!activeScene.sourceLayout && activeScene.visibleLayerComplete !== true)
-    ) {
-      return rebuildVirtualTextureState(activeScene);
+    byteBudget = Number.POSITIVE_INFINITY,
+    millisecondBudget = Number.POSITIVE_INFINITY,
+    trackQueueFrame = false,
+  ): VirtualTextureAppendResult => {
+    if (!activeScene.sourceLayout && activeScene.visibleLayerComplete !== true) {
+      return "failed";
     }
+    if (
+      !virtualTextureState
+      || virtualTextureState.tileSizeBins !== activeScene.tileSizeBins
+    ) {
+      if (!rebuildVirtualTextureState(activeScene)) {
+        return "failed";
+      }
+    }
+    const current = virtualTextureState!;
     const plan = virtualPagePlanForScene(activeScene);
-    if (!plan || !virtualPagePlanFits(plan)) {
-      return false;
+    if (
+      !plan
+      || !virtualPagePlanFits(plan)
+      || plan.populatedTiles.length > current.capacity
+    ) {
+      return "failed";
     }
     const pageBytes = plan.width * plan.height * 2 * Uint32Array.BYTES_PER_ELEMENT;
     const layerBytes = current.capacity
@@ -1578,7 +1843,7 @@ export function createContactTileGpuRenderer(
       layerBytes + pageBytes
       > Math.min(safeTextureBudget, contactTileGpuVirtualTextureBudgetBytes)
     ) {
-      return false;
+      return "failed";
     }
     const nextLayers = new Map(current.layerByTileKey);
     const nextTiles = new Map(current.tileByTileKey);
@@ -1592,11 +1857,30 @@ export function createContactTileGpuRenderer(
       .sort((left, right) => (
         (nextLastUsed.get(left) ?? 0) - (nextLastUsed.get(right) ?? 0)
       ));
+    const candidates = contactTileGpuUploadPlan(activeScene).filter((candidate) => (
+      nextTiles.get(virtualTextureAtlasKey(activeScene, candidate.key)) !== candidate.tile
+    ));
+    const selected = contactTileGpuUploadBatch(candidates, byteBudget);
+    if (trackQueueFrame) {
+      uploadContext.performance.uploadQueueFrames += 1;
+      uploadContext.performance.uploadQueueMaxDepth = Math.max(
+        uploadContext.performance.uploadQueueMaxDepth,
+        candidates.length,
+      );
+    }
     let uploaded = 0;
+    let uploadedBytes = 0;
     let evicted = 0;
+    const startedAt = uploadContext.clock();
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, current.tileArray);
-    for (const { key, tile } of plan.populatedTiles) {
+    for (const { key, tile, bytes } of selected) {
+      if (
+        uploaded > 0
+        && uploadContext.clock() - startedAt >= millisecondBudget
+      ) {
+        break;
+      }
       const atlasKey = virtualTextureAtlasKey(activeScene, key);
       let layer = nextLayers.get(atlasKey);
       if (layer === undefined) {
@@ -1609,11 +1893,11 @@ export function createContactTileGpuRenderer(
         } else {
           const evictedKey = evictionCandidates.shift();
           if (evictedKey === undefined) {
-            return false;
+            return "failed";
           }
           layer = nextLayers.get(evictedKey);
           if (layer === undefined) {
-            return false;
+            return "failed";
           }
           nextLayers.delete(evictedKey);
           nextTiles.delete(evictedKey);
@@ -1622,7 +1906,7 @@ export function createContactTileGpuRenderer(
           evicted += 1;
         }
         if (layer >= current.capacity) {
-          return false;
+          return "failed";
         }
         nextLayers.set(atlasKey, layer);
       }
@@ -1647,16 +1931,49 @@ export function createContactTileGpuRenderer(
       nextTiles.set(atlasKey, tile);
       nextGenerations.set(atlasKey, generation);
       uploaded += 1;
+      uploadedBytes += bytes;
     }
     if (uploaded > 0 && gl.getError() !== gl.NO_ERROR) {
-      return false;
+      return "failed";
+    }
+    current.layerByTileKey = nextLayers;
+    current.tileByTileKey = nextTiles;
+    current.generationByTileKey = nextGenerations;
+    current.lastUsedByTileKey = nextLastUsed;
+    current.resolution = activeScene.resolution;
+    uploadContext.performance.virtualTextureUploads += uploaded;
+    uploadContext.performance.virtualTextureLayers = nextLayers.size;
+    uploadContext.performance.evictions += evicted;
+    uploadContext.performance.evictedBytes += evicted
+      * activeScene.tileSizeBins
+      * activeScene.tileSizeBins
+      * Float32Array.BYTES_PER_ELEMENT;
+    uploadContext.performance.uploadQueueBytes += uploadedBytes;
+    if (trackQueueFrame) {
+      const elapsed = Math.max(0, uploadContext.clock() - startedAt);
+      uploadContext.performance.uploadQueueMilliseconds += elapsed;
+      uploadContext.performance.uploadQueueMaxFrameBytes = Math.max(
+        uploadContext.performance.uploadQueueMaxFrameBytes,
+        uploadedBytes,
+      );
+      uploadContext.performance.uploadQueueMaxFrameMilliseconds = Math.max(
+        uploadContext.performance.uploadQueueMaxFrameMilliseconds,
+        elapsed,
+      );
+    }
+    const remaining = candidates.length - uploaded;
+    if (remaining > 0) {
+      if (trackQueueFrame) {
+        uploadContext.performance.uploadQueueDeferredFrames += 1;
+      }
+      return "pending";
     }
     const pageTableData = contactTileVirtualPageTableData(
       plan,
       virtualTexturePageLayers(activeScene, plan, nextLayers),
     );
     if (!pageTableData) {
-      return false;
+      return "failed";
     }
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, current.pageTable);
@@ -1672,13 +1989,8 @@ export function createContactTileGpuRenderer(
       pageTableData,
     );
     if (gl.getError() !== gl.NO_ERROR) {
-      return false;
+      return "failed";
     }
-    current.layerByTileKey = nextLayers;
-    current.tileByTileKey = nextTiles;
-    current.generationByTileKey = nextGenerations;
-    current.lastUsedByTileKey = nextLastUsed;
-    current.resolution = activeScene.resolution;
     current.plan = plan;
     current.pageTableData = pageTableData;
     current.bytes = (
@@ -1687,17 +1999,18 @@ export function createContactTileGpuRenderer(
       * activeScene.tileSizeBins
       * Float32Array.BYTES_PER_ELEMENT
     ) + pageTableData.byteLength;
-    uploadContext.performance.virtualTextureUploads += uploaded;
     uploadContext.performance.virtualTexturePages = plan.pages.length;
-    uploadContext.performance.virtualTextureLayers = nextLayers.size;
     uploadContext.performance.virtualTextureBytes = current.bytes;
-    uploadContext.performance.evictions += evicted;
-    uploadContext.performance.evictedBytes += evicted
-      * activeScene.tileSizeBins
-      * activeScene.tileSizeBins
-      * Float32Array.BYTES_PER_ELEMENT;
-    return ensureSourceLayoutTextureState(activeScene);
+    return ensureSourceLayoutTextureState(activeScene) ? "ready" : "failed";
   };
+
+  const appendVirtualTextureScene = (
+    activeScene: ContactTileGpuScene,
+    generation = activeScene.sourceLayout?.generation ?? activeScene.generation,
+  ) => appendVirtualTextureScenePass(
+    activeScene,
+    generation,
+  ) === "ready";
 
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.CULL_FACE);
@@ -1711,7 +2024,10 @@ export function createContactTileGpuRenderer(
     sourceLayout?: ContactTileGpuSourceLayout,
   ) => {
     if (sourceLayout) {
-      const axisCovers = (
+      const compactSourceTile = new Map(
+        sourceLayout.sourceTiles.map((sourceTile, index) => [sourceTile, index] as const),
+      );
+      const requiredPages = (
         map: ContactGpuLayoutMap,
         start: number,
         end: number,
@@ -1720,14 +2036,51 @@ export function createContactTileGpuRenderer(
         const last = Math.ceil(end / state.resolution) - 1;
         const localFirst = first - map.firstVisualBin;
         const localLast = last - map.firstVisualBin;
-        return localFirst >= 0
-          && localLast < map.entries.length
-          && map.entries
-            .slice(localFirst, localLast + 1)
-            .every((entry) => !entry.valid || entry.exact);
+        if (localFirst < 0 || localLast >= map.entries.length) {
+          return null;
+        }
+        const pages = new Set<number>();
+        for (const entry of map.entries.slice(localFirst, localLast + 1)) {
+          if (!entry.valid) {
+            continue;
+          }
+          if (!entry.exact) {
+            return null;
+          }
+          const page = compactSourceTile.get(entry.sourceTile);
+          if (page === undefined) {
+            return null;
+          }
+          pages.add(page);
+        }
+        return pages;
       };
-      return axisCovers(sourceLayout.xMap, viewport.xStart, viewport.xEnd)
-        && axisCovers(sourceLayout.yMap, viewport.yStart, viewport.yEnd);
+      const xPages = requiredPages(sourceLayout.xMap, viewport.xStart, viewport.xEnd);
+      const yPages = requiredPages(sourceLayout.yMap, viewport.yStart, viewport.yEnd);
+      if (!xPages || !yPages) {
+        return false;
+      }
+      for (const pageY of yPages) {
+        for (const pageX of xPages) {
+          const localX = pageX - state.plan.originX;
+          const localY = pageY - state.plan.originY;
+          if (
+            localX < 0
+            || localX >= state.plan.width
+            || localY < 0
+            || localY >= state.plan.height
+          ) {
+            return false;
+          }
+          const flags = state.pageTableData[
+            (localY * state.plan.width + localX) * 2 + 1
+          ];
+          if ((flags & contactTileVirtualPageExactFlag) === 0) {
+            return false;
+          }
+        }
+      }
+      return true;
     }
     const tileSpan = state.resolution * state.tileSizeBins;
     const firstX = Math.floor(viewport.xStart / tileSpan);
@@ -2279,8 +2632,195 @@ export function createContactTileGpuRenderer(
     return drawVirtualTexturePan(activeScene, presentation, present);
   };
 
+  const cancelScheduledUploadFrame = () => {
+    if (scheduledUploadFrame === null) {
+      return;
+    }
+    cancelUploadFrame(scheduledUploadFrame);
+    scheduledUploadFrame = null;
+  };
+
+  const scheduleUploadPump = () => {
+    if (destroyed || scheduledUploadFrame !== null) {
+      return;
+    }
+    scheduledUploadFrame = requestUploadFrame(() => {
+      scheduledUploadFrame = null;
+      processUploadPump();
+    });
+  };
+
+  const finishPendingFence = (presented: boolean) => {
+    const pending = pendingPresentationFence;
+    if (!pending) {
+      return;
+    }
+    gl.deleteSync(pending.sync);
+    pendingPresentationFence = null;
+    if (!presented) {
+      uploadContext.performance.uploadFenceFailures += 1;
+      pending.onPresented?.(false);
+      emitPerformanceIfChanged();
+      return;
+    }
+    if (pending.target === "staging") {
+      const previousFrontPresentation = framePresentation;
+      framePresentation = pending.presentation;
+      stagingFramePresentation = previousFrontPresentation;
+      uploadContext.performance.stagedSceneDraws += 1;
+      uploadContext.performance.framebufferSwaps += 1;
+    } else {
+      framePresentation = pending.presentation;
+    }
+    scene = pending.scene;
+    deltaScene = null;
+    deltaBuffers = new Map();
+    pendingAppendedDescriptors.clear();
+    presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+    uploadContext.performance.uploadFenceSignals += 1;
+    pending.onPresented?.(true);
+    pendingPrefetchScene = contactTileGpuUploadPlan(pending.scene)
+      .some((candidate) => candidate.priorityRank === 2)
+      ? pending.scene
+      : null;
+    pendingPrefetchGeneration = pendingPrefetchScene
+      ? pending.scene.sourceLayout?.generation ?? pending.scene.generation
+      : undefined;
+    emitPerformanceIfChanged();
+    scheduleUploadPump();
+  };
+
+  const pollPendingFence = () => {
+    const pending = pendingPresentationFence;
+    if (!pending) {
+      return false;
+    }
+    uploadContext.performance.uploadFencePolls += 1;
+    const status = gl.clientWaitSync(pending.sync, 0, 0);
+    if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+      finishPendingFence(true);
+      return true;
+    }
+    if (status === gl.WAIT_FAILED) {
+      finishPendingFence(false);
+      return true;
+    }
+    uploadContext.performance.uploadFenceWaitFrames += 1;
+    scheduleUploadPump();
+    return true;
+  };
+
+  const submitPresentationFence = (pending: PendingVirtualPresentation) => {
+    const drawn = drawCompleteVirtualScene(
+      pending.visibleScene,
+      pending.target,
+      false,
+    );
+    const presentation = pending.target === "staging"
+      ? stagingFramePresentation
+      : framePresentation;
+    if (!drawn || !presentation) {
+      pending.onPresented?.(false);
+      return false;
+    }
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!sync) {
+      uploadContext.performance.uploadFenceFailures += 1;
+      pending.onPresented?.(false);
+      return false;
+    }
+    gl.flush();
+    pendingPresentationFence = { ...pending, sync, presentation };
+    pollPendingFence();
+    return true;
+  };
+
+  function processUploadPump() {
+    if (destroyed || gl!.isContextLost()) {
+      return;
+    }
+    if (pendingPresentationFence) {
+      pollPendingFence();
+      return;
+    }
+    const pending = pendingVirtualPresentation;
+    if (pending) {
+      const result = appendVirtualTextureScenePass(
+        pending.visibleScene,
+        pending.scene.sourceLayout?.generation ?? pending.scene.generation,
+        uploadBudgetBytes,
+        uploadBudgetMilliseconds,
+        true,
+      );
+      if (result === "pending") {
+        scheduleUploadPump();
+        emitPerformanceIfChanged();
+        return;
+      }
+      pendingVirtualPresentation = null;
+      if (result === "failed") {
+        pending.onPresented?.(false);
+      } else {
+        submitPresentationFence(pending);
+      }
+      return;
+    }
+    if (pendingPrefetchScene) {
+      const prefetchScene = pendingPrefetchScene;
+      const result = appendVirtualTextureScenePass(
+        prefetchScene,
+        pendingPrefetchGeneration
+          ?? prefetchScene.sourceLayout?.generation
+          ?? prefetchScene.generation,
+        uploadBudgetBytes,
+        uploadBudgetMilliseconds,
+        true,
+      );
+      if (result !== "pending") {
+        pendingPrefetchScene = null;
+        pendingPrefetchGeneration = undefined;
+        if (result === "ready" && pendingPrefetchPresentationRequested && scene) {
+          drawVirtualTexturePan(scene);
+        }
+        pendingPrefetchPresentationRequested = false;
+      }
+      if (result === "pending") {
+        scheduleUploadPump();
+      }
+      emitPerformanceIfChanged();
+    }
+  }
+
+  const enqueueVirtualPresentation = (
+    nextScene: ContactTileGpuScene,
+    target: "front" | "staging",
+    onPresented?: (presented: boolean) => void,
+  ) => {
+    if (!virtualResources || (!nextScene.sourceLayout && nextScene.visibleLayerComplete !== true)) {
+      return false;
+    }
+    pendingVirtualPresentation?.onPresented?.(false);
+    if (pendingPresentationFence) {
+      gl.deleteSync(pendingPresentationFence.sync);
+      pendingPresentationFence.onPresented?.(false);
+      pendingPresentationFence = null;
+    }
+    pendingPrefetchScene = null;
+    pendingPrefetchGeneration = undefined;
+    pendingPrefetchPresentationRequested = false;
+    pendingVirtualPresentation = {
+      id: nextUploadRequestId++,
+      scene: nextScene,
+      visibleScene: contactTileGpuVisibleUploadScene(nextScene),
+      target,
+      onPresented,
+    };
+    processUploadPump();
+    return true;
+  };
+
   return {
-    setScene: (nextScene) => {
+    setScene: (nextScene, onPresented) => {
       if (
         !deltaScene
         && scene
@@ -2290,6 +2830,7 @@ export function createContactTileGpuRenderer(
         // immediately after promoteScene(). Do not clear, upload, or draw the
         // same pixels a second time in the child layout effect.
         scene = nextScene;
+        onPresented?.(true);
         return true;
       }
       if (
@@ -2337,18 +2878,37 @@ export function createContactTileGpuRenderer(
       deltaScene = null;
       deltaBuffers = new Map();
       pendingAppendedDescriptors.clear();
+      if (
+        virtualResources
+        && (nextScene.sourceLayout || nextScene.visibleLayerComplete === true)
+      ) {
+        return enqueueVirtualPresentation(
+          nextScene,
+          framePresentation ? "staging" : "front",
+          onPresented,
+        );
+      }
       scene = nextScene;
-      return nextScene.sourceLayout
+      const painted = nextScene.sourceLayout
         ? drawCompleteVirtualScene(nextScene)
         : drawCompleteVirtualScene(nextScene) || draw();
+      onPresented?.(painted);
+      return painted;
     },
-    stageScene: (nextScene) => {
+    stageScene: (nextScene, onPresented) => {
       if (destroyed || !scene || gl.isContextLost()) {
         return false;
       }
       if (!deltaScene && sameContactTileGpuScene(scene, nextScene)) {
         scene = nextScene;
+        onPresented?.(true);
         return true;
+      }
+      if (
+        virtualResources
+        && (nextScene.sourceLayout || nextScene.visibleLayerComplete === true)
+      ) {
+        return enqueueVirtualPresentation(nextScene, "staging", onPresented);
       }
       const previousScene = scene;
       const previousDeltaScene = deltaScene;
@@ -2381,6 +2941,7 @@ export function createContactTileGpuRenderer(
       uploadContext.performance.stagedSceneDraws += 1;
       uploadContext.performance.framebufferSwaps += 1;
       emitPerformanceIfChanged();
+      onPresented?.(true);
       return true;
     },
     promoteScene: (nextScene) => {
@@ -2563,6 +3124,8 @@ export function createContactTileGpuRenderer(
         return false;
       }
       const currentScene = scene;
+      const refreshesPendingPrefetch = pendingPrefetchScene !== null
+        && pendingPrefetchGeneration === input.generation;
       const usesPersistentAtlas = Boolean(
         virtualResources
         && virtualTextureState
@@ -2603,6 +3166,17 @@ export function createContactTileGpuRenderer(
               refreshedTiles.set(tileKey, tile);
             }
             continue;
+          }
+          if (refreshesPendingPrefetch) {
+            const retainedTile = retainedTiles.get(tileKey);
+            if (
+              retainedTile
+              && contactTileCellCount(tile) >= contactTileCellCount(retainedTile)
+            ) {
+              retainedTiles.set(tileKey, tile);
+              refreshedTiles.set(tileKey, tile);
+              continue;
+            }
           }
           // Keep a complete tile from the currently presented generation over
           // a partial snapshot for the same page.
@@ -2701,11 +3275,12 @@ export function createContactTileGpuRenderer(
       // framebuffer here; the next requestAnimationFrame pan uses the expanded
       // descriptor set, while a stationary pointer keeps the current frame.
       scene = { ...currentScene, descriptors: retainedDescriptors };
-      if (!appendVirtualTextureScene(scene, input.generation)) {
+      if (usesPersistentAtlas) {
+        pendingPrefetchScene = scene;
+        pendingPrefetchGeneration = input.generation;
+        scheduleUploadPump();
+      } else if (!appendVirtualTextureScene(scene, input.generation)) {
         uploadContext.performance.virtualTextureFallbacks += 1;
-        if (usesPersistentAtlas) {
-          return false;
-        }
       }
       textureBytes = cachedTextureBytes(textureCache);
       if (textureBytes > safeTextureBudget) {
@@ -2735,6 +3310,11 @@ export function createContactTileGpuRenderer(
         || gl.isContextLost()
       ) {
         return false;
+      }
+      if (pendingPrefetchScene) {
+        pendingPrefetchPresentationRequested = true;
+        scheduleUploadPump();
+        return true;
       }
       const descriptors = [...pendingAppendedDescriptors.values()];
       pendingAppendedDescriptors.clear();
@@ -2810,11 +3390,26 @@ export function createContactTileGpuRenderer(
       if (destroyed || gl.isContextLost()) {
         return;
       }
+      if (pendingVirtualPresentation || pendingPresentationFence) {
+        // The retained front FBO is authoritative while atlas layers/page-table
+        // entries are in flight. Sampling a half-updated atlas would be worse
+        // than holding the already-painted surface for this frame.
+        return;
+      }
       if (deltaScene) {
         deltaScene = { ...deltaScene, viewport };
       } else if (scene) {
         scene = { ...scene, viewport };
       } else {
+        return;
+      }
+      if (pendingPrefetchScene) {
+        // A camera move that remains inside the resident page table can still
+        // render. Crossing into a queued page simply retains the last front
+        // FBO until that page becomes exact; never fall back to bulk uploads.
+        if (scene && drawVirtualTexturePan(scene)) {
+          pendingAppendedDescriptors.clear();
+        }
         return;
       }
       // Pretext/Juicebox-style camera navigation: the visible textures are
@@ -2829,6 +3424,16 @@ export function createContactTileGpuRenderer(
       }
     },
     redraw: () => {
+      if (pendingVirtualPresentation || pendingPresentationFence) {
+        return true;
+      }
+      if (scene && pendingPrefetchScene) {
+        // Resize/style invalidation must not bypass the frame-budgeted queue.
+        // Repaint only when the resident page table already covers the camera;
+        // otherwise retain the last front surface until the queue catches up.
+        drawVirtualTexturePan(scene);
+        return true;
+      }
       return scene?.sourceLayout
         ? drawCompleteVirtualScene(scene)
         : scene
@@ -2844,6 +3449,15 @@ export function createContactTileGpuRenderer(
         return;
       }
       destroyed = true;
+      cancelScheduledUploadFrame();
+      pendingVirtualPresentation?.onPresented?.(false);
+      pendingVirtualPresentation = null;
+      pendingPrefetchScene = null;
+      if (pendingPresentationFence) {
+        gl.deleteSync(pendingPresentationFence.sync);
+        pendingPresentationFence.onPresented?.(false);
+        pendingPresentationFence = null;
+      }
       for (const entry of textureCache.values()) {
         gl.deleteTexture(entry.texture);
       }

@@ -19,16 +19,21 @@ import {
 } from "react";
 import type { ContactMapView, ExampleDatasetSummary } from "../App";
 import {
+  assemblyCutCandidateBlocks,
   assemblyContigDisplayName,
   assemblyRenameTarget,
   buildAssemblyEditModel,
+  buildAssemblyHitTestIndex,
+  buildAssemblyInteractionIndex,
   contigIdsInScreenSelection,
   hasDeletableGap,
   hitTestAssemblyLayout,
   insertionTargetAtScreenPoint,
+  nearestAssemblyBlockIndex,
   selectedBlockIds,
   type AssemblyEditModel,
   type AssemblyHit,
+  type AssemblyInteractionIndex,
   type AssemblySelection,
 } from "../state/assemblyEditing";
 import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
@@ -179,6 +184,7 @@ interface AssemblyContextMenuState extends AssemblyContextMenuPosition {
 interface AssemblyCutTargetInput {
   model: AssemblyEditModel;
   selectedIds: ReadonlySet<string>;
+  interactionIndex?: AssemblyInteractionIndex;
   lockedCutBlockId?: string | null;
   point: { x: number; y: number };
   widthPx: number;
@@ -196,6 +202,21 @@ interface AssemblyPointerTargetInput extends AssemblyCutTargetInput {
 interface AssemblyPointerPosition {
   clientX: number;
   clientY: number;
+}
+
+interface CachedElementBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+interface PendingAssemblyPointerFrame {
+  pointerId: number;
+  pointer: AssemblyPointerPosition;
+  selectionDrag: AssemblySelectionDragState | null;
 }
 
 export interface AssemblySelectionProjectionBands {
@@ -792,6 +813,7 @@ export function advancePaintedContactPresentationFrame(
 export function assemblyCutTargetAtScreenPoint({
   model,
   selectedIds,
+  interactionIndex,
   lockedCutBlockId = null,
   point,
   widthPx,
@@ -808,6 +830,10 @@ export function assemblyCutTargetAtScreenPoint({
   const maxEdgeGuardPx = 18;
   const acquireTolerancePx = 12;
   const releaseTolerancePx = 36;
+  const compatibleInteractionIndex = interactionIndex?.model === model
+    && interactionIndex.selectedIds === selectedIds
+    ? interactionIndex
+    : null;
 
   interface CutCandidate {
     blockId: string;
@@ -890,7 +916,8 @@ export function assemblyCutTargetAtScreenPoint({
   // scissors follows the projected diagonal point and releases only after the
   // pointer clearly leaves that corridor.
   if (lockedCutBlockId && selectedIds.has(lockedCutBlockId)) {
-    const lockedBlock = model.blocks.find((block) => block.id === lockedCutBlockId);
+    const lockedBlock = compatibleInteractionIndex?.blocksById.get(lockedCutBlockId)
+      ?? model.blocks.find((block) => block.id === lockedCutBlockId);
     if (lockedBlock) {
       const lockedCandidate = candidateForBlock(lockedBlock, releaseTolerancePx);
       if (lockedCandidate) {
@@ -903,7 +930,24 @@ export function assemblyCutTargetAtScreenPoint({
   }
 
   let closestCandidate: CutCandidate | null = null;
-  for (const block of model.blocks) {
+  const pixelsPerVisualX = safeWidthPx / viewportXSpan;
+  const pixelsPerVisualY = safeHeightPx / viewportYSpan;
+  const pixelsPerVisualSquared = pixelsPerVisualX * pixelsPerVisualX
+    + pixelsPerVisualY * pixelsPerVisualY;
+  const projectedVisualPosition = (
+    pixelsPerVisualX * (point.x + pixelsPerVisualX * viewportXStart)
+    + pixelsPerVisualY * (point.y + pixelsPerVisualY * viewportYStart)
+  ) / Math.max(Number.EPSILON, pixelsPerVisualSquared);
+  const visualTolerance = acquireTolerancePx
+    / Math.sqrt(Math.max(Number.EPSILON, pixelsPerVisualSquared));
+  const candidateBlocks = compatibleInteractionIndex
+    ? assemblyCutCandidateBlocks(
+        compatibleInteractionIndex,
+        projectedVisualPosition - visualTolerance,
+        projectedVisualPosition + visualTolerance,
+      )
+    : model.blocks;
+  for (const block of candidateBlocks) {
     if (!selectedIds.has(block.id)) {
       continue;
     }
@@ -952,6 +996,7 @@ export function assemblyPointerStateAtScreenPoint(
       viewportYEnd: input.viewportYEnd,
       selectionKind: input.selectionKind,
     },
+    input.interactionIndex,
   );
   if (insertTarget) {
     return {
@@ -994,6 +1039,7 @@ export function ContactMapViewport({
   const mapLayoutRef = useRef<HTMLDivElement>(null);
   const mapContentRef = useRef<HTMLDivElement>(null);
   const canvasFrameRef = useRef<HTMLDivElement>(null);
+  const canvasFrameBoundsRef = useRef<CachedElementBounds | null>(null);
   const contactTileLayerRef = useRef<HTMLDivElement>(null);
   const contactTileTransformRef = useRef<HTMLDivElement>(null);
   const contactTilePanRendererRef = useRef<ContactTileGpuRenderer | null>(null);
@@ -1060,6 +1106,8 @@ export function ContactMapViewport({
     )
   ));
   const panAnimationFrameRef = useRef<number | null>(null);
+  const assemblyPointerAnimationFrameRef = useRef<number | null>(null);
+  const pendingAssemblyPointerFrameRef = useRef<PendingAssemblyPointerFrame | null>(null);
   const redrawAnimationFrameRef = useRef<number | null>(null);
   const prepaintedCellContactMapRef = useRef<ContactMapView | null>(null);
   const pendingPanFrameRef = useRef<PendingPanFrame | null>(null);
@@ -1312,6 +1360,10 @@ export function ContactMapViewport({
     : presentationContactMap?.layoutBlocks ?? activeAssemblyBlocks;
   const usesDomAssemblyBoundaries = !gpuAssemblyBoundariesActive;
   const assemblyModel = useMemo(() => buildAssemblyEditModel(assemblyBlocks), [assemblyBlocks]);
+  const assemblyHitTestIndex = useMemo(
+    () => buildAssemblyHitTestIndex(assemblyModel),
+    [assemblyModel],
+  );
   const gpuAssemblyBoundaries = useMemo(
     () => contactGpuAssemblyBoundaries({
       model: assemblyModel,
@@ -1331,6 +1383,20 @@ export function ContactMapViewport({
   const selectedAssemblyBlockIds = useMemo(
     () => new Set(selectedBlockIds(assemblyModel.blocks, uiState.assembly.selection)),
     [assemblyModel, uiState.assembly.selection],
+  );
+  const assemblyInteractionIndex = useMemo(
+    () => buildAssemblyInteractionIndex(
+      assemblyModel,
+      selectedAssemblyBlockIds,
+      uiState.assembly.selection?.kind ?? "contigs",
+      assemblyHitTestIndex,
+    ),
+    [
+      assemblyHitTestIndex,
+      assemblyModel,
+      selectedAssemblyBlockIds,
+      uiState.assembly.selection?.kind,
+    ],
   );
   const selectedAssemblyUnitIds = useMemo(
     () => new Set(
@@ -1549,6 +1615,7 @@ export function ContactMapViewport({
       }
 
       onUiAction({ type: "clearAssemblySelection" });
+      cancelScheduledAssemblyPointerFrame();
       dragStateRef.current = null;
       panLoadingSuspendedRef.current = false;
       panTilePrefetchSignatureRef.current = null;
@@ -1568,6 +1635,7 @@ export function ContactMapViewport({
 
     function handleWindowBlur() {
       setShiftSelectionCursor(false);
+      cancelScheduledAssemblyPointerFrame();
       lastAssemblyPointerRef.current = null;
       finishWheelPan();
       if (dragStateRef.current) {
@@ -1607,9 +1675,37 @@ export function ContactMapViewport({
   useEffect(() => {
     return () => {
       cancelScheduledPanFrame();
+      cancelScheduledAssemblyPointerFrame();
       onContactViewportPreview?.(null);
     };
   }, [onContactViewportPreview]);
+
+  function refreshCanvasFrameBounds(
+    fallback: HTMLElement | null = canvasFrameRef.current,
+  ): CachedElementBounds | null {
+    const frame = canvasFrameRef.current ?? fallback;
+    if (!frame) {
+      canvasFrameBoundsRef.current = null;
+      return null;
+    }
+    const measured = frame.getBoundingClientRect();
+    const bounds = {
+      left: measured.left,
+      top: measured.top,
+      right: measured.right,
+      bottom: measured.bottom,
+      width: measured.width,
+      height: measured.height,
+    };
+    canvasFrameBoundsRef.current = bounds;
+    return bounds;
+  }
+
+  function currentCanvasFrameBounds(
+    fallback: HTMLElement | null = null,
+  ): CachedElementBounds | null {
+    return canvasFrameBoundsRef.current ?? refreshCanvasFrameBounds(fallback);
+  }
 
   useEffect(() => {
     const stage = mapContentRef.current;
@@ -1629,8 +1725,10 @@ export function ContactMapViewport({
         }
         const latestUiState = latestUiStateRef.current;
         if (latestUiState.contact.resolutionLocked) {
-          const bounds = canvasFrameRef.current?.getBoundingClientRect()
-            ?? stage!.getBoundingClientRect();
+          const bounds = currentCanvasFrameBounds(stage);
+          if (!bounds) {
+            return;
+          }
           const zoomAction = lockedContactResolutionWheelZoomIntent(
             event.deltaX,
             event.deltaY,
@@ -1676,8 +1774,10 @@ export function ContactMapViewport({
         return;
       }
 
-      const bounds = canvasFrameRef.current?.getBoundingClientRect()
-        ?? stage!.getBoundingClientRect();
+      const bounds = currentCanvasFrameBounds(stage);
+      if (!bounds) {
+        return;
+      }
       const latestUiState = latestUiStateRef.current;
       let wheelSession = wheelPanSessionRef.current;
       const startsWheelSession = wheelSession === null;
@@ -1789,8 +1889,14 @@ export function ContactMapViewport({
       return;
     }
 
+    const updateCachedBounds = () => {
+      refreshCanvasFrameBounds(frame);
+    };
     const reportMetricsAndRedraw = () => {
-      const bounds = frame.getBoundingClientRect();
+      const bounds = refreshCanvasFrameBounds(frame);
+      if (!bounds) {
+        return;
+      }
       const viewportSizePx = contactViewportSizePxFromBounds(bounds);
       if (viewportSizePx !== null) {
         onUiAction({
@@ -1812,12 +1918,16 @@ export function ContactMapViewport({
       }
     };
     reportMetricsAndRedraw();
-    if (typeof ResizeObserver === "undefined") {
-      return;
-    }
-    const observer = new ResizeObserver(reportMetricsAndRedraw);
-    observer.observe(frame);
-    return () => observer.disconnect();
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(reportMetricsAndRedraw);
+    observer?.observe(frame);
+    window.addEventListener("scroll", updateCachedBounds, true);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("scroll", updateCachedBounds, true);
+      canvasFrameBoundsRef.current = null;
+    };
   }, [onUiAction, totalSpanMb, usesTiledRenderer]);
 
   usePrePaintEffect(() => {
@@ -1912,8 +2022,10 @@ export function ContactMapViewport({
     event.preventDefault();
     window.getSelection()?.removeAllRanges();
     event.currentTarget.setPointerCapture(event.pointerId);
-    const bounds = canvasFrameRef.current?.getBoundingClientRect()
-      ?? event.currentTarget.getBoundingClientRect();
+    const bounds = currentCanvasFrameBounds(event.currentTarget);
+    if (!bounds) {
+      return;
+    }
     const nextDragState = {
       pointerId: event.pointerId,
       startViewport: liveViewport,
@@ -2211,7 +2323,7 @@ export function ContactMapViewport({
       return;
     }
 
-    const bounds = canvasFrameRef.current?.getBoundingClientRect();
+    const bounds = currentCanvasFrameBounds();
     if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
       return;
     }
@@ -2266,7 +2378,10 @@ export function ContactMapViewport({
   }
 
   function handleAssemblyDoubleClick(event: React.MouseEvent<HTMLDivElement>) {
-    const bounds = event.currentTarget.getBoundingClientRect();
+    const bounds = currentCanvasFrameBounds(event.currentTarget);
+    if (!bounds) {
+      return;
+    }
     const focusRatioX = bounds.width > 0 ? (event.clientX - bounds.left) / bounds.width : 0.5;
     const focusRatioY = bounds.height > 0 ? (event.clientY - bounds.top) / bounds.height : 0.5;
 
@@ -2300,11 +2415,16 @@ export function ContactMapViewport({
       return;
     }
 
-    lastAssemblyPointerRef.current = latestPointerCoordinates(event.nativeEvent);
+    cancelScheduledAssemblyPointerFrame();
+    const pointer = latestPointerCoordinates(event.nativeEvent);
+    lastAssemblyPointerRef.current = pointer;
     event.preventDefault();
     window.getSelection()?.removeAllRanges();
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const point = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+    const bounds = currentCanvasFrameBounds(event.currentTarget);
+    if (!bounds) {
+      return;
+    }
+    const point = { x: pointer.clientX - bounds.left, y: pointer.clientY - bounds.top };
     const hit = hitTestAssemblyLayout(assemblyModel, point, {
       widthPx: Math.max(1, bounds.width),
       heightPx: Math.max(1, bounds.height),
@@ -2313,13 +2433,14 @@ export function ContactMapViewport({
       viewportXEnd: displayViewport.xEnd,
       viewportYStart: displayViewport.yStart,
       viewportYEnd: displayViewport.yEnd,
-    });
+    }, assemblyHitTestIndex);
 
     const currentPointerState = assemblyPointerStateRef.current;
     const confirmedCutState = !event.shiftKey && currentPointerState.kind === "cut"
       ? assemblyPointerStateAtScreenPoint({
           model: assemblyModel,
           selectedIds: selectedAssemblyBlockIds,
+          interactionIndex: assemblyInteractionIndex,
           lockedCutBlockId: currentPointerState.blockId,
           point,
           widthPx: Math.max(1, bounds.width),
@@ -2360,6 +2481,7 @@ export function ContactMapViewport({
         viewportYEnd: displayViewport.yEnd,
         selectionKind: uiState.assembly.selection?.kind,
       },
+      assemblyInteractionIndex,
     );
     if (
       !event.shiftKey
@@ -2389,10 +2511,10 @@ export function ContactMapViewport({
     event.currentTarget.setPointerCapture(event.pointerId);
     setAssemblySelectionDrag({
       pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      currentX: event.clientX,
-      currentY: event.clientY,
+      startX: pointer.clientX,
+      startY: pointer.clientY,
+      currentX: pointer.clientX,
+      currentY: pointer.clientY,
       startLocalX: point.x,
       startLocalY: point.y,
       currentLocalX: point.x,
@@ -2401,25 +2523,53 @@ export function ContactMapViewport({
     });
   }
 
-  function moveAssemblyHover(event: React.PointerEvent<HTMLDivElement>) {
-    const pointer = latestPointerCoordinates(event.nativeEvent);
-    lastAssemblyPointerRef.current = pointer;
-    // Panning is a compositor-only operation. Do not mix it with the O(n)
-    // contig cut/insert hit-test path on every pointer sample.
-    if (dragStateRef.current || assemblySelectionDrag) {
+  function scheduleAssemblyPointerFrame(frame: PendingAssemblyPointerFrame) {
+    pendingAssemblyPointerFrameRef.current = frame;
+    if (assemblyPointerAnimationFrameRef.current !== null) {
       return;
     }
-    refreshAssemblyHoverAtClientPosition(pointer, event.currentTarget);
+    assemblyPointerAnimationFrameRef.current = window.requestAnimationFrame(() => {
+      assemblyPointerAnimationFrameRef.current = null;
+      const pending = pendingAssemblyPointerFrameRef.current;
+      pendingAssemblyPointerFrameRef.current = null;
+      if (!pending) {
+        return;
+      }
+      const bounds = currentCanvasFrameBounds();
+      if (!bounds) {
+        return;
+      }
+      if (pending.selectionDrag?.pointerId === pending.pointerId) {
+        setAssemblySelectionDrag({
+          ...pending.selectionDrag,
+          currentX: pending.pointer.clientX,
+          currentY: pending.pointer.clientY,
+          currentLocalX: pending.pointer.clientX - bounds.left,
+          currentLocalY: pending.pointer.clientY - bounds.top,
+        });
+        return;
+      }
+      if (!dragStateRef.current) {
+        refreshAssemblyHoverAtClientPosition(pending.pointer);
+      }
+    });
+  }
+
+  function cancelScheduledAssemblyPointerFrame() {
+    if (assemblyPointerAnimationFrameRef.current !== null) {
+      window.cancelAnimationFrame(assemblyPointerAnimationFrameRef.current);
+      assemblyPointerAnimationFrameRef.current = null;
+    }
+    pendingAssemblyPointerFrameRef.current = null;
   }
 
   function refreshAssemblyHoverAtClientPosition(
     pointer: AssemblyPointerPosition,
-    target: HTMLElement | null = canvasFrameRef.current,
   ) {
-    if (!target) {
+    const bounds = currentCanvasFrameBounds();
+    if (!bounds) {
       return;
     }
-    const bounds = target.getBoundingClientRect();
     const pointerInside = bounds.width > 0
       && bounds.height > 0
       && pointer.clientX >= bounds.left
@@ -2435,6 +2585,7 @@ export function ContactMapViewport({
     setAssemblyPointerStateIfChanged(assemblyPointerStateAtScreenPoint({
       model: assemblyModel,
       selectedIds: selectedAssemblyBlockIds,
+      interactionIndex: assemblyInteractionIndex,
       lockedCutBlockId: assemblyPointerStateRef.current.kind === "cut"
         ? assemblyPointerStateRef.current.blockId
         : null,
@@ -2458,6 +2609,7 @@ export function ContactMapViewport({
     }
     const pointer = lastAssemblyPointerRef.current;
     if (pointer) {
+      cancelScheduledAssemblyPointerFrame();
       refreshAssemblyHoverAtClientPosition(pointer);
     }
   }, [
@@ -2474,28 +2626,42 @@ export function ContactMapViewport({
   ]);
 
   function moveAssemblyPointer(event: React.PointerEvent<HTMLDivElement>) {
-    if (!assemblySelectionDrag || assemblySelectionDrag.pointerId !== event.pointerId) {
+    const pointer = latestPointerCoordinates(event.nativeEvent);
+    lastAssemblyPointerRef.current = pointer;
+    if (assemblySelectionDrag?.pointerId === event.pointerId) {
+      scheduleAssemblyPointerFrame({
+        pointerId: event.pointerId,
+        pointer,
+        selectionDrag: assemblySelectionDrag,
+      });
+      return;
+    }
+    if (dragStateRef.current) {
       movePan(event);
       return;
     }
-
-    const bounds = event.currentTarget.getBoundingClientRect();
-    setAssemblySelectionDrag({
-      ...assemblySelectionDrag,
-      currentX: event.clientX,
-      currentY: event.clientY,
-      currentLocalX: event.clientX - bounds.left,
-      currentLocalY: event.clientY - bounds.top,
+    // Hover, cut, and insertion work runs at most once per display frame. The
+    // retained latest coordinate also absorbs high-rate coalesced pointer input.
+    scheduleAssemblyPointerFrame({
+      pointerId: event.pointerId,
+      pointer,
+      selectionDrag: null,
     });
   }
 
   function stopAssemblyPointer(event: React.PointerEvent<HTMLDivElement>) {
-    lastAssemblyPointerRef.current = latestPointerCoordinates(event.nativeEvent);
+    cancelScheduledAssemblyPointerFrame();
+    const pointer = latestPointerCoordinates(event.nativeEvent);
+    lastAssemblyPointerRef.current = pointer;
     if (assemblySelectionDrag?.pointerId === event.pointerId) {
-      const bounds = event.currentTarget.getBoundingClientRect();
+      const bounds = currentCanvasFrameBounds(event.currentTarget);
+      if (!bounds) {
+        setAssemblySelectionDrag(null);
+        return;
+      }
       const moved = Math.hypot(
-        event.clientX - assemblySelectionDrag.startX,
-        event.clientY - assemblySelectionDrag.startY,
+        pointer.clientX - assemblySelectionDrag.startX,
+        pointer.clientY - assemblySelectionDrag.startY,
       );
 
       if (moved < 8) {
@@ -2523,7 +2689,7 @@ export function ContactMapViewport({
             x: assemblySelectionDrag.startLocalX,
             y: assemblySelectionDrag.startLocalY,
           },
-          { x: event.clientX - bounds.left, y: event.clientY - bounds.top },
+          { x: pointer.clientX - bounds.left, y: pointer.clientY - bounds.top },
           {
             widthPx: Math.max(1, bounds.width),
             heightPx: Math.max(1, bounds.height),
@@ -2683,6 +2849,7 @@ export function ContactMapViewport({
             overlayLayerRef={assemblyOverlayLayerRef}
             selectionVerticalBandRef={assemblySelectionVerticalBandRef}
             selectionHorizontalBandRef={assemblySelectionHorizontalBandRef}
+            viewportBoundsRef={canvasFrameBoundsRef}
             boundaryMountViewport={assemblyBoundaryMountViewport}
             renderVisualBoundaries={usesDomAssemblyBoundaries}
             model={assemblyModel}
@@ -2708,18 +2875,17 @@ export function ContactMapViewport({
             onResizeSelection={(ids) => onUiAction({ type: "selectAssemblyContigs", ids })}
             onDoubleClick={handleAssemblyDoubleClick}
             onPointerDown={startAssemblyPointer}
-            onPointerMove={(event) => {
-              moveAssemblyPointer(event);
-              moveAssemblyHover(event);
-            }}
+            onPointerMove={moveAssemblyPointer}
             onPointerUp={stopAssemblyPointer}
             onPointerCancel={(event) => {
+              cancelScheduledAssemblyPointerFrame();
               lastAssemblyPointerRef.current = null;
               setAssemblySelectionDrag(null);
               stopPan(event);
               setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
             }}
             onPointerLeave={() => {
+              cancelScheduledAssemblyPointerFrame();
               lastAssemblyPointerRef.current = null;
               if (!assemblySelectionDrag && !dragStateRef.current) {
                 setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
@@ -2878,6 +3044,7 @@ interface AssemblyOverlayProps {
   overlayLayerRef: React.RefObject<HTMLDivElement>;
   selectionVerticalBandRef: React.RefObject<HTMLSpanElement>;
   selectionHorizontalBandRef: React.RefObject<HTMLSpanElement>;
+  viewportBoundsRef: React.MutableRefObject<CachedElementBounds | null>;
   boundaryMountViewport: ContactViewport;
   renderVisualBoundaries: boolean;
   model: AssemblyEditModel;
@@ -2908,6 +3075,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
   overlayLayerRef,
   selectionVerticalBandRef,
   selectionHorizontalBandRef,
+  viewportBoundsRef,
   boundaryMountViewport,
   renderVisualBoundaries,
   model,
@@ -3014,7 +3182,11 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
     event.preventDefault();
     event.stopPropagation();
     const overlay = event.currentTarget.closest(".assembly-overlay");
-    const bounds = overlay?.getBoundingClientRect();
+    const measuredBounds = viewportBoundsRef.current ?? overlay?.getBoundingClientRect();
+    const bounds = measuredBounds ? {
+      left: measuredBounds.left,
+      width: measuredBounds.width,
+    } : null;
     if (!bounds) {
       return;
     }
@@ -3308,26 +3480,6 @@ export function sameAssemblyOverlayPresentation(
     && previous.visibleChromosomes === next.visibleChromosomes
     && previous.selectionBox === next.selectionBox
     && previous.pointerState === next.pointerState;
-}
-
-function nearestAssemblyBlockIndex(model: AssemblyEditModel, visualPosition: number) {
-  let nearestIndex = 0;
-  let nearestDistance = Number.POSITIVE_INFINITY;
-  for (let index = 0; index < model.assemblyBlocks.length; index += 1) {
-    const block = model.assemblyBlocks[index];
-    if (visualPosition >= block.visualStart && visualPosition < block.visualEnd) {
-      return index;
-    }
-    const distance = Math.min(
-      Math.abs(visualPosition - block.visualStart),
-      Math.abs(visualPosition - block.visualEnd),
-    );
-    if (distance < nearestDistance) {
-      nearestDistance = distance;
-      nearestIndex = index;
-    }
-  }
-  return nearestIndex;
 }
 
 function intervalBox(

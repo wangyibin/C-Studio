@@ -12,6 +12,8 @@ import {
   contactTileGpuBoundaryInstanceData,
   contactTileGpuDrawCoverageIsComplete,
   contactTileGpuTexturePreference,
+  contactTileGpuUploadBatch,
+  contactTileGpuUploadPlan,
   contactTileGpuVirtualTextureBudgetBytes,
   contactTileGpuVirtualTextureEnabled,
   contactTileSourcePagePlan,
@@ -36,6 +38,8 @@ function mockWebGlCanvas() {
   const scissor = vi.fn();
   const uniform4f = vi.fn();
   const blitFramebuffer = vi.fn();
+  const fenceSync = vi.fn(() => ({}));
+  const clientWaitSync = vi.fn(() => 52);
   const clientWidthRead = vi.fn(() => 256);
   const clientHeightRead = vi.fn(() => 256);
   const gl = {
@@ -89,6 +93,11 @@ function mockWebGlCanvas() {
     MAX_ARRAY_TEXTURE_LAYERS: 42,
     MAX_TEXTURE_SIZE: 43,
     NO_ERROR: 0,
+    SYNC_GPU_COMMANDS_COMPLETE: 50,
+    ALREADY_SIGNALED: 51,
+    CONDITION_SATISFIED: 52,
+    TIMEOUT_EXPIRED: 53,
+    WAIT_FAILED: 54,
     createShader: vi.fn(() => ({})),
     shaderSource: vi.fn(),
     compileShader: vi.fn(),
@@ -114,6 +123,10 @@ function mockWebGlCanvas() {
     framebufferTexture2D: vi.fn(),
     checkFramebufferStatus: vi.fn(() => 34),
     blitFramebuffer,
+    fenceSync,
+    clientWaitSync,
+    deleteSync: vi.fn(),
+    flush: vi.fn(),
     disable: vi.fn(),
     enable: vi.fn(),
     pixelStorei: vi.fn(),
@@ -154,6 +167,7 @@ function mockWebGlCanvas() {
     canvas,
     getContext: canvas.getContext as ReturnType<typeof vi.fn>,
     blitFramebuffer,
+    clientWaitSync,
     bufferData,
     clear,
     clientHeightRead,
@@ -161,12 +175,45 @@ function mockWebGlCanvas() {
     drawArrays,
     drawArraysInstanced,
     getError,
+    fenceSync,
     scissor,
     texImage2D,
     texImage3D,
     texSubImage2D,
     texSubImage3D,
     uniform4f,
+  };
+}
+
+function mockFrameScheduler() {
+  let nextHandle = 1;
+  const callbacks = new Map<number, FrameRequestCallback>();
+  return {
+    requestFrame: (callback: FrameRequestCallback) => {
+      const handle = nextHandle++;
+      callbacks.set(handle, callback);
+      return handle;
+    },
+    cancelFrame: (handle: number) => {
+      callbacks.delete(handle);
+    },
+    pending: () => callbacks.size,
+    flushOne: () => {
+      const frame = [...callbacks.entries()];
+      callbacks.clear();
+      for (const [handle, callback] of frame) {
+        callback(handle * 16.7);
+      }
+    },
+    flushAll: () => {
+      while (callbacks.size > 0) {
+        const frame = [...callbacks.entries()];
+        callbacks.clear();
+        for (const [handle, callback] of frame) {
+          callback(handle * 16.7);
+        }
+      }
+    },
   };
 }
 
@@ -276,6 +323,192 @@ describe("contactTileFloatTextureData", () => {
       contactTileVirtualPageExactFlag | contactTileVirtualPageTransposeFlag,
     ]);
     expect(entry(4, 3)).toEqual([0, contactTileVirtualPageExactFlag]);
+  });
+
+  it("orders center tiles before visible edges and prefetch pages", () => {
+    const makeDescriptor = (tileX: number) => ({
+      key: `${tileX}:0:source`,
+      tile: {
+        tileX,
+        tileY: 0,
+        cells: [{ xBin: tileX * 4, yBin: 0, count: tileX + 1 }],
+      },
+      transpose: false,
+    });
+    const plan = contactTileGpuUploadPlan({
+      descriptors: [makeDescriptor(4), makeDescriptor(0), makeDescriptor(1)],
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 16_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    });
+    expect(plan.map(({ key, priority }) => [key, priority])).toEqual([
+      ["0:1", "center"],
+      ["0:0", "edge"],
+      ["0:4", "prefetch"],
+    ]);
+    expect(contactTileGpuUploadBatch(plan, 128).map(({ key }) => key)).toEqual([
+      "0:1",
+      "0:0",
+    ]);
+  });
+
+  it("prioritizes source atlas pages through visual AGP addresses", () => {
+    const addressSpace = buildContactSourceAddressSpace([{ name: "a", length: 20_000 }]);
+    const map = buildContactGpuLayoutMap({
+      addressSpace,
+      layoutBlocks: [{
+        id: "moved",
+        objectId: "chr1",
+        sourceId: "a",
+        sourceStart: 8_000,
+        sourceEnd: 16_000,
+        visualStart: 0,
+        visualEnd: 8_000,
+        orientation: "+",
+      }],
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 8_000 },
+      overscanBins: 4,
+    });
+    const visible = {
+      tileX: 2,
+      tileY: 2,
+      cells: [{ xBin: 8, yBin: 8, count: 4 }],
+    };
+    const unrelatedSourcePage = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 0, yBin: 0, count: 9 }],
+    };
+    const plan = contactTileGpuUploadPlan({
+      descriptors: [],
+      generation: 3,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 8_000, yStart: 0, yEnd: 8_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+      sourceLayout: {
+        dataScope: "source-priority",
+        descriptors: [
+          { key: "visible", tile: visible, transpose: false },
+          { key: "unrelated", tile: unrelatedSourcePage, transpose: false },
+        ],
+        generation: 3,
+        sourceTiles: [0, 2, 3],
+        xMap: map,
+        yMap: map,
+      },
+    });
+    expect(plan.map(({ key, priority }) => [key, priority])).toEqual([
+      ["2:2", "center"],
+      ["0:0", "prefetch"],
+    ]);
+  });
+
+  it("submits at most one byte-budgeted atlas layer per scheduled frame", () => {
+    const { canvas, texSubImage3D } = mockWebGlCanvas();
+    const frames = mockFrameScheduler();
+    const presented = vi.fn();
+    const descriptors = Array.from({ length: 6 }, (_, tileX) => ({
+      key: `${tileX}:0:source`,
+      tile: {
+        tileX,
+        tileY: 0,
+        cells: [{ xBin: tileX * 4, yBin: 0, count: tileX + 1 }],
+      },
+      transpose: false,
+    }));
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+      uploadBudgetBytes: 64,
+      uploadBudgetMilliseconds: 100,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
+    });
+    expect(renderer?.setScene({
+      descriptors,
+      generation: 1,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 24_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    }, presented)).toBe(true);
+    expect(texSubImage3D).toHaveBeenCalledOnce();
+    expect(presented).not.toHaveBeenCalled();
+    for (let uploaded = 2; uploaded <= 6; uploaded += 1) {
+      expect(frames.pending()).toBe(1);
+      frames.flushOne();
+      expect(texSubImage3D).toHaveBeenCalledTimes(uploaded);
+    }
+    expect(presented).toHaveBeenCalledWith(true);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      uploadQueueFrames: 6,
+      uploadQueueDeferredFrames: 5,
+      uploadQueueMaxDepth: 6,
+      uploadQueueBytes: 384,
+    });
+    renderer?.destroy();
+  });
+
+  it("retains the front until a staging GPU fence signals completion", () => {
+    const {
+      canvas,
+      blitFramebuffer,
+      clientWaitSync,
+      fenceSync,
+    } = mockWebGlCanvas();
+    clientWaitSync.mockReturnValueOnce(53).mockReturnValue(52);
+    const frames = mockFrameScheduler();
+    const presented = vi.fn();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
+    });
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 4 }] },
+        transpose: false,
+      }],
+      generation: 1,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    }, presented)).toBe(true);
+    expect(fenceSync).toHaveBeenCalledOnce();
+    expect(blitFramebuffer).not.toHaveBeenCalled();
+    expect(presented).not.toHaveBeenCalled();
+    frames.flushOne();
+    expect(blitFramebuffer).toHaveBeenCalledOnce();
+    expect(presented).toHaveBeenCalledWith(true);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      uploadFencePolls: 2,
+      uploadFenceWaitFrames: 1,
+      uploadFenceSignals: 1,
+      uploadFenceFailures: 0,
+    });
+    renderer?.destroy();
   });
 
   it("rejects virtual pages outside the non-negative safe tile grid", () => {
@@ -1090,8 +1323,11 @@ describe("contactTileFloatTextureData", () => {
 
   it("presents an updated virtual page table without waiting for another pointer frame", () => {
     const { canvas, blitFramebuffer } = mockWebGlCanvas();
+    const frames = mockFrameScheduler();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
       virtualTextureEnabled: true,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
     });
     const viewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
     expect(renderer?.setScene({
@@ -1138,6 +1374,7 @@ describe("contactTileFloatTextureData", () => {
       tileSizeBins: 4,
     })).toBe(true);
     expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
+    frames.flushAll();
     expect(renderer?.performanceSnapshot().virtualTextureDraws)
       .toBe(virtualDrawsBeforeAppend + 1);
     expect(blitFramebuffer.mock.calls.length).toBe(blitsBeforeAppend + 1);
@@ -1155,8 +1392,11 @@ describe("contactTileFloatTextureData", () => {
       texSubImage2D,
       texSubImage3D,
     } = mockWebGlCanvas();
+    const frames = mockFrameScheduler();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
       performanceEnabled: false,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
     });
     const renderStyle = {
       colormap: "Reds" as const,
@@ -1218,13 +1458,16 @@ describe("contactTileFloatTextureData", () => {
     const arrayUploadsBeforePointer = texSubImage3D.mock.calls.length;
     const layoutReadsBeforePointer = clientWidthRead.mock.calls.length
       + clientHeightRead.mock.calls.length;
+    frames.flushAll();
     renderer?.setPanViewport({ xStart: 4_000, xEnd: 8_000, yStart: 0, yEnd: 4_000 });
     expect(drawArrays).toHaveBeenCalledTimes(drawsBeforePrefetch + 1);
     expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePrefetch + 1);
-    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePointer);
+    // The upload frame publishes one compact page table after the atlas layer
+    // becomes resident; pointer sampling itself performs no texture upload.
+    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePointer + 1);
     expect(texSubImage2D).toHaveBeenCalledTimes(subUploadsBeforePointer);
     expect(texImage3D).toHaveBeenCalledTimes(arrayAllocationsBeforePointer);
-    expect(texSubImage3D).toHaveBeenCalledTimes(arrayUploadsBeforePointer);
+    expect(texSubImage3D).toHaveBeenCalledTimes(arrayUploadsBeforePointer + 1);
     expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
       .toBe(layoutReadsBeforePointer);
     expect(renderer?.performanceSnapshot()).toMatchObject({
