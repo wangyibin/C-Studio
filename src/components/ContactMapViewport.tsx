@@ -34,7 +34,10 @@ import {
 import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
 import { contactColorLut } from "../state/contactColor";
 import type { ContactPanPreview } from "../state/contactPanPerformance";
-import type { ContactPanPrefetchBridge } from "../state/contactPanPrefetch";
+import type {
+  ContactPanPrefetchBatch,
+  ContactPanPrefetchBridge,
+} from "../state/contactPanPrefetch";
 import type { ContactTileDeltaRenderStream } from "../state/contactTileDelta";
 import type { ContactTileRenderMilestone } from "../state/contactTilePerformance";
 import {
@@ -46,8 +49,14 @@ import { rasterizeContactMapCells } from "../state/contactMapRaster";
 import { contactOverviewBaseIsCompatible } from "../state/contactOverviewTiles";
 import { contactResolutionToBasePairs } from "../state/contactResolution";
 import {
+  advanceContactPanPrefetchFrontier,
   buildCenteredContactViewport,
+  contactViewportWithVelocityAwareLead,
+  sampleContactViewportVelocity,
+  urgentContactPrefetchTileCount,
+  type ContactPanPrefetchFrontier,
   type ContactViewport,
+  type ContactViewportVelocitySample,
 } from "../state/contactViewport";
 import { contactTileViewportRequestKey } from "../state/contactTiles";
 import {
@@ -110,7 +119,7 @@ interface ContactMapViewportProps {
   onClosePanel?: () => void;
   onExpandPanel?: () => void;
   onContactPanGestureStart?: () => void;
-  onContactPanTilePrefetch?: (viewport: ContactViewport) => void;
+  onContactPanTilePrefetch?: (preview: ContactPanPreview) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
@@ -231,6 +240,32 @@ const resolutionWheelCooldownMs = 140;
 // generations still start while the wheel is moving, so Windows WebView2 does
 // not repeatedly cancel the first visible-tile stream before it can paint.
 const wheelPanCommitDelayMs = 80;
+
+/** Upload every completed pan-prefetch batch, then present the updated page table once. */
+export function presentContactPanPrefetchBatches(
+  renderer: Pick<
+    ContactTileGpuRenderer,
+    "appendSceneDescriptors" | "presentAppendedSceneDescriptors"
+  >,
+  batches: readonly ContactPanPrefetchBatch[],
+) {
+  let appended = false;
+  for (const batch of batches) {
+    appended = renderer.appendSceneDescriptors({
+      descriptors: contactTileCanvasDescriptorsForViewport(
+        batch.tiles,
+        batch.resolution,
+        batch.tileSizeBins,
+        batch.viewport,
+        "all",
+      ),
+      generation: batch.generation,
+      resolution: batch.resolution,
+      tileSizeBins: batch.tileSizeBins,
+    }) || appended;
+  }
+  return appended ? renderer.presentAppendedSceneDescriptors() : false;
+}
 
 export function contactWheelPanCommitDelta(
   startViewport: ContactViewport,
@@ -965,25 +1000,30 @@ export function ContactMapViewport({
   const contactTileTransformRef = useRef<HTMLDivElement>(null);
   const contactTilePanRendererRef = useRef<ContactTileGpuRenderer | null>(null);
   useEffect(() => {
+    let presentationFrame: number | null = null;
+    let pendingBatches: ContactPanPrefetchBatch[] = [];
     const unsubscribe = contactPanPrefetchBridge?.subscribe((batch) => {
-      const renderer = contactTilePanRendererRef.current;
-      if (!renderer) {
+      pendingBatches.push(batch);
+      if (presentationFrame !== null) {
         return;
       }
-      renderer.appendSceneDescriptors({
-        descriptors: contactTileCanvasDescriptorsForViewport(
-          batch.tiles,
-          batch.resolution,
-          batch.tileSizeBins,
-          batch.viewport,
-          "all",
-        ),
-        generation: batch.generation,
-        resolution: batch.resolution,
-        tileSizeBins: batch.tileSizeBins,
+      presentationFrame = window.requestAnimationFrame(() => {
+        presentationFrame = null;
+        const batches = pendingBatches;
+        pendingBatches = [];
+        const renderer = contactTilePanRendererRef.current;
+        if (renderer) {
+          presentContactPanPrefetchBatches(renderer, batches);
+        }
       });
     });
-    return () => unsubscribe?.();
+    return () => {
+      unsubscribe?.();
+      if (presentationFrame !== null) {
+        window.cancelAnimationFrame(presentationFrame);
+      }
+      pendingBatches = [];
+    };
   }, [contactPanPrefetchBridge]);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const assemblySelectionVerticalBandRef = useRef<HTMLSpanElement>(null);
@@ -1005,6 +1045,8 @@ export function ContactMapViewport({
   const panLoadingSuspendedRef = useRef(false);
   const panTilePrefetchSignatureRef = useRef<string | null>(null);
   const panPreviewSequenceRef = useRef(0);
+  const panViewportVelocitySampleRef = useRef<ContactViewportVelocitySample | null>(null);
+  const panPrefetchFrontierRef = useRef<ContactPanPrefetchFrontier | null>(null);
   const wheelPanSessionRef = useRef<WheelPanSession | null>(null);
   const wheelPanCommitTimerRef = useRef<number | null>(null);
   const [assemblyBoundaryPanViewport, setAssemblyBoundaryPanViewport] = useState<
@@ -1510,6 +1552,7 @@ export function ContactMapViewport({
           dragStateRef.current = null;
           panLoadingSuspendedRef.current = false;
           panTilePrefetchSignatureRef.current = null;
+          resetPanPrefetchPrediction();
           onContactViewportPreview?.(null);
           resetPanTransform();
           setDragState(null);
@@ -1534,6 +1577,7 @@ export function ContactMapViewport({
       dragStateRef.current = null;
       panLoadingSuspendedRef.current = false;
       panTilePrefetchSignatureRef.current = null;
+      resetPanPrefetchPrediction();
       onContactViewportPreview?.(null);
       resetPanTransform();
       setDragState(null);
@@ -1555,6 +1599,7 @@ export function ContactMapViewport({
         dragStateRef.current = null;
         panLoadingSuspendedRef.current = false;
         panTilePrefetchSignatureRef.current = null;
+        resetPanPrefetchPrediction();
         setDragState(null);
         resetPanTransform();
         onContactViewportPreview?.(null);
@@ -1575,6 +1620,7 @@ export function ContactMapViewport({
       wheelPanSessionRef.current = null;
       panLoadingSuspendedRef.current = false;
       panTilePrefetchSignatureRef.current = null;
+      resetPanPrefetchPrediction();
       window.removeEventListener("click", closeContextMenu);
       window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("keyup", handleKeyUp, true);
@@ -1680,6 +1726,7 @@ export function ContactMapViewport({
         // The first real wheel delta should immediately schedule diagonal
         // warming, even if the visible viewport remains inside the same tile.
         panTilePrefetchSignatureRef.current = null;
+        resetPanPrefetchPrediction();
         wheelPanSessionRef.current = wheelSession;
       }
       const currentViewport = wheelSession.previewViewport;
@@ -1695,6 +1742,7 @@ export function ContactMapViewport({
         if (startsWheelSession) {
           wheelPanSessionRef.current = null;
           panTilePrefetchSignatureRef.current = null;
+          resetPanPrefetchPrediction();
         }
         return;
       }
@@ -1719,6 +1767,7 @@ export function ContactMapViewport({
         if (startsWheelSession) {
           wheelPanSessionRef.current = null;
           panTilePrefetchSignatureRef.current = null;
+          resetPanPrefetchPrediction();
         }
         return;
       }
@@ -1854,6 +1903,7 @@ export function ContactMapViewport({
     wheelPanSessionRef.current = null;
     panLoadingSuspendedRef.current = false;
     panTilePrefetchSignatureRef.current = null;
+    resetPanPrefetchPrediction();
     if (!session) {
       return;
     }
@@ -1905,6 +1955,7 @@ export function ContactMapViewport({
     // The first real pointer move should immediately schedule diagonal
     // warming, even if it has not crossed a visible tile boundary yet.
     panTilePrefetchSignatureRef.current = null;
+    resetPanPrefetchPrediction();
     setDragState(nextDragState);
   }
 
@@ -1982,6 +2033,7 @@ export function ContactMapViewport({
     dragStateRef.current = null;
     panLoadingSuspendedRef.current = false;
     panTilePrefetchSignatureRef.current = null;
+    resetPanPrefetchPrediction();
     setDragState(null);
     if (commitAction) {
       onUiAction(commitAction);
@@ -2007,30 +2059,68 @@ export function ContactMapViewport({
       Boolean(onContactViewportPreview),
     );
     if (prefetchChannel && liveContactMap) {
+      const totalSpanBp = totalSpanMb * 1_000_000;
+      const tileSizeBins = liveContactMap.tileSizeBins ?? 256;
+      const tileSpanBp = liveContactMap.resolution * tileSizeBins;
+      const pointerTimestamp = performance.now();
+      const velocitySample = sampleContactViewportVelocity(
+        panViewportVelocitySampleRef.current,
+        previewViewport,
+        pointerTimestamp,
+      );
+      panViewportVelocitySampleRef.current = velocitySample;
+      const sourceViewport = wheelPanSessionRef.current?.startViewport
+        ?? dragStateRef.current?.startViewport
+        ?? liveContactMap.viewport;
+      const candidatePrefetchViewport = contactViewportWithVelocityAwareLead(
+        sourceViewport,
+        previewViewport,
+        tileSpanBp,
+        velocitySample,
+        totalSpanBp,
+      );
+      const frontier = advanceContactPanPrefetchFrontier({
+        current: panPrefetchFrontierRef.current,
+        sourceViewport,
+        targetViewport: previewViewport,
+        candidateViewport: candidatePrefetchViewport,
+        tileSpanBp,
+        urgentPrefetchTileCount: urgentContactPrefetchTileCount(
+          velocitySample,
+          tileSpanBp,
+        ),
+      });
+      panPrefetchFrontierRef.current = frontier;
       const signature = contactTileViewportRequestKey(
         previewViewport,
-        previewViewport,
+        frontier.viewport,
         liveContactMap.resolution,
-        liveContactMap.tileSizeBins ?? 256,
-        totalSpanMb * 1_000_000,
-        0,
+        tileSizeBins,
+        totalSpanBp,
+        frontier.urgentPrefetchTileCount,
       );
       if (signature !== panTilePrefetchSignatureRef.current) {
         panTilePrefetchSignatureRef.current = signature;
+        panPreviewSequenceRef.current += 1;
+        const preview = {
+          viewport: previewViewport,
+          prefetchViewport: frontier.viewport,
+          urgentPrefetchTileCount: frontier.urgentPrefetchTileCount,
+          sequence: panPreviewSequenceRef.current,
+          pointerTimestamp,
+        };
         if (prefetchChannel === "backend") {
-          onContactPanTilePrefetch?.(previewViewport);
+          onContactPanTilePrefetch?.(preview);
         } else if (onContactViewportPreview) {
-          panPreviewSequenceRef.current += 1;
-          onContactViewportPreview({
-            viewport: previewViewport,
-            prefetchViewport: previewViewport,
-            urgentPrefetchTileCount: 0,
-            sequence: panPreviewSequenceRef.current,
-            pointerTimestamp: performance.now(),
-          });
+          onContactViewportPreview(preview);
         }
       }
     }
+  }
+
+  function resetPanPrefetchPrediction() {
+    panViewportVelocitySampleRef.current = null;
+    panPrefetchFrontierRef.current = null;
   }
 
   function applyPanTransform(
@@ -2179,6 +2269,7 @@ export function ContactMapViewport({
     resetPanTransform();
     panLoadingSuspendedRef.current = false;
     panTilePrefetchSignatureRef.current = null;
+    resetPanPrefetchPrediction();
     onContactViewportPreview?.(null);
   }
 
@@ -2195,6 +2286,7 @@ export function ContactMapViewport({
     });
     panLoadingSuspendedRef.current = false;
     panTilePrefetchSignatureRef.current = null;
+    resetPanPrefetchPrediction();
     onContactViewportPreview?.(null);
   }
 
@@ -2487,6 +2579,7 @@ export function ContactMapViewport({
         dragStateRef.current = null;
         panLoadingSuspendedRef.current = false;
         panTilePrefetchSignatureRef.current = null;
+        resetPanPrefetchPrediction();
         setDragState(null);
         cancelScheduledPanFrame();
         resetPanTransform();

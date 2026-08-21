@@ -1,10 +1,141 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   ContactPanPrefetchBridge,
+  ContactPanPrefetchPriorityQueue,
   contactPanPrefetchBatches,
   contactPanSettledGeneration,
   contactPanTileLoadPriority,
 } from "./contactPanPrefetch";
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+}
+
+async function flushScheduler() {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+describe("ContactPanPrefetchPriorityQueue", () => {
+  it("reserves foreground lanes and never cancels already-started prefetch", async () => {
+    const queue = new ContactPanPrefetchPriorityQueue({
+      concurrency: 4,
+      prefetchConcurrency: 2,
+    });
+    const started: string[] = [];
+    const completions = new Map<string, ReturnType<typeof deferred>>();
+    const task = (
+      key: string,
+      priority: "visible" | "lead" | "prefetch",
+      sequence: number,
+    ) => {
+      const completion = deferred();
+      completions.set(key, completion);
+      return {
+        key,
+        priority,
+        sequence,
+        run: () => {
+          started.push(key);
+          return completion.promise;
+        },
+      };
+    };
+
+    queue.replacePending([
+      task("old-prefetch-1", "prefetch", 1),
+      task("old-prefetch-2", "prefetch", 1),
+      task("old-prefetch-3", "prefetch", 1),
+      task("old-prefetch-4", "prefetch", 1),
+    ]);
+    await flushScheduler();
+    expect(started).toEqual(["old-prefetch-1", "old-prefetch-2"]);
+
+    queue.replacePending([
+      task("visible-1", "visible", 2),
+      task("visible-2", "visible", 2),
+      task("visible-3", "visible", 2),
+      task("new-prefetch", "prefetch", 2),
+    ]);
+    await flushScheduler();
+    expect(started).toEqual([
+      "old-prefetch-1",
+      "old-prefetch-2",
+      "visible-1",
+      "visible-2",
+    ]);
+    expect(queue.snapshot().pendingKeys).toEqual(["visible-3", "new-prefetch"]);
+    expect(queue.snapshot().runningKeys).toContain("old-prefetch-2");
+    expect(started).not.toContain("old-prefetch-3");
+    expect(started).not.toContain("old-prefetch-4");
+
+    completions.get("old-prefetch-1")?.resolve();
+    await flushScheduler();
+    expect(started[started.length - 1]).toBe("visible-3");
+
+    for (const completion of completions.values()) {
+      completion.resolve();
+    }
+    await flushScheduler();
+  });
+
+  it("orders current tiles before predicted lead and caps only side warming", async () => {
+    const queue = new ContactPanPrefetchPriorityQueue({
+      concurrency: 4,
+      prefetchConcurrency: 2,
+    });
+    const started: string[] = [];
+    const task = (
+      key: string,
+      priority: "visible" | "lead" | "prefetch",
+    ) => ({
+      key,
+      priority,
+      sequence: 3,
+      run: () => {
+        started.push(key);
+        return new Promise<void>(() => undefined);
+      },
+    });
+
+    queue.replacePending([
+      task("side-1", "prefetch"),
+      task("lead-1", "lead"),
+      task("visible-1", "visible"),
+      task("lead-2", "lead"),
+      task("side-2", "prefetch"),
+      task("lead-3", "lead"),
+    ]);
+    await flushScheduler();
+
+    expect(started).toEqual(["visible-1", "lead-1", "lead-2", "lead-3"]);
+    expect(queue.snapshot().pendingKeys).toEqual(["side-1", "side-2"]);
+    expect(queue.snapshot().runningPrefetchCount).toBe(0);
+  });
+
+  it("normalizes concurrency to the supported two-to-four lane range", () => {
+    const low = new ContactPanPrefetchPriorityQueue({ concurrency: 0 });
+    const high = new ContactPanPrefetchPriorityQueue({ concurrency: 99 });
+    const never = () => new Promise<void>(() => undefined);
+    low.replacePending(Array.from({ length: 4 }, (_, index) => ({
+      key: `low-${index}`,
+      priority: "visible" as const,
+      sequence: 1,
+      run: never,
+    })));
+    high.replacePending(Array.from({ length: 6 }, (_, index) => ({
+      key: `high-${index}`,
+      priority: "visible" as const,
+      sequence: 1,
+      run: never,
+    })));
+    expect(low.snapshot().runningKeys).toHaveLength(2);
+    expect(high.snapshot().runningKeys).toHaveLength(4);
+  });
+});
 
 describe("contactPanPrefetchBatches", () => {
   it("preserves center-first order while bounding the first publish", () => {

@@ -19,6 +19,7 @@ import {
   contactPanCommitAction,
   contactPanPrefetchChannel,
   contactPanPreviewTileSignature,
+  presentContactPanPrefetchBatches,
   contactCanvasBackingSizeFromBounds,
   contactResolutionWheelIntent,
   lockedContactResolutionWheelZoomIntent,
@@ -41,6 +42,30 @@ const bounds = {
   width: 400,
   height: 200,
 };
+
+describe("pan-prefetch GPU presentation", () => {
+  it("uploads every completed batch before presenting once", () => {
+    const events: string[] = [];
+    const renderer = {
+      appendSceneDescriptors: (input: { generation: number }) => {
+        events.push(`append:${input.generation}`);
+        return true;
+      },
+      presentAppendedSceneDescriptors: () => {
+        events.push("present");
+        return true;
+      },
+    };
+    const viewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
+    const tile = { tileX: 0, tileY: 0, cells: [] };
+
+    expect(presentContactPanPrefetchBatches(renderer, [
+      { tiles: [tile], generation: 7, resolution: 1_000, tileSizeBins: 4, viewport },
+      { tiles: [tile], generation: 8, resolution: 1_000, tileSizeBins: 4, viewport },
+    ])).toBe(true);
+    expect(events).toEqual(["append:7", "append:8", "present"]);
+  });
+});
 
 describe("assembly overlay screen-space LOD", () => {
   it("drops subpixel whole-genome intervals while preserving selected context", () => {

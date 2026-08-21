@@ -2085,6 +2085,13 @@ export function createContactTileGpuRenderer(
       }
       const descriptors = [...pendingAppendedDescriptors.values()];
       pendingAppendedDescriptors.clear();
+      // The page table was already extended by appendSceneDescriptors(). If
+      // it now covers the live camera, present one complete virtual-texture
+      // frame immediately. Otherwise preserve the current framebuffer and
+      // overlay only the newly resident legacy quads below.
+      if (drawVirtualTexturePan(scene)) {
+        return true;
+      }
       if (descriptors.length === 0) {
         return true;
       }

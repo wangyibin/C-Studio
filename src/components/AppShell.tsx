@@ -128,7 +128,7 @@ interface AppShellProps {
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
   onContactPanGestureStart?: () => void;
-  onContactPanTilePrefetch?: (viewport: ContactViewport) => void;
+  onContactPanTilePrefetch?: (preview: ContactPanPreview) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;

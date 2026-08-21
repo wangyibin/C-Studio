@@ -887,6 +887,61 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
+  it("presents an updated virtual page table without waiting for another pointer frame", () => {
+    const { canvas, blitFramebuffer } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      virtualTextureEnabled: true,
+    });
+    const viewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 1, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport,
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+    renderer?.setPanViewport({ xStart: 500, xEnd: 4_500, yStart: 500, yEnd: 4_500 });
+    const virtualDrawsBeforeAppend = renderer?.performanceSnapshot().virtualTextureDraws ?? 0;
+    const blitsBeforeAppend = blitFramebuffer.mock.calls.length;
+
+    const offDiagonalTile = {
+      tileX: 0,
+      tileY: 1,
+      cells: [{ xBin: 1, yBin: 4, count: 6 }],
+    };
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [{
+        key: "0:1:source",
+        tile: offDiagonalTile,
+        transpose: false,
+      }, {
+        key: "1:0:mirror",
+        tile: offDiagonalTile,
+        transpose: true,
+      }, {
+        key: "1:1:source",
+        tile: { tileX: 1, tileY: 1, cells: [{ xBin: 5, yBin: 4, count: 7 }] },
+        transpose: false,
+      }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
+    expect(renderer?.performanceSnapshot().virtualTextureDraws)
+      .toBe(virtualDrawsBeforeAppend + 1);
+    expect(blitFramebuffer.mock.calls.length).toBe(blitsBeforeAppend + 1);
+  });
+
   it("atomically promotes a fully prefetched pan scene with zero new tile uploads", () => {
     const {
       canvas,
