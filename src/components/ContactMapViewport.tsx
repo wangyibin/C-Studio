@@ -964,26 +964,13 @@ export function ContactMapViewport({
   const contactTileLayerRef = useRef<HTMLDivElement>(null);
   const contactTileTransformRef = useRef<HTMLDivElement>(null);
   const contactTilePanRendererRef = useRef<ContactTileGpuRenderer | null>(null);
-  const panPrefetchPresentFrameRef = useRef<number | null>(null);
   useEffect(() => {
-    const presentPendingDescriptors = () => {
-      if (panPrefetchPresentFrameRef.current !== null) {
-        return;
-      }
-      panPrefetchPresentFrameRef.current = window.requestAnimationFrame(() => {
-        panPrefetchPresentFrameRef.current = null;
-        // Tile completion may happen while the pointer is stationary. Present
-        // only appended or refreshed quads so the exposed edge fills and each
-        // cumulative batch appears immediately, without a React map frame.
-        contactTilePanRendererRef.current?.presentAppendedSceneDescriptors();
-      });
-    };
     const unsubscribe = contactPanPrefetchBridge?.subscribe((batch) => {
       const renderer = contactTilePanRendererRef.current;
       if (!renderer) {
         return;
       }
-      if (renderer.appendSceneDescriptors({
+      renderer.appendSceneDescriptors({
         descriptors: contactTileCanvasDescriptorsForViewport(
           batch.tiles,
           batch.resolution,
@@ -994,17 +981,9 @@ export function ContactMapViewport({
         generation: batch.generation,
         resolution: batch.resolution,
         tileSizeBins: batch.tileSizeBins,
-      })) {
-        presentPendingDescriptors();
-      }
+      });
     });
-    return () => {
-      unsubscribe?.();
-      if (panPrefetchPresentFrameRef.current !== null) {
-        window.cancelAnimationFrame(panPrefetchPresentFrameRef.current);
-        panPrefetchPresentFrameRef.current = null;
-      }
-    };
+    return () => unsubscribe?.();
   }, [contactPanPrefetchBridge]);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const assemblySelectionVerticalBandRef = useRef<HTMLSpanElement>(null);

@@ -32,6 +32,19 @@ export interface ContactPanSettledGeneration {
   reusePanGeneration: boolean;
 }
 
+/** Keep pointer-prefetch latency bounded by publishing center-first small batches. */
+export function contactPanPrefetchBatches<T>(
+  values: readonly T[],
+  batchSize: number,
+): T[][] {
+  const size = Number.isFinite(batchSize) ? Math.max(1, Math.floor(batchSize)) : 1;
+  const batches: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    batches.push(values.slice(index, index + size));
+  }
+  return batches;
+}
+
 /**
  * A committed pan consumes the generation that already owns its diagonal
  * flights. Unrelated viewport changes advance normally so stale pan work never

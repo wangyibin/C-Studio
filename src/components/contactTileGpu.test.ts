@@ -741,7 +741,15 @@ describe("contactTileFloatTextureData", () => {
   });
 
   it("atomically promotes a fully prefetched pan scene with zero new tile uploads", () => {
-    const { canvas, blitFramebuffer, texImage2D } = mockWebGlCanvas();
+    const {
+      canvas,
+      blitFramebuffer,
+      clientHeightRead,
+      clientWidthRead,
+      drawArrays,
+      texImage2D,
+      texSubImage2D,
+    } = mockWebGlCanvas();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
       performanceEnabled: false,
     });
@@ -769,15 +777,52 @@ describe("contactTileFloatTextureData", () => {
       renderStyle,
     })).toBe(true);
     renderer?.setPanViewport({ xStart: 4_000, xEnd: 8_000, yStart: 0, yEnd: 4_000 });
+    const drawsBeforePrefetch = drawArrays.mock.calls.length;
+    const presentationsBeforePrefetch = blitFramebuffer.mock.calls.length;
     expect(renderer?.appendSceneDescriptors({
       descriptors: [{ key: "1:0:source", tile: prefetchedTile, transpose: false }],
       generation: 8,
       resolution: 1_000,
       tileSizeBins: 4,
     })).toBe(true);
-    expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforePrefetch);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePrefetch);
 
-    const targetTile = { ...prefetchedTile, cells: [...prefetchedTile.cells] };
+    const completedPrefetchedTile = {
+      ...prefetchedTile,
+      cells: [
+        ...prefetchedTile.cells,
+        { xBin: 5, yBin: 1, count: 3 },
+      ],
+    };
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [{ key: "1:0:source", tile: completedPrefetchedTile, transpose: false }],
+      generation: 8,
+      resolution: 1_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforePrefetch);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePrefetch);
+
+    // Prefetch never presents asynchronously, but it is armed in the active
+    // scene so the next pointer frame can draw the old front and new edge tile
+    // together without waiting for the terminal target generation.
+    const imageUploadsBeforePointer = texImage2D.mock.calls.length;
+    const subUploadsBeforePointer = texSubImage2D.mock.calls.length;
+    const layoutReadsBeforePointer = clientWidthRead.mock.calls.length
+      + clientHeightRead.mock.calls.length;
+    renderer?.setPanViewport({ xStart: 4_250, xEnd: 8_250, yStart: 0, yEnd: 4_000 });
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforePrefetch + 2);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePrefetch + 1);
+    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePointer);
+    expect(texSubImage2D).toHaveBeenCalledTimes(subUploadsBeforePointer);
+    expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
+      .toBe(layoutReadsBeforePointer);
+
+    const targetTile = {
+      ...completedPrefetchedTile,
+      cells: [...completedPrefetchedTile.cells],
+    };
     const targetScene = {
       descriptors: [{ key: "1:0:source", tile: targetTile, transpose: false }],
       generation: 8,

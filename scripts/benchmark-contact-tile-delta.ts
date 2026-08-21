@@ -34,7 +34,7 @@ function run(legacySnapshots: boolean) {
   for (const chunk of chunks) {
     const changedTileKeys = accumulator.merge(chunk);
     if (legacySnapshots) {
-      accumulator.snapshotTiles(changedTileKeys);
+      accumulator.previewBatch(changedTileKeys);
     }
   }
   accumulator.finish();

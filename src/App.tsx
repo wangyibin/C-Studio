@@ -38,6 +38,7 @@ import {
 } from "./state/contactPanPerformance";
 import {
   ContactPanPrefetchBridge,
+  contactPanPrefetchBatches,
   contactPanSettledGeneration,
   contactPanTileLoadPriority,
 } from "./state/contactPanPrefetch";
@@ -364,6 +365,9 @@ const emptyLayout: AgpLayout = { blocks: [], totalSpan: 0 };
 const maxBackgroundPrefetchTiles = 16;
 const visibleContactTileRequestBatchSize = 8;
 const panVisibleContactTileRequestBatchSize = 2;
+// Drag prefetch publishes one tile at a time so a warm request can land within
+// a 16.7 ms frame instead of waiting for a multi-tile batch to finish.
+const contactPanPrefetchRequestBatchSize = 1;
 const prefetchContactTileRequestBatchSize = 16;
 const contactViewportRequestDelayMs = 24;
 const secondaryTrackRequestDelayMs = 180;
@@ -1377,6 +1381,7 @@ export function App() {
     // Keep React out of pointer motion, but retain the expanded viewport for
     // final-pan timing and all-visible batching after pointer release.
     contactPanPrefetchSequenceRef.current += 1;
+    const panPrefetchSequence = contactPanPrefetchSequenceRef.current;
     pendingPanPerformancePreviewRef.current = {
       viewport,
       prefetchViewport: plan.prefetchViewport,
@@ -1449,45 +1454,56 @@ export function App() {
       return;
     }
 
-    const loadPromise = tileFlights.loadBatch({
-      scope: tileScope,
-      tiles: missingTiles,
-      cacheKeyForTile,
-      nextRequestId: () => {
-        const nextRequestId = contactTileBackendRequestIdRef.current + 1;
-        contactTileBackendRequestIdRef.current = nextRequestId;
-        return nextRequestId;
-      },
-      load: async (requestId, tiles) => {
-        const generationStartError = await generationStart.promise;
-        if (generationStartError !== null) {
-          throw generationStartError;
+    const panPrefetchIsCurrent = () => (
+      contactPanGenerationStartRef.current === generationStart
+      && contactPanPrefetchSequenceRef.current === panPrefetchSequence
+    );
+    const missingTileBatches = contactPanPrefetchBatches(
+      missingTiles,
+      contactPanPrefetchRequestBatchSize,
+    );
+    void (async () => {
+      for (const missingTileBatch of missingTileBatches) {
+        if (!panPrefetchIsCurrent()) {
+          return;
         }
-        if (contactPanGenerationStartRef.current !== generationStart) {
-          throw new Error(contactTileRequestCancelledMessage);
-        }
-        return loadContactTilesWithLayoutHandle(
-          contactLayoutHandleRegistry,
-          viewContactLayoutBlocks,
-          {
-            requestId,
-            generation: generationStart.generation,
-            purpose: "spatial_prefetch",
-            coolPath: contactCoolPath,
-            baseResolution: plan.baseResolution,
-            sourceResolution: plan.sourceResolution,
-            targetResolution: plan.targetResolution,
-            tileSizeBins: plan.tileSizeBins,
-            normalization,
-            tiles,
-            adaptiveRefinement: plan.adaptiveRefinement,
+        const tiles = await tileFlights.loadBatch({
+          scope: tileScope,
+          tiles: missingTileBatch,
+          cacheKeyForTile,
+          nextRequestId: () => {
+            const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+            contactTileBackendRequestIdRef.current = nextRequestId;
+            return nextRequestId;
           },
-        );
-      },
-    });
-    void loadPromise.then(
-      (tiles) => {
-        if (contactPanGenerationStartRef.current !== generationStart) {
+          load: async (requestId, requestedTiles) => {
+            const generationStartError = await generationStart.promise;
+            if (generationStartError !== null) {
+              throw generationStartError;
+            }
+            if (!panPrefetchIsCurrent()) {
+              throw new Error(contactTileRequestCancelledMessage);
+            }
+            return loadContactTilesWithLayoutHandle(
+              contactLayoutHandleRegistry,
+              viewContactLayoutBlocks,
+              {
+                requestId,
+                generation: generationStart.generation,
+                purpose: "spatial_prefetch",
+                coolPath: contactCoolPath,
+                baseResolution: plan.baseResolution,
+                sourceResolution: plan.sourceResolution,
+                targetResolution: plan.targetResolution,
+                tileSizeBins: plan.tileSizeBins,
+                normalization,
+                tiles: requestedTiles,
+                adaptiveRefinement: plan.adaptiveRefinement,
+              },
+            );
+          },
+        });
+        if (!panPrefetchIsCurrent()) {
           return;
         }
         tileCacheLru.merge(
@@ -1511,16 +1527,15 @@ export function App() {
           tileSizeBins: plan.tileSizeBins,
           viewport: plan.prefetchViewport,
         });
-      },
-      (error: unknown) => {
-        if (!isContactTileRequestCancelled(error)) {
-          dispatchUi({
-            type: "appendLog",
-            message: `Diagonal contact prefetch failed: ${String(error)}`,
-          });
-        }
-      },
-    );
+      }
+    })().catch((error: unknown) => {
+      if (!isContactTileRequestCancelled(error)) {
+        dispatchUi({
+          type: "appendLog",
+          message: `Diagonal contact prefetch failed: ${String(error)}`,
+        });
+      }
+    });
   }, [
     viewAssemblyLayout,
     beginContactPanGeneration,
@@ -1693,6 +1708,11 @@ export function App() {
     const panPreviewActive = contactTilePanPreviewActive;
     const pendingPanPreview = pendingPanPerformancePreviewRef.current;
     const panGenerationStart = contactPanGenerationStartRef.current;
+    if (!panPreviewActive && pendingPanPreview && panGenerationStart) {
+      // The authoritative settled viewport now owns loading. Stop scheduling
+      // directional prefetch batches after the currently in-flight tile.
+      contactPanPrefetchSequenceRef.current += 1;
+    }
     const settledGeneration = contactPanSettledGeneration(
       contactTileGenerationRef.current,
       effectiveContactTileViewport,

@@ -1,9 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   ContactPanPrefetchBridge,
+  contactPanPrefetchBatches,
   contactPanSettledGeneration,
   contactPanTileLoadPriority,
 } from "./contactPanPrefetch";
+
+describe("contactPanPrefetchBatches", () => {
+  it("preserves center-first order while bounding the first publish", () => {
+    expect(contactPanPrefetchBatches(["center-a", "center-b", "edge-a", "edge-b", "edge-c"], 2))
+      .toEqual([
+        ["center-a", "center-b"],
+        ["edge-a", "edge-b"],
+        ["edge-c"],
+      ]);
+  });
+
+  it("normalizes invalid batch sizes to one item", () => {
+    expect(contactPanPrefetchBatches([1, 2], 0)).toEqual([[1], [2]]);
+    expect(contactPanPrefetchBatches([1, 2], Number.NaN)).toEqual([[1], [2]]);
+  });
+});
 
 describe("ContactPanPrefetchBridge", () => {
   it("publishes without retaining batches and detaches cleanly", () => {
