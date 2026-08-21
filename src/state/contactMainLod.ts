@@ -50,6 +50,20 @@ export interface ContactMainLodPlan {
   binsPerPixel: number;
 }
 
+/** A same-resolution plan would only move identical tiles into a cold LOD cache. */
+export function contactMainLodPlanChangesSampling(
+  plan: ContactMainLodPlan | null,
+  selectedResolution: number,
+) {
+  return Boolean(
+    plan
+    && (
+      plan.sourceResolution !== selectedResolution
+      || plan.targetResolution !== selectedResolution
+    ),
+  );
+}
+
 /**
  * Large navigation views are terminal screen-density renders instead of an
  * invitation to load every exact tile. Local views stay on the AGP-aware

@@ -94,6 +94,7 @@ import {
 import {
   buildContactMainLodPlan,
   combineContactMainLodVisibleBatches,
+  contactMainLodPlanChangesSampling,
   contactMainLodPrefetchBatchSize,
   contactMainLodTileCacheLimits,
   contactMainLodTileSizeBins,
@@ -412,7 +413,7 @@ function buildContactPanPrefetchPlan({
   const adaptiveMcoolPolicy = normalization === "raw"
     && selectedResolution === 2_500_000
     && coolPath.toLowerCase().endsWith(".mcool");
-  const mainLodPlan = contactMainLodEnabled || adaptiveMcoolPolicy
+  const candidateMainLodPlan = contactMainLodEnabled || adaptiveMcoolPolicy
     ? buildContactMainLodPlan({
         viewport,
         selectedResolution,
@@ -423,6 +424,19 @@ function buildContactPanPrefetchPlan({
           ? maxAdaptiveMcoolExactTiles
           : maxExactMainContactTiles,
       }, availableResolutions)
+    : null;
+  // A tile-count boundary can move by a few tiles when the camera crosses a
+  // 256-bin edge. If the resulting LOD plan samples the exact same stored and
+  // displayed resolution, switching pipelines only abandons the warm exact
+  // cache and starts a duplicate cold load. Keep the adaptive 2.5 Mb safety
+  // policy, but otherwise stay on the ordinary tile pipeline until LOD
+  // actually changes the sampling resolution.
+  const mainLodPlan = candidateMainLodPlan
+    && (
+      adaptiveMcoolPolicy
+      || contactMainLodPlanChangesSampling(candidateMainLodPlan, selectedResolution)
+    )
+    ? candidateMainLodPlan
     : null;
   const targetResolution = mainLodPlan?.targetResolution ?? selectedResolution;
   const tileSizeBins = mainLodPlan ? contactMainLodTileSizeBins : contactTileSizeBins;
@@ -1883,7 +1897,7 @@ export function App() {
     // The adaptive 2.5 Mb safety boundary is not a diagnostic toggle: even a
     // build with general main-canvas LOD disabled must not fan out recursive
     // 1 kb refinement beyond the local exact limit.
-    const mainLodPlan = contactMainLodEnabled || usesAdaptiveMcoolExactPolicy
+    const candidateMainLodPlan = contactMainLodEnabled || usesAdaptiveMcoolExactPolicy
       ? buildContactMainLodPlan({
           viewport,
           selectedResolution: targetResolution,
@@ -1894,6 +1908,19 @@ export function App() {
             ? maxAdaptiveMcoolExactTiles
             : maxExactMainContactTiles,
         }, contactAvailableResolutions)
+      : null;
+    // Do not cross from the exact cache into the independent LOD cache merely
+    // because viewport alignment changed the canonical tile count around the
+    // threshold. A no-op LOD (same source and target resolution) has identical
+    // data but would force a second cold request and make pan release look
+    // stalled. Adaptive 2.5 Mb refinement remains deliberately bounded by the
+    // LOD path even when its displayed resolution is unchanged.
+    const mainLodPlan = candidateMainLodPlan
+      && (
+        usesAdaptiveMcoolExactPolicy
+        || contactMainLodPlanChangesSampling(candidateMainLodPlan, targetResolution)
+      )
+      ? candidateMainLodPlan
       : null;
     const mainLodTileState = (() => {
       if (!mainLodPlan) {
@@ -3033,7 +3060,12 @@ export function App() {
           && !shouldSingleScanVisibleTiles
           && visibleTilesForGeneration.length > 0
         )
-          ? new ContactTileDeltaAccumulator(visibleTilesForGeneration, tileSizeBins)
+          // The hidden replacement surface starts with cache hits and then
+          // receives the missing batches. Seed the accumulator with the whole
+          // visible domain; using only the missing batch keys makes the first
+          // cached tile look like an unsolicited stream delta after a wide
+          // high-resolution pan crosses the exact-tile batch threshold.
+          ? new ContactTileDeltaAccumulator(tileWorld.visibleTiles, tileSizeBins)
           : null;
         const stagedCompleteTileKeys = new Set<string>();
         const stageCompleteTiles = (tiles: readonly ContactMapTile[]) => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildContactMainLodPlan,
   combineContactMainLodVisibleBatches,
+  contactMainLodPlanChangesSampling,
   contactMainLodTileCacheLimits,
   contactMainLodTileSizeBins,
   contactMainLodVisibleBatchSize,
@@ -19,6 +20,36 @@ const wholePojViewport = {
 };
 
 describe("main contact-map LOD planning", () => {
+  it("keeps a same-resolution tile-count crossing on the warm exact pipeline", () => {
+    const plan = buildContactMainLodPlan({
+      viewport: {
+        xStart: 5_750_000_000,
+        xEnd: 6_770_000_000,
+        yStart: 5_303_000_000,
+        yEnd: 6_014_000_000,
+      },
+      selectedResolution: 1_000_000,
+      viewportWidthPx: 1_020,
+      viewportHeightPx: 711,
+      visibleTileCount: 19,
+    }, [1_000_000, 2_500_000]);
+
+    expect(plan).toMatchObject({
+      sourceResolution: 1_000_000,
+      targetResolution: 1_000_000,
+    });
+    expect(contactMainLodPlanChangesSampling(plan, 1_000_000)).toBe(false);
+  });
+
+  it("retains LOD when it actually changes stored or displayed sampling", () => {
+    expect(contactMainLodPlanChangesSampling({
+      sourceResolution: 100_000,
+      targetResolution: 200_000,
+      viewport: { xStart: 0, xEnd: 1, yStart: 0, yEnd: 1 },
+      binsPerPixel: 2,
+    }, 50_000)).toBe(true);
+  });
+
   it("combines center-first presentation batches into one visible LOD request", () => {
     expect(combineContactMainLodVisibleBatches([
       [{ tileX: 0, tileY: 0 }],

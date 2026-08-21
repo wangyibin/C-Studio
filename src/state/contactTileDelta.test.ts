@@ -123,25 +123,40 @@ describe("ContactTileDeltaAccumulator", () => {
     expect([...accumulator.finish()[0]!.packedCells!.counts]).toEqual([7]);
   });
 
-  it("seeds cached and progressive complete tiles exactly once for GPU staging", () => {
-    const accumulator = new ContactTileDeltaAccumulator([{ tileX: 0, tileY: 0 }], 4);
+  it("stages cached and progressive parts across the whole visible tile domain", () => {
+    const accumulator = new ContactTileDeltaAccumulator([
+      { tileX: 0, tileY: 0 },
+      { tileX: 0, tileY: 1 },
+    ], 4);
     const mergedKeys = new Set<string>();
-    const tile = {
+    const cachedTile = {
       tileX: 0,
       tileY: 0,
       cells: [{ xBin: 1, yBin: 2, count: 7 }],
+    };
+    const streamedTile = {
+      tileX: 0,
+      tileY: 1,
+      cells: [{ xBin: 2, yBin: 5, count: 11 }],
     };
 
     expect(mergeCompleteContactTilesIntoDeltaAccumulator(
       accumulator,
       mergedKeys,
-      [tile],
+      [cachedTile],
     )).toEqual(["0:0"]);
     expect(mergeCompleteContactTilesIntoDeltaAccumulator(
       accumulator,
       mergedKeys,
-      [tile],
+      [cachedTile, streamedTile],
+    )).toEqual(["0:1"]);
+    expect(mergeCompleteContactTilesIntoDeltaAccumulator(
+      accumulator,
+      mergedKeys,
+      [streamedTile],
     )).toEqual([]);
-    expect([...accumulator.finish()[0]!.packedCells!.counts]).toEqual([7]);
+    const finished = accumulator.finish();
+    expect([...finished[0]!.packedCells!.counts]).toEqual([7]);
+    expect([...finished[1]!.packedCells!.counts]).toEqual([11]);
   });
 });
