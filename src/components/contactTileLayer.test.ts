@@ -8,6 +8,7 @@ import {
   canPromoteContactTilePanInPlace,
   ContactTileLayer,
   contactTileDeltaStagingSlot,
+  contactTileGpuSharedTextureBudgetBytes,
   contactTileGpuSlotTextureBudgetBytes,
   contactTileCanvasBox,
   contactTileCanvasDescriptorsForViewport,
@@ -191,7 +192,8 @@ describe("contact tile presentation buffer", () => {
     expect(contactTileDeltaStagingSlot(initial, { ...stream, retainPreviousFrame: false })).toBeNull();
   });
 
-  it("splits the global tile-texture budget evenly across front and staging slots", () => {
+  it("gives the shared context the global budget and keeps the legacy slot cap bounded", () => {
+    expect(contactTileGpuSharedTextureBudgetBytes).toBe(contactTileGpuTextureBudgetBytes);
     expect(contactTileGpuSlotTextureBudgetBytes * 2).toBe(contactTileGpuTextureBudgetBytes);
   });
 
@@ -765,6 +767,40 @@ describe("contactTileCanvasBox", () => {
     expect(markup).not.toContain('data-phase="staging"');
     expect(markup).toContain("left:0%;top:50%");
     expect(markup).toContain("left:50%;top:0%");
+  });
+
+  it("mounts one shared GPU canvas for the production front/staging path", () => {
+    vi.stubGlobal("document", {});
+    try {
+      const markup = renderToStaticMarkup(
+        createElement(ContactTileLayer, {
+          contactMap: {
+            resolution: 1_000,
+            viewport: { xStart: 0, xEnd: 256_000, yStart: 0, yEnd: 256_000 },
+            cells: [],
+            tileSizeBins: 256,
+            visibleLayerComplete: true,
+            tiles: [{
+              tileX: 0,
+              tileY: 0,
+              cells: [{ xBin: 0, yBin: 0, count: 5 }],
+            }],
+          },
+          renderStyle: initialRenderStyle(),
+          layerRef: createRef<HTMLDivElement>(),
+          onPointerDown: () => undefined,
+          onPointerMove: () => undefined,
+          onPointerUp: () => undefined,
+          onPointerCancel: () => undefined,
+        }),
+      );
+
+      expect(markup.match(/data-gpu-context="shared"/g)).toHaveLength(1);
+      expect(markup.match(/contact-tile-gpu-canvas/g)).toHaveLength(1);
+      expect(markup.match(/contact-tile-surface/g)).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("positions existing tiles against a live resized viewport instead of a stale response viewport", () => {

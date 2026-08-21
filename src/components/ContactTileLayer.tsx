@@ -109,10 +109,20 @@ type ContactTileBufferSlot = 0 | 1;
 export const contactTileGpuSlotTextureBudgetBytes = Math.floor(
   contactTileGpuTextureBudgetBytes / 2,
 );
+/** The production GPU path owns one context and one global atlas budget. */
+export const contactTileGpuSharedTextureBudgetBytes = contactTileGpuTextureBudgetBytes;
 
 export interface ContactTileLayerFrame {
   contactMap: ContactMapView;
   renderStyle: ContactTileRenderStyle;
+}
+
+interface ContactTileBufferedGpuScene {
+  slot: ContactTileBufferSlot;
+  frame: ContactTileLayerFrame;
+  scene: ContactTileGpuScene;
+  canvasCount: number;
+  paintRevision?: number;
 }
 
 export interface ContactTileLayerBufferState {
@@ -518,6 +528,67 @@ export function contactTileViewportForBufferedSurface(
     : liveViewport ?? frame.contactMap.viewport;
 }
 
+function contactTileBufferedGpuScene(
+  slot: ContactTileBufferSlot,
+  phase: "presented" | "staging",
+  frame: ContactTileLayerFrame,
+  incomingFrame: ContactTileLayerFrame | null,
+  liveViewport: ContactViewport | undefined,
+  boundaries: readonly ContactTileGpuBoundary[],
+  overview: ContactTileGpuOverview | null,
+  overviewContactMap: ContactMapView | null | undefined,
+  overscanDirection: ContactTileOverscanMode,
+): ContactTileBufferedGpuScene {
+  const map = frame.contactMap;
+  const tileSizeBins = map.tileSizeBins ?? 256;
+  const tiles = canonicalTilesForRendering(contactTilesWithPreviewFallback(
+    map.cachedTiles ?? map.tiles ?? [],
+    map.previewTiles ?? [],
+  ));
+  const viewport = contactTileViewportForBufferedSurface(
+    phase,
+    frame,
+    incomingFrame,
+    liveViewport,
+  );
+  const acceptsOverview = Boolean(
+    overviewContactMap
+    && map.layoutBlocks === overviewContactMap.layoutBlocks
+    && (map.normalization ?? "raw") === (overviewContactMap.normalization ?? "raw"),
+  );
+  const visibleTiles = canonicalTilesForRendering(map.tiles ?? tiles);
+  return {
+    slot,
+    frame,
+    canvasCount: contactTileCanvasDescriptorsForViewport(
+      visibleTiles,
+      map.resolution,
+      tileSizeBins,
+      map.viewport,
+      { x: 0, y: 0 },
+    ).length,
+    paintRevision: map.renderGeneration,
+    scene: {
+      boundaries,
+      dataScope: `${map.layoutScope ?? ""}|${map.normalization ?? "raw"}`,
+      descriptors: contactTileCanvasDescriptorsForViewport(
+        tiles,
+        map.resolution,
+        tileSizeBins,
+        map.viewport,
+        overscanDirection,
+      ),
+      generation: map.renderGeneration,
+      overview: acceptsOverview ? overview : null,
+      resolution: map.resolution,
+      tileSizeBins,
+      visibleLayerComplete: map.visibleLayerComplete === true,
+      viewport,
+      renderStyle: frame.renderStyle,
+    },
+  };
+}
+
 function sameContactTileDataSurface(left: ContactMapView, right: ContactMapView) {
   return left.resolution === right.resolution
     && (left.tileSizeBins ?? 256) === (right.tileSizeBins ?? 256)
@@ -682,6 +753,16 @@ export function ContactTileLayer({
   const publishedRevealRevisionRef = useRef(0);
   const slotZeroLayerRef = useRef<HTMLDivElement>(null);
   const slotOneLayerRef = useRef<HTMLDivElement>(null);
+  const [sharedGpuAvailable, setSharedGpuAvailable] = useState(
+    () => typeof document !== "undefined",
+  );
+  const disableSharedGpu = useCallback(() => {
+    setSharedGpuAvailable(false);
+    if (panRendererRef) {
+      panRendererRef.current = null;
+    }
+    onGpuAvailabilityChange?.(false);
+  }, [onGpuAvailabilityChange, panRendererRef]);
 
   const incomingGpuScene = useMemo<ContactTileGpuScene | null>(() => {
     if (!incomingFrame) {
@@ -700,6 +781,7 @@ export function ContactTileLayer({
     );
     return {
       boundaries,
+      dataScope: `${map.layoutScope ?? ""}|${map.normalization ?? "raw"}`,
       descriptors: contactTileCanvasDescriptorsForViewport(
         tiles,
         map.resolution,
@@ -852,6 +934,37 @@ export function ContactTileLayer({
 
   const slots = [0, 1] as const;
   const deltaStagingSlot = contactTileDeltaStagingSlot(buffer, deltaStream);
+  const bufferedGpuScenes = useMemo(() => slots.map((slot) => {
+    const frame = buffer.slots[slot];
+    if (!frame) {
+      return null;
+    }
+    return contactTileBufferedGpuScene(
+      slot,
+      buffer.frontSlot === slot ? "presented" : "staging",
+      frame,
+      incomingFrame,
+      viewport,
+      boundaries,
+      overview,
+      overviewContactMap,
+      overscanDirection,
+    );
+  }), [
+    boundaries,
+    buffer,
+    incomingFrame,
+    overview,
+    overviewContactMap,
+    overscanDirection,
+    viewport,
+  ]);
+  const frontGpuScene = buffer.frontSlot === null
+    ? null
+    : bufferedGpuScenes[buffer.frontSlot];
+  const stagingGpuScene = buffer.stagingSlot === null
+    ? null
+    : bufferedGpuScenes[buffer.stagingSlot];
 
   return (
     <div
@@ -862,7 +975,21 @@ export function ContactTileLayer({
       onPointerCancel={onPointerCancel}
     >
       <div ref={transformRef} className="contact-tile-transform-stack">
-        {slots.map((slot) => {
+        {sharedGpuAvailable ? (
+          <div className="contact-tile-surface" data-phase="presented">
+            <div ref={layerRef} className="contact-tile-layer">
+              <ContactTileSharedGpuCanvas
+                front={frontGpuScene}
+                staging={stagingGpuScene}
+                onGpuAvailabilityChange={onGpuAvailabilityChange}
+                onSlotCommit={reportSlotCommit}
+                onSlotPaintComplete={reportSlotPaintComplete}
+                onUnavailable={disableSharedGpu}
+                panRendererRef={panRendererRef}
+              />
+            </div>
+          </div>
+        ) : slots.map((slot) => {
           const frame = buffer.slots[slot];
           const stagedDeltaStream = deltaStagingSlot === slot ? deltaStream : null;
           if (!frame && !stagedDeltaStream) {
@@ -909,6 +1036,7 @@ export function ContactTileLayer({
               paintRevision={frame?.contactMap.renderGeneration ?? paintRevision}
               panRendererRef={phase === "presented" ? panRendererRef : undefined}
               phase={phase}
+              gpuEnabled={false}
               renderStyle={frame?.renderStyle ?? renderStyle}
               overscanDirection={overscanDirection}
               viewport={surfaceViewport}
@@ -1066,10 +1194,150 @@ function ContactTileDeltaCanvas({
   );
 }
 
+function ContactTileSharedGpuCanvas({
+  front,
+  onGpuAvailabilityChange,
+  onSlotCommit,
+  onSlotPaintComplete,
+  onUnavailable,
+  panRendererRef,
+  staging,
+}: {
+  front: ContactTileBufferedGpuScene | null;
+  staging: ContactTileBufferedGpuScene | null;
+  onSlotCommit: (slot: ContactTileBufferSlot, event: ContactTileLayerPaintEvent) => void;
+  onSlotPaintComplete: (
+    slot: ContactTileBufferSlot,
+    event: ContactTileLayerPaintEvent,
+  ) => void;
+  onUnavailable: () => void;
+  onGpuAvailabilityChange?: (available: boolean) => void;
+  panRendererRef?: MutableRefObject<ContactTileGpuRenderer | null>;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rendererRef = useRef<ContactTileGpuRenderer | null>(null);
+  const presentedRef = useRef<ContactTileBufferedGpuScene | null>(null);
+  const paintEpochRef = useRef(0);
+  const onUnavailableRef = useRef(onUnavailable);
+  const onSlotCommitRef = useRef(onSlotCommit);
+  const onSlotPaintCompleteRef = useRef(onSlotPaintComplete);
+  const onGpuAvailabilityChangeRef = useRef(onGpuAvailabilityChange);
+  onUnavailableRef.current = onUnavailable;
+  onSlotCommitRef.current = onSlotCommit;
+  onSlotPaintCompleteRef.current = onSlotPaintComplete;
+  onGpuAvailabilityChangeRef.current = onGpuAvailabilityChange;
+
+  usePrePaintEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      onUnavailableRef.current();
+      return;
+    }
+    const renderer = createContactTileGpuRenderer(canvas, contactTileGpuSharedTextureBudgetBytes, {
+      performanceEnabled: isContactTilePerformanceEnabled(),
+      emitPerformance: emitContactTileGpuPerformance,
+    });
+    if (!renderer) {
+      onUnavailableRef.current();
+      return;
+    }
+    rendererRef.current = renderer;
+    if (panRendererRef) {
+      panRendererRef.current = renderer;
+    }
+    onGpuAvailabilityChangeRef.current?.(true);
+    const handleContextLost = (event: Event) => {
+      event.preventDefault();
+      onUnavailableRef.current();
+    };
+    canvas.addEventListener("webglcontextlost", handleContextLost);
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(() => {
+          if (presentedRef.current && !renderer.redraw()) {
+            onUnavailableRef.current();
+          }
+        });
+    observer?.observe(canvas);
+    return () => {
+      observer?.disconnect();
+      canvas.removeEventListener("webglcontextlost", handleContextLost);
+      if (panRendererRef?.current === renderer) {
+        panRendererRef.current = null;
+      }
+      rendererRef.current = null;
+      presentedRef.current = null;
+      renderer.destroy();
+      onGpuAvailabilityChangeRef.current?.(false);
+    };
+  }, [panRendererRef]);
+
+  usePrePaintEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) {
+      return;
+    }
+    const candidate = staging ?? front;
+    if (!candidate || sameContactTileBufferedGpuPresentation(presentedRef.current, candidate)) {
+      return;
+    }
+    const event: ContactTileLayerPaintEvent = {
+      renderEpoch: ++paintEpochRef.current,
+      canvasCount: candidate.canvasCount,
+      paintRevision: candidate.paintRevision,
+      commitTimestamp: frontendPerformanceTimestamp(),
+    };
+    onSlotCommitRef.current(candidate.slot, event);
+    const painted = staging
+      ? renderer.stageScene(candidate.scene)
+      : renderer.setScene(candidate.scene);
+    if (!painted) {
+      onUnavailableRef.current();
+      return;
+    }
+    presentedRef.current = candidate;
+    onSlotPaintCompleteRef.current(candidate.slot, event);
+  }, [front, staging]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="contact-tile-canvas contact-tile-gpu-canvas"
+      data-gpu-context="shared"
+      aria-hidden="true"
+    />
+  );
+}
+
+function sameContactTileBufferedGpuPresentation(
+  left: ContactTileBufferedGpuScene | null,
+  right: ContactTileBufferedGpuScene,
+) {
+  if (!left || left.frame !== right.frame) {
+    return false;
+  }
+  const leftScene = left.scene;
+  const rightScene = right.scene;
+  return leftScene.boundaries === rightScene.boundaries
+    && leftScene.overview === rightScene.overview
+    && leftScene.viewport.xStart === rightScene.viewport.xStart
+    && leftScene.viewport.xEnd === rightScene.viewport.xEnd
+    && leftScene.viewport.yStart === rightScene.viewport.yStart
+    && leftScene.viewport.yEnd === rightScene.viewport.yEnd
+    && leftScene.descriptors.length === rightScene.descriptors.length
+    && leftScene.descriptors.every((descriptor, index) => {
+      const candidate = rightScene.descriptors[index];
+      return candidate?.key === descriptor.key
+        && candidate.transpose === descriptor.transpose
+        && candidate.tile === descriptor.tile;
+    });
+}
+
 function ContactTileSurface({
   boundaries,
   contactMap,
   deltaStream,
+  gpuEnabled = true,
   layerRef,
   overview,
   overviewContactMap,
@@ -1087,6 +1355,7 @@ function ContactTileSurface({
   boundaries: readonly ContactTileGpuBoundary[];
   contactMap: ContactMapView | null;
   deltaStream?: ContactTileDeltaRenderStream | null;
+  gpuEnabled?: boolean;
   layerRef: React.RefObject<HTMLDivElement>;
   paintRevision?: number;
   onTileLayerCommit: (event: ContactTileLayerPaintEvent) => void;
@@ -1221,7 +1490,9 @@ function ContactTileSurface({
     paintCoordinator?.commit();
   }, [paintCoordinator]);
 
-  const [gpuAvailable, setGpuAvailable] = useState(() => typeof document !== "undefined");
+  const [gpuAvailable, setGpuAvailable] = useState(
+    () => gpuEnabled && typeof document !== "undefined",
+  );
   const disableGpu = useCallback(() => {
     setGpuAvailable(false);
     onGpuAvailabilityChange?.(false);
@@ -1236,7 +1507,7 @@ function ContactTileSurface({
   return (
     <div className="contact-tile-surface" data-phase={phase} aria-hidden={phase === "staging"}>
       <div ref={layerRef} className="contact-tile-layer">
-        {gpuAvailable ? (
+        {gpuEnabled && gpuAvailable ? (
           <ContactTileGpuCanvas
             boundaries={boundaries}
             contactMap={contactMap}
@@ -1406,6 +1677,7 @@ function ContactTileGpuCanvas({
     }
     const painted = renderer.setScene({
       boundaries,
+      dataScope: `${contactMap.layoutScope ?? ""}|${contactMap.normalization ?? "raw"}`,
       descriptors,
       generation: contactMap.renderGeneration,
       overview,
@@ -1476,6 +1748,9 @@ function ContactTileGpuCanvas({
     };
     const painted = renderer.setDeltaScene({
       boundaries,
+      dataScope: contactMap
+        ? `${contactMap.layoutScope ?? ""}|${contactMap.normalization ?? "raw"}`
+        : undefined,
       buffers: deltaStream.accumulator.denseBuffers(),
       deferTextureUpdates,
       descriptors: deltaDescriptors,

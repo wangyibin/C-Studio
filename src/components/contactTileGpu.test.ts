@@ -141,6 +141,7 @@ function mockWebGlCanvas() {
   Object.defineProperty(canvas, "clientHeight", { get: clientHeightRead });
   return {
     canvas,
+    getContext: canvas.getContext as ReturnType<typeof vi.fn>,
     blitFramebuffer,
     bufferData,
     clear,
@@ -253,9 +254,12 @@ describe("contactTileFloatTextureData", () => {
     );
     expect(virtualRenderer?.setScene(scene)).toBe(true);
     const virtualDrawsBeforePan = virtualMock.drawArrays.mock.calls.length;
+    const virtualTextureDrawsBeforePan = virtualRenderer?.performanceSnapshot()
+      .virtualTextureDraws ?? 0;
     virtualRenderer?.setPanViewport({ xStart: 100, xEnd: 16_000, yStart: 0, yEnd: 7_900 });
     expect(virtualMock.drawArrays).toHaveBeenCalledTimes(virtualDrawsBeforePan + 1);
-    expect(virtualRenderer?.performanceSnapshot().virtualTextureDraws).toBe(1);
+    expect(virtualRenderer?.performanceSnapshot().virtualTextureDraws)
+      .toBe(virtualTextureDrawsBeforePan + 1);
     expect(virtualRenderer?.performanceSnapshot().virtualTextureBytes)
       .toBeLessThanOrEqual(contactTileGpuVirtualTextureBudgetBytes);
 
@@ -272,6 +276,116 @@ describe("contactTileFloatTextureData", () => {
     expect(legacyRenderer?.performanceSnapshot().virtualTextureDraws).toBe(0);
     virtualRenderer?.destroy();
     legacyRenderer?.destroy();
+  });
+
+  it("stages a replacement through a second FBO without creating another context or atlas", () => {
+    const {
+      canvas,
+      getContext,
+      blitFramebuffer,
+      texImage3D,
+      texSubImage3D,
+    } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 10 },
+    };
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      generation: 1,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle,
+    })).toBe(true);
+    const atlasAllocations = texImage3D.mock.calls.length;
+    const atlasUploads = texSubImage3D.mock.calls.length;
+    const presentations = blitFramebuffer.mock.calls.length;
+
+    expect(renderer?.stageScene({
+      descriptors: [{
+        key: "1:0:source",
+        tile: { tileX: 1, tileY: 0, cells: [{ xBin: 4, yBin: 0, count: 7 }] },
+        transpose: false,
+      }],
+      generation: 2,
+      resolution: 2_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 8_000, xEnd: 16_000, yStart: 0, yEnd: 8_000 },
+      renderStyle,
+    })).toBe(true);
+
+    expect(getContext).toHaveBeenCalledOnce();
+    expect(texImage3D).toHaveBeenCalledTimes(atlasAllocations);
+    expect(texSubImage3D).toHaveBeenCalledTimes(atlasUploads + 1);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentations + 1);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      cacheBytes: 0,
+      framebufferSwaps: 1,
+      stagedSceneDraws: 1,
+      virtualTextureRebuilds: 1,
+      virtualTextureLayers: 2,
+    });
+    renderer?.destroy();
+  });
+
+  it("reuses LRU atlas slots at capacity instead of reallocating the array", () => {
+    const { canvas, texImage3D, texSubImage3D } = mockWebGlCanvas();
+    // A 256-byte budget leaves three 4x4 R32F atlas layers after page-table reserve.
+    const renderer = createContactTileGpuRenderer(canvas, 256, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 10 },
+    };
+    const scene = (generation: number, tileXs: number[]) => ({
+      descriptors: tileXs.map((tileX) => ({
+        key: `${tileX}:0:source`,
+        tile: {
+          tileX,
+          tileY: 0,
+          cells: [{ xBin: tileX * 4, yBin: 0, count: tileX + 1 }],
+        },
+        transpose: false,
+      })),
+      generation,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: {
+        xStart: Math.min(...tileXs) * 4_000,
+        xEnd: (Math.max(...tileXs) + 1) * 4_000,
+        yStart: 0,
+        yEnd: 4_000,
+      },
+      renderStyle,
+    });
+
+    expect(renderer?.setScene(scene(1, [0, 1]))).toBe(true);
+    const allocations = texImage3D.mock.calls.length;
+    const uploads = texSubImage3D.mock.calls.length;
+    expect(renderer?.stageScene(scene(2, [2, 3]))).toBe(true);
+
+    expect(texImage3D).toHaveBeenCalledTimes(allocations);
+    expect(texSubImage3D).toHaveBeenCalledTimes(uploads + 2);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      virtualTextureRebuilds: 1,
+      virtualTextureLayers: 3,
+      evictions: 1,
+    });
+    renderer?.destroy();
   });
 
   it("builds one fixed overview and accounts preferred R16F storage", () => {
@@ -531,7 +645,9 @@ describe("contactTileFloatTextureData", () => {
 
   it("draws the overview first, masks terminal exact tiles, and reuses its texture", () => {
     const { canvas, drawArrays, scissor, texImage2D } = mockWebGlCanvas();
-    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      virtualTextureEnabled: false,
+    });
     const overview = contactOverviewFloatTextureData({
       resolution: 100,
       viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
@@ -569,7 +685,9 @@ describe("contactTileFloatTextureData", () => {
 
   it("uses an independent coarse scale for the overview, then restores the exact scale", () => {
     const { canvas, uniform4f } = mockWebGlCanvas();
-    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      virtualTextureEnabled: false,
+    });
     const overview = contactOverviewFloatTextureData({
       resolution: 10_000,
       viewport: { xStart: 0, xEnd: 40_000, yStart: 0, yEnd: 40_000 },
@@ -1027,7 +1145,7 @@ describe("contactTileFloatTextureData", () => {
     expect(clientWidthRead.mock.calls.length + clientHeightRead.mock.calls.length)
       .toBe(layoutReadsBeforePointer);
     expect(renderer?.performanceSnapshot()).toMatchObject({
-      virtualTextureDraws: 1,
+      virtualTextureDraws: 2,
       virtualTextureFallbacks: 1,
       virtualTexturePages: 2,
       virtualTextureLayers: 2,
@@ -1048,6 +1166,7 @@ describe("contactTileFloatTextureData", () => {
     };
     const uploadsBeforePromotion = renderer?.performanceSnapshot().fullUploads;
     const imageUploadsBeforePromotion = texImage2D.mock.calls.length;
+    const atlasUploadsBeforePromotion = texSubImage3D.mock.calls.length;
     const presentationsBeforePromotion = blitFramebuffer.mock.calls.length;
 
     expect(renderer?.promoteScene(targetScene)).toBe(true);
@@ -1056,13 +1175,17 @@ describe("contactTileFloatTextureData", () => {
       scenePromotions: 1,
       scenePromotionMisses: 0,
     });
-    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePromotion);
+    // Promotion updates only the tiny page table; resident atlas layers are
+    // neither allocated nor uploaded again.
+    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePromotion + 1);
+    expect(texSubImage3D).toHaveBeenCalledTimes(atlasUploadsBeforePromotion);
     expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
 
     // React publishes the promoted frame after the imperative commit. The
     // child setScene call recognizes it and performs no second GPU paint.
     expect(renderer?.setScene(targetScene)).toBe(true);
-    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePromotion);
+    expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePromotion + 1);
+    expect(texSubImage3D).toHaveBeenCalledTimes(atlasUploadsBeforePromotion);
     expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
     renderer?.destroy();
   });
