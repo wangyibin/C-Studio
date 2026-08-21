@@ -2,6 +2,7 @@ import {
   Check,
   ChevronDown,
   Ellipsis,
+  ListFilter,
   Maximize2,
   PanelRight,
   Plus,
@@ -57,6 +58,12 @@ import {
   juiceboxShortcutIntent,
 } from "../state/juiceboxShortcuts";
 import { keyboardShortcutLabels } from "../state/keyboardShortcutLabels";
+import {
+  chromosomeDisplayScope,
+  type ChromosomeVisibility,
+  updateHiddenChromosomeSelection,
+} from "../state/chromosomeVisibility";
+import type { ContactMapLayoutBlock } from "../state/importers";
 import { ContactMapViewport } from "./ContactMapViewport";
 import { GfaGraphPanel } from "./GfaGraphPanel";
 import { HeatmapToolbar } from "./HeatmapToolbar";
@@ -83,6 +90,14 @@ interface AppShellProps {
   onLoadGfaEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
   gfaHomologPattern: string;
   onGfaHomologPatternChange: (pattern: string) => void;
+  chromosomeVisibility: ChromosomeVisibility;
+  hiddenChromosomeIds: ReadonlySet<string>;
+  chromosomeFilterPattern: string;
+  includeUnanchoredInChromosomeFilter: boolean;
+  viewAssemblyBlocks: ContactMapLayoutBlock[];
+  onHiddenChromosomeIdsChange: (ids: Set<string>) => void;
+  onChromosomeFilterPatternChange: (pattern: string) => void;
+  onIncludeUnanchoredInChromosomeFilterChange: (include: boolean) => void;
   onPafTextChange: (value: string) => void;
   agpInputRef: RefObject<HTMLInputElement>;
   gfaInputRef: RefObject<HTMLInputElement>;
@@ -176,6 +191,14 @@ export function AppShell({
   onLoadGfaEndpointHiCBatch,
   gfaHomologPattern,
   onGfaHomologPatternChange,
+  chromosomeVisibility,
+  hiddenChromosomeIds,
+  chromosomeFilterPattern,
+  includeUnanchoredInChromosomeFilter,
+  viewAssemblyBlocks,
+  onHiddenChromosomeIdsChange,
+  onChromosomeFilterPatternChange,
+  onIncludeUnanchoredInChromosomeFilterChange,
   onPafTextChange,
   agpInputRef,
   gfaInputRef,
@@ -231,9 +254,18 @@ export function AppShell({
   const [gfaPanelHeight, setGfaPanelHeight] = useState<number | null>(null);
   const [confirmingClearData, setConfirmingClearData] = useState(false);
   const [confirmingReloadAssembly, setConfirmingReloadAssembly] = useState(false);
+  const [chromosomeFilterPatternDraft, setChromosomeFilterPatternDraft] = useState(
+    chromosomeFilterPattern,
+  );
+  const chromosomeFilterPatternDraftRef = useRef(chromosomeFilterPattern);
+  const committedChromosomeFilterPatternRef = useRef(chromosomeFilterPattern);
+  const onChromosomeFilterPatternChangeRef = useRef(onChromosomeFilterPatternChange);
+  const commitChromosomeFilterPatternRef = useRef<() => void>(() => undefined);
+  const chromosomeCheckboxAnchorRef = useRef<string | null>(null);
   const projectMenuRef = useRef<HTMLDetailsElement>(null);
   const addDataMenuRef = useRef<HTMLDetailsElement>(null);
   const appMenuRef = useRef<HTMLDetailsElement>(null);
+  const chromosomeFilterMenuRef = useRef<HTMLDetailsElement>(null);
   const hiddenAssemblyOverlaysRef = useRef<{
     chromosome: boolean;
     block: boolean;
@@ -256,6 +288,24 @@ export function AppShell({
   ].filter((label): label is string => label !== null);
   const hasLoadedData = loadedDataLabels.length > 0;
 
+  onChromosomeFilterPatternChangeRef.current = onChromosomeFilterPatternChange;
+
+  function updateChromosomeFilterPatternDraft(value: string) {
+    chromosomeFilterPatternDraftRef.current = value;
+    setChromosomeFilterPatternDraft(value);
+  }
+
+  function commitChromosomeFilterPattern() {
+    const nextPattern = chromosomeFilterPatternDraftRef.current;
+    if (nextPattern === committedChromosomeFilterPatternRef.current) {
+      return;
+    }
+    committedChromosomeFilterPatternRef.current = nextPattern;
+    onChromosomeFilterPatternChangeRef.current(nextPattern);
+  }
+
+  commitChromosomeFilterPatternRef.current = commitChromosomeFilterPattern;
+
   function closeHeatmapPanel() {
     setHeatmapPanelOpen(false);
     if (!uiState.layout.syntenySplitOpen && !gfaPanelOpen) {
@@ -277,16 +327,18 @@ export function AppShell({
   const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
     ? uiState.assembly.blocks
     : dataset?.agp_layout.blocks ?? [];
-  const activeAssemblyTotalBp = activeAssemblyBlocks.reduce(
+  const activeAssemblyTotalBp = viewAssemblyBlocks.reduce(
     (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
     0,
   );
   const totalSpanMb = Math.max(
     0.000001,
     (
-      activeAssemblyTotalBp
-      || dataset?.agp_layout.totalSpan
-      || uiState.contact.totalSpanMb * 1_000_000
+      (chromosomeVisibility.active
+        ? activeAssemblyTotalBp
+        : activeAssemblyTotalBp
+          || dataset?.agp_layout.totalSpan
+          || uiState.contact.totalSpanMb * 1_000_000)
     ) / 1_000_000,
   );
   const selectedAssemblyBlockIds = selectedBlockIds(
@@ -306,26 +358,60 @@ export function AppShell({
     [...new Set(activeAssemblyBlocks.map((block) => block.objectId))],
     gfaHomologPattern,
   );
-  // Curation/Bandage follow every chromosome touched by the heatmap viewport,
-  // expanding each hit to its whole homolog group as the minimum scope.
-  const gfaVisibleHomologScaffoldIds = gfaScaffoldsForHeatmapViewport(
-    activeAssemblyBlocks,
+  const chromosomeIds = chromosomeVisibility.chromosomeIds;
+  const unanchoredObjectIds = chromosomeVisibility.unanchoredIds;
+  const visibleChromosomeCount = chromosomeIds.filter(
+    (id) => chromosomeVisibility.visibleIds.has(id),
+  ).length;
+  const knownAssemblyObjectIds = new Set([...chromosomeIds, ...unanchoredObjectIds]);
+  const chromosomeByBlockId = new Map(
+    activeAssemblyBlocks.map((block) => [block.id, block.objectId]),
+  );
+  // Without an explicit filter, Curation/Bandage follow the heatmap viewport
+  // and expand each hit to its whole homolog group. An explicit checkbox or
+  // regex selection becomes authoritative so filtered chromosomes stay shown.
+  const automaticGfaVisibleHomologScaffoldIds = gfaScaffoldsForHeatmapViewport(
+    viewAssemblyBlocks,
     heatmapViewport,
     gfaHomologs,
   );
-  // The compact preview stays intentionally focused on one primary group.
-  const gfaPreviewScaffoldIds = gfaPrimaryHomologScaffoldsForHeatmapViewport(
-    activeAssemblyBlocks,
+  const gfaVisibleHomologScaffoldIds = chromosomeDisplayScope(
+    automaticGfaVisibleHomologScaffoldIds,
+    chromosomeVisibility,
+  );
+  // The compact preview follows one primary group until the user explicitly
+  // chooses a chromosome display set.
+  const automaticGfaPreviewScaffoldIds = gfaPrimaryHomologScaffoldsForHeatmapViewport(
+    viewAssemblyBlocks,
     heatmapViewport,
     gfaHomologs,
   );
-  // Guided narrows the focus to the AGP contig plus five neighbors per side.
-  const gfaGuidedContigIds = gfaContigsForHeatmapViewport(
-    activeAssemblyBlocks,
+  const gfaPreviewScaffoldIds = chromosomeDisplayScope(
+    automaticGfaPreviewScaffoldIds,
+    chromosomeVisibility,
+  );
+  // Guided normally narrows to the AGP contig plus five neighbors per side;
+  // explicit chromosome selection lifts that focus to all matching AGP blocks.
+  const automaticGfaGuidedContigIds = gfaContigsForHeatmapViewport(
+    viewAssemblyBlocks,
     heatmapViewport,
     5,
     new Set(selectedAssemblyBlockIds),
   );
+  const explicitlyVisibleChromosomeContigIds = chromosomeVisibility.active
+    ? activeAssemblyBlocks
+      .filter((block) => chromosomeVisibility.visibleIds.has(block.objectId))
+      .map((block) => block.id)
+    : [];
+  const gfaGuidedContigIds = new Set([
+    ...explicitlyVisibleChromosomeContigIds,
+    ...[...automaticGfaGuidedContigIds].filter((id) => {
+      const chromosomeId = chromosomeByBlockId.get(id);
+      return chromosomeId === undefined
+        || !knownAssemblyObjectIds.has(chromosomeId)
+        || chromosomeVisibility.visibleIds.has(chromosomeId);
+    }),
+  ]);
   const selectedContactNormalization = contactNormalizationForBackend(uiState.normalization);
   const displayedContactNormalization = contactMap?.normalization;
   const displayedNormalizationLabel =
@@ -566,9 +652,21 @@ export function AppShell({
   }, [gfaDocument]);
 
   useEffect(() => {
+    committedChromosomeFilterPatternRef.current = chromosomeFilterPattern;
+    updateChromosomeFilterPatternDraft(chromosomeFilterPattern);
+  }, [chromosomeFilterPattern]);
+
+  useEffect(() => {
     function closeToolbarMenusOutside(event: PointerEvent) {
-      for (const menu of [projectMenuRef.current, addDataMenuRef.current]) {
+      for (const menu of [
+        projectMenuRef.current,
+        addDataMenuRef.current,
+        chromosomeFilterMenuRef.current,
+      ]) {
         if (menu?.open && !menu.contains(event.target as Node)) {
+          if (menu === chromosomeFilterMenuRef.current) {
+            commitChromosomeFilterPatternRef.current();
+          }
           menu.open = false;
           if (menu === addDataMenuRef.current) {
             setConfirmingClearData(false);
@@ -582,8 +680,17 @@ export function AppShell({
       if (event.key !== "Escape") {
         return;
       }
-      for (const menu of [projectMenuRef.current, addDataMenuRef.current]) {
+      for (const menu of [
+        projectMenuRef.current,
+        addDataMenuRef.current,
+        chromosomeFilterMenuRef.current,
+      ]) {
         if (menu?.open) {
+          if (menu === chromosomeFilterMenuRef.current) {
+            updateChromosomeFilterPatternDraft(
+              committedChromosomeFilterPatternRef.current,
+            );
+          }
           menu.open = false;
           menu.querySelector<HTMLElement>("summary")?.focus();
           if (menu === addDataMenuRef.current) {
@@ -796,6 +903,160 @@ export function AppShell({
                   ?? "Global setting: capture group 1 defines a homolog column; group 2 orders chromosomes within it"}
               />
             </label>
+            <details ref={chromosomeFilterMenuRef} className="chromosome-filter-menu">
+              <summary
+                aria-label="Filter chromosomes shown in assembly views"
+                title="Filter chromosomes shown in the heatmap, dotplot, coverage, and GFA views"
+              >
+                <ListFilter size={13} aria-hidden="true" />
+                <span>Chromosomes</span>
+                <strong>
+                  {visibleChromosomeCount}/{chromosomeIds.length}
+                  {chromosomeVisibility.active
+                    && includeUnanchoredInChromosomeFilter
+                    && unanchoredObjectIds.length > 0
+                    ? "+U"
+                    : ""}
+                </strong>
+                <ChevronDown size={12} aria-hidden="true" />
+              </summary>
+              <section className="chromosome-filter-popover" aria-label="Chromosome display filter">
+                <header>
+                  <span>
+                    <strong>Displayed chromosomes</strong>
+                    <small>Heatmap · dotplot · coverage · GFA · AGP unchanged</small>
+                  </span>
+                  <span className="chromosome-filter-actions">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        chromosomeCheckboxAnchorRef.current = null;
+                        onHiddenChromosomeIdsChange(new Set());
+                        onChromosomeFilterPatternChange("");
+                        onIncludeUnanchoredInChromosomeFilterChange(false);
+                      }}
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      disabled={chromosomeIds.length === 0}
+                      onClick={() => {
+                        chromosomeCheckboxAnchorRef.current = null;
+                        onHiddenChromosomeIdsChange(new Set(chromosomeIds));
+                        onChromosomeFilterPatternChange("");
+                        onIncludeUnanchoredInChromosomeFilterChange(false);
+                      }}
+                    >
+                      None
+                    </button>
+                  </span>
+                </header>
+                <label className={`chromosome-filter-regex${chromosomeVisibility.error ? " invalid" : ""}`}>
+                  <span>Name regex</span>
+                  <input
+                    type="text"
+                    aria-label="Chromosome display regular expression"
+                    value={chromosomeFilterPatternDraft}
+                    placeholder="e.g. ^Chr01"
+                    spellCheck={false}
+                    onChange={(event) => updateChromosomeFilterPatternDraft(
+                      event.currentTarget.value,
+                    )}
+                    onBlur={() => commitChromosomeFilterPattern()}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        commitChromosomeFilterPattern();
+                        event.currentTarget.blur();
+                      }
+                    }}
+                    title={chromosomeVisibility.error
+                      ?? "Press Enter or leave the field to apply this filter after the chromosome checkboxes"}
+                  />
+                </label>
+                {chromosomeVisibility.error ? (
+                  <p className="chromosome-filter-error" role="alert">
+                    {chromosomeVisibility.error}
+                  </p>
+                ) : null}
+                <label
+                  className="chromosome-filter-unanchored"
+                  title={unanchoredObjectIds.length > 0
+                    ? "Include unmatched or unanchored AGP objects with the active chromosome filter. Use None plus this option to show only unanchored objects."
+                    : "No unmatched or unanchored AGP objects are available"}
+                >
+                  <input
+                    type="checkbox"
+                    aria-label="Include unanchored objects in chromosome filter"
+                    checked={includeUnanchoredInChromosomeFilter}
+                    disabled={unanchoredObjectIds.length === 0}
+                    onChange={(event) => onIncludeUnanchoredInChromosomeFilterChange(
+                      event.currentTarget.checked,
+                    )}
+                  />
+                  <span>
+                    <strong>Unanchored / unmatched</strong>
+                    <small>
+                      {unanchoredObjectIds.length.toLocaleString()} AGP {unanchoredObjectIds.length === 1
+                        ? "object"
+                        : "objects"}
+                    </small>
+                  </span>
+                </label>
+                <div className="chromosome-filter-list" role="group" aria-label="Chromosome checkboxes">
+                  {chromosomeIds.length === 0 ? (
+                    <p>No chromosomes match the Homolog regex.</p>
+                  ) : chromosomeIds.map((chromosomeId) => {
+                    const checked = !hiddenChromosomeIds.has(chromosomeId);
+                    const regexVisible = chromosomeVisibility.error !== null
+                      || chromosomeFilterPattern.trim() === ""
+                      || chromosomeVisibility.visibleIds.has(chromosomeId);
+                    return (
+                      <label
+                        key={chromosomeId}
+                        className={regexVisible ? undefined : "regex-excluded"}
+                        title={regexVisible ? chromosomeId : `${chromosomeId} is excluded by the regex`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(event) => {
+                            const visible = event.currentTarget.checked;
+                            const shiftKey = "shiftKey" in event.nativeEvent
+                              && event.nativeEvent.shiftKey === true;
+                            const anchorId = shiftKey
+                              ? chromosomeCheckboxAnchorRef.current
+                              : null;
+                            const next = updateHiddenChromosomeSelection(
+                              chromosomeIds,
+                              hiddenChromosomeIds,
+                              chromosomeId,
+                              visible,
+                              anchorId,
+                            );
+                            if (!shiftKey || anchorId === null || !chromosomeIds.includes(anchorId)) {
+                              chromosomeCheckboxAnchorRef.current = chromosomeId;
+                            }
+                            onHiddenChromosomeIdsChange(next);
+                          }}
+                        />
+                        <span>{chromosomeId}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <footer>
+                  Showing {visibleChromosomeCount.toLocaleString()} of {chromosomeIds.length.toLocaleString()} chromosomes
+                  {chromosomeVisibility.active
+                    ? ` · Unanchored ${includeUnanchoredInChromosomeFilter ? "included" : "excluded"}`
+                    : unanchoredObjectIds.length > 0
+                      ? " · All data shown by default"
+                      : ""}
+                  {chromosomeIds.length > 1 ? " · Shift-click for a range" : ""}
+                </footer>
+              </section>
+            </details>
           </div>
 
           <div className="global-toolbar-trailing" aria-label="Project actions">
@@ -981,6 +1242,7 @@ export function AppShell({
                   contactTileDeltaStream={contactTileDeltaStream}
                   overviewContactMap={overviewContactMap}
                   coverageView={coverageView}
+                  assemblyBlocks={viewAssemblyBlocks}
                   uiState={uiState}
                   homologPattern={gfaHomologPattern}
                   useStoredResolutionOptions={contactIsMcool}
@@ -1030,7 +1292,7 @@ export function AppShell({
                   <SyntenyDotplot
                     syntenyView={syntenyView}
                     totalSpanMb={totalSpanMb}
-                    assemblyBlocks={activeAssemblyBlocks}
+                    assemblyBlocks={viewAssemblyBlocks}
                     selectedAssemblyBlockIds={selectedAssemblyBlockIds}
                     onSelectBlock={selectSyntenyBlock}
                     onSelectBlocks={selectSyntenyBlocks}
@@ -1069,6 +1331,7 @@ export function AppShell({
                 homologPattern={gfaHomologPattern}
                 visibleScaffoldIds={gfaVisibleHomologScaffoldIds}
                 visibleContigIds={gfaGuidedContigIds}
+                chromosomeFilterActive={chromosomeVisibility.active}
                 onRestoreHeatmap={!heatmapPanelOpen && !uiState.layout.syntenySplitOpen
                   ? () => setHeatmapPanelOpen(true)
                   : undefined}
@@ -1119,12 +1382,14 @@ export function AppShell({
               onUiAction={onUiAction}
               syntenyView={syntenyView}
               assemblyBlocks={activeAssemblyBlocks}
+              viewAssemblyBlocks={viewAssemblyBlocks}
               selectedAssemblyBlockIds={selectedAssemblyBlockIds}
               pafText={pafText}
               onPafTextChange={onPafTextChange}
               gfaDocument={gfaDocument}
               gfaHomologPattern={gfaHomologPattern}
               gfaPreviewScaffoldIds={gfaPreviewScaffoldIds}
+              gfaChromosomeFilterActive={chromosomeVisibility.active}
               onExpandHeatmap={expandHeatmapPanel}
               onOpenGfaPanel={() => setGfaPanelOpen(true)}
             />

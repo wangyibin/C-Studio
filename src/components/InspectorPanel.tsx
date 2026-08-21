@@ -42,6 +42,7 @@ interface InspectorPanelProps {
   onUiAction: (action: UiAction) => void;
   syntenyView: SyntenyView | null;
   assemblyBlocks: ContactMapLayoutBlock[];
+  viewAssemblyBlocks?: ContactMapLayoutBlock[];
   selectedAssemblyBlockIds: string[];
   pafText: string;
   onPafTextChange: (value: string) => void;
@@ -50,6 +51,7 @@ interface InspectorPanelProps {
   onExpandHeatmap?: () => void;
   onOpenGfaPanel?: () => void;
   gfaPreviewScaffoldIds?: ReadonlySet<string>;
+  gfaChromosomeFilterActive?: boolean;
 }
 
 export function InspectorPanel({
@@ -63,6 +65,7 @@ export function InspectorPanel({
   onUiAction,
   syntenyView,
   assemblyBlocks,
+  viewAssemblyBlocks = assemblyBlocks,
   selectedAssemblyBlockIds,
   pafText,
   onPafTextChange,
@@ -71,6 +74,7 @@ export function InspectorPanel({
   onExpandHeatmap = () => undefined,
   onOpenGfaPanel = () => undefined,
   gfaPreviewScaffoldIds = new Set<string>(),
+  gfaChromosomeFilterActive = false,
 }: InspectorPanelProps) {
   const [historyMenu, setHistoryMenu] = useState<{
     id: number;
@@ -172,8 +176,8 @@ export function InspectorPanel({
             overviewContactMap={overviewContactMap}
             totalSpanBp={Math.max(
               1,
-              assemblyBlocks.length > 0
-                ? assemblyBlocks.reduce(
+              viewAssemblyBlocks.length > 0
+                ? viewAssemblyBlocks.reduce(
                   (largestEnd, block) => Math.max(largestEnd, block.visualEnd),
                   0,
                 )
@@ -187,7 +191,7 @@ export function InspectorPanel({
           <SyntenyPreview
             syntenyView={syntenyView}
             onExpand={() => onUiAction({ type: "setSyntenySplitOpen", open: true })}
-            assemblyBlocks={assemblyBlocks}
+            assemblyBlocks={viewAssemblyBlocks}
             selectedAssemblyBlockIds={selectedAssemblyBlockIds}
             uiState={uiState}
             onUiAction={onUiAction}
@@ -200,6 +204,7 @@ export function InspectorPanel({
             onExpand={onOpenGfaPanel}
             embedded
             visibleScaffoldIds={gfaPreviewScaffoldIds}
+            chromosomeFilterActive={gfaChromosomeFilterActive}
           />
         ) : (
           <p className="empty-state">Import a GFA file to preview the assembly graph.</p>

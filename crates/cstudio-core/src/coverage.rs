@@ -423,6 +423,53 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_copy_keeps_its_share_without_rendering_outside_the_viewport() {
+        let query = CoverageQuery {
+            display_resolution: 1_000,
+            viewport: Viewport {
+                x_start: 0,
+                x_end: 2_000,
+                y_start: 0,
+                y_end: 1,
+            },
+            layout_blocks: vec![
+                LayoutBlock {
+                    id: "visible".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 0,
+                    source_end: 2_000,
+                    visual_start: 0,
+                    orientation: Orientation::Forward,
+                },
+                LayoutBlock {
+                    id: "hidden".to_string(),
+                    source_id: "contig-a".to_string(),
+                    source_start: 0,
+                    source_end: 2_000,
+                    visual_start: 4_000,
+                    orientation: Orientation::Forward,
+                },
+            ],
+        };
+        let records = vec![BedGraphRecord {
+            chrom: "contig-a".to_string(),
+            start: 0,
+            end: 2_000,
+            value: 50.0,
+        }];
+
+        let view = build_coverage_view(&query, records).expect("valid query");
+
+        assert_eq!(
+            view.bins
+                .iter()
+                .map(|bin| (bin.x_bin, bin.value))
+                .collect::<Vec<_>>(),
+            vec![(0, 25.0), (1, 25.0)]
+        );
+    }
+
+    #[test]
     fn partial_copy_boundaries_change_coverage_share_inside_a_display_bin() {
         let query = CoverageQuery {
             display_resolution: 1_000,

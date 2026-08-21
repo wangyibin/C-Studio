@@ -97,6 +97,7 @@ const usePrePaintEffect = typeof window === "undefined" ? useEffect : useLayoutE
 
 interface ContactMapViewportProps {
   dataset: ExampleDatasetSummary | null;
+  assemblyBlocks?: ContactMapLayoutBlock[];
   contactMap: ContactMapView | null;
   contactTileDeltaStream?: ContactTileDeltaRenderStream | null;
   overviewContactMap?: ContactMapView | null;
@@ -937,6 +938,7 @@ function setShiftSelectionCursor(active: boolean) {
 }
 
 export function ContactMapViewport({
+  assemblyBlocks: displayAssemblyBlocks,
   contactMap: incomingContactMap,
   contactTileDeltaStream,
   overviewContactMap,
@@ -1102,10 +1104,12 @@ export function ContactMapViewport({
   }, [onContactTileLayerPaintComplete]);
   const hasContactMap = Boolean(dataset?.mcool_path);
   const contactSize = dataset?.mcool_size_bytes ? formatBytes(dataset.mcool_size_bytes) : null;
-  const hasCoverageTrack = Boolean(dataset?.coverage_path);
-  const activeAssemblyBlocks = uiState.assembly.blocks.length > 0
-    ? uiState.assembly.blocks
-    : dataset?.agp_layout.blocks ?? [];
+  const hasCoverageTrack = Boolean(dataset?.coverage_path || incomingCoverageView);
+  const activeAssemblyBlocks = displayAssemblyBlocks ?? (
+    uiState.assembly.blocks.length > 0
+      ? uiState.assembly.blocks
+      : dataset?.agp_layout.blocks ?? []
+  );
   const compatibleOverviewContactMap = useMemo(
     () => contactOverviewBaseIsCompatible(
       overviewContactMap ?? null,
@@ -1125,9 +1129,11 @@ export function ContactMapViewport({
   );
   const liveTotalSpanBp = Math.max(
     1,
-    activeAssemblyTotalBp
-      || dataset?.agp_layout.totalSpan
-      || uiState.contact.totalSpanMb * 1_000_000,
+    displayAssemblyBlocks !== undefined
+      ? activeAssemblyTotalBp
+      : activeAssemblyTotalBp
+        || dataset?.agp_layout.totalSpan
+        || uiState.contact.totalSpanMb * 1_000_000,
   );
   const liveViewport = useMemo(() => buildCenteredContactViewport({
     centerMb: uiState.contact.viewportCenterMb,
@@ -2565,6 +2571,7 @@ export function ContactMapViewport({
         {hasCoverageTrack ? (
           <TrackPanel
             coverageView={presentationCoverageView}
+            assemblyBlocks={assemblyBlocks}
             viewport={displayViewport}
             totalSpanMb={totalSpanMb}
             uiState={uiState}

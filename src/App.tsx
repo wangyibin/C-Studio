@@ -137,7 +137,12 @@ import {
   type GfaEndpointHiCLoader,
   type GfaEndpointHiCQueryPlan,
 } from "./state/gfaEndpointHiC";
-import { defaultGfaHomologPattern } from "./state/gfaHomologLayout";
+import { classifyGfaScaffolds, defaultGfaHomologPattern } from "./state/gfaHomologLayout";
+import {
+  buildChromosomeViewLayout,
+  placeHiddenChromosomeBlocksAfter,
+  resolveChromosomeVisibility,
+} from "./state/chromosomeVisibility";
 import { summarizePafText } from "./state/pafPreview";
 import {
   buildBrowserSyntenyView,
@@ -973,6 +978,10 @@ export function App() {
   const [pafImported, setPafImported] = useState(false);
   const [gfaDocument, setGfaDocument] = useState<GfaEvidenceDocument | null>(null);
   const [gfaHomologPattern, setGfaHomologPattern] = useState(defaultGfaHomologPattern);
+  const [hiddenChromosomeIds, setHiddenChromosomeIds] = useState<Set<string>>(new Set());
+  const [chromosomeFilterPattern, setChromosomeFilterPattern] = useState("");
+  const [includeUnanchoredInChromosomeFilter, setIncludeUnanchoredInChromosomeFilter]
+    = useState(false);
   const [statusMessage, setStatusMessage] = useState("Workbench ready");
   const [contactTilePerformanceLog, setContactTilePerformanceLog] = useState<string | null>(() => (
     contactTileIpcPerformanceEnabled
@@ -1221,11 +1230,74 @@ export function App() {
         : emptyLayout,
     [assemblyBlocks, datasetAgpLayout],
   );
+  useEffect(() => {
+    setHiddenChromosomeIds(new Set());
+    setChromosomeFilterPattern("");
+    setIncludeUnanchoredInChromosomeFilter(false);
+  }, [dataset?.agp_path]);
+  const assemblyScaffoldClassification = useMemo(() => classifyGfaScaffolds(
+    [...new Set(assemblyLayout.blocks.map((block) => block.objectId))],
+    gfaHomologPattern,
+  ), [
+    assemblyLayout.blocks,
+    gfaHomologPattern,
+  ]);
+  const chromosomeIds = useMemo(
+    () => assemblyScaffoldClassification.columns
+      .flatMap((column) => column.scaffolds.map((scaffold) => scaffold.id)),
+    [assemblyScaffoldClassification.columns],
+  );
+  const unanchoredObjectIds = useMemo(
+    () => assemblyScaffoldClassification.otherScaffolds
+      .filter((objectId) => objectId !== "debris"),
+    [assemblyScaffoldClassification.otherScaffolds],
+  );
+  const chromosomeVisibility = useMemo(() => resolveChromosomeVisibility(
+    chromosomeIds,
+    hiddenChromosomeIds,
+    chromosomeFilterPattern,
+    {
+      unanchoredIds: unanchoredObjectIds,
+      includeUnanchored: includeUnanchoredInChromosomeFilter,
+    },
+  ), [
+    chromosomeFilterPattern,
+    chromosomeIds,
+    hiddenChromosomeIds,
+    includeUnanchoredInChromosomeFilter,
+    unanchoredObjectIds,
+  ]);
+  const viewAssemblyLayout = useMemo(
+    () => buildChromosomeViewLayout(assemblyLayout.blocks, chromosomeVisibility),
+    [assemblyLayout.blocks, chromosomeVisibility],
+  );
+  const chromosomeDisplayScopeKey = chromosomeVisibility.active
+    ? [
+        chromosomeIds.filter((id) => chromosomeVisibility.visibleIds.has(id)).join("\u0000"),
+        `unanchored:${includeUnanchoredInChromosomeFilter ? unanchoredObjectIds.length : 0}`,
+      ].join("\u0001")
+    : "all";
+  const previousChromosomeDisplayScopeRef = useRef(chromosomeDisplayScopeKey);
+  useEffect(() => {
+    if (previousChromosomeDisplayScopeRef.current === chromosomeDisplayScopeKey) {
+      return;
+    }
+    previousChromosomeDisplayScopeRef.current = chromosomeDisplayScopeKey;
+    setContactTilePreviewViewport(null);
+    dispatchUi({
+      type: "fitContactViewport",
+      totalSpanMb: Math.max(0.000001, viewAssemblyLayout.totalSpan / 1_000_000),
+    });
+  }, [chromosomeDisplayScopeKey, viewAssemblyLayout.totalSpan]);
   const contactSourceResolution = useMemo(
     () => resolveContactLayoutSources(assemblyLayout.blocks, contactSources),
     [assemblyLayout.blocks, contactSources],
   );
   const contactLayoutBlocks = contactSourceResolution.blocks;
+  const viewContactLayoutBlocks = useMemo(
+    () => resolveContactLayoutSources(viewAssemblyLayout.projectionBlocks, contactSources).blocks,
+    [contactSources, viewAssemblyLayout.projectionBlocks],
+  );
   const reportedContactSourceResolutionRef = useRef("");
   useEffect(() => {
     if (!contactCoolPath || contactSources.length === 0) {
@@ -1266,14 +1338,14 @@ export function App() {
   const isAgpDirty = assemblyLayout.blocks.length > 0 && (
     currentAgpText !== savedAgpText || currentHistoryIdentity !== savedHistoryIdentity
   );
-  const backgroundAssemblyLayout = useDebouncedValue(assemblyLayout, secondaryTrackRequestDelayMs);
+  const backgroundAssemblyLayout = useDebouncedValue(viewAssemblyLayout, secondaryTrackRequestDelayMs);
   const handleContactPanTilePrefetch = useCallback((viewport: ContactMapView["viewport"]) => {
-    if (!contactCoolPath || assemblyLayout.blocks.length === 0) {
+    if (!contactCoolPath || viewAssemblyLayout.blocks.length === 0) {
       return;
     }
     const selectedResolution = resolutionToBasePairs(uiState.contact.resolution);
     const normalization = contactNormalizationForBackend(uiState.normalization);
-    const totalSpanBp = Math.max(selectedResolution, assemblyLayout.totalSpan);
+    const totalSpanBp = Math.max(selectedResolution, viewAssemblyLayout.totalSpan);
     const plan = buildContactPanPrefetchPlan({
       availableResolutions: contactAvailableResolutions,
       coolPath: contactCoolPath,
@@ -1306,7 +1378,7 @@ export function App() {
       plan.targetResolution,
       plan.tileSizeBins,
       normalization,
-      assemblyLayout.blocks,
+      viewAssemblyLayout.projectionBlocks,
     );
     const layerScope = {
       id: contactTileDataScope(
@@ -1322,7 +1394,7 @@ export function App() {
       plan.targetResolution,
       plan.tileSizeBins,
       normalization,
-      assemblyLayout.blocks,
+      viewAssemblyLayout.projectionBlocks,
     );
     const tileCacheLru = plan.usesMainLod
       ? contactMainLodTileCacheLru
@@ -1382,7 +1454,7 @@ export function App() {
         }
         return loadContactTilesWithLayoutHandle(
           contactLayoutHandleRegistry,
-          contactLayoutBlocks,
+          viewContactLayoutBlocks,
           {
             requestId,
             generation: generationStart.generation,
@@ -1436,11 +1508,11 @@ export function App() {
       },
     );
   }, [
-    assemblyLayout,
+    viewAssemblyLayout,
     beginContactPanGeneration,
     contactAvailableResolutions,
     contactCoolPath,
-    contactLayoutBlocks,
+    viewContactLayoutBlocks,
     contactLayoutHandleRegistry,
     contactMainLodTileCacheLru,
     contactPanPrefetchBridge,
@@ -1505,7 +1577,7 @@ export function App() {
     if (
       !contactIsMcool
       || contactAvailableResolutions.length === 0
-      || assemblyLayout.blocks.length === 0
+      || viewAssemblyLayout.blocks.length === 0
     ) {
       return;
     }
@@ -1529,8 +1601,8 @@ export function App() {
       `${unavailableResolution} is not stored in this .mcool; switched to ${resolution}`,
     );
   }, [
-    assemblyLayout.blocks.length,
-    assemblyLayout.totalSpan,
+    viewAssemblyLayout.blocks.length,
+    viewAssemblyLayout.totalSpan,
     contactAvailableResolutions,
     contactIsMcool,
     uiState.contact.resolution,
@@ -1546,7 +1618,7 @@ export function App() {
     centerYMb: uiState.contact.viewportCenterYMb,
     totalSpanBp: Math.max(
       resolutionToBasePairs(uiState.contact.resolution),
-      assemblyLayout.totalSpan,
+      viewAssemblyLayout.totalSpan,
     ),
     windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
     viewportWidthPx: uiState.contact.viewportWidthPx,
@@ -1559,7 +1631,7 @@ export function App() {
   );
   const effectiveContactTileTotalSpanBp = Math.max(
     effectiveContactTileResolution,
-    assemblyLayout.totalSpan,
+    viewAssemblyLayout.totalSpan,
   );
   const effectiveExactVisibleTileCount = contactTilesForViewport(
     effectiveContactTileViewport,
@@ -1676,7 +1748,7 @@ export function App() {
     } else if (contactResolutionResponsiveness.activeGeneration() !== null) {
       contactResolutionResponsiveness.retargetGeneration(generation);
     }
-    if (!contactCoolPath || assemblyLayout.blocks.length === 0) {
+    if (!contactCoolPath || viewAssemblyLayout.blocks.length === 0) {
       setContactMap((current) => (current === null ? current : null));
       contactTileCacheLru.clear();
       contactTileCacheRef.current = new Map();
@@ -1715,7 +1787,7 @@ export function App() {
     // it immediately so the first visible tile request normally sees a warm
     // handle; failures are removed from the registry and surface on actual use.
     void contactLayoutHandleRegistry
-      .prepare(contactLayoutBlocks, registerContactMapLayout)
+      .prepare(viewContactLayoutBlocks, registerContactMapLayout)
       .catch(() => undefined);
 
     let cancelled = false;
@@ -1724,7 +1796,7 @@ export function App() {
     let cancelAdjacentIdleTask: (() => void) | null = null;
     let adjacentPrefetchStarted = false;
     const documentIsHidden = () => document.visibilityState === "hidden";
-    const totalSpanBp = Math.max(targetResolution, assemblyLayout.totalSpan);
+    const totalSpanBp = Math.max(targetResolution, viewAssemblyLayout.totalSpan);
     const viewport = effectiveContactTileViewport;
     const prefetchViewport = contactTilePreviewViewport?.prefetchViewport ?? viewport;
     const panPerformancePreview = contactTilePreviewViewport
@@ -1752,7 +1824,7 @@ export function App() {
       targetResolution,
       tileSizeBins,
       normalization,
-      assemblyLayout.blocks,
+      viewAssemblyLayout.projectionBlocks,
     );
     const activeLayerScope = {
       id: contactTileDataScope(
@@ -1768,7 +1840,7 @@ export function App() {
       targetResolution,
       tileSizeBins,
       normalization,
-      assemblyLayout.blocks,
+      viewAssemblyLayout.projectionBlocks,
     );
     const untouchTileWorld = buildContactTileWorld({
       viewport,
@@ -1833,7 +1905,7 @@ export function App() {
         mainLodPlan.targetResolution,
         lodTileSizeBins,
         normalization,
-        assemblyLayout.blocks,
+        viewAssemblyLayout.projectionBlocks,
       );
       const lodLayerScope = {
         id: `main-lod|${contactTileDataScope(
@@ -1849,7 +1921,7 @@ export function App() {
         mainLodPlan.targetResolution,
         lodTileSizeBins,
         normalization,
-        assemblyLayout.blocks,
+        viewAssemblyLayout.projectionBlocks,
       );
       const untouchedLodWorld = buildContactTileWorld({
         viewport,
@@ -1969,7 +2041,7 @@ export function App() {
         ...projectContactTileWorldView(world),
         requestedResolution: targetResolution,
         normalization,
-        layoutBlocks: assemblyLayout.blocks,
+        layoutBlocks: viewAssemblyLayout.blocks,
         layoutScope: mainLodScope,
         visibleLayerComplete: world.missingVisibleTiles.length === 0,
         renderGeneration: generation,
@@ -2023,7 +2095,7 @@ export function App() {
       const reuseMainLodAsOverview = (map: ContactMapView) => {
         const reusableOverview = wholeAssemblyOverviewFromCoveringMap(
           map,
-          assemblyLayout.totalSpan,
+          viewAssemblyLayout.totalSpan,
         );
         if (reusableOverview) {
           overviewContactMapRef.current = reusableOverview;
@@ -2185,7 +2257,7 @@ export function App() {
             },
             load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
               contactLayoutHandleRegistry,
-              contactLayoutBlocks,
+              viewContactLayoutBlocks,
               {
                 requestId: backendRequestId,
                 generation,
@@ -2254,7 +2326,7 @@ export function App() {
             load: (backendRequestId, requestedTiles) => (
               streamContactTileDeltasWithLayoutHandle(
                 contactLayoutHandleRegistry,
-                contactLayoutBlocks,
+                viewContactLayoutBlocks,
                 {
                   requestId: backendRequestId,
                   generation,
@@ -2460,7 +2532,7 @@ export function App() {
       ...projectContactTileWorldView(world),
       requestedResolution: targetResolution,
       normalization,
-      layoutBlocks: assemblyLayout.blocks,
+      layoutBlocks: viewAssemblyLayout.blocks,
       layoutScope: tileScope,
       visibleLayerComplete: world.missingVisibleTiles.length === 0,
       renderGeneration: generation,
@@ -2565,12 +2637,12 @@ export function App() {
               ? availableContactResolutionsForDataset(
                   currentUiState.contact,
                   contactAvailableResolutions,
-                  assemblyLayout.totalSpan / 1_000_000,
+                  viewAssemblyLayout.totalSpan / 1_000_000,
                   false,
                 )
               : availableContactResolutions(
                   currentUiState.contact,
-                  assemblyLayout.totalSpan / 1_000_000,
+                  viewAssemblyLayout.totalSpan / 1_000_000,
                   false,
                 );
             const adjacentLayerScopeIds = new Set([activeLayerScope.id]);
@@ -2599,7 +2671,7 @@ export function App() {
               }
               const candidateTotalSpanBp = Math.max(
                 candidateTargetResolution,
-                assemblyLayout.totalSpan,
+                viewAssemblyLayout.totalSpan,
               );
               const candidateViewport = buildCenteredContactViewport({
                 centerMb: candidateUiState.contact.viewportCenterMb,
@@ -2615,7 +2687,7 @@ export function App() {
                 candidateTargetResolution,
                 tileSizeBins,
                 normalization,
-                assemblyLayout.blocks,
+                viewAssemblyLayout.projectionBlocks,
               );
               const candidateLayerScope = {
                 id: contactTileDataScope(
@@ -2632,7 +2704,7 @@ export function App() {
                 candidateTargetResolution,
                 tileSizeBins,
                 normalization,
-                assemblyLayout.blocks,
+                viewAssemblyLayout.projectionBlocks,
               );
               const candidateWorld = buildContactTileWorld({
                 viewport: candidateViewport,
@@ -2722,7 +2794,7 @@ export function App() {
                   load: (backendRequestId, requestedTiles) =>
                     loadContactTilesWithLayoutHandle(
                       contactLayoutHandleRegistry,
-                      contactLayoutBlocks,
+                      viewContactLayoutBlocks,
                       {
                         requestId: backendRequestId,
                         generation,
@@ -3007,7 +3079,7 @@ export function App() {
             },
             load: (backendRequestId, requestedTiles) => loadContactTilesWithLayoutHandle(
               contactLayoutHandleRegistry,
-              contactLayoutBlocks,
+              viewContactLayoutBlocks,
               {
                 requestId: backendRequestId,
                 generation,
@@ -3075,7 +3147,7 @@ export function App() {
               load: (backendRequestId, requestedTiles) => (
                 streamContactTileDeltasWithLayoutHandle(
                   contactLayoutHandleRegistry,
-                  contactLayoutBlocks,
+                  viewContactLayoutBlocks,
                   {
                     requestId: backendRequestId,
                     generation,
@@ -3183,7 +3255,7 @@ export function App() {
                   .filter((chunk) => chunk.length > 0);
                 return streamContactTilesWithLayoutHandle(
                   contactLayoutHandleRegistry,
-                  assemblyLayout.blocks,
+                  viewContactLayoutBlocks,
                   {
                     requestId: backendRequestId,
                     generation,
@@ -3244,7 +3316,7 @@ export function App() {
             },
             load: (backendRequestId, tiles) => loadContactTilesWithLayoutHandle(
               contactLayoutHandleRegistry,
-              contactLayoutBlocks,
+              viewContactLayoutBlocks,
               {
                 requestId: backendRequestId,
                 generation,
@@ -3352,8 +3424,8 @@ export function App() {
     contactTilePerformance,
     contactCoolPath,
     contactAvailableResolutions,
-    assemblyLayout,
-    contactLayoutBlocks,
+    viewAssemblyLayout,
+    viewContactLayoutBlocks,
     uiState.contact.resolution,
     uiState.contact.viewportSpanMb,
     uiState.contact.viewportWidthPx,
@@ -3374,13 +3446,13 @@ export function App() {
       overviewContactMapRef.current = null;
       setOverviewContactMap(null);
     };
-    if (!contactCoolPath || assemblyLayout.blocks.length === 0) {
+    if (!contactCoolPath || viewAssemblyLayout.blocks.length === 0) {
       clearStaleOverview();
       return;
     }
     const overviewCoolPath = contactCoolPath;
 
-    const totalSpanBp = Math.max(1, assemblyLayout.totalSpan);
+    const totalSpanBp = Math.max(1, viewAssemblyLayout.totalSpan);
     const plan = buildContactOverviewTilePlan(
       totalSpanBp,
       contactAvailableResolutions,
@@ -3391,11 +3463,11 @@ export function App() {
       plan.targetResolution,
       plan.targetBins,
       normalization,
-      assemblyLayout.blocks,
+      viewAssemblyLayout.projectionBlocks,
     );
     const currentOverview = overviewContactMapRef.current;
     const currentOverviewUsesCurrentLayout = currentOverview?.layoutBlocks
-      === assemblyLayout.blocks;
+      === viewAssemblyLayout.blocks;
     if (
       currentOverview
       && currentOverview.normalization === normalization
@@ -3465,7 +3537,7 @@ export function App() {
       try {
         const response = await loadContactOverviewWithLayoutHandle(
           contactLayoutHandleRegistry,
-          contactLayoutBlocks,
+          viewContactLayoutBlocks,
           {
             requestId: nextRequestId,
             generation,
@@ -3484,7 +3556,7 @@ export function App() {
           normalization,
           viewport: response.viewport,
           cells: response.cells,
-          layoutBlocks: assemblyLayout.blocks,
+          layoutBlocks: viewAssemblyLayout.blocks,
           layoutScope: overviewScope,
           visibleLayerComplete: true,
         };
@@ -3536,10 +3608,10 @@ export function App() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [
-    assemblyLayout,
+    viewAssemblyLayout,
     contactAvailableResolutions,
     contactCoolPath,
-    contactLayoutBlocks,
+    viewContactLayoutBlocks,
     uiState.normalization,
   ]);
 
@@ -3677,12 +3749,17 @@ export function App() {
       viewportWidthPx: uiState.contact.viewportWidthPx,
       viewportHeightPx: uiState.contact.viewportHeightPx,
     });
+    const displayResolution = contactResolutionToBasePairs(uiState.contact.resolution);
+    const coverageLayoutBlocks = placeHiddenChromosomeBlocksAfter(
+      backgroundAssemblyLayout,
+      Math.ceil(viewport.xEnd / displayResolution) * displayResolution,
+    );
     const request = buildCoverageViewRequest(
       coverageRecords,
-      backgroundAssemblyLayout.blocks,
+      coverageLayoutBlocks,
       totalSpanBp,
       {
-        displayResolution: contactResolutionToBasePairs(uiState.contact.resolution),
+        displayResolution,
         viewport,
       },
     );
@@ -3751,10 +3828,14 @@ export function App() {
       viewportWidthPx: uiState.contact.viewportWidthPx,
       viewportHeightPx: uiState.contact.viewportHeightPx,
     });
+    const syntenyLayoutBlocks = placeHiddenChromosomeBlocksAfter(
+      backgroundAssemblyLayout,
+      viewport.xEnd,
+    );
     const request = buildSyntenyViewRequest({
       pafText: pafPath ? "" : pafText,
       viewport,
-      layoutBlocks: backgroundAssemblyLayout.blocks,
+      layoutBlocks: syntenyLayoutBlocks,
     });
 
     if (!pafPath && request.pafRecords.length === 0) {
@@ -4746,6 +4827,14 @@ export function App() {
       onLoadGfaEndpointHiCBatch={loadGfaEndpointHiCBatch}
       gfaHomologPattern={gfaHomologPattern}
       onGfaHomologPatternChange={setGfaHomologPattern}
+      chromosomeVisibility={chromosomeVisibility}
+      hiddenChromosomeIds={hiddenChromosomeIds}
+      chromosomeFilterPattern={chromosomeFilterPattern}
+      includeUnanchoredInChromosomeFilter={includeUnanchoredInChromosomeFilter}
+      viewAssemblyBlocks={viewAssemblyLayout.blocks}
+      onHiddenChromosomeIdsChange={setHiddenChromosomeIds}
+      onChromosomeFilterPatternChange={setChromosomeFilterPattern}
+      onIncludeUnanchoredInChromosomeFilterChange={setIncludeUnanchoredInChromosomeFilter}
       onPafTextChange={(value) => {
         setPafPath(null);
         setPafText(value);

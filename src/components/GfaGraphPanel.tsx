@@ -85,6 +85,7 @@ interface GfaPreviewCardProps {
   onExpand: () => void;
   embedded?: boolean;
   visibleScaffoldIds?: ReadonlySet<string>;
+  chromosomeFilterActive?: boolean;
 }
 
 interface GfaGraphPanelProps {
@@ -98,6 +99,7 @@ interface GfaGraphPanelProps {
   homologPattern: string;
   visibleScaffoldIds: ReadonlySet<string>;
   visibleContigIds: ReadonlySet<string>;
+  chromosomeFilterActive: boolean;
   onRestoreHeatmap?: () => void;
   onClose: () => void;
   onSelectOccurrences: (ids: string[]) => void;
@@ -624,6 +626,7 @@ export function GfaPreviewCard({
   onExpand,
   embedded = false,
   visibleScaffoldIds = new Set<string>(),
+  chromosomeFilterActive = false,
 }: GfaPreviewCardProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fullGraph = useMemo(
@@ -636,10 +639,16 @@ export function GfaPreviewCard({
   );
   const graph = useMemo(
     () => graphForGfaOnlyNodeVisibility(
-      graphForVisibleHomologScaffolds(fullGraph, visibleScaffoldIds, homologs, false),
+      graphForVisibleHomologScaffolds(
+        fullGraph,
+        visibleScaffoldIds,
+        homologs,
+        false,
+        !chromosomeFilterActive,
+      ),
       false,
     ),
-    [fullGraph, homologs, visibleScaffoldIds],
+    [chromosomeFilterActive, fullGraph, homologs, visibleScaffoldIds],
   );
   const chromosomeScaffolds = useMemo(
     () => homologScaffoldIds(homologs),
@@ -706,6 +715,7 @@ export function GfaGraphPanel({
   homologPattern,
   visibleScaffoldIds,
   visibleContigIds,
+  chromosomeFilterActive,
   onRestoreHeatmap,
   onClose,
   onSelectOccurrences,
@@ -903,10 +913,17 @@ export function GfaGraphPanel({
         visibleScaffoldIds,
         homologs,
         showDisconnectedNodes,
+        !chromosomeFilterActive,
       ),
       graphNodeLimit,
     ),
-    [completeGraph, homologs, showDisconnectedNodes, visibleScaffoldKey],
+    [
+      chromosomeFilterActive,
+      completeGraph,
+      homologs,
+      showDisconnectedNodes,
+      visibleScaffoldKey,
+    ],
   );
   const guidedFocalNodeIds = useMemo(
     () => gfaBandageFocalNodeIds(completeGraph.nodes, visibleContigIds),
@@ -924,8 +941,16 @@ export function GfaGraphPanel({
       showGfaOnlyNodes,
       showDisconnectedNodes,
       graphNodeLimit,
+      !chromosomeFilterActive,
     ),
-    [completeGraph, homologs, showDisconnectedNodes, showGfaOnlyNodes, visibleContigKey],
+    [
+      chromosomeFilterActive,
+      completeGraph,
+      homologs,
+      showDisconnectedNodes,
+      showGfaOnlyNodes,
+      visibleContigKey,
+    ],
   );
   const visibleBandageGraph = useMemo(
     () => graphForGfaOnlyNodeVisibility(
@@ -2708,12 +2733,13 @@ export function graphForVisibleHomologScaffolds(
   visibleScaffoldIds: ReadonlySet<string>,
   homologs: GfaHomologClassification,
   includeDisconnected = true,
+  fallbackToAllChromosomes = true,
 ): GfaAssemblyGraph {
   const regexMatchedScaffolds = homologScaffoldIds(homologs);
   const requestedScaffolds = new Set(
     [...visibleScaffoldIds].filter((id) => regexMatchedScaffolds.has(id)),
   );
-  const displayedScaffolds = requestedScaffolds.size > 0
+  const displayedScaffolds = requestedScaffolds.size > 0 || !fallbackToAllChromosomes
     ? requestedScaffolds
     : regexMatchedScaffolds;
   const chromosomeNodes = graph.nodes.filter((node) => displayedScaffolds.has(node.groupId));
@@ -2876,8 +2902,9 @@ export function graphForGuidedNodeVisibility(
   showGfaOnlyNodes: boolean,
   showDisconnectedNodes: boolean,
   maxNodes = Number.POSITIVE_INFINITY,
+  fallbackToAllContigs = true,
 ) {
-  const focused = graphForVisibleContigs(graph, visibleContigIds);
+  const focused = graphForVisibleContigs(graph, visibleContigIds, fallbackToAllContigs);
   let candidate = focused;
   if (showDisconnectedNodes) {
     const chromosomeConnected = graphForChromosomeConnectionVisibility(
@@ -2912,9 +2939,10 @@ function homologScaffoldIds(homologs: GfaHomologClassification) {
 function graphForVisibleContigs(
   graph: GfaAssemblyGraph,
   visibleContigIds: ReadonlySet<string>,
+  fallbackToAllContigs = true,
 ): GfaAssemblyGraph {
   if (visibleContigIds.size === 0) {
-    return graph;
+    return fallbackToAllContigs ? graph : inducedGfaGraph(graph, new Set());
   }
   const focalIds = gfaBandageFocalNodeIds(graph.nodes, visibleContigIds);
   const directNeighborIds = new Set<string>();

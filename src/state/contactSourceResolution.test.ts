@@ -21,6 +21,69 @@ function block(
 }
 
 describe("resolveContactLayoutSources", () => {
+  it("projects chimeric-break boundary names onto one unsplit Cooler source", () => {
+    const blocks = [
+      block("utg:1-10000", 10_000, 0),
+      block("utg:10000-20000", 10_000, 10_000),
+    ];
+
+    const resolved = resolveContactLayoutSources(blocks, [{ name: "utg", length: 20_000 }]);
+
+    expect(resolved.remappedSourceIds).toEqual(["utg:1-10000", "utg:10000-20000"]);
+    expect(resolved.unresolvedSourceIds).toEqual([]);
+    expect(resolved.blocks.map((value) => ({
+      sourceId: value.sourceId,
+      displayName: value.displayName,
+      interval: [value.sourceStart, value.sourceEnd],
+    }))).toEqual([
+      { sourceId: "utg", displayName: "utg:1-10000", interval: [0, 10_000] },
+      { sourceId: "utg", displayName: "utg:10000-20000", interval: [10_000, 20_000] },
+    ]);
+  });
+
+  it("also accepts standard 1-based closed chimeric-break names", () => {
+    const blocks = [
+      block("utg:1-10000", 10_000, 0),
+      block("utg:10001-20000", 10_000, 10_000),
+    ];
+
+    const resolved = resolveContactLayoutSources(blocks, [{ name: "utg", length: 20_000 }]);
+
+    expect(resolved.remappedSourceIds).toEqual(["utg:1-10000", "utg:10001-20000"]);
+    expect(resolved.blocks.map((value) => [value.sourceStart, value.sourceEnd])).toEqual([
+      [0, 10_000],
+      [10_000, 20_000],
+    ]);
+  });
+
+  it("keeps an exact coordinate-named Cooler source match", () => {
+    const blocks = [block("utg:1-10000", 10_000, 0)];
+    const resolved = resolveContactLayoutSources(blocks, [
+      { name: "utg", length: 20_000 },
+      { name: "utg:1-10000", length: 10_000 },
+    ]);
+
+    expect(resolved.blocks).toBe(blocks);
+    expect(resolved.remappedSourceIds).toEqual([]);
+    expect(resolved.unresolvedSourceIds).toEqual([]);
+  });
+
+  it("rejects a coordinate name whose declared span disagrees with the AGP piece", () => {
+    const blocks = [block("utg:10000-20000", 9_999, 0)];
+    const resolved = resolveContactLayoutSources(blocks, [{ name: "utg", length: 20_000 }]);
+
+    expect(resolved.remappedSourceIds).toEqual([]);
+    expect(resolved.unresolvedSourceIds).toEqual(["utg:10000-20000"]);
+  });
+
+  it("rejects a coordinate name outside the unsplit Cooler source", () => {
+    const blocks = [block("utg:20000-30000", 10_000, 0)];
+    const resolved = resolveContactLayoutSources(blocks, [{ name: "utg", length: 20_000 }]);
+
+    expect(resolved.remappedSourceIds).toEqual([]);
+    expect(resolved.unresolvedSourceIds).toEqual(["utg:20000-30000"]);
+  });
+
   it("projects verified _dN AGP pieces onto one unsplit Cooler source", () => {
     const blocks = [
       block("utg1", 40, 0),

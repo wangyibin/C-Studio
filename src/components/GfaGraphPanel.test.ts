@@ -515,6 +515,31 @@ describe("GFA homolog and unanchored filtering", () => {
     expect(filtered.groupOrder).toEqual(["Chr01g1", "utg000024l", "Unplaced"]);
   });
 
+  it("does not fall back to every chromosome when an explicit filter selects none", () => {
+    const graph: GfaAssemblyGraph = {
+      nodes: [node("chr-1", "Chr01g1"), node("chr-2", "Chr02g1")],
+      edges: [],
+      groupOrder: ["Chr01g1", "Chr02g1"],
+      matchedSegmentCount: 2,
+      unmatchedSegmentCount: 0,
+      ambiguousLinkCount: 0,
+      truncated: false,
+    };
+    const homologs = classifyGfaScaffolds(graph.groupOrder);
+
+    const filtered = graphForVisibleHomologScaffolds(
+      graph,
+      new Set(),
+      homologs,
+      false,
+      false,
+    );
+
+    expect(filtered.nodes).toEqual([]);
+    expect(filtered.edges).toEqual([]);
+    expect(filtered.groupOrder).toEqual([]);
+  });
+
   it("hides only GFA-only utgs and their links by default", () => {
     const graph: GfaAssemblyGraph = {
       nodes: [
@@ -626,6 +651,33 @@ describe("GFA homolog and unanchored filtering", () => {
         "disconnected-agp",
         "disconnected-gfa",
       ]);
+  });
+
+  it("does not restore the full Guided graph when the chromosome filter selects none", () => {
+    const graph: GfaAssemblyGraph = {
+      nodes: [node("chr-1", "Chr01g1"), node("chr-2", "Chr02g1")],
+      edges: [],
+      groupOrder: ["Chr01g1", "Chr02g1"],
+      matchedSegmentCount: 2,
+      unmatchedSegmentCount: 0,
+      ambiguousLinkCount: 0,
+      truncated: false,
+    };
+    const homologs = classifyGfaScaffolds(graph.groupOrder);
+
+    const filtered = graphForGuidedNodeVisibility(
+      graph,
+      new Set(),
+      homologs,
+      false,
+      false,
+      Number.POSITIVE_INFINITY,
+      false,
+    );
+
+    expect(filtered.nodes).toEqual([]);
+    expect(filtered.edges).toEqual([]);
+    expect(filtered.groupOrder).toEqual([]);
   });
 
   it("keeps a GFA link between a retained selection and refreshed Guided focus", () => {

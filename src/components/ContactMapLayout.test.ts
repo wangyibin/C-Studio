@@ -93,8 +93,11 @@ describe("confirmed contact map layout styles", () => {
 
   it("queries coverage with the current heatmap X viewport and resolution", () => {
     expect(appSource).toContain(
-      "displayResolution: contactResolutionToBasePairs(uiState.contact.resolution)",
+      "const displayResolution = contactResolutionToBasePairs(uiState.contact.resolution)",
     );
+    expect(appSource).toContain("const coverageLayoutBlocks = placeHiddenChromosomeBlocksAfter(");
+    expect(appSource).toContain("Math.ceil(viewport.xEnd / displayResolution) * displayResolution");
+    expect(appSource).toContain("coverageLayoutBlocks,\n      totalSpanBp,");
     expect(appSource).toContain("centerXMb: uiState.contact.viewportCenterXMb");
     expect(appSource).toContain("windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000");
     expect(appSource).toContain("uiState.contact.viewportCenterXMb,");

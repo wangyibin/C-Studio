@@ -27,6 +27,7 @@ import type { UiAction, UiState } from "../state/uiState";
 
 interface TrackPanelProps {
   coverageView: CoverageView | null;
+  assemblyBlocks?: ContactMapLayoutBlock[];
   viewport?: ContactViewport;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
@@ -95,6 +96,7 @@ export function coverageRenderBarLimitForWidth(viewportWidthPx: number) {
 }
 
 export function TrackPanel({
+  assemblyBlocks,
   coverageView: sourceCoverageView,
   onContextMenu,
   onUiAction,
@@ -102,6 +104,7 @@ export function TrackPanel({
   viewport,
   totalSpanMb = uiState.contact.totalSpanMb,
 }: TrackPanelProps) {
+  const activeAssemblyBlocks = assemblyBlocks ?? uiState.assembly.blocks;
   const [scaleOverride, setScaleOverride] = useState<CoverageScaleDomain | null>(null);
   const [automaticMultiplier, setAutomaticMultiplier] = useState(defaultCoverageMultiplier);
   const [automaticMultiplierInput, setAutomaticMultiplierInput] = useState(
@@ -134,29 +137,29 @@ export function TrackPanel({
   const bars = useMemo(
     () => buildCoverageTrackBars(
       coverageView,
-      uiState.assembly.blocks,
+      activeAssemblyBlocks,
       coverageRenderBarLimit,
     ),
-    [coverageRenderBarLimit, coverageView, uiState.assembly.blocks],
+    [activeAssemblyBlocks, coverageRenderBarLimit, coverageView],
   );
   const selectedIds = new Set(selectedBlockIds(
-    uiState.assembly.blocks,
+    activeAssemblyBlocks,
     uiState.assembly.selection,
   ));
   const selectionRanges = buildCoverageSelectionRanges(
     coverageView?.viewport ?? null,
-    uiState.assembly.blocks,
+    activeAssemblyBlocks,
     selectedIds,
   );
   const interactiveRanges = buildCoverageSelectionRanges(
     coverageView?.viewport ?? null,
-    uiState.assembly.blocks,
-    new Set(uiState.assembly.blocks.map((block) => block.id)),
+    activeAssemblyBlocks,
+    new Set(activeAssemblyBlocks.map((block) => block.id)),
   );
-  const blocksById = new Map(uiState.assembly.blocks.map((block) => [block.id, block]));
+  const blocksById = new Map(activeAssemblyBlocks.map((block) => [block.id, block]));
   const chromosomeBoundaries = buildCoverageChromosomeBoundaries(
     coverageView?.viewport ?? null,
-    uiState.assembly.blocks,
+    activeAssemblyBlocks,
     coverageViewportWidthPx,
   );
   const coverageValues = bars.map((bar) => bar.value);
@@ -357,7 +360,7 @@ export function TrackPanel({
     event.preventDefault();
     const ids = coverageContigIdsInRatioRange(
       coverageView?.viewport ?? null,
-      uiState.assembly.blocks,
+      activeAssemblyBlocks,
       nextDrag.startRatio,
       nextDrag.currentRatio,
     );
@@ -382,7 +385,7 @@ export function TrackPanel({
         : drag.currentRatio;
       const ids = coverageContigIdsInRatioRange(
         coverageView?.viewport ?? null,
-        uiState.assembly.blocks,
+        activeAssemblyBlocks,
         drag.startRatio,
         currentRatio,
       );
@@ -390,7 +393,7 @@ export function TrackPanel({
     } else {
       const id = coverageBlockIdAtRatio(
         coverageView?.viewport ?? null,
-        uiState.assembly.blocks,
+        activeAssemblyBlocks,
         drag.startRatio,
       );
       if (id) {

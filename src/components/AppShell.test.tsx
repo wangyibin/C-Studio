@@ -3,6 +3,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { ContactMapView, ExampleDatasetSummary } from "../App";
 import { keyboardShortcutLabels } from "../state/keyboardShortcutLabels";
+import { resolveChromosomeVisibility } from "../state/chromosomeVisibility";
+import { classifyGfaScaffolds } from "../state/gfaHomologLayout";
 import { createInitialUiState, type UiState } from "../state/uiState";
 import { AppShell, clampGfaPanelHeight, clampInspectorPanelWidth } from "./AppShell";
 
@@ -16,11 +18,22 @@ function renderShell(
     autoSaveEnabled?: boolean;
     autoSaveAvailable?: boolean;
     gfaHomologPattern?: string;
+    includeUnanchoredInChromosomeFilter?: boolean;
   } = {},
 ) {
   const uiState = createInitialUiState("Ready");
   uiState.layout.rightCollapsed = rightCollapsed;
   uiState.normalization = normalization;
+  const viewAssemblyBlocks = project.dataset?.agp_layout.blocks ?? [];
+  const gfaHomologPattern = project.gfaHomologPattern ?? "(Chr\\d+)g(\\d+)";
+  const classification = classifyGfaScaffolds(
+    [...new Set(viewAssemblyBlocks.map((block) => block.objectId))],
+    gfaHomologPattern,
+  );
+  const chromosomeIds = classification.columns
+    .flatMap((column) => column.scaffolds.map((scaffold) => scaffold.id));
+  const unanchoredIds = classification.otherScaffolds.filter((id) => id !== "debris");
+  const includeUnanchoredInChromosomeFilter = project.includeUnanchoredInChromosomeFilter ?? false;
 
   return renderToStaticMarkup(
     <AppShell
@@ -32,8 +45,19 @@ function renderShell(
       pafText=""
       pafImported={false}
       gfaDocument={null}
-      gfaHomologPattern={project.gfaHomologPattern ?? "(Chr\\d+)g(\\d+)"}
+      gfaHomologPattern={gfaHomologPattern}
       onGfaHomologPatternChange={() => undefined}
+      chromosomeVisibility={resolveChromosomeVisibility(chromosomeIds, new Set(), "", {
+        unanchoredIds,
+        includeUnanchored: includeUnanchoredInChromosomeFilter,
+      })}
+      hiddenChromosomeIds={new Set()}
+      chromosomeFilterPattern=""
+      includeUnanchoredInChromosomeFilter={includeUnanchoredInChromosomeFilter}
+      viewAssemblyBlocks={viewAssemblyBlocks}
+      onHiddenChromosomeIdsChange={() => undefined}
+      onChromosomeFilterPatternChange={() => undefined}
+      onIncludeUnanchoredInChromosomeFilterChange={() => undefined}
       onPafTextChange={() => undefined}
       agpInputRef={createRef<HTMLInputElement>()}
       gfaInputRef={createRef<HTMLInputElement>()}
@@ -80,6 +104,14 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('class="global-homolog-pattern"');
     expect(markup).toContain('aria-label="Homologous chromosome regular expression"');
     expect(markup).toContain('value="(Chr\\d+)g(\\d+)"');
+    expect(markup).toContain('class="chromosome-filter-menu"');
+    expect(markup).toContain('aria-label="Filter chromosomes shown in assembly views"');
+    expect(markup).toContain("Heatmap · dotplot · coverage · GFA · AGP unchanged");
+    expect(markup).toContain('aria-label="Chromosome display regular expression"');
+    expect(markup).toContain("Press Enter or leave the field to apply this filter");
+    expect(markup).toContain('aria-label="Include unanchored objects in chromosome filter"');
+    expect(markup).toContain("Displayed chromosomes");
+    expect(markup).toContain("Showing 0 of 0");
     expect(markup).toContain('class="heatmap-toolbar"');
     expect(markup).toContain("Assembly (.agp)");
     expect(markup).toContain("Assembly graph (.gfa)");
@@ -120,6 +152,58 @@ describe("AppShell confirmed workspace", () => {
 
     expect(markup).toContain('class="global-homolog-pattern invalid"');
     expect(markup).toContain("Invalid regular expression:");
+  });
+
+  it("offers unanchored AGP objects as one aggregated filter option", () => {
+    const dataset: ExampleDatasetSummary = {
+      agp_path: "/tmp/unanchored.agp",
+      mcool_path: "",
+      cool_path: "",
+      paf_path: null,
+      coverage_path: null,
+      agp_lines: 2,
+      agp_objects: 2,
+      agp_components: 2,
+      agp_gaps: 0,
+      max_object_span: 100,
+      mcool_size_bytes: 0,
+      agp_layout: {
+        blocks: [
+          {
+            id: "Chr01g1:1:ctg1",
+            objectId: "Chr01g1",
+            sourceId: "ctg1",
+            sourceStart: 0,
+            sourceEnd: 100,
+            visualStart: 0,
+            visualEnd: 100,
+            orientation: "+",
+          },
+          {
+            id: "utg1:1:utg1",
+            objectId: "utg1",
+            sourceId: "utg1",
+            sourceStart: 0,
+            sourceEnd: 50,
+            visualStart: 100,
+            visualEnd: 150,
+            orientation: "+",
+          },
+        ],
+        totalSpan: 150,
+      },
+    };
+
+    const markup = renderShell(false, null, "None (Raw)", { dataset });
+    const listStart = markup.indexOf('class="chromosome-filter-list"');
+    const listEnd = markup.indexOf("</div>", listStart);
+    const chromosomeList = markup.slice(listStart, listEnd);
+
+    expect(markup).toContain("Unanchored / unmatched");
+    expect(markup).toContain("1 AGP object");
+    expect(chromosomeList).toContain("Chr01g1");
+    expect(chromosomeList).not.toContain("utg1");
+    expect(markup).toContain("Use None plus this option to show only unanchored objects.");
   });
 
   it("clamps the bottom GFA panel between a usable minimum and workspace share", () => {

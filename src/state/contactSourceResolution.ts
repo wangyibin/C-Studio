@@ -22,14 +22,22 @@ interface DerivedPiece {
   length: number;
 }
 
+interface CoordinateSourceName {
+  base: string;
+  start: number;
+  end: number;
+}
+
 /**
  * Resolve externally split AGP component names against an unsplit Cooler axis.
  *
- * A suffix such as `utg1_d2` is never interpreted when the Cooler contains that
- * exact source name. Otherwise, `_d2 ... _dN` may be projected onto `utg1` only
- * when the observed AGP pieces are consecutive and an unsuffixed first piece
- * proves that all piece lengths exactly partition the Cooler source. The AGP
- * fields remain untouched; this cloned layout is used only for contact lookup.
+ * A derived name is never interpreted when the Cooler contains that exact
+ * source name. Otherwise, coordinate names such as `utg1:1-10000` are checked
+ * against the AGP component length and the unsplit Cooler source bounds.
+ * `_d2 ... _dN` names may be projected onto `utg1` only when the observed AGP
+ * pieces are consecutive and an unsuffixed first piece proves that all piece
+ * lengths exactly partition the Cooler source. The AGP fields remain untouched;
+ * this cloned layout is used only for contact lookup.
  */
 export function resolveContactLayoutSources(
   blocks: ContactMapLayoutBlock[],
@@ -70,28 +78,36 @@ export function resolveContactLayoutSources(
       .filter((sourceId) => !coolNames.has(sourceId)),
   );
   const derivedByBase = new Map<string, DerivedPiece[]>();
+  const resolvedIntervals = new Map<string, { base: string; offset: number }>();
 
   for (const sourceId of missingSourceIds) {
+    const coordinateSource = parseCoordinateSourceName(sourceId);
+    const coordinateBaseLength = coordinateSource
+      ? coolLengths.get(coordinateSource.base)
+      : undefined;
+    if (coordinateSource && coordinateBaseLength !== undefined) {
+      const sourceBlocks = blocks.filter((block) => block.sourceId === sourceId);
+      const pieceLength = sourcePieceLength(sourceBlocks);
+      const interval = pieceLength === null
+        ? null
+        : coordinateSourceInterval(coordinateSource, pieceLength);
+      if (interval && interval.end <= coordinateBaseLength) {
+        resolvedIntervals.set(sourceId, {
+          base: coordinateSource.base,
+          offset: interval.start,
+        });
+        continue;
+      }
+    }
+
     const derived = parseDerivedSourceName(sourceId);
     const baseLength = derived ? coolLengths.get(derived.base) : undefined;
     if (!derived || baseLength === undefined) {
       continue;
     }
     const sourceBlocks = blocks.filter((block) => block.sourceId === sourceId);
-    const pieceLength = Math.max(0, ...sourceBlocks.map((block) => block.sourceEnd));
-    const coversPieceFromStart = sourceBlocks.some((block) => block.sourceStart === 0);
-    if (
-      !Number.isSafeInteger(pieceLength)
-      || pieceLength <= 0
-      || !coversPieceFromStart
-      || sourceBlocks.some((block) => (
-        !Number.isSafeInteger(block.sourceStart)
-        || !Number.isSafeInteger(block.sourceEnd)
-        || block.sourceStart < 0
-        || block.sourceEnd <= block.sourceStart
-        || block.sourceEnd > pieceLength
-      ))
-    ) {
+    const pieceLength = sourcePieceLength(sourceBlocks);
+    if (pieceLength === null) {
       continue;
     }
     const pieces = derivedByBase.get(derived.base) ?? [];
@@ -99,7 +115,6 @@ export function resolveContactLayoutSources(
     derivedByBase.set(derived.base, pieces);
   }
 
-  const resolvedIntervals = new Map<string, { base: string; offset: number }>();
   for (const [base, pieces] of derivedByBase) {
     pieces.sort((left, right) => left.index - right.index);
     if (!derivedIndexesAreConsecutive(pieces)) {
@@ -169,6 +184,66 @@ function parseDerivedSourceName(sourceId: string): DerivedSourceName | null {
   }
   const index = Number(match[2]);
   return Number.isSafeInteger(index) && index >= 2 ? { base: match[1], index } : null;
+}
+
+function parseCoordinateSourceName(sourceId: string): CoordinateSourceName | null {
+  const match = /^(.*):([0-9]+)-([0-9]+)$/.exec(sourceId);
+  if (!match || !match[1]) {
+    return null;
+  }
+  const start = Number(match[2]);
+  const end = Number(match[3]);
+  if (
+    !Number.isSafeInteger(start)
+    || !Number.isSafeInteger(end)
+    || start < 0
+    || end <= start
+  ) {
+    return null;
+  }
+  return { base: match[1], start, end };
+}
+
+function coordinateSourceInterval(
+  source: CoordinateSourceName,
+  pieceLength: number,
+): { start: number; end: number } | null {
+  const candidates = [
+    // Chimeric-break boundary notation commonly reuses the cut coordinate:
+    // 1-10000, 10000-20000. Normalize the leading 1 to source coordinate 0.
+    { start: source.start === 1 ? 0 : source.start, end: source.end },
+    // Standard 1-based closed coordinates: 1-10000, 10001-20000.
+    { start: source.start - 1, end: source.end },
+  ].filter((interval) => (
+    interval.start >= 0
+    && interval.end > interval.start
+    && interval.end - interval.start === pieceLength
+  ));
+  const unique = new Map(candidates.map((interval) => [
+    `${interval.start}:${interval.end}`,
+    interval,
+  ]));
+  return unique.size === 1 ? [...unique.values()][0] : null;
+}
+
+function sourcePieceLength(blocks: ContactMapLayoutBlock[]): number | null {
+  const pieceLength = Math.max(0, ...blocks.map((block) => block.sourceEnd));
+  const coversPieceFromStart = blocks.some((block) => block.sourceStart === 0);
+  if (
+    !Number.isSafeInteger(pieceLength)
+    || pieceLength <= 0
+    || !coversPieceFromStart
+    || blocks.some((block) => (
+      !Number.isSafeInteger(block.sourceStart)
+      || !Number.isSafeInteger(block.sourceEnd)
+      || block.sourceStart < 0
+      || block.sourceEnd <= block.sourceStart
+      || block.sourceEnd > pieceLength
+    ))
+  ) {
+    return null;
+  }
+  return pieceLength;
 }
 
 function derivedIndexesAreConsecutive(pieces: DerivedPiece[]) {
