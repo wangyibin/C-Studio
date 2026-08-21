@@ -77,8 +77,6 @@ export interface ContactTileLayerProps {
   onTileLayerCommit?: (event: ContactTileLayerPaintEvent) => void;
   /** Fires after every visible canvas in that epoch is ready for presentation. */
   onTileLayerPaintComplete?: (event: ContactTileLayerPaintEvent) => void;
-  /** Notifies ref consumers after presented canvas contents or identity change. */
-  onPresentedSurfaceChange?: () => void;
   /** Reports whether the presented surface owns assembly-boundary visuals. */
   onGpuAvailabilityChange?: (available: boolean) => void;
 }
@@ -585,6 +583,7 @@ function contactTileBufferedGpuScene(
       visibleLayerComplete: map.visibleLayerComplete === true,
       viewport,
       renderStyle: frame.renderStyle,
+      sourceLayout: contactTileGpuSourceLayout(map),
     },
   };
 }
@@ -689,7 +688,6 @@ export function ContactTileLayer({
   paintRevision,
   onTileLayerCommit,
   onTileLayerPaintComplete,
-  onPresentedSurfaceChange,
   onGpuAvailabilityChange,
   onPointerCancel,
   onPointerDown,
@@ -747,8 +745,6 @@ export function ContactTileLayer({
   onTileLayerCommitRef.current = onTileLayerCommit;
   const onTileLayerPaintCompleteRef = useRef(onTileLayerPaintComplete);
   onTileLayerPaintCompleteRef.current = onTileLayerPaintComplete;
-  const onPresentedSurfaceChangeRef = useRef(onPresentedSurfaceChange);
-  onPresentedSurfaceChangeRef.current = onPresentedSurfaceChange;
   const preparedRevealRef = useRef<{ revision: number; timestamp: number } | null>(null);
   const publishedRevealRevisionRef = useRef(0);
   const slotZeroLayerRef = useRef<HTMLDivElement>(null);
@@ -796,6 +792,7 @@ export function ContactTileLayer({
       visibleLayerComplete: map.visibleLayerComplete === true,
       viewport: viewport ?? map.viewport,
       renderStyle: incomingFrame.renderStyle,
+      sourceLayout: contactTileGpuSourceLayout(map),
     };
   }, [
     boundaries,
@@ -840,7 +837,6 @@ export function ContactTileLayer({
   ) => {
     const current = bufferRef.current;
     if (current.frontSlot === slot) {
-      onPresentedSurfaceChangeRef.current?.();
       if (current.slots[slot]?.contactMap.visibleLayerComplete !== false) {
         onTileLayerPaintCompleteRef.current?.(event);
       }
@@ -927,7 +923,6 @@ export function ContactTileLayer({
       : frontendPerformanceTimestamp();
     const event = { ...buffer.revealEvent, commitTimestamp };
     publishedRevealRevisionRef.current = buffer.revealRevision;
-    onPresentedSurfaceChangeRef.current?.();
     onTileLayerCommitRef.current?.(event);
     onTileLayerPaintCompleteRef.current?.(event);
   }, [buffer.revealEvent, buffer.revealRevision]);
@@ -1320,6 +1315,9 @@ function sameContactTileBufferedGpuPresentation(
   const rightScene = right.scene;
   return leftScene.boundaries === rightScene.boundaries
     && leftScene.overview === rightScene.overview
+    && leftScene.sourceLayout?.xMap === rightScene.sourceLayout?.xMap
+    && leftScene.sourceLayout?.yMap === rightScene.sourceLayout?.yMap
+    && leftScene.sourceLayout?.generation === rightScene.sourceLayout?.generation
     && leftScene.viewport.xStart === rightScene.viewport.xStart
     && leftScene.viewport.xEnd === rightScene.viewport.xEnd
     && leftScene.viewport.yStart === rightScene.viewport.yStart
@@ -1840,6 +1838,44 @@ export function canonicalTilesForRendering(tiles: ContactMapTile[]): ContactMapT
     }
   }
   return [...unique.values()];
+}
+
+function contactTileGpuSourceLayout(
+  map: ContactMapView,
+): ContactTileGpuScene["sourceLayout"] {
+  const sourceLayout = map.sourceLayout;
+  if (
+    !sourceLayout
+    || sourceLayout.resolution !== map.resolution
+    || sourceLayout.tileSizeBins !== (map.tileSizeBins ?? 256)
+  ) {
+    return undefined;
+  }
+  const descriptors = canonicalTilesForRendering([...sourceLayout.tiles]).flatMap((tile) => {
+    const source: ContactTileCanvasDescriptor = {
+      key: `source:${tile.tileX}:${tile.tileY}:source`,
+      tile,
+      transpose: false,
+    };
+    return tile.tileX === tile.tileY
+      ? [source]
+      : [
+          source,
+          {
+            key: `source:${tile.tileX}:${tile.tileY}:mirror`,
+            tile,
+            transpose: true,
+          },
+        ];
+  });
+  return {
+    dataScope: sourceLayout.dataScope,
+    descriptors,
+    generation: sourceLayout.generation,
+    sourceTiles: sourceLayout.sourceTiles,
+    xMap: sourceLayout.xMap,
+    yMap: sourceLayout.yMap,
+  };
 }
 
 function transposeDenseContactTileValues(values: Float32Array): Float32Array {

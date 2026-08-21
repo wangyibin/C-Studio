@@ -42,7 +42,6 @@ import type { ContactTileDeltaRenderStream } from "../state/contactTileDelta";
 import type { ContactTileRenderMilestone } from "../state/contactTilePerformance";
 import {
   buildContactLayoutRasterPlan,
-  contactLayoutRasterPlanCoversViewport,
 } from "../state/contactLayoutPreview";
 import { contactCellsForViewport } from "../state/contactMapView";
 import { rasterizeContactMapCells } from "../state/contactMapRaster";
@@ -87,7 +86,6 @@ import {
   AssemblyContextMenu,
   type AssemblyContextMenuPosition,
 } from "./AssemblyContextMenu";
-import { ContactLayoutRasterPreview } from "./ContactLayoutRasterPreview";
 import {
   ContactTileLayer,
   contactTileCanvasDescriptorsForViewport,
@@ -1073,7 +1071,6 @@ export function ContactMapViewport({
   });
   const assemblyPointerStateRef = useRef(assemblyPointerState);
   const lastAssemblyPointerRef = useRef<AssemblyPointerPosition | null>(null);
-  const [tilePresentedSurfaceRevision, setTilePresentedSurfaceRevision] = useState(0);
   const [presentedContactCoverageFrame, setPresentedContactCoverageFrame] = useState<
     ContactCoveragePresentationFrame | null
   >(null);
@@ -1085,9 +1082,6 @@ export function ContactMapViewport({
     colormap: uiState.contact.colormap,
     colorScale: uiState.contact.colorScale,
   }), [uiState.contact.colormap, uiState.contact.colorScale]);
-  const reportPresentedSurfaceChange = useCallback(() => {
-    setTilePresentedSurfaceRevision((revision) => revision + 1);
-  }, []);
   const reportTileLayerCommit = useCallback((event: ContactTileLayerPaintEvent) => {
     if (event.paintRevision !== undefined) {
       onContactTileLayerCommit?.({
@@ -1302,40 +1296,21 @@ export function ContactMapViewport({
   const viewportYCenterMb = (viewportYStartMb + viewportYEndMb) / 2 || uiState.contact.viewportCenterYMb;
   const viewportXSpanMb = Math.max(0.000001, viewportXEndMb - viewportXStartMb);
   const viewportYSpanMb = Math.max(0.000001, viewportYEndMb - viewportYStartMb);
-  const layoutRasterPlan = useMemo(
-    () => contactMap?.layoutBlocks
-      ? buildContactLayoutRasterPlan(contactMap.layoutBlocks, activeAssemblyBlocks)
+  const layoutChangePlan = useMemo(
+    () => presentationContactMap?.layoutBlocks
+      ? buildContactLayoutRasterPlan(presentationContactMap.layoutBlocks, activeAssemblyBlocks)
       : null,
-    [activeAssemblyBlocks, contactMap?.layoutBlocks],
+    [activeAssemblyBlocks, presentationContactMap?.layoutBlocks],
   );
-  const showsLayoutRasterPreview = Boolean(
-    usesTiledRenderer
-    && contactMap?.visibleLayerComplete
-    && layoutRasterPlan?.changesPixels
-    && contactLayoutRasterPlanCoversViewport(
-      layoutRasterPlan,
-      displayViewport.xStart,
-      displayViewport.xEnd,
-    )
-    && contactLayoutRasterPlanCoversViewport(
-      layoutRasterPlan,
-      displayViewport.yStart,
-      displayViewport.yEnd,
-    ),
-  );
-  // During a pure move/reverse, pixels and annotations switch to the edited
-  // geometry together via the raster preview. If a complete preview cannot be
-  // produced (for example, data moved in from outside the viewport), retain
-  // the matching authoritative layout until the new visible layer is ready.
-  const assemblyBlocks = layoutRasterPlan && (
-    !layoutRasterPlan.changesPixels || showsLayoutRasterPreview
+  // Source-space pixels and annotations switch to the edited geometry in the
+  // same committed GPU frame. Until that frame exists, keep annotations on
+  // the retained authoritative front surface.
+  const assemblyBlocks = layoutChangePlan && (
+    !layoutChangePlan.changesPixels || presentationContactMap?.sourceLayout
   )
     ? activeAssemblyBlocks
     : presentationContactMap?.layoutBlocks ?? activeAssemblyBlocks;
-  // The raster preview is a temporary 2D surface layered above WebGL. Keep the
-  // DOM outline fallback only for that short edit preview (or when WebGL is
-  // unavailable); ordinary navigation leaves every visual boundary on the GPU.
-  const usesDomAssemblyBoundaries = !gpuAssemblyBoundariesActive || showsLayoutRasterPreview;
+  const usesDomAssemblyBoundaries = !gpuAssemblyBoundariesActive;
   const assemblyModel = useMemo(() => buildAssemblyEditModel(assemblyBlocks), [assemblyBlocks]);
   const gpuAssemblyBoundaries = useMemo(
     () => contactGpuAssemblyBoundaries({
@@ -2698,26 +2673,9 @@ export function ContactMapViewport({
                 onTileLayerPaintComplete={renderGeneration === undefined
                   ? undefined
                   : reportTileLayerPaintComplete}
-                onPresentedSurfaceChange={reportPresentedSurfaceChange}
                 onGpuAvailabilityChange={setGpuAssemblyBoundariesActive}
                 renderStyle={tileRenderStyle}
                 viewport={tileDisplayViewport}
-              />
-            ) : null}
-            {showsLayoutRasterPreview && contactMap && layoutRasterPlan ? (
-              <ContactLayoutRasterPreview
-                sourceLayerRef={contactTileLayerRef}
-                segments={layoutRasterPlan.segments}
-                viewport={displayViewport}
-                sourceRevision={[
-                  contactMap.layoutScope,
-                  contactMap.resolution,
-                  uiState.contact.colormap,
-                  uiState.contact.colorScale.min,
-                  uiState.contact.colorScale.max,
-                  uiState.contact.colorScale.log,
-                  tilePresentedSurfaceRevision,
-                ].join("|")}
               />
             ) : null}
           </div>

@@ -121,6 +121,14 @@ import {
   type ContactSourceMetadata,
 } from "./state/contactSourceResolution";
 import {
+  buildContactGpuLayoutMap,
+  buildContactSourceAddressSpace,
+  contactGpuLayoutMapIsExact,
+  contactGpuSourceTilePlan,
+  contactSourceIdentityLayout,
+  type ContactGpuLayoutMap,
+} from "./state/contactSourceLayout";
+import {
   operationHistoryFilename,
   parseOperationHistory,
   serializeOperationHistory,
@@ -221,6 +229,20 @@ export interface ContactMapView {
   visibleLayerComplete?: boolean;
   /** Frontend-only identifier used to reject stale render timing callbacks. */
   renderGeneration?: number;
+  /** Immutable source-space tiles and exact visual-to-source shader maps. */
+  sourceLayout?: ContactGpuSourceLayoutView;
+}
+
+export interface ContactGpuSourceLayoutView {
+  resolution: number;
+  tileSizeBins: number;
+  viewport: ContactMapView["viewport"];
+  xMap: ContactGpuLayoutMap;
+  yMap: ContactGpuLayoutMap;
+  sourceTiles: readonly number[];
+  tiles: readonly ContactMapTile[];
+  dataScope: string;
+  generation: number;
 }
 
 export interface ContactMapTile {
@@ -380,6 +402,7 @@ const contactPanSidePrefetchLayers = 1;
 // tiles per batch this permits at most eight background tiles after a stable
 // foreground frame, split round-robin across the coarser and finer levels.
 const maxAdjacentResolutionPrefetchBatches = 4;
+const maxContactSourceTileCacheTiles = 192;
 const contactTileRequestCancelledMessage = "contact tile request cancelled";
 const autoSavePreferenceKey = "c-studio:auto-save-agp";
 const contactTileIpcPerformanceEnabled = (
@@ -948,6 +971,9 @@ export function App() {
   const [contactAvailableResolutions, setContactAvailableResolutions] = useState<number[]>([]);
   const [contactSources, setContactSources] = useState<ContactSourceMetadata[]>([]);
   const [contactMap, setContactMap] = useState<ContactMapView | null>(null);
+  const [contactGpuSourceLayout, setContactGpuSourceLayout] = useState<
+    ContactGpuSourceLayoutView | null
+  >(null);
   const [contactTileDeltaStream, setContactTileDeltaStream] = useState<
     ContactTileDeltaRenderStream | null
   >(null);
@@ -1016,6 +1042,8 @@ export function App() {
     promise: Promise<unknown | null>;
   } | null>(null);
   const contactTileFlightsRef = useRef(new ContactTileFlightRegistry<ContactMapTile>());
+  const contactSourceTileCacheRef = useRef(new Map<string, ContactMapTile>());
+  const contactSourceTileFlightsRef = useRef(new ContactTileFlightRegistry<ContactMapTile>());
   const contactMainLodTileFlightsRef = useRef(
     new ContactTileFlightRegistry<ContactMapTile>(),
   );
@@ -1356,6 +1384,15 @@ export function App() {
     () => resolveContactLayoutSources(viewAssemblyLayout.projectionBlocks, contactSources).blocks,
     [contactSources, viewAssemblyLayout.projectionBlocks],
   );
+  const contactSourceAddressSpace = useMemo(() => {
+    try {
+      return contactSources.length > 0
+        ? buildContactSourceAddressSpace(contactSources)
+        : null;
+    } catch {
+      return null;
+    }
+  }, [contactSources]);
   const reportedContactSourceResolutionRef = useRef("");
   useEffect(() => {
     if (!contactCoolPath || contactSources.length === 0) {
@@ -1650,6 +1687,9 @@ export function App() {
     contactMainLodTileFlightsRef.current.clear();
     endpointContactTileCacheRef.current.clear();
     endpointContactTileFlightsRef.current.clear();
+    contactSourceTileCacheRef.current.clear();
+    contactSourceTileFlightsRef.current.clear();
+    setContactGpuSourceLayout(null);
     autoColorScaleCacheRef.current.clear();
     lastCompleteContactMapRef.current = null;
   }, [
@@ -1657,6 +1697,241 @@ export function App() {
     contactMainLodTileCacheLru,
     contactPanPrefetchQueue,
     contactTileCacheLru,
+  ]);
+
+  useEffect(() => {
+    if (
+      !contactCoolPath
+      || !contactSourceAddressSpace
+      || contactSourceResolution.unresolvedSourceIds.length > 0
+      || viewContactLayoutBlocks.length === 0
+      || backendStartedContactTileGeneration === null
+    ) {
+      setContactGpuSourceLayout(null);
+      return;
+    }
+    const generationStart = contactTileGenerationStartRef.current;
+    if (!generationStart) {
+      setContactGpuSourceLayout(null);
+      return;
+    }
+    const generation = generationStart.generation;
+    if (generation !== backendStartedContactTileGeneration) {
+      setContactGpuSourceLayout(null);
+      return;
+    }
+    const selectedResolution = resolutionToBasePairs(uiState.contact.resolution);
+    const viewport = contactTilePreviewViewport?.viewport ?? buildCenteredContactViewport({
+      centerMb: uiState.contact.viewportCenterMb,
+      centerXMb: uiState.contact.viewportCenterXMb,
+      centerYMb: uiState.contact.viewportCenterYMb,
+      totalSpanBp: Math.max(selectedResolution, viewAssemblyLayout.totalSpan),
+      windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
+      viewportWidthPx: uiState.contact.viewportWidthPx,
+      viewportHeightPx: uiState.contact.viewportHeightPx,
+    });
+    const visibleTileCount = contactTilesForViewport(
+      viewport,
+      selectedResolution,
+      contactTileSizeBins,
+      Math.max(selectedResolution, viewAssemblyLayout.totalSpan),
+    ).length;
+    const usesAdaptiveMcoolExactPolicy = (
+      contactNormalizationForBackend(uiState.normalization) === "raw"
+      && selectedResolution === 2_500_000
+      && contactCoolPath.toLowerCase().endsWith(".mcool")
+    );
+    const sourceMainLodPlan = (
+      contactMainLodEnabled || usesAdaptiveMcoolExactPolicy
+    ) ? buildContactMainLodPlan({
+        viewport,
+        selectedResolution,
+        viewportWidthPx: uiState.contact.viewportWidthPx,
+        viewportHeightPx: uiState.contact.viewportHeightPx,
+        visibleTileCount,
+        exactTileLimit: usesAdaptiveMcoolExactPolicy
+          ? maxAdaptiveMcoolExactTiles
+          : maxExactMainContactTiles,
+      }, contactAvailableResolutions)
+      : null;
+    const resolution = sourceMainLodPlan?.targetResolution ?? selectedResolution;
+    const tileSizeBins = contactTileSizeBins;
+    const sourceLayoutBlocks = contactSourceIdentityLayout(
+      contactSourceAddressSpace,
+      resolution,
+    );
+    const normalization = contactNormalizationForBackend(uiState.normalization);
+    const xOverscanBins = Math.ceil((viewport.xEnd - viewport.xStart) / resolution);
+    const yOverscanBins = Math.ceil((viewport.yEnd - viewport.yStart) / resolution);
+    const xMap = buildContactGpuLayoutMap({
+      addressSpace: contactSourceAddressSpace,
+      layoutBlocks: viewContactLayoutBlocks,
+      resolution,
+      tileSizeBins,
+      viewport: { xStart: viewport.xStart, xEnd: viewport.xEnd },
+      overscanBins: xOverscanBins,
+    });
+    const yMap = buildContactGpuLayoutMap({
+      addressSpace: contactSourceAddressSpace,
+      layoutBlocks: viewContactLayoutBlocks,
+      resolution,
+      tileSizeBins,
+      viewport: { xStart: viewport.yStart, xEnd: viewport.yEnd },
+      overscanBins: yOverscanBins,
+    });
+    if (!contactGpuLayoutMapIsExact(xMap) || !contactGpuLayoutMapIsExact(yMap)) {
+      setContactGpuSourceLayout(null);
+      return;
+    }
+    const tilePlan = contactGpuSourceTilePlan(xMap, yMap);
+    const dataScope = `source|${contactTileDataScope(
+      contactCoolPath,
+      resolution,
+      tileSizeBins,
+      normalization,
+    )}`;
+    const flightScope = `${dataScope}|generation:${generation}`;
+    const cacheKeyForTile = (tile: ContactMapTileKey) => (
+      `${dataScope}|${contactTileKey(tile)}`
+    );
+    const cachedTiles = tilePlan.tiles.flatMap((tile) => {
+      const cached = contactSourceTileCacheRef.current.get(cacheKeyForTile(tile));
+      return cached ? [cached] : [];
+    });
+    const missingTiles = tilePlan.tiles.filter(
+      (tile) => !contactSourceTileCacheRef.current.has(cacheKeyForTile(tile)),
+    );
+    let cancelled = false;
+    const publish = (tiles: readonly ContactMapTile[]) => {
+      if (cancelled || generation !== contactTileGenerationRef.current) {
+        return;
+      }
+      setContactGpuSourceLayout({
+        resolution,
+        tileSizeBins,
+        viewport,
+        xMap,
+        yMap,
+        sourceTiles: tilePlan.sourceTiles,
+        tiles,
+        dataScope,
+        generation,
+      });
+    };
+    if (missingTiles.length === 0) {
+      publish(cachedTiles);
+      return () => {
+        cancelled = true;
+      };
+    }
+    setContactGpuSourceLayout(null);
+    void (async () => {
+      const generationStartError = await generationStart.promise;
+      if (
+        generationStartError !== null
+        || cancelled
+        || generation !== contactTileGenerationRef.current
+      ) {
+        return;
+      }
+      const startedAt = performance.now();
+      const loadedTiles = await contactSourceTileFlightsRef.current.loadBatch({
+        scope: flightScope,
+        tiles: missingTiles,
+        cacheKeyForTile,
+        nextRequestId: () => {
+          const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+          contactTileBackendRequestIdRef.current = nextRequestId;
+          return nextRequestId;
+        },
+        load: (requestId, tiles) => loadContactTilesWithLayoutHandle(
+          contactLayoutHandleRegistry,
+          sourceLayoutBlocks,
+          {
+            requestId,
+            generation,
+            purpose: "visible",
+            coolPath: contactCoolPath,
+            baseResolution: 1_000,
+            sourceResolution: sourceMainLodPlan?.sourceResolution,
+            targetResolution: resolution,
+            tileSizeBins,
+            normalization,
+            tiles,
+            adaptiveRefinement: false,
+          },
+        ),
+      });
+      if (cancelled || generation !== contactTileGenerationRef.current) {
+        return;
+      }
+      for (const tile of loadedTiles) {
+        const key = cacheKeyForTile(tile);
+        contactSourceTileCacheRef.current.delete(key);
+        contactSourceTileCacheRef.current.set(key, tile);
+      }
+      const completeTiles = tilePlan.tiles.flatMap((tile) => {
+        const cached = contactSourceTileCacheRef.current.get(cacheKeyForTile(tile));
+        return cached ? [cached] : [];
+      });
+      if (completeTiles.length !== tilePlan.tiles.length) {
+        return;
+      }
+      const protectedKeys = new Set(tilePlan.tiles.map(cacheKeyForTile));
+      for (const key of contactSourceTileCacheRef.current.keys()) {
+        if (contactSourceTileCacheRef.current.size <= maxContactSourceTileCacheTiles) {
+          break;
+        }
+        if (!protectedKeys.has(key)) {
+          contactSourceTileCacheRef.current.delete(key);
+        }
+      }
+      if (contactTileIpcPerformanceEnabled) {
+        console.info([
+          "CSTUDIO_PERF",
+          "event=contact_source_layout",
+          `generation=${generation}`,
+          `resolution=${resolution}`,
+          `visual_bins=${xMap.entries.length + yMap.entries.length}`,
+          `source_axis_tiles=${tilePlan.sourceTiles.length}`,
+          `source_tiles=${completeTiles.length}`,
+          `load_ms=${Math.round((performance.now() - startedAt) * 1_000) / 1_000}`,
+        ].join(" "));
+      }
+      publish(completeTiles);
+    })().catch((error) => {
+      if (
+        !cancelled
+        && generation === contactTileGenerationRef.current
+        && !isContactTileRequestCancelled(error)
+      ) {
+        dispatchUi({
+          type: "appendLog",
+          message: `Source-space GPU tile load failed: ${String(error)}`,
+        });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    backendStartedContactTileGeneration,
+    contactAvailableResolutions,
+    contactCoolPath,
+    contactLayoutHandleRegistry,
+    contactSourceAddressSpace,
+    contactSourceResolution.unresolvedSourceIds.length,
+    contactTilePreviewViewport,
+    uiState.contact.resolution,
+    uiState.contact.viewportCenterMb,
+    uiState.contact.viewportCenterXMb,
+    uiState.contact.viewportCenterYMb,
+    uiState.contact.viewportHeightPx,
+    uiState.contact.viewportSpanMb,
+    uiState.contact.viewportWidthPx,
+    uiState.normalization,
+    viewAssemblyLayout.totalSpan,
+    viewContactLayoutBlocks,
   ]);
 
   useEffect(() => {
@@ -4930,10 +5205,23 @@ export function App() {
     reason: "Endpoint 3D contact query produced no result.",
   }), [loadGfaEndpointHiCBatch]);
 
+  const contactMapWithSourceLayout = useMemo(() => {
+    if (
+      !contactMap
+      || !contactGpuSourceLayout
+      || contactGpuSourceLayout.resolution !== contactMap.resolution
+      || (contactMap.normalization ?? "raw")
+        !== contactNormalizationForBackend(uiState.normalization)
+    ) {
+      return contactMap;
+    }
+    return { ...contactMap, sourceLayout: contactGpuSourceLayout };
+  }, [contactGpuSourceLayout, contactMap, uiState.normalization]);
+
   return (
     <AppShell
       dataset={dataset}
-      contactMap={contactMap}
+      contactMap={contactMapWithSourceLayout}
       contactTileDeltaStream={contactTileDeltaStream}
       contactIsMcool={contactIsMcool}
       contactAvailableResolutions={contactAvailableResolutions}

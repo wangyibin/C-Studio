@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  buildContactGpuLayoutMap,
+  buildContactSourceAddressSpace,
+} from "../state/contactSourceLayout";
+import {
   contactOverviewFloatTextureData,
   contactOverviewTextureBytes,
   contactTileDenseFloatTextureData,
@@ -10,6 +14,7 @@ import {
   contactTileGpuTexturePreference,
   contactTileGpuVirtualTextureBudgetBytes,
   contactTileGpuVirtualTextureEnabled,
+  contactTileSourcePagePlan,
   contactTileVirtualCamera,
   contactTileVirtualPageExactFlag,
   contactTileVirtualPagePlan,
@@ -50,6 +55,10 @@ function mockWebGlCanvas() {
     TEXTURE1: 13,
     TEXTURE2: 35,
     TEXTURE3: 36,
+    TEXTURE4: 44,
+    TEXTURE5: 45,
+    TEXTURE6: 46,
+    TEXTURE7: 47,
     TEXTURE_2D: 14,
     TEXTURE_2D_ARRAY: 37,
     TEXTURE_MIN_FILTER: 15,
@@ -74,6 +83,8 @@ function mockWebGlCanvas() {
     FRAMEBUFFER_COMPLETE: 34,
     RG32UI: 39,
     RG_INTEGER: 40,
+    RGBA32UI: 48,
+    RGBA_INTEGER: 49,
     UNSIGNED_INT: 41,
     MAX_ARRAY_TEXTURE_LAYERS: 42,
     MAX_TEXTURE_SIZE: 43,
@@ -160,6 +171,78 @@ function mockWebGlCanvas() {
 }
 
 describe("contactTileFloatTextureData", () => {
+  it("compacts sparse source tile ids into one NxN page table", () => {
+    const tile = {
+      tileX: 7,
+      tileY: 42,
+      cells: [{ xBin: 29, yBin: 169, count: 5 }],
+    };
+    const plan = contactTileSourcePagePlan([7, 42], [
+      { key: "source", tile, transpose: false },
+      { key: "mirror", tile, transpose: true },
+    ]);
+    expect(plan).toMatchObject({ originX: 0, originY: 0, width: 2, height: 2 });
+    expect(plan?.pages.map((page) => [page.pageX, page.pageY, page.transpose])).toEqual([
+      [0, 1, false],
+      [1, 0, true],
+    ]);
+    expect(plan?.populatedTiles).toHaveLength(1);
+  });
+
+  it("renders an exact source layout before the projected layer is complete", () => {
+    const { canvas } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const addressSpace = buildContactSourceAddressSpace([{ name: "a", length: 4_000 }]);
+    const layoutBlocks = [{
+      id: "a",
+      objectId: "chr1",
+      sourceId: "a",
+      sourceStart: 0,
+      sourceEnd: 4_000,
+      visualStart: 0,
+      visualEnd: 4_000,
+      orientation: "+" as const,
+    }];
+    const map = buildContactGpuLayoutMap({
+      addressSpace,
+      layoutBlocks,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000 },
+    });
+    const tile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 1, yBin: 0, count: 8 }],
+    };
+    expect(renderer?.setScene({
+      descriptors: [],
+      generation: 9,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      visibleLayerComplete: false,
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+      sourceLayout: {
+        dataScope: "source-test",
+        descriptors: [{ key: "source", tile, transpose: false }],
+        generation: 9,
+        sourceTiles: [0],
+        xMap: map,
+        yMap: map,
+      },
+    })).toBe(true);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      sourceLayoutDraws: 1,
+      sourceLayoutUploads: 1,
+      sourceLayoutBytes: map.addressData.byteLength * 2 + map.weightData.byteLength * 2,
+    });
+    renderer?.destroy();
+  });
+
   it("builds a compact virtual page table with one shared layer for mirrors", () => {
     const populatedTile = {
       tileX: 2,

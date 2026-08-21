@@ -1217,18 +1217,6 @@ button {
   background: #ffffff;
 }
 
-.contact-map canvas.contact-layout-raster-preview {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  display: block;
-  max-width: none;
-  max-height: none;
-  border: 0;
-  pointer-events: none;
-  image-rendering: pixelated;
-}
-
 .legacy-pixi-host {
   display: none;
 }

@@ -1,7 +1,7 @@
 {
   "name": "c-studio",
   "private": true,
-  "version": "0.2.8",
+  "version": "0.2.9",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
@@ -9,6 +9,7 @@
     "benchmark:contact-delta": "vite-node scripts/benchmark-contact-tile-delta.ts",
     "benchmark:contact-virtual-pan": "vite-node scripts/benchmark-contact-virtual-pan.ts",
     "benchmark:contact-shared-gpu": "vite-node scripts/benchmark-contact-shared-gpu.ts",
+    "benchmark:contact-source-layout": "vite-node scripts/benchmark-contact-source-layout.ts",
     "test": "vitest run",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "tauri": "tauri"
