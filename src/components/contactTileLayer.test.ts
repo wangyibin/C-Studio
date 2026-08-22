@@ -9,6 +9,7 @@ import {
   ContactTileLayer,
   contactTileDeltaStagingSlot,
   contactTileGpuSharedTextureBudgetBytes,
+  contactTileGpuPresentationRetryDelay,
   contactTileGpuSlotTextureBudgetBytes,
   contactTileCanvasBox,
   contactTileCanvasDescriptorsForViewport,
@@ -59,6 +60,24 @@ function contactTileFrame(
     },
   };
 }
+
+describe("contact tile GPU presentation retry", () => {
+  it("backs off transient misses without growing beyond a quarter second", () => {
+    expect([
+      contactTileGpuPresentationRetryDelay(0),
+      contactTileGpuPresentationRetryDelay(1),
+      contactTileGpuPresentationRetryDelay(2),
+      contactTileGpuPresentationRetryDelay(3),
+      contactTileGpuPresentationRetryDelay(4),
+      contactTileGpuPresentationRetryDelay(50),
+    ]).toEqual([16, 32, 64, 128, 250, 250]);
+  });
+
+  it("normalizes negative and fractional attempts", () => {
+    expect(contactTileGpuPresentationRetryDelay(-4)).toBe(16);
+    expect(contactTileGpuPresentationRetryDelay(2.9)).toBe(64);
+  });
+});
 
 describe("contact tile paint epochs", () => {
   it("waits for commit and every unique canvas paint regardless of effect order", () => {

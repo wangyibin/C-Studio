@@ -113,6 +113,12 @@ export const contactTileGpuSlotTextureBudgetBytes = Math.floor(
 /** The production GPU path owns one context and one global atlas budget. */
 export const contactTileGpuSharedTextureBudgetBytes = contactTileGpuTextureBudgetBytes;
 
+/** Back off transient presentation misses without turning them into GPU loss. */
+export function contactTileGpuPresentationRetryDelay(attempt: number) {
+  const boundedAttempt = Math.min(4, Math.max(0, Math.floor(attempt)));
+  return Math.min(250, 16 * (2 ** boundedAttempt));
+}
+
 export interface ContactTileLayerFrame {
   contactMap: ContactMapView;
   renderStyle: ContactTileRenderStyle;
@@ -1260,6 +1266,7 @@ function ContactTileSharedGpuCanvas({
   usePrePaintEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) {
+      traceContactPanCamera("gpu_unavailable", { reason: "missing-canvas" });
       onUnavailableRef.current();
       return;
     }
@@ -1268,6 +1275,7 @@ function ContactTileSharedGpuCanvas({
       emitPerformance: emitContactTileGpuPerformance,
     });
     if (!renderer) {
+      traceContactPanCamera("gpu_unavailable", { reason: "renderer-create-failed" });
       onUnavailableRef.current();
       return;
     }
@@ -1278,6 +1286,7 @@ function ContactTileSharedGpuCanvas({
     onGpuAvailabilityChangeRef.current?.(true);
     const handleContextLost = (event: Event) => {
       event.preventDefault();
+      traceContactPanCamera("gpu_unavailable", { reason: "context-lost" });
       onUnavailableRef.current();
     };
     canvas.addEventListener("webglcontextlost", handleContextLost);
@@ -1285,7 +1294,13 @@ function ContactTileSharedGpuCanvas({
       ? null
       : new ResizeObserver(() => {
           if (presentedRef.current && !renderer.redraw()) {
-            onUnavailableRef.current();
+            // A redraw can be rejected while an atlas upload or presentation
+            // fence is in flight. The retained front FBO is still valid, so a
+            // temporary hold is not evidence that WebGL has been lost.
+            traceContactPanCamera("gpu_redraw_hold", {
+              viewport: presentedRef.current.scene.viewport,
+              generation: presentedRef.current.scene.generation,
+            });
           }
         });
     observer?.observe(canvas);
@@ -1311,6 +1326,8 @@ function ContactTileSharedGpuCanvas({
     if (!candidate || sameContactTileBufferedGpuPresentation(presentedRef.current, candidate)) {
       return;
     }
+    const activeRenderer = renderer;
+    const activeCandidate = candidate;
     const event: ContactTileLayerPaintEvent = {
       renderEpoch: ++paintEpochRef.current,
       canvasCount: candidate.canvasCount,
@@ -1325,33 +1342,64 @@ function ContactTileSharedGpuCanvas({
     });
     onSlotCommitRef.current(candidate.slot, event);
     let active = true;
+    let completed = false;
+    let retryAttempt = 0;
+    let retryTimer: number | null = null;
+    const scheduleRetry = (reason: "async-miss" | "sync-miss") => {
+      if (!active || completed || retryTimer !== null) {
+        return;
+      }
+      const delay = contactTileGpuPresentationRetryDelay(retryAttempt++);
+      traceContactPanCamera("layer_scene_retry", {
+        reason,
+        delay,
+        attempt: retryAttempt,
+        mode: staging ? "staging" : "front",
+        viewport: candidate.scene.viewport,
+        generation: candidate.scene.generation,
+        slot: candidate.slot,
+      });
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        attemptPresentation();
+      }, delay);
+    };
     const onPresented = (painted: boolean) => {
-      if (!active) {
+      if (!active || completed) {
         return;
       }
       if (!painted) {
-        onUnavailableRef.current();
+        scheduleRetry("async-miss");
         return;
       }
+      completed = true;
       presentedRef.current = candidate;
       traceContactPanCamera("layer_scene_presented", {
         mode: staging ? "staging" : "front",
         viewport: candidate.scene.viewport,
         generation: candidate.scene.generation,
         slot: candidate.slot,
+        retries: retryAttempt,
       });
       onSlotPaintCompleteRef.current(candidate.slot, event);
     };
-    const painted = staging
-      ? renderer.stageScene(candidate.scene, onPresented)
-      : renderer.setScene(candidate.scene, onPresented);
-    if (!painted) {
-      active = false;
-      onUnavailableRef.current();
-      return;
+    function attemptPresentation() {
+      if (!active || completed) {
+        return;
+      }
+      const accepted = staging
+        ? activeRenderer.stageScene(activeCandidate.scene, onPresented)
+        : activeRenderer.setScene(activeCandidate.scene, onPresented);
+      if (!accepted) {
+        scheduleRetry("sync-miss");
+      }
     }
+    attemptPresentation();
     return () => {
       active = false;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
     };
   }, [front, staging]);
 
