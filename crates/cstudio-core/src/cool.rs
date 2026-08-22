@@ -32,7 +32,10 @@ const PERSISTENT_NORMALIZATION_VERSION: u16 = 1;
 const RUNTIME_NORMALIZATION_MEMORY_NUMERATOR: usize = 4;
 const RUNTIME_NORMALIZATION_MEMORY_DENOMINATOR: usize = 5;
 const FALLBACK_RUNTIME_NORMALIZATION_MEMORY_BYTES: usize = 512 * 1024 * 1024;
-const MAX_COOL_READER_CACHE_ENTRIES: usize = 8;
+// One current resolution plus its two nearest preview candidates. Reader
+// handles keep their CoolIndex alive, so bounding this cache also bounds the
+// high-resolution index working set while the resolution slider is scrubbed.
+const MAX_COOL_READER_CACHE_ENTRIES: usize = 3;
 const MAX_ADAPTIVE_CHILD_CACHE_BYTES: usize = 128 * 1024 * 1024;
 // Cooler pixel columns are commonly stored in 1-2 MiB compressed HDF5 chunks.
 // HDF5's 1 MiB default raw chunk cache cannot retain even one bin2 chunk, so
@@ -204,15 +207,112 @@ struct CoolIndexCacheKey {
 }
 
 #[derive(Debug)]
+enum CoolBinLayout {
+    Fixed {
+        resolution: u64,
+        bin_count: usize,
+    },
+    Variable {
+        chrom_ids: Vec<i32>,
+        starts: Vec<u64>,
+    },
+}
+
+#[derive(Debug)]
 struct CoolIndex {
     prefix: String,
     chrom_names: Vec<String>,
     chrom_lengths: Vec<u64>,
-    bin_chrom_ids: Vec<i32>,
     chrom_offsets: Vec<usize>,
-    bin_starts: Vec<u64>,
+    bin_layout: CoolBinLayout,
     bin1_offsets: Vec<u64>,
     bytes: usize,
+}
+
+impl CoolIndex {
+    fn bin_count(&self) -> usize {
+        match &self.bin_layout {
+            CoolBinLayout::Fixed { bin_count, .. } => *bin_count,
+            CoolBinLayout::Variable { starts, .. } => starts.len(),
+        }
+    }
+
+    fn bin_start(&self, bin_index: usize) -> Option<u64> {
+        match &self.bin_layout {
+            CoolBinLayout::Fixed {
+                resolution,
+                bin_count,
+            } => {
+                if bin_index >= *bin_count {
+                    return None;
+                }
+                let source = self.source_for_fixed_bin(bin_index)?;
+                u64::try_from(bin_index.saturating_sub(self.chrom_offsets[source]))
+                    .ok()?
+                    .checked_mul(*resolution)
+            }
+            CoolBinLayout::Variable { starts, .. } => starts.get(bin_index).copied(),
+        }
+    }
+
+    fn source_for_fixed_bin(&self, bin_index: usize) -> Option<usize> {
+        let source = self
+            .chrom_offsets
+            .partition_point(|offset| *offset <= bin_index)
+            .saturating_sub(1);
+        (source < self.chrom_names.len()
+            && bin_index >= self.chrom_offsets[source]
+            && bin_index < self.chrom_offsets[source + 1])
+            .then_some(source)
+    }
+
+    fn source_for_bin(&self, bin_index: usize, pixel_column: &str) -> CStudioResult<usize> {
+        if bin_index >= self.bin_count() {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool pixel references missing {pixel_column} {bin_index}"
+            )));
+        }
+        match &self.bin_layout {
+            CoolBinLayout::Fixed { .. } => self.source_for_fixed_bin(bin_index).ok_or_else(|| {
+                CStudioError::InvalidContactMapQuery(format!(
+                    ".cool indexes/chrom_offset cannot resolve {pixel_column} {bin_index}"
+                ))
+            }),
+            CoolBinLayout::Variable { chrom_ids, .. } => {
+                let chrom_id = chrom_ids.get(bin_index).copied().ok_or_else(|| {
+                    CStudioError::InvalidContactMapQuery(format!(
+                        ".cool pixel references missing {pixel_column} {bin_index}"
+                    ))
+                })?;
+                validated_bin_chrom_index(bin_index, chrom_id, self.chrom_names.len())
+            }
+        }
+    }
+
+    fn source_bin_range(&self, source: usize, start: u64, end: u64) -> (usize, usize) {
+        let chrom_start = self.chrom_offsets[source];
+        let chrom_end = self.chrom_offsets[source + 1];
+        match &self.bin_layout {
+            CoolBinLayout::Fixed { resolution, .. } => {
+                let first =
+                    ceil_div_u64(start, *resolution).min((chrom_end - chrom_start) as u64) as usize;
+                let last =
+                    ceil_div_u64(end, *resolution).min((chrom_end - chrom_start) as u64) as usize;
+                (chrom_start + first, chrom_start + last)
+            }
+            CoolBinLayout::Variable { starts, .. } => {
+                let starts = &starts[chrom_start..chrom_end];
+                (
+                    chrom_start + starts.partition_point(|position| *position < start),
+                    chrom_start + starts.partition_point(|position| *position < end),
+                )
+            }
+        }
+    }
+}
+
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    value / divisor + u64::from(value % divisor != 0)
 }
 
 #[derive(Debug, Default)]
@@ -241,8 +341,15 @@ struct CoolNormalizationCache {
 }
 
 #[derive(Debug, Default)]
+struct CoolReaderFlight {
+    result: Mutex<Option<CStudioResult<Arc<CoolReader>>>>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
 struct CoolReaderCache {
     entries: VecDeque<(CoolIndexCacheKey, Arc<CoolReader>)>,
+    in_flight: HashMap<CoolIndexCacheKey, Arc<CoolReaderFlight>>,
 }
 
 #[derive(Debug, Default)]
@@ -516,6 +623,31 @@ pub fn prewarm_contact_normalization_at_resolution_cancellable(
         should_cancel,
     )?;
     ensure_not_cancelled(should_cancel)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoolReaderPrewarmStats {
+    pub compact_fixed: bool,
+    pub bin_count: usize,
+    pub index_bytes: usize,
+}
+
+/// Open one Cooler level and build only its reader/index. Resolution-slider
+/// preview uses this lighter path; resident pixel columns and normalization
+/// vectors remain idle work and cannot delay the probable next visible level.
+pub fn prewarm_contact_reader_at_resolution_cancellable(
+    path: &str,
+    resolution: Option<u64>,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<CoolReaderPrewarmStats> {
+    ensure_not_cancelled(should_cancel)?;
+    let reader = cached_cool_reader(path, resolution, should_cancel)?;
+    ensure_not_cancelled(should_cancel)?;
+    Ok(CoolReaderPrewarmStats {
+        compact_fixed: matches!(reader.index.bin_layout, CoolBinLayout::Fixed { .. }),
+        bin_count: reader.index.bin_count(),
+        index_bytes: reader.index.bytes,
+    })
 }
 
 /// Build the bounded resident secondary index for one displayed Cooler level.
@@ -1231,57 +1363,109 @@ fn cached_cool_reader(
     resolution: Option<u64>,
     should_cancel: &dyn Fn() -> bool,
 ) -> CStudioResult<Arc<CoolReader>> {
-    ensure_not_cancelled(should_cancel)?;
-    let key = cool_index_cache_key(path, resolution);
-    let cache = COOL_READER_CACHE.get_or_init(|| Mutex::new(CoolReaderCache::default()));
+    loop {
+        ensure_not_cancelled(should_cancel)?;
+        let key = cool_index_cache_key(path, resolution);
+        let cache = COOL_READER_CACHE.get_or_init(|| Mutex::new(CoolReaderCache::default()));
+        let (flight, is_leader) = {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(position) = cache
+                .entries
+                .iter()
+                .position(|(entry_key, _)| *entry_key == key)
+            {
+                let entry = cache
+                    .entries
+                    .remove(position)
+                    .expect("cached reader position exists");
+                let reader = Arc::clone(&entry.1);
+                cache.entries.push_back(entry);
+                return Ok(reader);
+            }
+            if let Some(flight) = cache.in_flight.get(&key) {
+                (Arc::clone(flight), false)
+            } else {
+                let flight = Arc::new(CoolReaderFlight::default());
+                cache.in_flight.insert(key.clone(), Arc::clone(&flight));
+                (flight, true)
+            }
+        };
+
+        if !is_leader {
+            match wait_for_reader_flight(&flight, should_cancel) {
+                Err(CStudioError::RequestCancelled) if !should_cancel() => continue,
+                result => return result,
+            }
+        }
+
+        // Opening HDF5 and building the index stays outside the cache mutex.
+        // A slider preview and its committed visible request now share this
+        // exact flight instead of opening the same resolution twice.
+        let result = CoolReader::open(path, resolution, should_cancel).map(Arc::new);
+        complete_reader_flight(cache, &key, &flight, &result);
+        return result;
+    }
+}
+
+fn wait_for_reader_flight(
+    flight: &CoolReaderFlight,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Arc<CoolReader>> {
+    loop {
+        ensure_not_cancelled(should_cancel)?;
+        let result = flight
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+        let (result, _) = flight
+            .ready
+            .wait_timeout(result, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+    }
+}
+
+fn complete_reader_flight(
+    cache: &Mutex<CoolReaderCache>,
+    key: &CoolIndexCacheKey,
+    flight: &Arc<CoolReaderFlight>,
+    result: &CStudioResult<Arc<CoolReader>>,
+) {
     {
         let mut cache = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(position) = cache
-            .entries
-            .iter()
-            .position(|(entry_key, _)| *entry_key == key)
+        if let Ok(reader) = result {
+            cache.entries.retain(|(entry_key, _)| {
+                entry_key.path != key.path || entry_key.resolution != key.resolution
+            });
+            while cache.entries.len() >= MAX_COOL_READER_CACHE_ENTRIES {
+                cache.entries.pop_front();
+            }
+            cache.entries.push_back((key.clone(), Arc::clone(reader)));
+        }
+        if cache
+            .in_flight
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
         {
-            let entry = cache
-                .entries
-                .remove(position)
-                .expect("cached reader position exists");
-            let reader = Arc::clone(&entry.1);
-            cache.entries.push_back(entry);
-            return Ok(reader);
+            cache.in_flight.remove(key);
         }
     }
 
-    // Opening the HDF5 file and resolving dataset types happens outside the
-    // cache mutex so an unrelated visible request never waits for this setup.
-    let opened = Arc::new(CoolReader::open(path, resolution, should_cancel)?);
-    ensure_not_cancelled(should_cancel)?;
-    let mut cache = cache
+    let mut completed = flight
+        .result
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(position) = cache
-        .entries
-        .iter()
-        .position(|(entry_key, _)| *entry_key == key)
-    {
-        let entry = cache
-            .entries
-            .remove(position)
-            .expect("concurrently cached reader position exists");
-        let reader = Arc::clone(&entry.1);
-        cache.entries.push_back(entry);
-        return Ok(reader);
-    }
-
-    cache.entries.retain(|(entry_key, _)| {
-        entry_key.path != key.path || entry_key.resolution != key.resolution
-    });
-    while cache.entries.len() >= MAX_COOL_READER_CACHE_ENTRIES {
-        cache.entries.pop_front();
-    }
-    cache.entries.push_back((key, Arc::clone(&opened)));
-    Ok(opened)
+    *completed = Some(result.clone());
+    flight.ready.notify_all();
 }
 
 fn cached_resident_bin2(
@@ -1796,7 +1980,12 @@ fn adaptive_bin_source_interval(index: &CoolIndex, bin: u64) -> CStudioResult<(u
     })?;
     let chrom_end = index.chrom_offsets[source_index + 1];
     let end = if bin_index + 1 < chrom_end {
-        index.bin_starts[bin_index + 1]
+        index.bin_start(bin_index + 1).ok_or_else(|| {
+            CStudioError::InvalidContactMapQuery(format!(
+                ".cool adaptive bin {} is missing its following start",
+                bin_index + 1,
+            ))
+        })?
     } else {
         index.chrom_lengths[source_index]
     };
@@ -1846,13 +2035,27 @@ fn contacts_to_adaptive_pixels(
 fn source_bin_for_start(index: &CoolIndex, source: usize, start: u64) -> CStudioResult<u64> {
     let chrom_start = index.chrom_offsets[source];
     let chrom_end = index.chrom_offsets[source + 1];
-    let starts = &index.bin_starts[chrom_start..chrom_end];
-    let relative = starts.binary_search(&start).map_err(|_| {
-        CStudioError::InvalidContactMapQuery(format!(
-            "adaptive bin start {start} is absent from source {}",
-            index.chrom_names[source]
-        ))
-    })?;
+    let relative = match &index.bin_layout {
+        CoolBinLayout::Fixed { resolution, .. }
+            if start % resolution == 0 && start / resolution < (chrom_end - chrom_start) as u64 =>
+        {
+            (start / resolution) as usize
+        }
+        CoolBinLayout::Fixed { .. } => {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                "adaptive bin start {start} is absent from source {}",
+                index.chrom_names[source]
+            )))
+        }
+        CoolBinLayout::Variable { starts, .. } => starts[chrom_start..chrom_end]
+            .binary_search(&start)
+            .map_err(|_| {
+                CStudioError::InvalidContactMapQuery(format!(
+                    "adaptive bin start {start} is absent from source {}",
+                    index.chrom_names[source]
+                ))
+            })?,
+    };
     u64::try_from(chrom_start + relative).map_err(|_| {
         CStudioError::InvalidContactMapQuery("adaptive bin exceeds u64 range".to_string())
     })
@@ -2231,14 +2434,7 @@ fn adaptive_child_bin_range(
     _child_resolution: u64,
 ) -> CStudioResult<(u64, u64)> {
     let (source_index, start, end) = adaptive_bin_source_interval(parent, parent_bin)?;
-    let child_start = child.chrom_offsets[source_index]
-        + child.bin_starts
-            [child.chrom_offsets[source_index]..child.chrom_offsets[source_index + 1]]
-            .partition_point(|position| *position < start);
-    let child_end = child.chrom_offsets[source_index]
-        + child.bin_starts
-            [child.chrom_offsets[source_index]..child.chrom_offsets[source_index + 1]]
-            .partition_point(|position| *position < end);
+    let (child_start, child_end) = child.source_bin_range(source_index, start, end);
     Ok((child_start as u64, child_end as u64))
 }
 
@@ -2254,10 +2450,20 @@ fn adaptive_parent_bin_for_child(
 fn source_bin_at_or_before(index: &CoolIndex, source: usize, start: u64) -> CStudioResult<u64> {
     let chrom_start = index.chrom_offsets[source];
     let chrom_end = index.chrom_offsets[source + 1];
-    let starts = &index.bin_starts[chrom_start..chrom_end];
-    let relative = starts
-        .partition_point(|position| *position <= start)
-        .saturating_sub(1);
+    if chrom_start >= chrom_end {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            "adaptive source {} has no bins",
+            index.chrom_names[source]
+        )));
+    }
+    let relative = match &index.bin_layout {
+        CoolBinLayout::Fixed { resolution, .. } => {
+            (start / resolution).min((chrom_end - chrom_start - 1) as u64) as usize
+        }
+        CoolBinLayout::Variable { starts, .. } => starts[chrom_start..chrom_end]
+            .partition_point(|position| *position <= start)
+            .saturating_sub(1),
+    };
     u64::try_from(chrom_start + relative).map_err(|_| {
         CStudioError::InvalidContactMapQuery("adaptive parent bin exceeds u64 range".to_string())
     })
@@ -2331,7 +2537,7 @@ impl SelectedBinIndex {
         should_cancel: &dyn Fn() -> bool,
     ) -> CStudioResult<Self> {
         ensure_not_cancelled(should_cancel)?;
-        let bin_count = index.bin_starts.len();
+        let bin_count = index.bin_count();
         if source_ranges.select_all {
             return Ok(Self::all(bin_count));
         }
@@ -2344,15 +2550,9 @@ impl SelectedBinIndex {
             let Some(source_ranges) = source_ranges.ranges(source) else {
                 continue;
             };
-            let chrom_start = index.chrom_offsets[chrom_index];
-            let chrom_end = index.chrom_offsets[chrom_index + 1];
-            let starts = &index.bin_starts[chrom_start..chrom_end];
-
             for &(source_start, source_end) in source_ranges {
-                let selected_start =
-                    chrom_start + starts.partition_point(|position| *position < source_start);
-                let selected_end =
-                    chrom_start + starts.partition_point(|position| *position < source_end);
+                let (selected_start, selected_end) =
+                    index.source_bin_range(chrom_index, source_start, source_end);
                 push_merged_bin_range(&mut ranges, selected_start, selected_end);
             }
         }
@@ -2430,17 +2630,12 @@ fn bin_source_and_start(
             ".cool pixel {pixel_column} {bin_id} exceeds this platform's index range"
         ))
     })?;
-    let start = index.bin_starts.get(bin_index).copied().ok_or_else(|| {
+    let start = index.bin_start(bin_index).ok_or_else(|| {
         CStudioError::InvalidContactMapQuery(format!(
             ".cool pixel references missing {pixel_column} {bin_id}"
         ))
     })?;
-    let chrom_id = index.bin_chrom_ids.get(bin_index).copied().ok_or_else(|| {
-        CStudioError::InvalidContactMapQuery(format!(
-            ".cool pixel references missing {pixel_column} {bin_id}"
-        ))
-    })?;
-    let chrom_index = validated_bin_chrom_index(bin_index, chrom_id, index.chrom_names.len())?;
+    let chrom_index = index.source_for_bin(bin_index, pixel_column)?;
 
     Ok((chrom_index, start))
 }
@@ -2452,6 +2647,7 @@ fn cached_cool_index(
     should_cancel: &dyn Fn() -> bool,
 ) -> CStudioResult<Arc<CoolIndex>> {
     ensure_not_cancelled(should_cancel)?;
+    let build_started = Instant::now();
     let key = cool_index_cache_key(path, resolution);
     let cache = COOL_INDEX_CACHE.get_or_init(|| Mutex::new(CoolIndexCache::default()));
     if let Ok(mut cache) = cache.lock() {
@@ -2480,48 +2676,99 @@ fn cached_cool_index(
         ));
     }
     ensure_not_cancelled(should_cancel)?;
-    let bin_chrom_ids = read_i32_dataset(file, &format!("{prefix}bins/chrom"))?;
-    ensure_not_cancelled(should_cancel)?;
-    let bin_starts = read_u64_dataset(file, &format!("{prefix}bins/start"))?;
-    if bin_chrom_ids.len() != bin_starts.len() {
-        return Err(CStudioError::InvalidContactMapQuery(
-            ".cool bins/chrom and bins/start have different lengths".to_string(),
-        ));
-    }
-    ensure_not_cancelled(should_cancel)?;
     let chrom_offset_path = format!("{prefix}indexes/chrom_offset");
     let stored_chrom_offsets = if file.link_exists(&chrom_offset_path) {
         Some(read_u64_dataset(file, &chrom_offset_path)?)
     } else {
         None
     };
-    let chrom_offsets = resolve_chrom_offsets(
-        chrom_names.len(),
-        &bin_chrom_ids,
-        stored_chrom_offsets.as_deref(),
-        should_cancel,
-    )?;
-    validate_bin_starts_by_chrom(&bin_starts, &chrom_offsets, should_cancel)?;
+    let fixed_resolution = fixed_mcool_bin_resolution(file, &prefix, resolution);
+    let (chrom_offsets, bin_layout) = if let (Some(fixed_resolution), Some(stored_offsets)) =
+        (fixed_resolution, stored_chrom_offsets.as_deref())
+    {
+        let chrom_offsets = validate_fixed_chrom_offsets(
+            &chrom_lengths,
+            fixed_resolution,
+            stored_offsets,
+            should_cancel,
+        )?;
+        let bin_count = chrom_offsets.last().copied().unwrap_or(0);
+        (
+            chrom_offsets,
+            CoolBinLayout::Fixed {
+                resolution: fixed_resolution,
+                bin_count,
+            },
+        )
+    } else {
+        // Variable-bin Cooler files and legacy files without trustworthy fixed
+        // metadata retain the exact prior arrays and validation path.
+        let bin_chrom_ids = read_i32_dataset(file, &format!("{prefix}bins/chrom"))?;
+        ensure_not_cancelled(should_cancel)?;
+        let bin_starts = read_u64_dataset(file, &format!("{prefix}bins/start"))?;
+        if bin_chrom_ids.len() != bin_starts.len() {
+            return Err(CStudioError::InvalidContactMapQuery(
+                ".cool bins/chrom and bins/start have different lengths".to_string(),
+            ));
+        }
+        let chrom_offsets = resolve_chrom_offsets(
+            chrom_names.len(),
+            &bin_chrom_ids,
+            stored_chrom_offsets.as_deref(),
+            should_cancel,
+        )?;
+        validate_bin_starts_by_chrom(&bin_starts, &chrom_offsets, should_cancel)?;
+        (
+            chrom_offsets,
+            CoolBinLayout::Variable {
+                chrom_ids: bin_chrom_ids,
+                starts: bin_starts,
+            },
+        )
+    };
     ensure_not_cancelled(should_cancel)?;
     let bin1_offsets = read_u64_dataset(file, &format!("{prefix}indexes/bin1_offset"))?;
-    validate_bin1_offsets(&bin1_offsets, bin_starts.len(), should_cancel)?;
+    let bin_count = match &bin_layout {
+        CoolBinLayout::Fixed { bin_count, .. } => *bin_count,
+        CoolBinLayout::Variable { starts, .. } => starts.len(),
+    };
+    validate_bin1_offsets(&bin1_offsets, bin_count, should_cancel)?;
     ensure_not_cancelled(should_cancel)?;
+    let bin_layout_bytes = match &bin_layout {
+        CoolBinLayout::Fixed { .. } => 0,
+        CoolBinLayout::Variable { chrom_ids, starts } => {
+            chrom_ids.capacity() * std::mem::size_of::<i32>()
+                + starts.capacity() * std::mem::size_of::<u64>()
+        }
+    };
     let bytes = chrom_names.iter().map(String::capacity).sum::<usize>()
         + chrom_lengths.capacity() * std::mem::size_of::<u64>()
-        + bin_chrom_ids.capacity() * std::mem::size_of::<i32>()
         + chrom_offsets.capacity() * std::mem::size_of::<usize>()
-        + bin_starts.capacity() * std::mem::size_of::<u64>()
+        + bin_layout_bytes
         + bin1_offsets.capacity() * std::mem::size_of::<u64>();
     let index = Arc::new(CoolIndex {
         prefix,
         chrom_names,
         chrom_lengths,
-        bin_chrom_ids,
         chrom_offsets,
-        bin_starts,
+        bin_layout,
         bin1_offsets,
         bytes,
     });
+
+    if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
+        eprintln!(
+            "CSTUDIO_PERF event=cool_index status=built resolution={} layout={} bins={} index_bytes={} elapsed_us={}",
+            resolution.map_or_else(|| "native".to_string(), |value| value.to_string()),
+            match &index.bin_layout {
+                CoolBinLayout::Fixed { .. } => "compact_fixed",
+                CoolBinLayout::Variable { .. } => "materialized_variable",
+            },
+            index.bin_count(),
+            index.bytes,
+            build_started.elapsed().as_micros(),
+        );
+    }
 
     if bytes <= MAX_COOL_INDEX_CACHE_BYTES {
         if let Ok(mut cache) = cache.lock() {
@@ -2536,6 +2783,84 @@ fn cached_cool_index(
         }
     }
     Ok(index)
+}
+
+fn fixed_mcool_bin_resolution(
+    file: &File,
+    prefix: &str,
+    requested_resolution: Option<u64>,
+) -> Option<u64> {
+    let requested_resolution = requested_resolution?;
+    let group = file.group(prefix.trim_end_matches('/')).ok()?;
+    let bin_type_attribute = group.attr("bin-type").ok()?;
+    let bin_type = bin_type_attribute
+        .read_scalar::<VarLenUnicode>()
+        .map(|value| value.as_str().to_string())
+        .or_else(|_| {
+            bin_type_attribute
+                .read_scalar::<VarLenAscii>()
+                .map(|value| value.as_str().to_string())
+        })
+        .ok()?;
+    if !bin_type.eq_ignore_ascii_case("fixed") {
+        return None;
+    }
+    let bin_size_attribute = group.attr("bin-size").ok()?;
+    let bin_size = bin_size_attribute.read_scalar::<u64>().ok().or_else(|| {
+        bin_size_attribute
+            .read_scalar::<i64>()
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+    })?;
+    (bin_size == requested_resolution && bin_size > 0).then_some(bin_size)
+}
+
+fn validate_fixed_chrom_offsets(
+    chrom_lengths: &[u64],
+    resolution: u64,
+    stored_offsets: &[u64],
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Vec<usize>> {
+    if resolution == 0 {
+        return Err(CStudioError::InvalidContactMapQuery(
+            ".cool fixed bin-size must be positive".to_string(),
+        ));
+    }
+    if stored_offsets.len() != chrom_lengths.len() + 1 {
+        return Err(CStudioError::InvalidContactMapQuery(format!(
+            ".cool indexes/chrom_offset has {} values for {} chromosomes; expected {}",
+            stored_offsets.len(),
+            chrom_lengths.len(),
+            chrom_lengths.len() + 1,
+        )));
+    }
+    let mut expected_offset = 0_u64;
+    let mut offsets = Vec::with_capacity(stored_offsets.len());
+    for (chrom_index, &stored_offset) in stored_offsets.iter().enumerate() {
+        if chrom_index % 256 == 0 {
+            ensure_not_cancelled(should_cancel)?;
+        }
+        if stored_offset != expected_offset {
+            return Err(CStudioError::InvalidContactMapQuery(format!(
+                ".cool fixed indexes/chrom_offset[{chrom_index}] is {stored_offset}; expected {expected_offset} from chrom lengths and bin-size {resolution}",
+            )));
+        }
+        offsets.push(usize::try_from(stored_offset).map_err(|_| {
+            CStudioError::InvalidContactMapQuery(format!(
+                ".cool indexes/chrom_offset value {stored_offset} at index {chrom_index} exceeds this platform's index range"
+            ))
+        })?);
+        if let Some(length) = chrom_lengths.get(chrom_index) {
+            expected_offset = expected_offset
+                .checked_add(ceil_div_u64(*length, resolution))
+                .ok_or_else(|| {
+                    CStudioError::InvalidContactMapQuery(
+                        ".cool fixed bin count exceeds u64 range".to_string(),
+                    )
+                })?;
+        }
+    }
+    Ok(offsets)
 }
 
 fn resolve_chrom_offsets(
@@ -2749,7 +3074,7 @@ fn cached_normalization_weights(
             let values = if let Some(values) = read_stored_normalization_weights(
                 &reader.file,
                 &index.prefix,
-                index.bin_starts.len(),
+                index.bin_count(),
                 normalization,
                 should_cancel,
             )? {
@@ -2758,7 +3083,7 @@ fn cached_normalization_weights(
                 path,
                 resolution,
                 normalization,
-                index.bin_starts.len(),
+                index.bin_count(),
             ) {
                 if std::env::var("CSTUDIO_PERF_LOG").as_deref() == Ok("1") {
                     eprintln!(
@@ -2779,12 +3104,12 @@ fn cached_normalization_weights(
                 values
             };
             ensure_not_cancelled(should_cancel)?;
-            if values.len() != index.bin_starts.len() {
+            if values.len() != index.bin_count() {
                 return Err(CStudioError::InvalidContactMapQuery(format!(
                     ".cool {} normalization has {} weights for {} bins",
                     normalization.as_str(),
                     values.len(),
-                    index.bin_starts.len(),
+                    index.bin_count(),
                 )));
             }
             Ok(values)
@@ -2958,7 +3283,7 @@ fn compute_runtime_normalization_weights(
                 read_normalization_matrix(&reader.file, index, normalization, should_cancel)?;
             compute_normalization_weights(&matrix, normalization, should_cancel)
         }
-        ContactNormalization::Raw => Ok(vec![1.0; index.bin_starts.len()]),
+        ContactNormalization::Raw => Ok(vec![1.0; index.bin_count()]),
     }
 }
 
@@ -2968,7 +3293,7 @@ fn compute_cis_normalization_weights_by_chromosome(
     normalization: ContactNormalization,
     should_cancel: &dyn Fn() -> bool,
 ) -> CStudioResult<Vec<f64>> {
-    let mut combined = vec![f64::NAN; index.bin_starts.len()];
+    let mut combined = vec![f64::NAN; index.bin_count()];
     let mut completed_chromosomes = 0_usize;
     let mut failed_chromosomes = 0_usize;
 
@@ -3329,17 +3654,11 @@ fn read_normalization_matrix(
                 ".cool normalization pixel count exceeds this platform's index range".to_string(),
             )
         })?;
-    let estimated_bytes = estimated_runtime_normalization_peak_bytes(
-        pixel_count,
-        index.bin_starts.len(),
-        normalization,
-    );
+    let estimated_bytes =
+        estimated_runtime_normalization_peak_bytes(pixel_count, index.bin_count(), normalization);
     ensure_runtime_normalization_memory_budget(
         estimated_bytes,
-        &format!(
-            "for {} bins and {pixel_count} pixels",
-            index.bin_starts.len()
-        ),
+        &format!("for {} bins and {pixel_count} pixels", index.bin_count()),
     )?;
     let mut bin1 = Vec::with_capacity(pixel_count);
     let mut bin2 = Vec::with_capacity(pixel_count);
@@ -3368,7 +3687,7 @@ fn read_normalization_matrix(
         counts.extend(chunk_counts);
     }
 
-    SparseContactMatrix::new(index.bin_starts.len(), bin1, bin2, counts)
+    SparseContactMatrix::new(index.bin_count(), bin1, bin2, counts)
 }
 
 fn normalized_contact_count(
@@ -3690,6 +4009,7 @@ mod tests {
         collections::HashMap,
         fs,
         path::PathBuf,
+        str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             mpsc, Arc, Barrier, Condvar, Mutex,
@@ -3698,7 +4018,10 @@ mod tests {
         time::Duration,
     };
 
-    use hdf5::{types::FixedAscii, File};
+    use hdf5::{
+        types::{FixedAscii, VarLenUnicode},
+        File,
+    };
 
     use super::{
         batch_nearby_pixel_ranges, bin1_for_pixel_offset, cached_cool_reader,
@@ -3714,8 +4037,9 @@ mod tests {
         visit_cool_contact_chunks_indexed_for_source_ranges_at_resolution_with_normalization_cancellable,
         visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
         visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
-        CoolContactVisitTimings, CoolIndex, CoolIndexCacheKey, CoolNormalizationCacheKey,
-        CoolSourceMetadata, SelectedBinIndex, SelectedBinMembership, SourceRangeIndex,
+        CoolBinLayout, CoolContactVisitTimings, CoolIndex, CoolIndexCacheKey,
+        CoolNormalizationCacheKey, CoolSourceMetadata, SelectedBinIndex, SelectedBinMembership,
+        SourceRangeIndex,
     };
     use crate::{
         agp::Orientation,
@@ -3980,6 +4304,21 @@ mod tests {
         fn write_resolution(file: &File, resolution: u64, observations: &[(u64, u64, i32)]) {
             let prefix = format!("resolutions/{resolution}");
             file.create_group(&prefix).expect("create resolution");
+            let group = file.group(&prefix).expect("open resolution group");
+            group
+                .new_attr::<VarLenUnicode>()
+                .shape(())
+                .create("bin-type")
+                .expect("create fixed bin type")
+                .write_scalar(&VarLenUnicode::from_str("fixed").expect("fixed bin string"))
+                .expect("write fixed bin type");
+            group
+                .new_attr::<u64>()
+                .shape(())
+                .create("bin-size")
+                .expect("create bin size")
+                .write_scalar(&resolution)
+                .expect("write bin size");
             for group in ["chroms", "bins", "indexes", "pixels"] {
                 file.create_group(&format!("{prefix}/{group}"))
                     .expect("create resolution subgroup");
@@ -4303,7 +4642,12 @@ mod tests {
             cached_cool_reader(file.path(), None, &|| false).expect("reuse the persistent reader");
 
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.index.bin_starts, vec![0, 1_000]);
+        assert!(matches!(
+            first.index.bin_layout,
+            CoolBinLayout::Variable { .. }
+        ));
+        assert_eq!(first.index.bin_start(0), Some(0));
+        assert_eq!(first.index.bin_start(1), Some(1_000));
     }
 
     #[test]
@@ -4511,9 +4855,11 @@ mod tests {
             prefix: String::new(),
             chrom_names: vec!["duplicate".to_string(), "duplicate".to_string()],
             chrom_lengths: vec![200, 200],
-            bin_chrom_ids: vec![0, 0, 1, 1],
             chrom_offsets: vec![0, 2, 4],
-            bin_starts: vec![0, 100, 0, 100],
+            bin_layout: CoolBinLayout::Variable {
+                chrom_ids: vec![0, 0, 1, 1],
+                starts: vec![0, 100, 0, 100],
+            },
             bin1_offsets: vec![0; 5],
             bytes: 0,
         };
@@ -4530,6 +4876,111 @@ mod tests {
         let second =
             SelectedBinIndex::new(&index, &second, &|| false).expect("include the lower boundary");
         assert_eq!(second.ranges(), &[(1, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn fixed_bin_pure_mapping_matches_the_materialized_index() {
+        let fixed = CoolIndex {
+            prefix: String::new(),
+            chrom_names: vec!["chr1".to_string(), "chr2".to_string()],
+            chrom_lengths: vec![250, 180],
+            chrom_offsets: vec![0, 3, 5],
+            bin_layout: CoolBinLayout::Fixed {
+                resolution: 100,
+                bin_count: 5,
+            },
+            bin1_offsets: vec![0; 6],
+            bytes: 0,
+        };
+        let materialized = CoolIndex {
+            prefix: String::new(),
+            chrom_names: fixed.chrom_names.clone(),
+            chrom_lengths: fixed.chrom_lengths.clone(),
+            chrom_offsets: fixed.chrom_offsets.clone(),
+            bin_layout: CoolBinLayout::Variable {
+                chrom_ids: vec![0, 0, 0, 1, 1],
+                starts: vec![0, 100, 200, 0, 100],
+            },
+            bin1_offsets: vec![0; 6],
+            bytes: 0,
+        };
+
+        for bin in 0..5_u64 {
+            assert_eq!(
+                super::bin_source_and_start(&fixed, bin, "bin"),
+                super::bin_source_and_start(&materialized, bin, "bin"),
+            );
+            assert_eq!(
+                super::adaptive_bin_source_interval(&fixed, bin),
+                super::adaptive_bin_source_interval(&materialized, bin),
+            );
+        }
+        for source in 0..2 {
+            for &(start, end) in &[
+                (0, 1),
+                (0, 100),
+                (1, 100),
+                (99, 101),
+                (100, 101),
+                (179, 250),
+            ] {
+                assert_eq!(
+                    fixed.source_bin_range(source, start, end),
+                    materialized.source_bin_range(source, start, end),
+                );
+            }
+            for start in [0, 100] {
+                assert_eq!(
+                    super::source_bin_for_start(&fixed, source, start),
+                    super::source_bin_for_start(&materialized, source, start),
+                );
+            }
+            for start in [0, 1, 99, 100, 179, 250] {
+                assert_eq!(
+                    super::source_bin_at_or_before(&fixed, source, start),
+                    super::source_bin_at_or_before(&materialized, source, start),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_mcool_reader_uses_the_compact_layout() {
+        let file = TestAdaptiveMcool::create();
+        let reader =
+            cached_cool_reader(file.path(), Some(1_000), &|| false).expect("open fixed-bin mcool");
+
+        assert!(matches!(
+            reader.index.bin_layout,
+            CoolBinLayout::Fixed {
+                resolution: 1_000,
+                ..
+            }
+        ));
+        assert_eq!(reader.index.bin_count(), 3_000);
+        assert_eq!(reader.index.bin_start(2_999), Some(2_999_000));
+    }
+
+    #[test]
+    fn variable_mcool_metadata_preserves_the_materialized_layout() {
+        let file = TestAdaptiveMcool::create();
+        let handle = File::open_rw(file.path()).expect("open variable-bin fixture");
+        handle
+            .group("resolutions/1000")
+            .expect("open variable resolution")
+            .attr("bin-type")
+            .expect("open bin type")
+            .write_scalar(&VarLenUnicode::from_str("variable").expect("variable bin string"))
+            .expect("write variable bin type");
+        drop(handle);
+
+        let reader = cached_cool_reader(file.path(), Some(1_000), &|| false)
+            .expect("open variable-bin mcool");
+        assert!(matches!(
+            reader.index.bin_layout,
+            CoolBinLayout::Variable { .. }
+        ));
+        assert_eq!(reader.index.bin_start(2_999), Some(2_999_000));
     }
 
     #[test]

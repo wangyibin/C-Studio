@@ -3,6 +3,9 @@ import {
   ContactPanPrefetchBridge,
   ContactPanPrefetchPriorityQueue,
   contactPanPrefetchBatches,
+  contactSpatialPrefetchBatchSize,
+  formatContactPanPrefetchPerformanceLog,
+  formatContactPanPrefetchPlanPerformanceLog,
   contactPanSettledGeneration,
   contactPanTileLoadPriority,
 } from "./contactPanPrefetch";
@@ -150,6 +153,71 @@ describe("contactPanPrefetchBatches", () => {
   it("normalizes invalid batch sizes to one item", () => {
     expect(contactPanPrefetchBatches([1, 2], 0)).toEqual([[1], [2]]);
     expect(contactPanPrefetchBatches([1, 2], Number.NaN)).toEqual([[1], [2]]);
+  });
+
+  it("uses the measured latency-first background batch size", () => {
+    expect(contactSpatialPrefetchBatchSize).toBe(4);
+  });
+});
+
+describe("formatContactPanPrefetchPerformanceLog", () => {
+  it("records queue, generation, backend, merge, and publish costs", () => {
+    expect(formatContactPanPrefetchPerformanceLog({
+      status: "ok",
+      generation: 8,
+      sequence: 3,
+      requestId: 12,
+      priority: "lead",
+      tileX: 4,
+      tileY: 7,
+      sharedFlight: false,
+      queueWaitMs: 1.25,
+      generationWaitMs: 2.5,
+      backendIpcMs: 30.75,
+      flightWaitMs: 34.5,
+      cacheMergeMs: 0.5,
+      publishMs: 0.25,
+      totalMs: 36.5,
+    })).toBe(
+      "CSTUDIO_PERF event=contact_pan_prefetch status=ok generation=8 pan_sequence=3 request_id=12 priority=lead tile_x=4 tile_y=7 shared_flight=0 queue_wait_ms=1.250 generation_wait_ms=2.500 backend_ipc_ms=30.750 flight_wait_ms=34.500 cache_merge_ms=0.500 publish_ms=0.250 total_ms=36.500",
+    );
+  });
+
+  it("marks a shared or pre-backend flight without inventing IPC time", () => {
+    const line = formatContactPanPrefetchPerformanceLog({
+      status: "cancelled",
+      generation: 9,
+      sequence: 4,
+      requestId: null,
+      priority: "visible",
+      tileX: 2,
+      tileY: 2,
+      sharedFlight: true,
+      queueWaitMs: 0,
+      generationWaitMs: 0,
+      backendIpcMs: null,
+      flightWaitMs: 4,
+      cacheMergeMs: 0,
+      publishMs: 0,
+      totalMs: 4,
+    });
+    expect(line).toContain("request_id=-1");
+    expect(line).toContain("shared_flight=1");
+    expect(line).toContain("backend_ipc_ms=-1");
+  });
+
+  it("reports the cache coverage of the changed pan frontier", () => {
+    expect(formatContactPanPrefetchPlanPerformanceLog({
+      generation: 10,
+      sequence: 5,
+      totalTiles: 12,
+      visibleTiles: 6,
+      leadTiles: 3,
+      cachedTiles: 8,
+      missingTiles: 4,
+    })).toBe(
+      "CSTUDIO_PERF event=contact_pan_prefetch status=plan generation=10 pan_sequence=5 total_tiles=12 visible_tiles=6 lead_tiles=3 cached_tiles=8 missing_tiles=4",
+    );
   });
 });
 

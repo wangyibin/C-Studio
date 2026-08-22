@@ -1,6 +1,6 @@
 [package]
 name = "c-studio"
-version = "0.3.0"
+version = "0.3.1"
 description = "C-Studio desktop application"
 edition = "2021"
 

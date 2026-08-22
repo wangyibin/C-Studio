@@ -21,6 +21,7 @@ import {
   contactPanPreviewTileSignature,
   presentContactPanPrefetchBatches,
   contactCanvasBackingSizeFromBounds,
+  committedPanTargetIsPainted,
   contactResolutionWheelIntent,
   lockedContactResolutionWheelZoomIntent,
   contactViewportForAxisNavigator,
@@ -406,6 +407,38 @@ describe("shouldRetainPresentedContactViewport", () => {
       normalization: "raw",
       viewport,
     }, 100_000, "raw", viewport)).toBe(false);
+  });
+});
+
+describe("committed pan front-surface handoff", () => {
+  const committedViewport = {
+    xStart: 2_000_000,
+    xEnd: 12_000_000,
+    yStart: 3_000_000,
+    yEnd: 13_000_000,
+  };
+
+  it("ignores a late paint callback from the old viewport", () => {
+    expect(committedPanTargetIsPainted(committedViewport, {
+      renderGeneration: 7,
+      viewport: {
+        xStart: 0,
+        xEnd: 10_000_000,
+        yStart: 0,
+        yEnd: 10_000_000,
+      },
+    }, 7)).toBe(false);
+  });
+
+  it("releases only after the matching committed viewport generation paints", () => {
+    expect(committedPanTargetIsPainted(committedViewport, {
+      renderGeneration: 8,
+      viewport: committedViewport,
+    }, 8)).toBe(true);
+    expect(committedPanTargetIsPainted(committedViewport, {
+      renderGeneration: 8,
+      viewport: committedViewport,
+    }, 7)).toBe(false);
   });
 });
 

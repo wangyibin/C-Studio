@@ -11,6 +11,7 @@ import {
   contactTileGpuFloatValuesFitR16f,
   contactTileGpuBoundaryInstanceData,
   contactTileGpuDrawCoverageIsComplete,
+  contactTileGpuSceneTextureFormat,
   contactTileGpuTexturePreference,
   contactTileGpuUploadBatch,
   contactTileGpuUploadPlan,
@@ -738,6 +739,64 @@ describe("contactTileFloatTextureData", () => {
     expect(contactTileGpuFloatValuesFitR16f(new Float32Array([-1, 0, 65_504]))).toBe(true);
     expect(contactTileGpuFloatValuesFitR16f(new Float32Array([65_505]))).toBe(false);
     expect(contactTileGpuFloatValuesFitR16f(new Float32Array([Number.NaN]))).toBe(false);
+  });
+
+  it("negotiates one R32F atlas before uploading a mixed precision scene", () => {
+    const r16fValues = new Uint16Array(16);
+    const overflowValues = new Float32Array(16);
+    overflowValues.fill(-1);
+    overflowValues[1] = 70_000;
+    const scene = {
+      descriptors: [{
+        key: "0:0:source",
+        tile: {
+          tileX: 0,
+          tileY: 0,
+          cells: [],
+          denseR16fValues: r16fValues,
+          denseOccupiedCount: 1,
+        },
+        transpose: false,
+      }, {
+        key: "1:0:source",
+        tile: {
+          tileX: 1,
+          tileY: 0,
+          cells: [],
+          denseValues: overflowValues,
+          denseOccupiedCount: 1,
+        },
+        transpose: false,
+      }],
+      generation: 1,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 8_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds" as const,
+        colorScale: { log: false, min: 0, max: 70_000 },
+      },
+    };
+    expect(contactTileGpuSceneTextureFormat(scene, "r16f")).toBe("r32f");
+
+    const { canvas, texImage3D, texSubImage3D } = mockWebGlCanvas();
+    const presented = vi.fn();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      texturePreference: "r16f",
+      virtualTextureEnabled: true,
+    });
+    expect(renderer?.setScene(scene, presented)).toBe(true);
+    expect(presented).toHaveBeenCalledWith(true);
+    expect(texImage3D.mock.calls[texImage3D.mock.calls.length - 1]?.[2]).toBe(21);
+    expect(texSubImage3D).toHaveBeenCalledTimes(2);
+    expect(renderer?.performanceSnapshot()).toMatchObject({
+      rangeFallbacks: 1,
+      virtualTextureRebuilds: 1,
+      virtualTextureUploads: 2,
+    });
+    renderer?.destroy();
   });
 
   it("uploads eligible tiles as R16F and accounts two bytes per texel", () => {

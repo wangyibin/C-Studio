@@ -39,8 +39,12 @@ import {
 import {
   ContactPanPrefetchBridge,
   ContactPanPrefetchPriorityQueue,
+  contactSpatialPrefetchBatchSize,
+  formatContactPanPrefetchPerformanceLog,
+  formatContactPanPrefetchPlanPerformanceLog,
   contactPanSettledGeneration,
   contactPanTileLoadPriority,
+  type ContactPanPrefetchPerformanceRecord,
 } from "./state/contactPanPrefetch";
 import {
   closestContactResolution,
@@ -362,6 +366,13 @@ interface PrewarmContactNormalizationsResponse {
   cancelled: boolean;
 }
 
+interface PrewarmContactResolutionReaderResponse {
+  compactFixed: boolean;
+  binCount: number;
+  indexBytes: number;
+  cancelled: boolean;
+}
+
 interface ContactPanPrefetchPlan {
   adaptiveRefinement: boolean;
   baseResolution: number;
@@ -395,7 +406,6 @@ const panVisibleContactTileRequestBatchSize = 2;
 // scheduler may run four visible flights or two background flights at once.
 const contactPanPrefetchConcurrency = 4;
 const contactPanBackgroundPrefetchConcurrency = 2;
-const prefetchContactTileRequestBatchSize = 16;
 const contactViewportRequestDelayMs = 24;
 const secondaryTrackRequestDelayMs = 180;
 const idleAdjacentContactTileBatchSize = 2;
@@ -416,6 +426,20 @@ const contactTileStreamEnabled = import.meta.env.VITE_CSTUDIO_TILE_STREAM !== "0
 const contactTileSingleScanEnabled = import.meta.env.VITE_CSTUDIO_TILE_SINGLE_SCAN !== "0";
 const contactTileDirectDeltaEnabled = import.meta.env.VITE_CSTUDIO_TILE_DIRECT_DELTA !== "0";
 const contactMainLodEnabled = import.meta.env.VITE_CSTUDIO_MAIN_LOD !== "0";
+
+function emitContactFrontendPerformanceLine(line: string) {
+  if (!contactTileIpcPerformanceEnabled) {
+    return;
+  }
+  console.info(line);
+  void invoke("log_contact_frontend_performance", { line }).catch(() => undefined);
+}
+
+function emitContactPanPrefetchPerformance(
+  record: ContactPanPrefetchPerformanceRecord,
+) {
+  emitContactFrontendPerformanceLine(formatContactPanPrefetchPerformanceLog(record));
+}
 
 function buildContactPanPrefetchPlan({
   availableResolutions,
@@ -1052,6 +1076,9 @@ export function App() {
     new ContactTileFlightRegistry<ContactMapTile>(),
   );
   const normalizationPrewarmRequestIdRef = useRef<number | null>(null);
+  const resolutionReaderPrewarmRequestIdRef = useRef<number | null>(null);
+  const resolutionReaderPrewarmTimerRef = useRef<number | null>(null);
+  const contactResolutionPreviewRef = useRef<ContactResolution | null>(null);
   const endpointContactTileCacheRef = useRef(new Map<string, ContactMapTile>());
   const endpointContactTileFlightsRef = useRef(new ContactTileFlightRegistry<ContactMapTile>());
   const contactLayoutHandleRegistryRef = useRef<ContactLayoutHandleRegistry | null>(null);
@@ -1097,6 +1124,8 @@ export function App() {
     reduceUiState,
     createInitialUiState("Workbench ready"),
   );
+  const currentContactResolutionRef = useRef(uiState.contact.resolution);
+  currentContactResolutionRef.current = uiState.contact.resolution;
   const contactTilePerformanceRef = useRef<ReturnType<
     typeof createContactTilePerformanceTracker
   > | null>(null);
@@ -1149,6 +1178,12 @@ export function App() {
     const generation = contactTileGenerationRef.current + 1;
     contactTileGenerationRef.current = generation;
     contactTilePerformance.supersedeBefore(generation);
+    // Rust cancels every non-retained request from the previous generation.
+    // Detach the matching frontend flights before pointer-prefetch can reuse a
+    // promise that is already destined to reject without a current retry.
+    contactTileFlightsRef.current.clear();
+    contactMainLodTileFlightsRef.current.clear();
+    contactSourceTileFlightsRef.current.clear();
     const retainedRequestIds = retainContactOverviewRequestId(
       [],
       activeContactOverviewRequestIdRef.current,
@@ -1309,6 +1344,69 @@ export function App() {
   }, [contactMap, contactResolutionResponsiveness, uiState.contact.resolution]);
   const contactCoolPath = dataset?.cool_path ?? null;
   const contactIsMcool = contactCoolPath?.toLowerCase().endsWith(".mcool") ?? false;
+  const handleContactResolutionPreview = useCallback((resolution: ContactResolution | null) => {
+    contactResolutionPreviewRef.current = resolution;
+    if (resolutionReaderPrewarmTimerRef.current !== null) {
+      window.clearTimeout(resolutionReaderPrewarmTimerRef.current);
+      resolutionReaderPrewarmTimerRef.current = null;
+    }
+    const previousRequestId = resolutionReaderPrewarmRequestIdRef.current;
+    if (previousRequestId !== null) {
+      resolutionReaderPrewarmRequestIdRef.current = null;
+      void invoke("cancel_contact_resolution_reader_prewarm", {
+        request: { requestId: previousRequestId },
+      }).catch(() => undefined);
+    }
+    if (
+      resolution === null
+      || !contactCoolPath
+      || !contactIsMcool
+      || resolution === currentContactResolutionRef.current
+    ) {
+      return;
+    }
+
+    // Slider input events can arrive much faster than HDF5 can open a level.
+    // Debounce the intent, then let a committed visible request join the same
+    // Rust single-flight if it arrives while this preparation is still active.
+    resolutionReaderPrewarmTimerRef.current = window.setTimeout(() => {
+      resolutionReaderPrewarmTimerRef.current = null;
+      if (contactResolutionPreviewRef.current !== resolution) {
+        return;
+      }
+      const normalizationRequestId = normalizationPrewarmRequestIdRef.current;
+      if (normalizationRequestId !== null) {
+        normalizationPrewarmRequestIdRef.current = null;
+        void invoke("cancel_contact_normalization_prewarm", {
+          request: { requestId: normalizationRequestId },
+        }).catch(() => undefined);
+      }
+
+      const requestId = contactTileBackendRequestIdRef.current + 1;
+      contactTileBackendRequestIdRef.current = requestId;
+      resolutionReaderPrewarmRequestIdRef.current = requestId;
+      const generation = contactTileGenerationRef.current;
+      void invoke<PrewarmContactResolutionReaderResponse>(
+        "prewarm_contact_resolution_reader",
+        {
+          request: {
+            requestId,
+            generation,
+            coolPath: contactCoolPath,
+            resolution: contactResolutionToBasePairs(resolution),
+          },
+        },
+      ).catch(() => undefined).finally(() => {
+        if (resolutionReaderPrewarmRequestIdRef.current === requestId) {
+          resolutionReaderPrewarmRequestIdRef.current = null;
+        }
+      });
+    }, 120);
+  }, [contactCoolPath, contactIsMcool]);
+
+  useEffect(() => () => {
+    handleContactResolutionPreview(null);
+  }, [handleContactResolutionPreview]);
   const datasetAgpLayout = dataset?.agp_layout ?? null;
   const assemblyBlocks = uiState.assembly.blocks.length > 0
     ? uiState.assembly.blocks
@@ -1516,6 +1614,15 @@ export function App() {
         missingTiles.push(tile);
       }
     }
+    emitContactFrontendPerformanceLine(formatContactPanPrefetchPlanPerformanceLog({
+      generation: generationStart.generation,
+      sequence: panPrefetchSequence,
+      totalTiles: plan.tiles.length,
+      visibleTiles: plan.visibleTiles.length,
+      leadTiles: plan.leadTiles.length,
+      cachedTiles: cachedTiles.length,
+      missingTiles: missingTiles.length,
+    }));
     const protectedKeys = new Set(plan.tiles.map(cacheKeyForTile));
     contactPanPrefetchProtectedKeysRef.current = {
       generation: generationStart.generation,
@@ -1546,6 +1653,7 @@ export function App() {
       contactPanGenerationStartRef.current === generationStart
     );
     contactPanPrefetchQueue.replacePending(missingTiles.map((missingTile) => {
+      const enqueuedAt = performance.now();
       const tileKey = cacheKeyForTile(missingTile);
       const priority = visibleTileKeys.has(tileKey)
         ? "visible" as const
@@ -1557,72 +1665,121 @@ export function App() {
         priority,
         sequence: panPrefetchSequence,
         run: async () => {
-          const tiles = await tileFlights.loadBatch({
-            scope: tileScope,
-            tiles: [missingTile],
-            cacheKeyForTile,
-            nextRequestId: () => {
-              const nextRequestId = contactTileBackendRequestIdRef.current + 1;
-              contactTileBackendRequestIdRef.current = nextRequestId;
-              return nextRequestId;
-            },
-            load: async (requestId, requestedTiles) => {
-              const generationStartError = await generationStart.promise;
-              if (generationStartError !== null) {
-                throw generationStartError;
-              }
-              if (!panGenerationIsCurrent()) {
-                throw new Error(contactTileRequestCancelledMessage);
-              }
-              return loadContactTilesWithLayoutHandle(
-                contactLayoutHandleRegistry,
-                viewContactLayoutBlocks,
-                {
-                  requestId,
-                  generation: generationStart.generation,
-                  purpose: "spatial_prefetch",
-                  coolPath: contactCoolPath,
-                  baseResolution: plan.baseResolution,
-                  sourceResolution: plan.sourceResolution,
-                  targetResolution: plan.targetResolution,
-                  tileSizeBins: plan.tileSizeBins,
-                  normalization,
-                  tiles: requestedTiles,
-                  adaptiveRefinement: plan.adaptiveRefinement,
-                },
-              );
-            },
-          });
-          if (!panGenerationIsCurrent()) {
-            return;
-          }
-          const latestProtection = contactPanPrefetchProtectedKeysRef.current;
-          const activeProtectedKeys = latestProtection?.generation === generationStart.generation
-            ? latestProtection.keys
-            : protectedKeys;
-          tileCacheLru.merge(
-            layerScope,
-            tiles.map((tile) => ({
-              key: cacheKeyForTile(tile),
-              value: tile,
-              cellCount: contactTileCellCount(tile),
-            })),
-            {
-              recency: priority === "visible" ? "foreground" : "background",
-              keys: activeProtectedKeys,
-              scopes: new Set([layerScope.id]),
-            },
-          );
-          tileCacheRef.current = tileCacheLru.toMap();
-          const latestPrefetchViewport = pendingPanPerformancePreviewRef.current
-            ?.prefetchViewport ?? plan.prefetchViewport;
-          contactPanPrefetchBridge.publish({
-            tiles,
+          const runStartedAt = performance.now();
+          const flightStartedAt = performance.now();
+          let backendRequestId: number | null = null;
+          let generationWaitMs = 0;
+          let backendIpcMs: number | null = null;
+          let flightWaitMs: number | null = null;
+          let cacheMergeMs = 0;
+          let publishMs = 0;
+          const report = (
+            status: ContactPanPrefetchPerformanceRecord["status"],
+            completedAt = performance.now(),
+          ) => emitContactPanPrefetchPerformance({
+            status,
             generation: generationStart.generation,
-            resolution: plan.targetResolution,
-            tileSizeBins: plan.tileSizeBins,
-            viewport: latestPrefetchViewport,
+            sequence: panPrefetchSequence,
+            requestId: backendRequestId,
+            priority,
+            tileX: missingTile.tileX,
+            tileY: missingTile.tileY,
+            sharedFlight: backendRequestId === null,
+            queueWaitMs: runStartedAt - enqueuedAt,
+            generationWaitMs,
+            backendIpcMs,
+            flightWaitMs: flightWaitMs ?? completedAt - flightStartedAt,
+            cacheMergeMs,
+            publishMs,
+            totalMs: completedAt - enqueuedAt,
           });
+          try {
+            const tiles = await tileFlights.loadBatch({
+              scope: tileScope,
+              tiles: [missingTile],
+              cacheKeyForTile,
+              nextRequestId: () => {
+                const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+                contactTileBackendRequestIdRef.current = nextRequestId;
+                backendRequestId = nextRequestId;
+                return nextRequestId;
+              },
+              load: async (requestId, requestedTiles) => {
+                backendRequestId = requestId;
+                const generationWaitStartedAt = performance.now();
+                const generationStartError = await generationStart.promise;
+                generationWaitMs = performance.now() - generationWaitStartedAt;
+                if (generationStartError !== null) {
+                  throw generationStartError;
+                }
+                if (!panGenerationIsCurrent()) {
+                  throw new Error(contactTileRequestCancelledMessage);
+                }
+                const backendStartedAt = performance.now();
+                try {
+                  return await loadContactTilesWithLayoutHandle(
+                    contactLayoutHandleRegistry,
+                    viewContactLayoutBlocks,
+                    {
+                      requestId,
+                      generation: generationStart.generation,
+                      purpose: "spatial_prefetch",
+                      coolPath: contactCoolPath,
+                      baseResolution: plan.baseResolution,
+                      sourceResolution: plan.sourceResolution,
+                      targetResolution: plan.targetResolution,
+                      tileSizeBins: plan.tileSizeBins,
+                      normalization,
+                      tiles: requestedTiles,
+                      adaptiveRefinement: plan.adaptiveRefinement,
+                    },
+                  );
+                } finally {
+                  backendIpcMs = performance.now() - backendStartedAt;
+                }
+              },
+            });
+            flightWaitMs = performance.now() - flightStartedAt;
+            if (!panGenerationIsCurrent()) {
+              report("cancelled");
+              return;
+            }
+            const latestProtection = contactPanPrefetchProtectedKeysRef.current;
+            const activeProtectedKeys = latestProtection?.generation === generationStart.generation
+              ? latestProtection.keys
+              : protectedKeys;
+            const cacheMergeStartedAt = performance.now();
+            tileCacheLru.merge(
+              layerScope,
+              tiles.map((tile) => ({
+                key: cacheKeyForTile(tile),
+                value: tile,
+                cellCount: contactTileCellCount(tile),
+              })),
+              {
+                recency: priority === "visible" ? "foreground" : "background",
+                keys: activeProtectedKeys,
+                scopes: new Set([layerScope.id]),
+              },
+            );
+            tileCacheRef.current = tileCacheLru.toMap();
+            cacheMergeMs = performance.now() - cacheMergeStartedAt;
+            const latestPrefetchViewport = pendingPanPerformancePreviewRef.current
+              ?.prefetchViewport ?? plan.prefetchViewport;
+            const publishStartedAt = performance.now();
+            contactPanPrefetchBridge.publish({
+              tiles,
+              generation: generationStart.generation,
+              resolution: plan.targetResolution,
+              tileSizeBins: plan.tileSizeBins,
+              viewport: latestPrefetchViewport,
+            });
+            publishMs = performance.now() - publishStartedAt;
+            report("ok");
+          } catch (error) {
+            report(isContactTileRequestCancelled(error) ? "cancelled" : "error");
+            throw error;
+          }
         },
         onError: (error: unknown) => {
           if (!isContactTileRequestCancelled(error)) {
@@ -2908,7 +3065,7 @@ export function App() {
       tileWorld,
       maxBackgroundPrefetchTiles,
       tileLoadPriority.visibleBatchSize,
-      prefetchContactTileRequestBatchSize,
+      contactSpatialPrefetchBatchSize,
       tileLoadPriority.urgentPrefetchTileCount,
     );
     if (pendingResolutionPerformance) {
@@ -4057,6 +4214,7 @@ export function App() {
       if (
         contactTileFlightsRef.current.size > 0
         || normalizationPrewarmRequestIdRef.current !== null
+        || resolutionReaderPrewarmRequestIdRef.current !== null
       ) {
         scheduleAttempt();
         return;
@@ -5283,6 +5441,7 @@ export function App() {
       onContactPanGestureStart={suspendContactTileLoadingForPan}
       onContactPanTilePrefetch={handleContactPanTilePrefetch}
       onContactViewportPreview={handleContactViewportPreview}
+      onContactResolutionPreview={handleContactResolutionPreview}
       contactPanPrefetchBridge={contactPanPrefetchBridge}
       onContactTileLayerCommit={contactTilePerformance.enabled
         ? handleContactTileLayerCommit

@@ -34,6 +34,87 @@ export interface ContactPanSettledGeneration {
 
 export type ContactPanPrefetchTaskPriority = "visible" | "lead" | "prefetch";
 
+/**
+ * Cold POJ measurements show that four tiles retain the one-scan startup cost,
+ * while a sixteen-tile batch delays the first usable frontier. Keep ordinary
+ * background warming in small, center-first batches so a later visible request
+ * never waits behind a large speculative response.
+ */
+export const contactSpatialPrefetchBatchSize = 4;
+
+export interface ContactPanPrefetchPerformanceRecord {
+  status: "ok" | "cancelled" | "error";
+  generation: number;
+  sequence: number;
+  requestId: number | null;
+  priority: ContactPanPrefetchTaskPriority;
+  tileX: number;
+  tileY: number;
+  sharedFlight: boolean;
+  queueWaitMs: number;
+  generationWaitMs: number;
+  backendIpcMs: number | null;
+  flightWaitMs: number;
+  cacheMergeMs: number;
+  publishMs: number;
+  totalMs: number;
+}
+
+export interface ContactPanPrefetchPlanPerformanceRecord {
+  generation: number;
+  sequence: number;
+  totalTiles: number;
+  visibleTiles: number;
+  leadTiles: number;
+  cachedTiles: number;
+  missingTiles: number;
+}
+
+const performanceMilliseconds = (value: number | null) => (
+  value === null || !Number.isFinite(value) ? "-1" : Math.max(0, value).toFixed(3)
+);
+
+/** One bounded logfmt line per attempted pointer-prefetch tile. */
+export function formatContactPanPrefetchPerformanceLog(
+  record: ContactPanPrefetchPerformanceRecord,
+) {
+  return [
+    "CSTUDIO_PERF event=contact_pan_prefetch",
+    `status=${record.status}`,
+    `generation=${record.generation}`,
+    `pan_sequence=${record.sequence}`,
+    `request_id=${record.requestId ?? -1}`,
+    `priority=${record.priority}`,
+    `tile_x=${record.tileX}`,
+    `tile_y=${record.tileY}`,
+    `shared_flight=${record.sharedFlight ? 1 : 0}`,
+    `queue_wait_ms=${performanceMilliseconds(record.queueWaitMs)}`,
+    `generation_wait_ms=${performanceMilliseconds(record.generationWaitMs)}`,
+    `backend_ipc_ms=${performanceMilliseconds(record.backendIpcMs)}`,
+    `flight_wait_ms=${performanceMilliseconds(record.flightWaitMs)}`,
+    `cache_merge_ms=${performanceMilliseconds(record.cacheMergeMs)}`,
+    `publish_ms=${performanceMilliseconds(record.publishMs)}`,
+    `total_ms=${performanceMilliseconds(record.totalMs)}`,
+  ].join(" ");
+}
+
+/** Cache coverage at each changed pointer-prefetch frontier. */
+export function formatContactPanPrefetchPlanPerformanceLog(
+  record: ContactPanPrefetchPlanPerformanceRecord,
+) {
+  return [
+    "CSTUDIO_PERF event=contact_pan_prefetch",
+    "status=plan",
+    `generation=${record.generation}`,
+    `pan_sequence=${record.sequence}`,
+    `total_tiles=${record.totalTiles}`,
+    `visible_tiles=${record.visibleTiles}`,
+    `lead_tiles=${record.leadTiles}`,
+    `cached_tiles=${record.cachedTiles}`,
+    `missing_tiles=${record.missingTiles}`,
+  ].join(" ");
+}
+
 export interface ContactPanPrefetchQueueTask {
   key: string;
   priority: ContactPanPrefetchTaskPriority;

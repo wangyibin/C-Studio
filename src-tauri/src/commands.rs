@@ -26,6 +26,7 @@ use crate::{
     contact_display_cache::{
         self, DisplayCacheStorageFormat, DisplayCacheTile, DisplayCacheValues,
     },
+    contact_display_memory_cache::DecodedDisplayTileCache,
     contact_lod_cache::{self, LodCacheCell, LodCachePayload},
 };
 
@@ -37,6 +38,21 @@ pub struct ContactCacheState {
 #[derive(Debug, Default)]
 pub struct ContactTileCacheState {
     cache: Arc<Mutex<HashMap<ContactTileCacheKey, ContactMapTileResponse>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContactDisplayMemoryCacheState {
+    cache: Arc<Mutex<DecodedDisplayTileCache>>,
+}
+
+impl Default for ContactDisplayMemoryCacheState {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(DecodedDisplayTileCache::new(
+                persistent_display_memory_cache_budget_bytes(),
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -259,6 +275,16 @@ impl ContactTileRequestState {
             || active_requests
                 .keys()
                 .any(|active_request_id| *active_request_id != request_id)
+    }
+
+    /// Reader preview may cross a visible generation boundary so the
+    /// committed request can join its single-flight. Slider retargeting calls
+    /// `finish`, which is the only normal cancellation signal for this work.
+    fn is_resolution_reader_prewarm_cancelled(&self, request_id: u64) -> bool {
+        let Ok(active_requests) = self.active_requests.lock() else {
+            return true;
+        };
+        !active_requests.contains_key(&request_id)
     }
 
     fn finish(&self, request_id: u64) {
@@ -1073,6 +1099,30 @@ pub struct PrewarmContactNormalizationsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CancelContactNormalizationPrewarmRequest {
     pub request_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrewarmContactResolutionReaderRequest {
+    pub request_id: u64,
+    pub generation: u64,
+    pub cool_path: String,
+    pub resolution: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelContactResolutionReaderPrewarmRequest {
+    pub request_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrewarmContactResolutionReaderResponse {
+    pub compact_fixed: bool,
+    pub bin_count: usize,
+    pub index_bytes: usize,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2049,6 +2099,8 @@ fn push_lod_key_bytes(key: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
 const DISPLAY_CACHE_COPY_SEMANTICS_VERSION: &[u8] = b"copy-share-interval-v1";
 const DISPLAY_CACHE_MAX_DATASET_ENTRIES: usize = 100_000;
 const DISPLAY_CACHE_MAX_GLOBAL_ENTRIES: usize = 500_000;
+const DEFAULT_DISPLAY_MEMORY_CACHE_MIB: usize = 64;
+const MAX_DISPLAY_MEMORY_CACHE_MIB: usize = 512;
 
 #[derive(Debug, Clone)]
 struct PersistentDisplayCacheContext {
@@ -2062,6 +2114,8 @@ struct PersistentDisplayTilePlan {
     tile_x: u64,
     tile_y: u64,
     key: Vec<u8>,
+    /// v0.2.x cache identity before storage format became part of the key.
+    legacy_key: Vec<u8>,
 }
 
 fn persistent_display_cache_context(
@@ -2135,44 +2189,49 @@ fn persistent_display_tile_plans(
     coordinates
         .into_iter()
         .map(|(tile_x, tile_y)| {
-            let mut key = Vec::new();
-            push_lod_key_bytes(&mut key, b"cstudio-display-tile-v2")?;
-            push_lod_key_bytes(
-                &mut key,
+            let build_key = |storage_identity: Option<&[u8]>| {
+                let mut key = Vec::new();
+                push_lod_key_bytes(&mut key, b"cstudio-display-tile-v2")?;
+                if let Some(storage_identity) = storage_identity {
+                    push_lod_key_bytes(&mut key, storage_identity)?;
+                }
+                push_lod_key_bytes(&mut key, &context.file_fingerprint)?;
+                key.extend_from_slice(&request.base_resolution.to_le_bytes());
+                key.extend_from_slice(&source_resolution.to_le_bytes());
+                key.extend_from_slice(&request.target_resolution.to_le_bytes());
+                key.extend_from_slice(&request.tile_size_bins.to_le_bytes());
+                key.push(u8::from(adaptive_refinement));
+                push_lod_key_bytes(&mut key, request.normalization.cache_key().as_bytes())?;
+                push_lod_key_bytes(&mut key, DISPLAY_CACHE_COPY_SEMANTICS_VERSION)?;
+                key.extend_from_slice(&tile_x.to_le_bytes());
+                key.extend_from_slice(&tile_y.to_le_bytes());
+                push_lod_key_bytes(
+                    &mut key,
+                    axis_fingerprints
+                        .get(&tile_x)
+                        .expect("display cache X fingerprint was precomputed")
+                        .as_bytes(),
+                )?;
+                push_lod_key_bytes(
+                    &mut key,
+                    axis_fingerprints
+                        .get(&tile_y)
+                        .expect("display cache Y fingerprint was precomputed")
+                        .as_bytes(),
+                )?;
+                Ok::<_, String>(key)
+            };
+            let storage_identity: &[u8] =
                 if persistent_display_cache_storage_format() == DisplayCacheStorageFormat::R16f {
                     b"gpu-ready-r16f-v1"
                 } else {
                     b"float32-v1"
-                },
-            )?;
-            push_lod_key_bytes(&mut key, &context.file_fingerprint)?;
-            key.extend_from_slice(&request.base_resolution.to_le_bytes());
-            key.extend_from_slice(&source_resolution.to_le_bytes());
-            key.extend_from_slice(&request.target_resolution.to_le_bytes());
-            key.extend_from_slice(&request.tile_size_bins.to_le_bytes());
-            key.push(u8::from(adaptive_refinement));
-            push_lod_key_bytes(&mut key, request.normalization.cache_key().as_bytes())?;
-            push_lod_key_bytes(&mut key, DISPLAY_CACHE_COPY_SEMANTICS_VERSION)?;
-            key.extend_from_slice(&tile_x.to_le_bytes());
-            key.extend_from_slice(&tile_y.to_le_bytes());
-            push_lod_key_bytes(
-                &mut key,
-                axis_fingerprints
-                    .get(&tile_x)
-                    .expect("display cache X fingerprint was precomputed")
-                    .as_bytes(),
-            )?;
-            push_lod_key_bytes(
-                &mut key,
-                axis_fingerprints
-                    .get(&tile_y)
-                    .expect("display cache Y fingerprint was precomputed")
-                    .as_bytes(),
-            )?;
+                };
             Ok(PersistentDisplayTilePlan {
                 tile_x,
                 tile_y,
-                key,
+                key: build_key(Some(storage_identity))?,
+                legacy_key: build_key(None)?,
             })
         })
         .collect()
@@ -2184,6 +2243,15 @@ fn persistent_display_cache_storage_format() -> DisplayCacheStorageFormat {
     } else {
         DisplayCacheStorageFormat::R16f
     }
+}
+
+fn persistent_display_memory_cache_budget_bytes() -> usize {
+    std::env::var("CSTUDIO_DISPLAY_CACHE_MEMORY_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DISPLAY_MEMORY_CACHE_MIB)
+        .min(MAX_DISPLAY_MEMORY_CACHE_MIB)
+        .saturating_mul(1024 * 1024)
 }
 
 fn persistent_display_cache_dataset_budget_bytes() -> u64 {
@@ -2399,6 +2467,7 @@ pub fn log_contact_pan_frontend_performance(request: ContactPanFrontendPerforman
 pub fn log_contact_frontend_performance(line: String) {
     let accepted_event = line.starts_with("CSTUDIO_PERF event=contact_tiles_frontend ")
         || line.starts_with("CSTUDIO_PERF event=contact_resolution_responsiveness ")
+        || line.starts_with("CSTUDIO_PERF event=contact_pan_prefetch ")
         || line.starts_with("CSTUDIO_PERF event=contact_gpu_texture ");
     if contact_tile_perf_logging_enabled() && line.len() <= 2_048 && accepted_event {
         emit_contact_tile_perf_line(&line);
@@ -2549,6 +2618,79 @@ pub fn cancel_contact_normalization_prewarm(
 }
 
 #[tauri::command]
+pub async fn prewarm_contact_resolution_reader(
+    request: PrewarmContactResolutionReaderRequest,
+    request_state: tauri::State<'_, ContactTileRequestState>,
+) -> Result<PrewarmContactResolutionReaderResponse, String> {
+    if request.resolution == 0 {
+        return Err("resolution reader prewarm requires a positive resolution".to_string());
+    }
+    request_state.register_current_generation(request.request_id, request.generation)?;
+    let task_request_state = request_state.inner().clone();
+    let request_id = request.request_id;
+    let generation = request.generation;
+    let resolution = request.resolution;
+    let cool_path = request.cool_path;
+    let _request_guard = ContactTileRequestGuard {
+        state: request_state.inner().clone(),
+        request_id,
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let should_cancel = || {
+            task_request_state.is_resolution_reader_prewarm_cancelled(request_id)
+        };
+        let result = cstudio_core::cool::prewarm_contact_reader_at_resolution_cancellable(
+            &cool_path,
+            Some(resolution),
+            &should_cancel,
+        );
+        let response = match result {
+            Ok(stats) => PrewarmContactResolutionReaderResponse {
+                compact_fixed: stats.compact_fixed,
+                bin_count: stats.bin_count,
+                index_bytes: stats.index_bytes,
+                cancelled: false,
+            },
+            Err(cstudio_core::CStudioError::RequestCancelled) => {
+                PrewarmContactResolutionReaderResponse {
+                    compact_fixed: false,
+                    bin_count: 0,
+                    index_bytes: 0,
+                    cancelled: true,
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if contact_tile_perf_logging_enabled() {
+            eprintln!(
+                "CSTUDIO_PERF event=contact_resolution_reader_prewarm status={} request_id={} generation={} resolution={} compact_fixed={} bins={} index_bytes={} elapsed_ms={}",
+                if response.cancelled { "cancelled" } else { "complete" },
+                request_id,
+                generation,
+                resolution,
+                response.compact_fixed,
+                response.bin_count,
+                response.index_bytes,
+                started.elapsed().as_millis(),
+            );
+        }
+        Ok(response)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn cancel_contact_resolution_reader_prewarm(
+    request: CancelContactResolutionReaderPrewarmRequest,
+    request_state: tauri::State<'_, ContactTileRequestState>,
+) {
+    request_state.finish(request.request_id);
+}
+
+#[tauri::command]
 pub async fn get_contact_map_tiles_from_cool(
     request: ContactMapTilesFromCoolRequest,
     layout_registry_state: tauri::State<'_, ContactLayoutRegistryState>,
@@ -2651,6 +2793,7 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
     layout_registry_state: tauri::State<'_, ContactLayoutRegistryState>,
     source_cache_state: tauri::State<'_, SourceContactCacheState>,
     tile_cache_state: tauri::State<'_, ContactTileCacheState>,
+    display_memory_cache_state: tauri::State<'_, ContactDisplayMemoryCacheState>,
     request_state: tauri::State<'_, ContactTileRequestState>,
 ) -> Result<tauri::ipc::Response, String> {
     let command_started = Instant::now();
@@ -2670,6 +2813,8 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
     };
     let source_cache = Arc::clone(&source_cache_state.inner().cache);
     let tile_cache = Arc::clone(&tile_cache_state.inner().cache);
+    let display_memory_cache = Arc::clone(&display_memory_cache_state.inner().cache);
+    let display_store_memory_cache = Arc::clone(&display_memory_cache);
     let task_request_state = request_state.inner().clone();
     let display_cache_context = persistent_display_cache_context(&app_handle, &request)?;
     let display_cache_plans = display_cache_context
@@ -2687,6 +2832,7 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
                         context,
                         &request,
                         display_cache_plans.clone(),
+                        &display_memory_cache,
                         &should_cancel,
                     )?;
                 let mut compute_request = request;
@@ -2756,7 +2902,7 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
     if let (Some(context), Some(pending)) = (display_store_context, pending_display_store) {
         if !pending.is_empty() {
             tauri::async_runtime::spawn_blocking(move || {
-                store_persistent_display_tiles(context, pending);
+                store_persistent_display_tiles(context, pending, display_store_memory_cache);
             });
         }
     }
@@ -2777,15 +2923,20 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
             },
         ));
         emit_contact_tile_perf_line(&format!(
-            "CSTUDIO_PERF event=contact_display_cache status=lookup transport=binary scenario={} request_id={} generation={} target_resolution={} requested_tiles={} hits={} misses={} corrupt={} read_us={} command_us={}",
+            "CSTUDIO_PERF event=contact_display_cache status=lookup transport=binary scenario={} request_id={} generation={} target_resolution={} requested_tiles={} hits={} memory_hits={} disk_hits={} legacy_disk_hits={} misses={} corrupt={} memory_lookup_us={} disk_read_us={} read_us={} command_us={}",
             purpose.scenario_key(),
             request_id,
             generation,
             target_resolution,
             requested_tiles,
             display_cache_stats.hits,
+            display_cache_stats.memory_hits,
+            display_cache_stats.disk_hits,
+            display_cache_stats.legacy_disk_hits,
             display_cache_stats.misses,
             display_cache_stats.corrupt,
+            display_cache_stats.memory_lookup.as_micros(),
+            display_cache_stats.disk_read.as_micros(),
             display_cache_stats.read.as_micros(),
             command_us,
         ));
@@ -2870,8 +3021,13 @@ pub async fn stream_contact_map_tiles_from_cool_binary_v1(
 #[derive(Debug, Clone, Copy, Default)]
 struct PersistentDisplayCacheLookupStats {
     hits: usize,
+    memory_hits: usize,
+    disk_hits: usize,
+    legacy_disk_hits: usize,
     misses: usize,
     corrupt: usize,
+    memory_lookup: Duration,
+    disk_read: Duration,
     read: Duration,
 }
 
@@ -3006,7 +3162,7 @@ impl PersistentDisplayTileAccumulator {
                         tile_size_bins,
                         tile_x: plan.tile_x,
                         tile_y: plan.tile_y,
-                        values: DisplayCacheValues::Float32(values),
+                        values: DisplayCacheValues::Float32(values.into()),
                     },
                 })
             })
@@ -3063,6 +3219,7 @@ fn load_persistent_display_tiles(
     context: &PersistentDisplayCacheContext,
     request: &ResolvedContactMapTilesFromCoolRequest,
     plans: Vec<PersistentDisplayTilePlan>,
+    memory_cache: &Arc<Mutex<DecodedDisplayTileCache>>,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<
     (
@@ -3076,15 +3233,51 @@ fn load_persistent_display_tiles(
     let mut cached_tiles = Vec::new();
     let mut missing_plans = Vec::new();
     let mut stats = PersistentDisplayCacheLookupStats::default();
+    let storage_format = persistent_display_cache_storage_format();
     for plan in plans {
         ensure_contact_tile_request_active(should_cancel)?;
-        match contact_display_cache::load(&context.dataset_root, &plan.key) {
+        let memory_started = Instant::now();
+        let memory_cached = memory_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&plan.key));
+        stats.memory_lookup += memory_started.elapsed();
+        if let Some(cached) = memory_cached {
+            if u64::from(cached.tile_size_bins) == request.tile_size_bins
+                && cached.tile_x == plan.tile_x
+                && cached.tile_y == plan.tile_y
+            {
+                stats.hits = stats.hits.saturating_add(1);
+                stats.memory_hits = stats.memory_hits.saturating_add(1);
+                cached_tiles.push(cached);
+                continue;
+            }
+            stats.corrupt = stats.corrupt.saturating_add(1);
+            if let Ok(mut cache) = memory_cache.lock() {
+                cache.remove(&plan.key);
+            }
+            if contact_tile_perf_logging_enabled() {
+                eprintln!(
+                    "CSTUDIO_PERF event=contact_display_cache status=memory_corrupt tile_x={} tile_y={} error=display cache tile identity mismatch",
+                    plan.tile_x, plan.tile_y,
+                );
+            }
+        }
+
+        let disk_started = Instant::now();
+        let disk_cached = contact_display_cache::load(&context.dataset_root, &plan.key);
+        stats.disk_read += disk_started.elapsed();
+        match disk_cached {
             Ok(Some(cached)) => {
                 if u64::from(cached.tile_size_bins) == request.tile_size_bins
                     && cached.tile_x == plan.tile_x
                     && cached.tile_y == plan.tile_y
                 {
                     stats.hits = stats.hits.saturating_add(1);
+                    stats.disk_hits = stats.disk_hits.saturating_add(1);
+                    if let Ok(mut cache) = memory_cache.lock() {
+                        cache.insert(plan.key.clone(), cached.clone());
+                    }
                     cached_tiles.push(cached);
                     continue;
                 }
@@ -3107,7 +3300,58 @@ fn load_persistent_display_tiles(
                 }
             }
         }
+
+        // v0.3.0 added the storage representation to the cache key. Reuse the
+        // otherwise identical v0.2.x Float32 entry instead of forcing a fresh
+        // HDF5 scan for every region the user had already visited. Conversion
+        // is presentation-only and keeps the current exact layout/key checks.
+        let legacy_started = Instant::now();
+        let legacy_cached = contact_display_cache::load(&context.dataset_root, &plan.legacy_key);
+        stats.disk_read += legacy_started.elapsed();
+        match legacy_cached {
+            Ok(Some(cached)) => {
+                if u64::from(cached.tile_size_bins) == request.tile_size_bins
+                    && cached.tile_x == plan.tile_x
+                    && cached.tile_y == plan.tile_y
+                {
+                    let cached =
+                        contact_display_cache::tile_for_storage_format(&cached, storage_format);
+                    stats.hits = stats.hits.saturating_add(1);
+                    stats.disk_hits = stats.disk_hits.saturating_add(1);
+                    stats.legacy_disk_hits = stats.legacy_disk_hits.saturating_add(1);
+                    if let Ok(mut cache) = memory_cache.lock() {
+                        cache.insert(plan.key.clone(), cached.clone());
+                    }
+                    cached_tiles.push(cached);
+                    continue;
+                }
+                stats.corrupt = stats.corrupt.saturating_add(1);
+                if contact_tile_perf_logging_enabled() {
+                    eprintln!(
+                        "CSTUDIO_PERF event=contact_display_cache status=legacy_corrupt tile_x={} tile_y={} error=display cache tile identity mismatch",
+                        plan.tile_x, plan.tile_y,
+                    );
+                }
+                let _ =
+                    contact_display_cache::remove_entry(&context.dataset_root, &plan.legacy_key);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                stats.corrupt = stats.corrupt.saturating_add(1);
+                if contact_tile_perf_logging_enabled() {
+                    eprintln!(
+                        "CSTUDIO_PERF event=contact_display_cache status=legacy_corrupt tile_x={} tile_y={} error={error}",
+                        plan.tile_x, plan.tile_y,
+                    );
+                }
+                let _ =
+                    contact_display_cache::remove_entry(&context.dataset_root, &plan.legacy_key);
+            }
+        }
         let _ = contact_display_cache::remove_entry(&context.dataset_root, &plan.key);
+        if let Ok(mut cache) = memory_cache.lock() {
+            cache.remove(&plan.key);
+        }
         stats.misses = stats.misses.saturating_add(1);
         missing_plans.push(plan);
     }
@@ -3118,17 +3362,24 @@ fn load_persistent_display_tiles(
 fn store_persistent_display_tiles(
     context: PersistentDisplayCacheContext,
     pending: Vec<PendingDisplayCacheStore>,
+    memory_cache: Arc<Mutex<DecodedDisplayTileCache>>,
 ) {
     let started = Instant::now();
     let mut stored = 0_usize;
     let mut stored_bytes = 0_u64;
     let mut failed = 0_usize;
+    let storage_format = persistent_display_cache_storage_format();
     for entry in pending {
+        let stored_tile =
+            contact_display_cache::tile_for_storage_format(&entry.tile, storage_format);
+        if let Ok(mut cache) = memory_cache.lock() {
+            cache.insert(entry.key.clone(), stored_tile.clone());
+        }
         match contact_display_cache::store_atomic_with_format(
             &context.dataset_root,
             &entry.key,
-            &entry.tile,
-            persistent_display_cache_storage_format(),
+            &stored_tile,
+            storage_format,
         ) {
             Ok(path) => {
                 stored = stored.saturating_add(1);
@@ -3140,12 +3391,16 @@ fn store_persistent_display_tiles(
                 if contact_tile_perf_logging_enabled() {
                     eprintln!(
                         "CSTUDIO_PERF event=contact_display_cache status=store_failed tile_x={} tile_y={} error={error}",
-                        entry.tile.tile_x, entry.tile.tile_y,
+                        stored_tile.tile_x, stored_tile.tile_y,
                     );
                 }
             }
         }
     }
+    let (memory_entries, memory_resident_bytes) = memory_cache
+        .lock()
+        .map(|cache| (cache.len(), cache.resident_bytes()))
+        .unwrap_or((0, 0));
     let dataset_prune = contact_display_cache::prune_tree(
         &context.dataset_root,
         persistent_display_cache_dataset_budget_bytes(),
@@ -3158,11 +3413,13 @@ fn store_persistent_display_tiles(
     );
     if contact_tile_perf_logging_enabled() {
         eprintln!(
-            "CSTUDIO_PERF event=contact_display_cache status=stored tiles={} bytes={} failed={} write_us={} dataset_pruned_entries={} dataset_pruned_bytes={} global_pruned_entries={} global_pruned_bytes={}",
+            "CSTUDIO_PERF event=contact_display_cache status=stored tiles={} bytes={} failed={} write_us={} memory_entries={} memory_resident_bytes={} dataset_pruned_entries={} dataset_pruned_bytes={} global_pruned_entries={} global_pruned_bytes={}",
             stored,
             stored_bytes,
             failed,
             started.elapsed().as_micros(),
+            memory_entries,
+            memory_resident_bytes,
             dataset_prune.as_ref().map_or(0, |stats| stats.removed_entries),
             dataset_prune.as_ref().map_or(0, |stats| stats.removed_bytes),
             global_prune.as_ref().map_or(0, |stats| stats.removed_entries),
@@ -3187,6 +3444,7 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
     on_chunk: tauri::ipc::Channel<tauri::ipc::Response>,
     app_handle: tauri::AppHandle,
     layout_registry_state: tauri::State<'_, ContactLayoutRegistryState>,
+    display_memory_cache_state: tauri::State<'_, ContactDisplayMemoryCacheState>,
     request_state: tauri::State<'_, ContactTileRequestState>,
 ) -> Result<(), String> {
     let command_started = Instant::now();
@@ -3203,6 +3461,8 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
         request_id,
     };
     let task_request_state = request_state.inner().clone();
+    let display_memory_cache = Arc::clone(&display_memory_cache_state.inner().cache);
+    let display_store_memory_cache = Arc::clone(&display_memory_cache);
     let display_cache_context = persistent_display_cache_context(&app_handle, &request)?;
     let display_cache_plans = display_cache_context
         .as_ref()
@@ -3219,6 +3479,7 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
                         context,
                         &request,
                         display_cache_plans,
+                        &display_memory_cache,
                         &should_cancel,
                     )?
                 } else {
@@ -3319,7 +3580,7 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
     if let (Some(context), Some(pending)) = (display_store_context, pending_display_store) {
         if !pending.is_empty() {
             tauri::async_runtime::spawn_blocking(move || {
-                store_persistent_display_tiles(context, pending);
+                store_persistent_display_tiles(context, pending, display_store_memory_cache);
             });
         }
     }
@@ -3328,8 +3589,10 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
         emit_contact_tile_perf_line(&format!(
             "CSTUDIO_PERF event=contact_tile_delta_stream status=ok scenario={} request_id={} \
              generation={} target_resolution={} requested_tiles={} emitted_chunks={} \
-             response_cells={} response_bytes={} display_cache_hits={} display_cache_misses={} \
-             display_cache_corrupt={} display_cache_read_us={} indexed_visitor={} first_emit_cell_threshold={} \
+             response_cells={} response_bytes={} display_cache_hits={} display_cache_memory_hits={} \
+             display_cache_disk_hits={} display_cache_legacy_disk_hits={} display_cache_misses={} display_cache_corrupt={} \
+             display_cache_memory_lookup_us={} display_cache_disk_read_us={} display_cache_read_us={} \
+             indexed_visitor={} first_emit_cell_threshold={} \
              emit_cell_threshold={} \
              hdf5_chunks={} scanned_pixels={} visited_contacts={} prepare_us={} \
              hdf5_read_us={} scan_project_us={} finish_chunk_us={} encode_send_us={} \
@@ -3343,8 +3606,13 @@ pub async fn stream_contact_map_tile_deltas_from_cool_binary_v1(
             stats.response_cells,
             stats.response_bytes,
             display_cache_stats.hits,
+            display_cache_stats.memory_hits,
+            display_cache_stats.disk_hits,
+            display_cache_stats.legacy_disk_hits,
             display_cache_stats.misses,
             display_cache_stats.corrupt,
+            display_cache_stats.memory_lookup.as_micros(),
+            display_cache_stats.disk_read.as_micros(),
             display_cache_stats.read.as_micros(),
             stats.indexed_visitor,
             stats.first_emit_cell_threshold,
@@ -6245,11 +6513,13 @@ mod tests {
                 tile_x: 0,
                 tile_y: 0,
                 key: b"tile-0-0".to_vec(),
+                legacy_key: b"legacy-tile-0-0".to_vec(),
             },
             PersistentDisplayTilePlan {
                 tile_x: 0,
                 tile_y: 1,
                 key: b"tile-0-1".to_vec(),
+                legacy_key: b"legacy-tile-0-1".to_vec(),
             },
         ];
         let mut accumulator = PersistentDisplayTileAccumulator::new(4, &plans).unwrap();
@@ -6299,20 +6569,22 @@ mod tests {
                 tile_x: 0,
                 tile_y: 0,
                 key: b"tile-0-0".to_vec(),
+                legacy_key: b"legacy-tile-0-0".to_vec(),
             },
             PersistentDisplayTilePlan {
                 tile_x: 0,
                 tile_y: 1,
                 key: b"tile-0-1".to_vec(),
+                legacy_key: b"legacy-tile-0-1".to_vec(),
             },
         ];
         let cached = vec![crate::contact_display_cache::DisplayCacheTile {
             tile_size_bins: 2,
             tile_x: 0,
             tile_y: 1,
-            values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![
-                -1.0, 2.0, -1.0, -1.0,
-            ]),
+            values: crate::contact_display_cache::DisplayCacheValues::Float32(
+                vec![-1.0, 2.0, -1.0, -1.0].into(),
+            ),
         }];
         let pending = vec![super::PendingDisplayCacheStore {
             key: plans[0].key.clone(),
@@ -6320,9 +6592,9 @@ mod tests {
                 tile_size_bins: 2,
                 tile_x: 0,
                 tile_y: 0,
-                values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![
-                    1.0, -1.0, -1.0, -1.0,
-                ]),
+                values: crate::contact_display_cache::DisplayCacheValues::Float32(
+                    vec![1.0, -1.0, -1.0, -1.0].into(),
+                ),
             },
         }];
 
@@ -6375,22 +6647,41 @@ mod tests {
         ];
         let resolved = super::resolve_contact_tile_request(request, None).unwrap();
         let plans = persistent_display_tile_plans(&context, &resolved).unwrap();
-        crate::contact_display_cache::store_atomic(
+        crate::contact_display_cache::store_atomic_with_format(
             &context.dataset_root,
-            &plans[0].key,
+            &plans[0].legacy_key,
             &crate::contact_display_cache::DisplayCacheTile {
                 tile_size_bins: 4,
                 tile_x: plans[0].tile_x,
                 tile_y: plans[0].tile_y,
-                values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![-1.0; 16]),
+                values: crate::contact_display_cache::DisplayCacheValues::Float32(
+                    vec![-1.0; 16].into(),
+                ),
             },
+            crate::contact_display_cache::DisplayCacheStorageFormat::Float32,
         )
         .unwrap();
+        assert!(
+            crate::contact_display_cache::load(&context.dataset_root, &plans[0].key)
+                .unwrap()
+                .is_none()
+        );
+        let memory_cache = Arc::new(Mutex::new(
+            crate::contact_display_memory_cache::DecodedDisplayTileCache::new(1024 * 1024),
+        ));
 
-        let (cached, missing, stats) =
-            super::load_persistent_display_tiles(&context, &resolved, plans.clone(), &|| false)
-                .unwrap();
+        let (cached, missing, stats) = super::load_persistent_display_tiles(
+            &context,
+            &resolved,
+            plans.clone(),
+            &memory_cache,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(stats.hits, 1);
+        assert_eq!(stats.disk_hits, 1);
+        assert_eq!(stats.legacy_disk_hits, 1);
+        assert_eq!(stats.memory_hits, 0);
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.corrupt, 0);
         assert_eq!(cached.len(), 1);
@@ -6400,8 +6691,28 @@ mod tests {
             .all(|value| *value == -1.0));
         assert_eq!(missing.len(), 1);
         assert_eq!((missing[0].tile_x, missing[0].tile_y), (0, 1));
+        crate::contact_display_cache::remove_entry(&context.dataset_root, &plans[0].key).unwrap();
+        let (memory_cached, memory_missing, memory_stats) = super::load_persistent_display_tiles(
+            &context,
+            &resolved,
+            vec![plans[0].clone()],
+            &memory_cache,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(memory_cached.len(), 1);
+        assert!(memory_missing.is_empty());
+        assert_eq!(memory_stats.memory_hits, 1);
+        assert_eq!(memory_stats.disk_hits, 0);
         assert_eq!(
-            super::load_persistent_display_tiles(&context, &resolved, plans, &|| true).unwrap_err(),
+            super::load_persistent_display_tiles(
+                &context,
+                &resolved,
+                plans,
+                &memory_cache,
+                &|| true,
+            )
+            .unwrap_err(),
             "contact tile request cancelled"
         );
         fs::remove_dir_all(root).unwrap();
@@ -6809,9 +7120,9 @@ mod tests {
             tile_size_bins: 2,
             tile_x: 3,
             tile_y: 7,
-            values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![
-                -1.0, 1.5, 2.25, 0.0,
-            ]),
+            values: crate::contact_display_cache::DisplayCacheValues::Float32(
+                vec![-1.0, 1.5, 2.25, 0.0].into(),
+            ),
         }];
 
         let bytes = super::encode_contact_map_dense_tiles_binary_v1(&tiles, 2, &|| false).unwrap();
@@ -6838,12 +7149,15 @@ mod tests {
             tile_size_bins: 2,
             tile_x: 3,
             tile_y: 7,
-            values: crate::contact_display_cache::DisplayCacheValues::R16f(vec![
-                crate::contact_display_cache::R16F_EMPTY_SENTINEL,
-                crate::contact_display_cache::f32_to_r16f_bits(1.5).unwrap(),
-                crate::contact_display_cache::f32_to_r16f_bits(2.25).unwrap(),
-                crate::contact_display_cache::f32_to_r16f_bits(0.0).unwrap(),
-            ]),
+            values: crate::contact_display_cache::DisplayCacheValues::R16f(
+                vec![
+                    crate::contact_display_cache::R16F_EMPTY_SENTINEL,
+                    crate::contact_display_cache::f32_to_r16f_bits(1.5).unwrap(),
+                    crate::contact_display_cache::f32_to_r16f_bits(2.25).unwrap(),
+                    crate::contact_display_cache::f32_to_r16f_bits(0.0).unwrap(),
+                ]
+                .into(),
+            ),
         }];
 
         let bytes = super::encode_contact_map_dense_tiles_binary_v1(&tiles, 2, &|| false).unwrap();
@@ -6866,17 +7180,17 @@ mod tests {
                 tile_size_bins: 2,
                 tile_x: 0,
                 tile_y: 0,
-                values: crate::contact_display_cache::DisplayCacheValues::R16f(vec![
-                    0xbc00, 0x3c00, 0x4000, 0,
-                ]),
+                values: crate::contact_display_cache::DisplayCacheValues::R16f(
+                    vec![0xbc00, 0x3c00, 0x4000, 0].into(),
+                ),
             },
             crate::contact_display_cache::DisplayCacheTile {
                 tile_size_bins: 2,
                 tile_x: 0,
                 tile_y: 1,
-                values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![
-                    -1.0, 70_000.0, 2.0, 0.0,
-                ]),
+                values: crate::contact_display_cache::DisplayCacheValues::Float32(
+                    vec![-1.0, 70_000.0, 2.0, 0.0].into(),
+                ),
             },
         ];
 
@@ -6897,13 +7211,15 @@ mod tests {
                 tile_size_bins: 1,
                 tile_x: 0,
                 tile_y: 0,
-                values: crate::contact_display_cache::DisplayCacheValues::R16f(vec![0x3c00]),
+                values: crate::contact_display_cache::DisplayCacheValues::R16f(vec![0x3c00].into()),
             },
             crate::contact_display_cache::DisplayCacheTile {
                 tile_size_bins: 1,
                 tile_x: 0,
                 tile_y: 1,
-                values: crate::contact_display_cache::DisplayCacheValues::Float32(vec![70_000.0]),
+                values: crate::contact_display_cache::DisplayCacheValues::Float32(
+                    vec![70_000.0].into(),
+                ),
             },
         ];
         let odd_bytes =
@@ -7454,6 +7770,25 @@ mod tests {
             .retain_and_begin_generation(8, &[])
             .expect("new interaction advances generation");
         assert!(state.is_normalization_prewarm_cancelled(80));
+    }
+
+    #[test]
+    fn resolution_reader_prewarm_survives_commit_generation_until_explicit_cancel() {
+        let state = super::ContactTileRequestState::default();
+        state
+            .retain_and_begin_generation(7, &[])
+            .expect("visible generation begins");
+        state
+            .register_current_generation(90, 7)
+            .expect("reader preview joins current generation");
+
+        state
+            .retain_and_begin_generation(8, &[])
+            .expect("resolution commit advances generation");
+        assert!(!state.is_resolution_reader_prewarm_cancelled(90));
+
+        state.finish(90);
+        assert!(state.is_resolution_reader_prewarm_cancelled(90));
     }
 
     #[test]
@@ -8851,6 +9186,56 @@ mod tests {
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
+            for (entry, plan) in pending.iter().zip(plans.iter()) {
+                crate::contact_display_cache::store_atomic_with_format(
+                    &context.dataset_root,
+                    &plan.legacy_key,
+                    &entry.tile,
+                    crate::contact_display_cache::DisplayCacheStorageFormat::Float32,
+                )
+                .expect("display cache benchmark legacy store");
+            }
+            let disabled_memory_cache = Arc::new(Mutex::new(
+                crate::contact_display_memory_cache::DecodedDisplayTileCache::new(0),
+            ));
+            for sample in 0..sample_count {
+                let hit_started = Instant::now();
+                let (cached, missing, cache_stats) = super::load_persistent_display_tiles(
+                    &context,
+                    &request,
+                    plans.clone(),
+                    &disabled_memory_cache,
+                    &|| false,
+                )
+                .expect("display cache benchmark legacy load");
+                assert!(missing.is_empty());
+                assert_eq!(cache_stats.legacy_disk_hits, plans.len());
+                let bytes = super::encode_contact_map_dense_tiles_binary_v1(
+                    &cached,
+                    tile_size_bins,
+                    &|| false,
+                )
+                .expect("display cache benchmark legacy encode")
+                .len();
+                println!(
+                    "CSTUDIO_POJ_BENCH result scenario={} phase=legacy_hit sample={} total_us={} memory_lookup_us={} disk_read_us={} read_us={} hits={} memory_hits={} disk_hits={} legacy_disk_hits={} response_cells={} response_bytes={}",
+                    scenario,
+                    sample + 1,
+                    hit_started.elapsed().as_micros(),
+                    cache_stats.memory_lookup.as_micros(),
+                    cache_stats.disk_read.as_micros(),
+                    cache_stats.read.as_micros(),
+                    cache_stats.hits,
+                    cache_stats.memory_hits,
+                    cache_stats.disk_hits,
+                    cache_stats.legacy_disk_hits,
+                    cached
+                        .iter()
+                        .map(crate::contact_display_cache::DisplayCacheTile::occupied_count)
+                        .sum::<usize>(),
+                    bytes,
+                );
+            }
             let write_started = Instant::now();
             let mut cache_bytes = 0_u64;
             for entry in pending {
@@ -8881,10 +9266,19 @@ mod tests {
                     &context,
                     &request,
                     plans.clone(),
+                    &disabled_memory_cache,
                     &|| false,
                 )
                 .expect("display cache benchmark warm load");
                 assert!(missing.is_empty());
+                let bytes = super::encode_contact_map_dense_tiles_binary_v1(
+                    &cached,
+                    tile_size_bins,
+                    &|| false,
+                )
+                .expect("display cache benchmark warm encode")
+                .len();
+                let total_us = hit_started.elapsed().as_micros();
                 let mut quantized_values = 0_usize;
                 let mut maximum_absolute_error = 0.0_f64;
                 let mut maximum_relative_error = 0.0_f64;
@@ -8910,20 +9304,17 @@ mod tests {
                         }
                     }
                 }
-                let bytes = super::encode_contact_map_dense_tiles_binary_v1(
-                    &cached,
-                    tile_size_bins,
-                    &|| false,
-                )
-                .expect("display cache benchmark warm encode")
-                .len();
                 println!(
-                    "CSTUDIO_POJ_BENCH result scenario={} phase=hit sample={} total_us={} read_us={} hits={} response_cells={} response_bytes={} quantized_values={} max_abs_error={:.6} max_relative_error={:.9}",
+                    "CSTUDIO_POJ_BENCH result scenario={} phase=disk_hit sample={} total_us={} memory_lookup_us={} disk_read_us={} read_us={} hits={} memory_hits={} disk_hits={} response_cells={} response_bytes={} quantized_values={} max_abs_error={:.6} max_relative_error={:.9}",
                     scenario,
                     sample + 1,
-                    hit_started.elapsed().as_micros(),
+                    total_us,
+                    cache_stats.memory_lookup.as_micros(),
+                    cache_stats.disk_read.as_micros(),
                     cache_stats.read.as_micros(),
                     cache_stats.hits,
+                    cache_stats.memory_hits,
+                    cache_stats.disk_hits,
                     cached
                         .iter()
                         .map(crate::contact_display_cache::DisplayCacheTile::occupied_count)
@@ -8932,6 +9323,65 @@ mod tests {
                     quantized_values,
                     maximum_absolute_error,
                     maximum_relative_error,
+                );
+            }
+            let memory_cache = Arc::new(Mutex::new(
+                crate::contact_display_memory_cache::DecodedDisplayTileCache::new(64 * 1024 * 1024),
+            ));
+            let (_, warmup_missing, warmup_stats) = super::load_persistent_display_tiles(
+                &context,
+                &request,
+                plans.clone(),
+                &memory_cache,
+                &|| false,
+            )
+            .expect("display cache benchmark memory warmup");
+            assert!(warmup_missing.is_empty());
+            assert_eq!(warmup_stats.disk_hits, plans.len());
+            let (memory_entries, memory_resident_bytes) = memory_cache
+                .lock()
+                .map(|cache| (cache.len(), cache.resident_bytes()))
+                .unwrap();
+            println!(
+                "CSTUDIO_POJ_BENCH result scenario={} phase=memory_warmup entries={} resident_bytes={} disk_hits={}",
+                scenario, memory_entries, memory_resident_bytes, warmup_stats.disk_hits,
+            );
+            for sample in 0..sample_count {
+                let hit_started = Instant::now();
+                let (cached, missing, cache_stats) = super::load_persistent_display_tiles(
+                    &context,
+                    &request,
+                    plans.clone(),
+                    &memory_cache,
+                    &|| false,
+                )
+                .expect("display cache benchmark decoded memory hit");
+                assert!(missing.is_empty());
+                assert_eq!(cache_stats.memory_hits, plans.len());
+                assert_eq!(cache_stats.disk_hits, 0);
+                let bytes = super::encode_contact_map_dense_tiles_binary_v1(
+                    &cached,
+                    tile_size_bins,
+                    &|| false,
+                )
+                .expect("display cache benchmark memory encode")
+                .len();
+                println!(
+                    "CSTUDIO_POJ_BENCH result scenario={} phase=memory_hit sample={} total_us={} memory_lookup_us={} disk_read_us={} read_us={} hits={} memory_hits={} disk_hits={} response_cells={} response_bytes={}",
+                    scenario,
+                    sample + 1,
+                    hit_started.elapsed().as_micros(),
+                    cache_stats.memory_lookup.as_micros(),
+                    cache_stats.disk_read.as_micros(),
+                    cache_stats.read.as_micros(),
+                    cache_stats.hits,
+                    cache_stats.memory_hits,
+                    cache_stats.disk_hits,
+                    cached
+                        .iter()
+                        .map(crate::contact_display_cache::DisplayCacheTile::occupied_count)
+                        .sum::<usize>(),
+                    bytes,
                 );
             }
             fs::remove_dir_all(cache_root).expect("remove display cache benchmark directory");

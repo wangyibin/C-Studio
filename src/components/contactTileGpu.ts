@@ -1240,6 +1240,56 @@ export function contactTileGpuFloatValuesFitR16f(values: Float32Array) {
   return true;
 }
 
+/**
+ * Pick one storage format for the complete virtual-texture atlas. A texture
+ * array cannot mix R16F and R32F layers, so a single overflowing source tile
+ * upgrades the whole scene before any layer is submitted. This keeps a mixed
+ * display-cache response on the shared GPU path instead of failing halfway
+ * through the upload queue and disabling WebGL for the layer.
+ */
+export function contactTileGpuSceneTextureFormat(
+  scene: ContactTileGpuScene,
+  preference: ContactTileGpuTexturePreference = "r16f",
+): ContactTileGpuTextureFormat {
+  if (preference === "r32f") {
+    return "r32f";
+  }
+  const descriptors = scene.sourceLayout?.descriptors ?? scene.descriptors;
+  const inspectedTiles = new Set<ContactMapTile>();
+  for (const descriptor of descriptors) {
+    const tile = descriptor.tile;
+    if (inspectedTiles.has(tile) || contactTileCellCount(tile) === 0) {
+      continue;
+    }
+    inspectedTiles.add(tile);
+    const dense = validatedDenseContactTileValues(tile);
+    if (dense?.format === "r16f") {
+      continue;
+    }
+    if (dense?.format === "float32") {
+      if (!contactTileGpuFloatValuesFitR16f(dense.values)) {
+        return "r32f";
+      }
+      continue;
+    }
+    const packed = validatedPackedContactTileCells(tile);
+    if (packed) {
+      for (const value of packed.counts) {
+        if (!Number.isFinite(value) || Math.abs(value) > contactTileGpuR16fMaximum) {
+          return "r32f";
+        }
+      }
+    } else {
+      for (const cell of tile.cells) {
+        if (!Number.isFinite(cell.count) || Math.abs(cell.count) > contactTileGpuR16fMaximum) {
+          return "r32f";
+        }
+      }
+    }
+  }
+  return "r16f";
+}
+
 export function contactTileGpuTexturePreference(
   search = typeof location === "undefined" ? "" : location.search,
 ): ContactTileGpuTexturePreference {
@@ -1600,6 +1650,19 @@ export function createContactTileGpuRenderer(
   let pendingPrefetchScene: ContactTileGpuScene | null = null;
   let pendingPrefetchGeneration: number | undefined;
   let pendingPrefetchPresentationRequested = false;
+  const virtualTextureFormatByScene = new WeakMap<
+    ContactTileGpuScene,
+    ContactTileGpuTextureFormat
+  >();
+  const virtualTextureFormatForScene = (activeScene: ContactTileGpuScene) => {
+    const cached = virtualTextureFormatByScene.get(activeScene);
+    if (cached) {
+      return cached;
+    }
+    const format = contactTileGpuSceneTextureFormat(activeScene, uploadContext.preference);
+    virtualTextureFormatByScene.set(activeScene, format);
+    return format;
+  };
 
   const updatePerformanceCacheState = () => {
     uploadContext.performance.cacheEntries = textureCache.size;
@@ -1801,7 +1864,10 @@ export function createContactTileGpuRenderer(
       && pageBytes <= Math.min(4 * 1024 * 1024, contactTileGpuVirtualTextureBudgetBytes / 4);
   };
 
-  const rebuildVirtualTextureState = (activeScene: ContactTileGpuScene) => {
+  const rebuildVirtualTextureState = (
+    activeScene: ContactTileGpuScene,
+    format = virtualTextureFormatForScene(activeScene),
+  ) => {
     if (
       !virtualResources
       || (!activeScene.sourceLayout && activeScene.visibleLayerComplete !== true)
@@ -1812,7 +1878,6 @@ export function createContactTileGpuRenderer(
     if (!plan || !virtualPagePlanFits(plan)) {
       return false;
     }
-    const format = uploadContext.preference;
     const capacity = maximumVirtualTextureLayers(activeScene.tileSizeBins, format);
     if (capacity === 0 || plan.populatedTiles.length > capacity) {
       return false;
@@ -1909,6 +1974,9 @@ export function createContactTileGpuRenderer(
     uploadContext.performance.virtualTextureLayers = 0;
     uploadContext.performance.virtualTextureBytes = nextState.bytes;
     uploadContext.performance.virtualTextureRebuilds += 1;
+    if (uploadContext.preference === "r16f" && format === "r32f") {
+      uploadContext.performance.rangeFallbacks += 1;
+    }
     return true;
   };
 
@@ -1923,12 +1991,15 @@ export function createContactTileGpuRenderer(
     if (!activeScene.sourceLayout && activeScene.visibleLayerComplete !== true) {
       return "failed";
     }
+    const requiredFormat = virtualTextureFormatForScene(activeScene);
+    const currentFormatIsCompatible = virtualTextureState?.format === requiredFormat
+      || (virtualTextureState?.format === "r32f" && requiredFormat === "r16f");
     if (
       !virtualTextureState
       || virtualTextureState.tileSizeBins !== activeScene.tileSizeBins
-      || virtualTextureState.format !== uploadContext.preference
+      || !currentFormatIsCompatible
     ) {
-      if (!rebuildVirtualTextureState(activeScene)) {
+      if (!rebuildVirtualTextureState(activeScene, requiredFormat)) {
         return "failed";
       }
     }

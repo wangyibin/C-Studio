@@ -50,6 +50,7 @@ import type { SyntenyView } from "../state/syntenyView";
 import {
   contactNormalizationForBackend,
   contactNormalizationLabel,
+  type ContactResolution,
   type UiAction,
   type UiState,
 } from "../state/uiState";
@@ -130,6 +131,7 @@ interface AppShellProps {
   onContactPanGestureStart?: () => void;
   onContactPanTilePrefetch?: (preview: ContactPanPreview) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
+  onContactResolutionPreview?: (resolution: ContactResolution | null) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
   onContactTileLayerPaintComplete?: (event: ContactTileRenderMilestone) => void;
@@ -227,6 +229,7 @@ export function AppShell({
   onContactPanGestureStart,
   onContactPanTilePrefetch,
   onContactViewportPreview,
+  onContactResolutionPreview,
   contactPanPrefetchBridge,
   onUiAction,
   status,
@@ -1211,6 +1214,7 @@ export function AppShell({
           totalSpanMb={totalSpanMb}
           useStoredResolutionOptions={contactIsMcool}
           availableResolutionBasePairs={contactAvailableResolutions}
+          onContactResolutionPreview={onContactResolutionPreview}
         />
       </header>
 

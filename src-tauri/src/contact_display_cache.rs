@@ -3,7 +3,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::SystemTime,
 };
 
@@ -21,8 +24,8 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayCacheValues {
-    Float32(Vec<f32>),
-    R16f(Vec<u16>),
+    Float32(Arc<[f32]>),
+    R16f(Arc<[u16]>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,14 +53,14 @@ impl DisplayCacheTile {
 
     pub fn r16f_values(&self) -> Option<&[u16]> {
         match &self.values {
-            DisplayCacheValues::R16f(values) => Some(values),
+            DisplayCacheValues::R16f(values) => Some(values.as_ref()),
             DisplayCacheValues::Float32(_) => None,
         }
     }
 
     pub fn float32_values(&self) -> Cow<'_, [f32]> {
         match &self.values {
-            DisplayCacheValues::Float32(values) => Cow::Borrowed(values),
+            DisplayCacheValues::Float32(values) => Cow::Borrowed(values.as_ref()),
             DisplayCacheValues::R16f(values) => Cow::Owned(
                 values
                     .iter()
@@ -76,6 +79,17 @@ impl DisplayCacheTile {
                 .iter()
                 .filter(|value| **value != R16F_EMPTY_SENTINEL)
                 .count(),
+        }
+    }
+
+    pub fn decoded_bytes(&self) -> usize {
+        match &self.values {
+            DisplayCacheValues::Float32(values) => {
+                values.len().saturating_mul(std::mem::size_of::<f32>())
+            }
+            DisplayCacheValues::R16f(values) => {
+                values.len().saturating_mul(std::mem::size_of::<u16>())
+            }
         }
     }
 }
@@ -190,7 +204,7 @@ pub fn load(root: &Path, key: &[u8]) -> io::Result<Option<DisplayCacheTile>> {
                 "display cache contains non-finite R16F values",
             ));
         }
-        DisplayCacheValues::R16f(values)
+        DisplayCacheValues::R16f(values.into())
     } else {
         let values = raw
             .chunks_exact(std::mem::size_of::<f32>())
@@ -199,7 +213,7 @@ pub fn load(root: &Path, key: &[u8]) -> io::Result<Option<DisplayCacheTile>> {
         if values.iter().any(|value| !value.is_finite()) {
             return Err(invalid_data("display cache contains non-finite values"));
         }
-        DisplayCacheValues::Float32(values)
+        DisplayCacheValues::Float32(values.into())
     };
     Ok(Some(DisplayCacheTile {
         tile_size_bins,
@@ -417,28 +431,61 @@ fn encoded_tile_values(
     tile: &DisplayCacheTile,
     preferred_format: DisplayCacheStorageFormat,
 ) -> (u16, Vec<u8>) {
-    if preferred_format == DisplayCacheStorageFormat::R16f {
-        let r16f = match &tile.values {
-            DisplayCacheValues::R16f(values) => Some(values.clone()),
-            DisplayCacheValues::Float32(values) => {
-                values.iter().copied().map(f32_to_r16f_bits).collect()
-            }
-        };
-        if let Some(values) = r16f {
+    let stored = tile_for_storage_format(tile, preferred_format);
+    match &stored.values {
+        DisplayCacheValues::R16f(values) => {
             let mut raw = Vec::with_capacity(values.len() * std::mem::size_of::<u16>());
-            for value in values {
+            for value in values.iter() {
                 raw.extend_from_slice(&value.to_le_bytes());
             }
-            return (FLAGS_ZLIB_R16F, raw);
+            (FLAGS_ZLIB_R16F, raw)
+        }
+        DisplayCacheValues::Float32(values) => {
+            let mut raw = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+            for value in values.iter() {
+                raw.extend_from_slice(&value.to_le_bytes());
+            }
+            (FLAGS_ZLIB_FLOAT32, raw)
         }
     }
+}
 
-    let values = tile.float32_values();
-    let mut raw = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
-    for value in values.iter() {
-        raw.extend_from_slice(&value.to_le_bytes());
+pub fn tile_for_storage_format(
+    tile: &DisplayCacheTile,
+    preferred_format: DisplayCacheStorageFormat,
+) -> DisplayCacheTile {
+    let values = match (&tile.values, preferred_format) {
+        (DisplayCacheValues::R16f(values), DisplayCacheStorageFormat::R16f) => {
+            DisplayCacheValues::R16f(Arc::clone(values))
+        }
+        (DisplayCacheValues::Float32(values), DisplayCacheStorageFormat::R16f) => values
+            .iter()
+            .copied()
+            .map(f32_to_r16f_bits)
+            .collect::<Option<Vec<_>>>()
+            .map_or_else(
+                || DisplayCacheValues::Float32(Arc::clone(values)),
+                |values| DisplayCacheValues::R16f(values.into()),
+            ),
+        (DisplayCacheValues::Float32(values), DisplayCacheStorageFormat::Float32) => {
+            DisplayCacheValues::Float32(Arc::clone(values))
+        }
+        (DisplayCacheValues::R16f(values), DisplayCacheStorageFormat::Float32) => {
+            DisplayCacheValues::Float32(
+                values
+                    .iter()
+                    .map(|value| r16f_bits_to_f32(*value))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+    };
+    DisplayCacheTile {
+        tile_size_bins: tile.tile_size_bins,
+        tile_x: tile.tile_x,
+        tile_y: tile.tile_y,
+        values,
     }
-    (FLAGS_ZLIB_FLOAT32, raw)
 }
 
 pub fn f32_to_r16f_bits(value: f32) -> Option<u16> {
@@ -565,7 +612,7 @@ mod tests {
             tile_size_bins: 4,
             tile_x,
             tile_y: 3,
-            values: DisplayCacheValues::Float32(values),
+            values: DisplayCacheValues::Float32(values.into()),
         }
     }
 
@@ -606,7 +653,7 @@ mod tests {
         let DisplayCacheValues::Float32(values) = &mut overflow.values else {
             unreachable!();
         };
-        values[1] = 70_000.0;
+        Arc::make_mut(values)[1] = 70_000.0;
         store_atomic(&root, overflow_key, &overflow).unwrap();
         assert_eq!(load(&root, overflow_key).unwrap(), Some(overflow));
         fs::remove_dir_all(root).unwrap();
@@ -673,7 +720,7 @@ mod tests {
                     let DisplayCacheValues::Float32(values) = &mut candidate.values else {
                         unreachable!();
                     };
-                    values[1] = writer as f32;
+                    Arc::make_mut(values)[1] = writer as f32;
                     barrier.wait();
                     store_atomic(&root, key, &candidate).unwrap();
                 })

@@ -8,7 +8,7 @@ import {
   Square,
   Unlock,
 } from "lucide-react";
-import type { UiAction, UiState } from "../state/uiState";
+import type { ContactResolution, UiAction, UiState } from "../state/uiState";
 import {
   availableContactResolutions,
   normalizations,
@@ -22,12 +22,14 @@ export interface HeatmapToolbarProps {
   totalSpanMb: number;
   useStoredResolutionOptions?: boolean;
   availableResolutionBasePairs?: number[];
+  onContactResolutionPreview?: (resolution: ContactResolution | null) => void;
 }
 
 export function HeatmapToolbar({
   onUiAction,
   useStoredResolutionOptions = false,
   availableResolutionBasePairs = [],
+  onContactResolutionPreview,
   totalSpanMb,
   uiState,
 }: HeatmapToolbarProps) {
@@ -65,6 +67,10 @@ export function HeatmapToolbar({
   useEffect(() => {
     setDraftResolutionIndex(safeResolutionIndex);
   }, [resolutionSignature, safeResolutionIndex]);
+
+  useEffect(() => () => {
+    onContactResolutionPreview?.(null);
+  }, [onContactResolutionPreview]);
 
   useEffect(() => {
     setDraftMin(String(colorScaleMin));
@@ -158,7 +164,11 @@ export function HeatmapToolbar({
               aria-valuetext={resolutionOptionsReady
                 ? resolutionOptions[draftResolutionIndex] ?? uiState.contact.resolution
                 : "Stored resolutions unavailable"}
-              onChange={(event) => setDraftResolutionIndex(Number(event.target.value))}
+              onChange={(event) => {
+                const nextIndex = Number(event.target.value);
+                setDraftResolutionIndex(nextIndex);
+                onContactResolutionPreview?.(resolutionOptions[nextIndex] ?? null);
+              }}
               onBlur={(event) => commitResolution(Number(event.currentTarget.value))}
               onKeyUp={(event) => commitResolution(Number(event.currentTarget.value))}
               onPointerUp={(event) => commitResolution(Number(event.currentTarget.value))}

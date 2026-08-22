@@ -1,5 +1,6 @@
 mod commands;
 mod contact_display_cache;
+mod contact_display_memory_cache;
 mod contact_lod_cache;
 
 use tauri::Manager;
@@ -18,6 +19,7 @@ pub fn run() {
         })
         .manage(commands::ContactCacheState::default())
         .manage(commands::ContactTileCacheState::default())
+        .manage(commands::ContactDisplayMemoryCacheState::default())
         .manage(commands::ContactTileRequestState::default())
         .manage(commands::ContactLayoutRegistryState::default())
         .manage(commands::SourceContactCacheState::default())
@@ -49,6 +51,8 @@ pub fn run() {
             commands::begin_contact_tile_generation,
             commands::prewarm_contact_normalizations,
             commands::cancel_contact_normalization_prewarm,
+            commands::prewarm_contact_resolution_reader,
+            commands::cancel_contact_resolution_reader_prewarm,
             commands::get_contact_map_tiles_from_cool,
             commands::prefetch_contact_map_tiles_from_cool,
             commands::get_contact_map_tiles_from_cool_binary_v1,

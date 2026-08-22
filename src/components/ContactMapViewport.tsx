@@ -654,6 +654,31 @@ export function shouldRetainPresentedContactViewport(
     || normalizationChanged;
 }
 
+/**
+ * A committed pan may keep showing an imperatively translated front surface
+ * while its authoritative tile generation is painted offscreen. A late paint
+ * from the old viewport must not release that surface merely because its
+ * generation still matches the target that React had before the commit.
+ */
+export function committedPanTargetIsPainted(
+  pendingViewport: ContactViewport | null,
+  target: (Pick<ContactMapView, "renderGeneration" | "viewport">) | null,
+  paintedGeneration: number | undefined,
+): boolean {
+  if (
+    !pendingViewport
+    || !target
+    || paintedGeneration === undefined
+    || target.renderGeneration !== paintedGeneration
+  ) {
+    return false;
+  }
+  return Math.abs(target.viewport.xStart - pendingViewport.xStart) <= 1
+    && Math.abs(target.viewport.xEnd - pendingViewport.xEnd) <= 1
+    && Math.abs(target.viewport.yStart - pendingViewport.yStart) <= 1
+    && Math.abs(target.viewport.yEnd - pendingViewport.yEnd) <= 1;
+}
+
 export interface ContactCoveragePresentationFrame {
   datasetKey: string;
   contactMap: ContactMapView;
@@ -1111,6 +1136,7 @@ export function ContactMapViewport({
   const redrawAnimationFrameRef = useRef<number | null>(null);
   const prepaintedCellContactMapRef = useRef<ContactMapView | null>(null);
   const pendingPanFrameRef = useRef<PendingPanFrame | null>(null);
+  const pendingCommittedPanViewportRef = useRef<ContactViewport | null>(null);
   const [assemblySelectionDrag, setAssemblySelectionDrag] = useState<AssemblySelectionDragState | null>(null);
   const [assemblyPointerState, setAssemblyPointerState] = useState<AssemblyPointerState>({
     kind: "select",
@@ -1142,13 +1168,17 @@ export function ContactMapViewport({
   }, [onContactTileLayerCommit]);
   const reportTileLayerPaintComplete = useCallback((event: ContactTileLayerPaintEvent) => {
     const target = targetContactPresentationFrameRef.current?.contactMap;
-    if (
+    const targetPaintComplete = (
       event.paintRevision !== undefined
       && target?.renderGeneration === event.paintRevision
+    );
+    if (
+      targetPaintComplete
+      && pendingCommittedPanViewportRef.current === null
     ) {
-      // The translated front remains visible while this generation paints in
-      // the hidden slot. Rebase the heatmap and annotations only when that
-      // complete target is being atomically revealed.
+      // With no committed pan in flight, the target can be rebased directly.
+      // A committed pan is instead released by the layout effect after React
+      // has projected the painted frame, avoiding one old-overlay paint.
       resetPanTransform();
     }
     setPaintedContactPresentationFrame((current) => advancePaintedContactPresentationFrame(
@@ -1299,15 +1329,32 @@ export function ContactMapViewport({
   const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
   usePrePaintEffect(() => {
     // The retained front, axes, and annotations stay in the source camera until
-    // the painted presentation frame reaches this target viewport. React has now
-    // projected every layer into target coordinates, so clear the imperative pan
-    // offset once, before the browser can paint either coordinate system alone.
+    // the painted presentation frame reaches this target viewport. Only this
+    // layout phase runs after React has projected every layer into the committed
+    // camera, so clearing the imperative offset here cannot expose old overlays.
+    const pendingCommittedViewport = pendingCommittedPanViewportRef.current;
+    if (pendingCommittedViewport && usesTiledRenderer) {
+      const committedFrameIsPresented = committedPanTargetIsPainted(
+        pendingCommittedViewport,
+        presentationContactMap,
+        presentationContactMap?.renderGeneration,
+      );
+      if (!committedFrameIsPresented) {
+        return;
+      }
+      pendingCommittedPanViewportRef.current = null;
+    }
+    if (!usesTiledRenderer) {
+      pendingCommittedPanViewportRef.current = null;
+    }
     resetPanTransform();
   }, [
     displayViewport.xEnd,
     displayViewport.xStart,
     displayViewport.yEnd,
     displayViewport.yStart,
+    presentationContactMap,
+    usesTiledRenderer,
   ]);
   // Keep the same overscanned boundary population across pointer release.
   // Falling back to the committed viewport only when it leaves the guard
@@ -2006,8 +2053,10 @@ export function ContactMapViewport({
       totalSpanMb,
     );
     if (commitAction) {
+      pendingCommittedPanViewportRef.current = session.previewViewport;
       onUiAction(commitAction);
     } else {
+      pendingCommittedPanViewportRef.current = null;
       resetPanTransform();
     }
     onContactViewportPreview?.(null);
@@ -2123,8 +2172,13 @@ export function ContactMapViewport({
     resetPanPrefetchPrediction();
     setDragState(null);
     if (commitAction) {
+      // React now removes dragState, but the painted presentation frame still
+      // belongs to the source viewport. Keep the exact front-surface camera
+      // until the matching target generation reports paint completion.
+      pendingCommittedPanViewportRef.current = finalViewport;
       onUiAction(commitAction);
     } else {
+      pendingCommittedPanViewportRef.current = null;
       resetPanTransform();
       drawContactMapBuffer(canvasRef.current, liveContactMap, uiState);
     }
