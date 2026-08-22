@@ -17,6 +17,7 @@ import {
   type ContactColorScale,
 } from "../state/contactColorScale";
 import { contactTileCellCount } from "../state/contactTileData";
+import { traceContactPanCamera } from "../state/contactPanCameraTrace";
 import type {
   ContactTileDeltaBatch,
   ContactTileDeltaRenderStream,
@@ -58,6 +59,8 @@ export interface ContactTileLayerProps {
   deltaStream?: ContactTileDeltaRenderStream | null;
   overviewContactMap?: ContactMapView | null;
   viewport?: ContactViewport;
+  /** Exact pointer-up camera retained until the matching pan target is painted. */
+  committedPanViewport?: ContactViewport | null;
   renderStyle: ContactTileRenderStyle;
   /** One cached tile beyond the viewport, only on the active pan axes. */
   overscanDirection?: ContactTileOverscanMode;
@@ -515,13 +518,25 @@ export function contactTileViewportForBufferedSurface(
   frame: ContactTileLayerFrame,
   incomingFrame: ContactTileLayerFrame | null,
   liveViewport?: ContactViewport,
+  committedPanViewport?: ContactViewport | null,
 ): ContactViewport {
+  if (phase === "staging") {
+    return frame.contactMap.viewport;
+  }
+  // The shared GPU front has already moved to this exact camera during the
+  // pointer gesture. Never reconstruct it from the old buffered frame while
+  // the authoritative target is arriving: that creates target -> source ->
+  // target on every pointer-up. Resolution/layout swaps have no committed pan
+  // camera and continue to freeze their old front below.
+  if (committedPanViewport) {
+    return committedPanViewport;
+  }
   const supersededByAtomicSwap = Boolean(
     incomingFrame
     && frame !== incomingFrame
     && requiresAtomicContactTileSwap(frame, incomingFrame),
   );
-  return phase === "staging" || supersededByAtomicSwap
+  return supersededByAtomicSwap
     ? frame.contactMap.viewport
     : liveViewport ?? frame.contactMap.viewport;
 }
@@ -532,6 +547,7 @@ function contactTileBufferedGpuScene(
   frame: ContactTileLayerFrame,
   incomingFrame: ContactTileLayerFrame | null,
   liveViewport: ContactViewport | undefined,
+  committedPanViewport: ContactViewport | null | undefined,
   boundaries: readonly ContactTileGpuBoundary[],
   overview: ContactTileGpuOverview | null,
   overviewContactMap: ContactMapView | null | undefined,
@@ -548,6 +564,7 @@ function contactTileBufferedGpuScene(
     frame,
     incomingFrame,
     liveViewport,
+    committedPanViewport,
   );
   const acceptsOverview = Boolean(
     overviewContactMap
@@ -680,6 +697,7 @@ export function createContactTilePaintCoordinator({
 
 export function ContactTileLayer({
   boundaries = [],
+  committedPanViewport,
   contactMap,
   deltaStream,
   freezePresentedStyle = false,
@@ -790,12 +808,13 @@ export function ContactTileLayer({
       resolution: map.resolution,
       tileSizeBins,
       visibleLayerComplete: map.visibleLayerComplete === true,
-      viewport: viewport ?? map.viewport,
+      viewport: committedPanViewport ?? viewport ?? map.viewport,
       renderStyle: incomingFrame.renderStyle,
       sourceLayout: contactTileGpuSourceLayout(map),
     };
   }, [
     boundaries,
+    committedPanViewport,
     incomingFrame,
     overview,
     overviewContactMap,
@@ -806,14 +825,28 @@ export function ContactTileLayer({
   usePrePaintEffect(() => {
     const current = bufferRef.current;
     const front = current.frontSlot === null ? null : current.slots[current.frontSlot];
-    const promoteViewportInPlace = Boolean(
+    const promotionEligible = Boolean(
       front
       && incomingFrame
       && incomingGpuScene
       && !freezePresentedStyle
-      && canPromoteContactTilePanInPlace(front, incomingFrame)
+      && canPromoteContactTilePanInPlace(front, incomingFrame),
+    );
+    const promoteViewportInPlace = Boolean(
+      promotionEligible
+      && incomingGpuScene
       && panRendererRef?.current?.promoteScene(incomingGpuScene),
     );
+    if (incomingGpuScene) {
+      traceContactPanCamera("layer_promotion_result", {
+        viewport: incomingGpuScene.viewport,
+        generation: incomingGpuScene.generation,
+        promotionEligible,
+        promoted: promoteViewportInPlace,
+        frontViewport: front?.contactMap.viewport,
+        frontGeneration: front?.contactMap.renderGeneration,
+      });
+    }
     setBuffer((current) => syncContactTileLayerBuffer(
       current,
       incomingFrame,
@@ -940,6 +973,7 @@ export function ContactTileLayer({
       frame,
       incomingFrame,
       viewport,
+      committedPanViewport,
       boundaries,
       overview,
       overviewContactMap,
@@ -948,6 +982,7 @@ export function ContactTileLayer({
   }), [
     boundaries,
     buffer,
+    committedPanViewport,
     incomingFrame,
     overview,
     overviewContactMap,
@@ -1282,6 +1317,12 @@ function ContactTileSharedGpuCanvas({
       paintRevision: candidate.paintRevision,
       commitTimestamp: frontendPerformanceTimestamp(),
     };
+    traceContactPanCamera("layer_scene_candidate", {
+      mode: staging ? "staging" : "front",
+      viewport: candidate.scene.viewport,
+      generation: candidate.scene.generation,
+      slot: candidate.slot,
+    });
     onSlotCommitRef.current(candidate.slot, event);
     let active = true;
     const onPresented = (painted: boolean) => {
@@ -1293,6 +1334,12 @@ function ContactTileSharedGpuCanvas({
         return;
       }
       presentedRef.current = candidate;
+      traceContactPanCamera("layer_scene_presented", {
+        mode: staging ? "staging" : "front",
+        viewport: candidate.scene.viewport,
+        generation: candidate.scene.generation,
+        slot: candidate.slot,
+      });
       onSlotPaintCompleteRef.current(candidate.slot, event);
     };
     const painted = staging

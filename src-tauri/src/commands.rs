@@ -2099,7 +2099,10 @@ fn push_lod_key_bytes(key: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
 const DISPLAY_CACHE_COPY_SEMANTICS_VERSION: &[u8] = b"copy-share-interval-v1";
 const DISPLAY_CACHE_MAX_DATASET_ENTRIES: usize = 100_000;
 const DISPLAY_CACHE_MAX_GLOBAL_ENTRIES: usize = 500_000;
-const DEFAULT_DISPLAY_MEMORY_CACHE_MIB: usize = 64;
+// Keep enough decoded 256x256 R16F tiles for roughly one thousand recent
+// tiles. This is the fast return path after the frontend/GPU history ages
+// out; the environment override remains capped for predictable process memory.
+const DEFAULT_DISPLAY_MEMORY_CACHE_MIB: usize = 128;
 const MAX_DISPLAY_MEMORY_CACHE_MIB: usize = 512;
 
 #[derive(Debug, Clone)]
@@ -2472,6 +2475,32 @@ pub fn log_contact_frontend_performance(line: String) {
     if contact_tile_perf_logging_enabled() && line.len() <= 2_048 && accepted_event {
         emit_contact_tile_perf_line(&line);
     }
+}
+
+#[tauri::command]
+pub fn log_contact_pan_camera_trace(lines: Vec<String>) {
+    #[cfg(debug_assertions)]
+    {
+        static TRACE_INITIALIZED: OnceLock<()> = OnceLock::new();
+        let first_batch = TRACE_INITIALIZED.set(()).is_ok();
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true);
+        if first_batch {
+            options.truncate(true);
+        } else {
+            options.append(true);
+        }
+        let Ok(mut file) = options.open("/private/tmp/cstudio-pan-camera.log") else {
+            return;
+        };
+        for line in lines.into_iter().take(2_000) {
+            if line.len() <= 4_096 && line.starts_with("CSTUDIO_CAMERA ") {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = lines;
 }
 
 #[tauri::command]

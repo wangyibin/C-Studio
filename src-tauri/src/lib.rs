@@ -47,6 +47,7 @@ pub fn run() {
             commands::log_contact_tile_frontend_ipc,
             commands::log_contact_pan_frontend_performance,
             commands::log_contact_frontend_performance,
+            commands::log_contact_pan_camera_trace,
             commands::log_gfa_frontend_performance,
             commands::begin_contact_tile_generation,
             commands::prewarm_contact_normalizations,

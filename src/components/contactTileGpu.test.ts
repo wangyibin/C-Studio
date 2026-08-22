@@ -596,6 +596,53 @@ describe("contactTileFloatTextureData", () => {
     legacyRenderer?.destroy();
   });
 
+  it("keeps the pointer-owned camera across declarative scene updates until release", () => {
+    const { canvas, drawArrays } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const sourceViewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
+    const targetViewport = { xStart: 100, xEnd: 3_900, yStart: 100, yEnd: 3_900 };
+    const scene = {
+      descriptors: [{
+        key: "0:0:source",
+        tile: {
+          tileX: 0,
+          tileY: 0,
+          cells: [{ xBin: 0, yBin: 0, count: 9 }],
+        },
+        transpose: false,
+      }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: sourceViewport,
+      renderStyle: {
+        colormap: "Reds" as const,
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    };
+
+    expect(renderer?.setScene(scene)).toBe(true);
+    renderer?.retainPanViewport(targetViewport);
+    const drawsAtPointerUp = drawArrays.mock.calls.length;
+
+    // React may still publish the old buffered scene while the target data is
+    // catching up. The renderer must treat that as data-only and retain the
+    // exact pointer camera without another draw back to the source.
+    expect(renderer?.setScene({ ...scene, viewport: sourceViewport })).toBe(true);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsAtPointerUp);
+    renderer?.releasePanViewport(targetViewport);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsAtPointerUp);
+
+    // Once released, a genuine declarative camera change is accepted again.
+    expect(renderer?.setScene({ ...scene, viewport: sourceViewport })).toBe(true);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsAtPointerUp + 1);
+    renderer?.destroy();
+  });
+
   it("stages a replacement through a second FBO without creating another context or atlas", () => {
     const {
       canvas,
@@ -1603,6 +1650,7 @@ describe("contactTileFloatTextureData", () => {
     expect(renderer?.promoteScene(targetScene)).toBe(true);
     expect(renderer?.performanceSnapshot()).toMatchObject({
       fullUploads: uploadsBeforePromotion,
+      framebufferSwaps: 1,
       scenePromotions: 1,
       scenePromotionMisses: 0,
     });
@@ -1610,6 +1658,13 @@ describe("contactTileFloatTextureData", () => {
     // neither allocated nor uploaded again.
     expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePromotion + 1);
     expect(texSubImage3D).toHaveBeenCalledTimes(atlasUploadsBeforePromotion);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
+
+    // Clearing the retained pan transform rebases to this same authoritative
+    // viewport. It must not submit a second draw/blit after promotion.
+    const drawsBeforeRebase = drawArrays.mock.calls.length;
+    renderer?.setPanViewport(targetScene.viewport);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforeRebase);
     expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
 
     // React publishes the promoted frame after the imperative commit. The

@@ -38,6 +38,7 @@ import {
 } from "../state/assemblyEditing";
 import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
 import { contactColorLut } from "../state/contactColor";
+import { traceContactPanCamera } from "../state/contactPanCameraTrace";
 import type { ContactPanPreview } from "../state/contactPanPerformance";
 import type {
   ContactPanPrefetchBatch,
@@ -1172,6 +1173,13 @@ export function ContactMapViewport({
       event.paintRevision !== undefined
       && target?.renderGeneration === event.paintRevision
     );
+    traceContactPanCamera("viewport_paint_complete", {
+      paintRevision: event.paintRevision,
+      targetGeneration: target?.renderGeneration,
+      targetViewport: target?.viewport,
+      pendingCommittedViewport: pendingCommittedPanViewportRef.current,
+      targetPaintComplete,
+    });
     if (
       targetPaintComplete
       && pendingCommittedPanViewportRef.current === null
@@ -1333,18 +1341,25 @@ export function ContactMapViewport({
     // layout phase runs after React has projected every layer into the committed
     // camera, so clearing the imperative offset here cannot expose old overlays.
     const pendingCommittedViewport = pendingCommittedPanViewportRef.current;
-    if (pendingCommittedViewport && usesTiledRenderer) {
+    if (pendingCommittedViewport) {
       const committedFrameIsPresented = committedPanTargetIsPainted(
         pendingCommittedViewport,
         presentationContactMap,
         presentationContactMap?.renderGeneration,
       );
       if (!committedFrameIsPresented) {
+        traceContactPanCamera("viewport_handoff_wait", {
+          pendingCommittedViewport,
+          presentedViewport: presentationContactMap?.viewport,
+          generation: presentationContactMap?.renderGeneration,
+        });
         return;
       }
-      pendingCommittedPanViewportRef.current = null;
-    }
-    if (!usesTiledRenderer) {
+      traceContactPanCamera("viewport_handoff_ready", {
+        pendingCommittedViewport,
+        presentedViewport: presentationContactMap?.viewport,
+        generation: presentationContactMap?.renderGeneration,
+      });
       pendingCommittedPanViewportRef.current = null;
     }
     resetPanTransform();
@@ -1991,7 +2006,12 @@ export function ContactMapViewport({
       resizeContactMapCanvas(canvas, frame);
     }
     drawContactMapBuffer(canvas, displayContactMap, uiState);
-    resetPanTransform();
+    // A new Canvas2D target can commit hundreds of milliseconds before it is
+    // actually painted. Keep the shifted front surface until the common
+    // presentation handoff above observes that exact viewport.
+    if (pendingCommittedPanViewportRef.current === null) {
+      resetPanTransform();
+    }
     prepaintedCellContactMapRef.current = displayContactMap;
   }, [displayContactMap?.renderGeneration, usesTiledRenderer]);
 
@@ -2006,7 +2026,9 @@ export function ContactMapViewport({
     redrawAnimationFrameRef.current = window.requestAnimationFrame(() => {
       redrawAnimationFrameRef.current = null;
       drawContactMapBuffer(canvasRef.current, displayContactMap, uiState);
-      resetPanTransform();
+      if (pendingCommittedPanViewportRef.current === null) {
+        resetPanTransform();
+      }
     });
     return () => {
       if (redrawAnimationFrameRef.current !== null) {
@@ -2052,6 +2074,12 @@ export function ContactMapViewport({
       session.previewViewport,
       totalSpanMb,
     );
+    traceContactPanCamera("wheel_commit", {
+      startViewport: session.startViewport,
+      finalViewport: session.previewViewport,
+      liveViewport: session.sourceContactMap.viewport,
+      hasCommitAction: Boolean(commitAction),
+    }, true);
     if (commitAction) {
       pendingCommittedPanViewportRef.current = session.previewViewport;
       onUiAction(commitAction);
@@ -2159,6 +2187,12 @@ export function ContactMapViewport({
       finalViewport,
       totalSpanMb,
     );
+    traceContactPanCamera("pointer_up_commit", {
+      startViewport: currentDragState.startViewport,
+      finalViewport,
+      liveViewport: liveContactMap.viewport,
+      hasCommitAction: Boolean(commitAction),
+    }, true);
     cancelScheduledPanFrame();
     applyPanTransform(
       liveContactMap,
@@ -2170,15 +2204,17 @@ export function ContactMapViewport({
     panLoadingSuspendedRef.current = false;
     panTilePrefetchSignatureRef.current = null;
     resetPanPrefetchPrediction();
+    // Publish the retained camera before any React update can remove the drag
+    // state. This keeps child layout effects from ever reconstructing the old
+    // buffered camera during pointer-up.
+    pendingCommittedPanViewportRef.current = commitAction ? finalViewport : null;
     setDragState(null);
     if (commitAction) {
       // React now removes dragState, but the painted presentation frame still
       // belongs to the source viewport. Keep the exact front-surface camera
       // until the matching target generation reports paint completion.
-      pendingCommittedPanViewportRef.current = finalViewport;
       onUiAction(commitAction);
     } else {
-      pendingCommittedPanViewportRef.current = null;
       resetPanTransform();
       drawContactMapBuffer(canvasRef.current, liveContactMap, uiState);
     }
@@ -2280,6 +2316,13 @@ export function ContactMapViewport({
     const offsetX = rawOffsetX;
     const offsetY = rawOffsetY;
     const transform = `translate(${offsetX}px, ${offsetY}px)`;
+    traceContactPanCamera("pointer_camera_apply", {
+      sourceViewport: sourceContactMap.viewport,
+      previewViewport: previewContactMap.viewport,
+      offsetX,
+      offsetY,
+      gpu: Boolean(contactTilePanRendererRef.current),
+    });
 
     if (canvasRef.current) {
       canvasRef.current.style.transform = transform;
@@ -2287,7 +2330,7 @@ export function ContactMapViewport({
     if (contactTileTransformRef.current) {
       if (contactTilePanRendererRef.current) {
         contactTileTransformRef.current.style.transform = "";
-        contactTilePanRendererRef.current.setPanViewport(previewContactMap.viewport);
+        contactTilePanRendererRef.current.retainPanViewport(previewContactMap.viewport);
       } else {
         contactTileTransformRef.current.style.transform = transform;
       }
@@ -2344,8 +2387,13 @@ export function ContactMapViewport({
       contactTileTransformRef.current.style.transform = "";
     }
     const authoritativeViewport = latestContactMapRef.current?.viewport;
+    traceContactPanCamera("viewport_transform_reset", {
+      authoritativeViewport,
+      pendingCommittedViewport: pendingCommittedPanViewportRef.current,
+      gpu: Boolean(contactTilePanRendererRef.current),
+    });
     if (authoritativeViewport) {
-      contactTilePanRendererRef.current?.setPanViewport(authoritativeViewport);
+      contactTilePanRendererRef.current?.releasePanViewport(authoritativeViewport);
     }
     resetPanAnnotationTransform();
   }
@@ -2874,6 +2922,7 @@ export function ContactMapViewport({
             {usesTiledRenderer || contactTileDeltaStream ? (
               <ContactTileLayer
                 boundaries={gpuAssemblyBoundaries}
+                committedPanViewport={pendingCommittedPanViewportRef.current}
                 contactMap={usesTiledRenderer ? contactMap : null}
                 deltaStream={contactTileDeltaStream}
                 overviewContactMap={compatibleOverviewContactMap}

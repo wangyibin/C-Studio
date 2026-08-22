@@ -18,7 +18,10 @@ import {
   decodeContactTileBinaryV1,
   type PackedContactTileCells,
 } from "./state/contactTileBinary";
-import { contactTileCellCount } from "./state/contactTileData";
+import {
+  contactTileCellCount,
+  contactTileRetainedValueBytes,
+} from "./state/contactTileData";
 import {
   ContactTileDeltaAccumulator,
   mergeCompleteContactTilesIntoDeltaAccumulator,
@@ -69,8 +72,11 @@ import {
   contactTileViewportRequestKey,
 } from "./state/contactTiles";
 import {
+  contactTileViewportHistoryKeys,
   contactTileRenderCache,
   ContactTileResolutionLru,
+  retainContactTileViewportFootprint,
+  type ContactTileViewportResidencyHistory,
 } from "./state/contactTileLru";
 import {
   contactLayoutRegistrationBlocks,
@@ -1041,6 +1047,8 @@ export function App() {
   }
   const contactTileCacheLru = contactTileCacheLruRef.current;
   const contactTileCacheRef = useRef<Map<string, ContactMapTile>>(contactTileCacheLru.toMap());
+  const contactTileViewportResidencyHistoryRef = useRef<ContactTileViewportResidencyHistory>([]);
+  const contactTileViewportResidencyScopeRef = useRef<string | null>(null);
   const contactMainLodTileCacheLruRef = useRef<
     ContactTileResolutionLru<ContactMapTile> | null
   >(null);
@@ -1623,13 +1631,27 @@ export function App() {
       cachedTiles: cachedTiles.length,
       missingTiles: missingTiles.length,
     }));
-    const protectedKeys = new Set(plan.tiles.map(cacheKeyForTile));
+    const plannedKeys = plan.tiles.map(cacheKeyForTile);
+    const visiblePlanKeys = new Set(plan.visibleTiles.map(cacheKeyForTile));
+    const recencyKeys = [
+      ...plannedKeys.filter((key) => !visiblePlanKeys.has(key)),
+      ...visiblePlanKeys,
+    ];
+    const protectedKeys = new Set([
+      ...plannedKeys,
+      ...(plan.usesMainLod || contactTileViewportResidencyScopeRef.current !== tileScope
+        ? []
+        : contactTileViewportHistoryKeys(contactTileViewportResidencyHistoryRef.current)),
+    ]);
     contactPanPrefetchProtectedKeysRef.current = {
       generation: generationStart.generation,
       keys: protectedKeys,
     };
     if (cachedTiles.length > 0) {
-      tileCacheLru.touch(layerScope, protectedKeys, {
+      // Backtrack footprints are protected eviction candidates, not active
+      // camera samples. Touching them after the current plan made old viewports
+      // newer than the center-visible target under byte pressure.
+      tileCacheLru.touch(layerScope, recencyKeys, {
         keys: protectedKeys,
         scopes: new Set([layerScope.id]),
       });
@@ -1755,6 +1777,7 @@ export function App() {
                 key: cacheKeyForTile(tile),
                 value: tile,
                 cellCount: contactTileCellCount(tile),
+                valueBytes: contactTileRetainedValueBytes(tile),
               })),
               {
                 recency: priority === "visible" ? "foreground" : "background",
@@ -1842,6 +1865,8 @@ export function App() {
     contactPanPrefetchProtectedKeysRef.current = null;
     contactTileCacheLru.clear();
     contactTileCacheRef.current = emptyTileCache;
+    contactTileViewportResidencyHistoryRef.current = [];
+    contactTileViewportResidencyScopeRef.current = null;
     contactTileFlightsRef.current.clear();
     contactMainLodTileCacheLru.clear();
     contactMainLodTileCacheRef.current = new Map();
@@ -2362,6 +2387,10 @@ export function App() {
       normalization,
       viewAssemblyLayout.projectionBlocks,
     );
+    if (contactTileViewportResidencyScopeRef.current !== tileScope) {
+      contactTileViewportResidencyScopeRef.current = tileScope;
+      contactTileViewportResidencyHistoryRef.current = [];
+    }
     const activeLayerScope = {
       id: contactTileDataScope(
         contactCoolPath,
@@ -2378,6 +2407,12 @@ export function App() {
       normalization,
       viewAssemblyLayout.projectionBlocks,
     );
+    const retainCompletedViewport = (visibleTiles: readonly ContactMapTileKey[]) => {
+      contactTileViewportResidencyHistoryRef.current = retainContactTileViewportFootprint(
+        contactTileViewportResidencyHistoryRef.current,
+        visibleTiles.map(cacheKeyForTile),
+      );
+    };
     const untouchTileWorld = buildContactTileWorld({
       viewport,
       prefetchViewport,
@@ -2394,11 +2429,14 @@ export function App() {
     const warmCacheKeys = untouchTileWorld.prefetchTiles
       .map(cacheKeyForTile)
       .filter((key) => !visibleCacheKeys.has(key));
+    const backtrackProtectedKeys = contactTileViewportHistoryKeys(
+      contactTileViewportResidencyHistoryRef.current,
+    );
     contactTileCacheLru.touch(
       activeLayerScope,
       [...warmCacheKeys, ...visibleCacheKeys],
       {
-        keys: visibleCacheKeys,
+        keys: new Set([...visibleCacheKeys, ...backtrackProtectedKeys]),
         scopes: new Set([activeLayerScope.id]),
       },
     );
@@ -2729,6 +2767,7 @@ export function App() {
               key: mainLodCacheKeyForTile(tile),
               value: tile,
               cellCount: contactTileCellCount(tile),
+              valueBytes: contactTileRetainedValueBytes(tile),
             })),
             {
               recency: kind === "visible" ? "foreground" : "background",
@@ -3015,7 +3054,10 @@ export function App() {
       }
     }
     const foregroundProtectedKeys = new Set(
-      tileWorld.prefetchTiles.map(cacheKeyForTile),
+      [
+        ...tileWorld.prefetchTiles.map(cacheKeyForTile),
+        ...backtrackProtectedKeys,
+      ],
     );
     // The LRU budgets remain strict, but the layer currently being assembled
     // must remain complete even if its visible working set alone exceeds one
@@ -3366,6 +3408,7 @@ export function App() {
                     key: job.cacheKeyForTile(tile),
                     value: tile,
                     cellCount: contactTileCellCount(tile),
+                    valueBytes: contactTileRetainedValueBytes(tile),
                   })),
                   {
                     recency: "background",
@@ -3407,6 +3450,7 @@ export function App() {
       });
     };
     if (!panPreviewActive && tileWorld.missingVisibleTiles.length === 0) {
+      retainCompletedViewport(tileWorld.visibleTiles);
       // Resolve the final target style before publishing the complete layer.
       // React batches this reducer update with the map update, so the hidden
       // surface is never prepared once with a provisional color scale.
@@ -3464,6 +3508,7 @@ export function App() {
             key: cacheKeyForTile(tile),
             value: tile,
             cellCount: contactTileCellCount(tile),
+            valueBytes: contactTileRetainedValueBytes(tile),
           })),
           {
             keys: foregroundProtectedKeys,
@@ -3496,6 +3541,7 @@ export function App() {
           updatedTileWorld.missingVisibleTiles.length === 0,
         );
         if (!panPreviewActive && updatedTileWorld.missingVisibleTiles.length === 0) {
+          retainCompletedViewport(updatedTileWorld.visibleTiles);
           lastCompleteContactMapRef.current = updatedContactMap;
         }
         if (!panPreviewActive && shouldPublishContactMapLayer(
@@ -4955,6 +5001,8 @@ export function App() {
 
     contactTileCacheLru.clear();
     contactTileCacheRef.current = new Map();
+    contactTileViewportResidencyHistoryRef.current = [];
+    contactTileViewportResidencyScopeRef.current = null;
     contactTileFlightsRef.current.clear();
     contactMainLodTileCacheLru.clear();
     contactMainLodTileCacheRef.current = new Map();

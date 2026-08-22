@@ -54,6 +54,28 @@ export function contactTileCellCount(tile: ContactTileData): number {
   return packed?.counts.length ?? tile.cells.length;
 }
 
+/**
+ * Estimate the retained payload rather than using occupied pixels as a memory
+ * proxy. Dense R16F tiles always own their complete typed array even when only
+ * a few pixels are occupied; packed arrays and legacy object cells use their
+ * respective storage shapes.
+ */
+export function contactTileRetainedValueBytes(tile: ContactTileData): number {
+  const dense = validatedDenseContactTileValues(tile);
+  if (dense) {
+    return dense.values.byteLength;
+  }
+  const packed = validatedPackedContactTileCells(tile);
+  if (packed) {
+    return packed.xLocal.byteLength
+      + packed.yLocal.byteLength
+      + packed.counts.byteLength;
+  }
+  // Three numbers plus normal JS object/array references. This is deliberately
+  // conservative because legacy cells do not have a directly measurable byteLength.
+  return tile.cells.length * 48;
+}
+
 /** Iterate global bin coordinates without allocating one object per packed cell. */
 export function forEachContactTileCell(
   tile: ContactTileData,

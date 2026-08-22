@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  contactTileViewportHistoryKeys,
   contactTileRenderCache,
   ContactTileResolutionLru,
   defaultContactTileLruLimits,
+  retainContactTileViewportFootprint,
   type ContactTileLruEntry,
 } from "./contactTileLru";
 
@@ -14,8 +16,9 @@ function tile(
   key: string,
   cellCount = 1,
   label = key,
+  valueBytes = cellCount,
 ): ContactTileLruEntry<TestTile> {
-  return { key, cellCount, value: { label } };
+  return { key, cellCount, value: { label }, valueBytes };
 }
 
 function scope(id: string, resolution: number) {
@@ -23,11 +26,12 @@ function scope(id: string, resolution: number) {
 }
 
 describe("ContactTileResolutionLru", () => {
-  it("preserves the existing frontend budgets and three resolution scopes by default", () => {
+  it("uses a byte-bounded backtrack budget across three resolution scopes", () => {
     expect(defaultContactTileLruLimits).toEqual({
       maxScopes: 3,
-      maxTiles: 96,
-      maxCells: 750_000,
+      maxTiles: 192,
+      maxCells: 12_000_000,
+      maxBytes: 32 * 1024 * 1024,
     });
     expect(new ContactTileResolutionLru<TestTile>().limits).toEqual(
       defaultContactTileLruLimits,
@@ -55,7 +59,7 @@ describe("ContactTileResolutionLru", () => {
     cache.merge(scope("ice|layout-a", 25_000), [tile("ice-key")]);
     cache.merge(scope("raw|layout-b", 25_000), [tile("edited-key")]);
 
-    expect(cache.stats().scopes).toEqual([
+    expect(cache.stats().scopes).toMatchObject([
       { id: "raw|layout-a", resolution: 25_000, tileCount: 1, cellCount: 1 },
       { id: "ice|layout-a", resolution: 25_000, tileCount: 1, cellCount: 1 },
       { id: "raw|layout-b", resolution: 25_000, tileCount: 1, cellCount: 1 },
@@ -71,7 +75,7 @@ describe("ContactTileResolutionLru", () => {
 
     expect(cache.size).toBe(1);
     expect(cache.cellCount).toBe(7);
-    expect(cache.stats().scopes).toEqual([
+    expect(cache.stats().scopes).toMatchObject([
       { id: "layout-b", resolution: 25_000, tileCount: 1, cellCount: 7 },
     ]);
     expect(cache.peek(opaqueKey)).toEqual({ label: opaqueKey });
@@ -105,6 +109,24 @@ describe("ContactTileResolutionLru", () => {
       ["a", "cell-limit"],
     ]);
     expect(cellLimited.cellCount).toBe(5);
+  });
+
+  it("evicts by retained bytes independently of occupied cell count", () => {
+    const cache = new ContactTileResolutionLru<TestTile>({
+      maxTiles: 10,
+      maxCells: 100,
+      maxBytes: 400,
+    });
+    const result = cache.merge(scope("scope", 10_000), [
+      tile("a", 1, "a", 100),
+      tile("b", 1, "b", 100),
+    ]);
+
+    expect(result.evicted.map(({ key, reason }) => [key, reason])).toEqual([
+      ["a", "byte-limit"],
+    ]);
+    expect(cache.residentBytes).toBeLessThanOrEqual(400);
+    expect(cache.has("b")).toBe(true);
   });
 
   it("keeps an over-budget visible assembly complete outside the strict LRU", () => {
@@ -250,7 +272,12 @@ describe("ContactTileResolutionLru", () => {
 
     expect(cache.has("a")).toBe(true);
     cache.clear();
-    expect(cache.stats()).toEqual({ tileCount: 0, cellCount: 0, scopes: [] });
+    expect(cache.stats()).toEqual({
+      tileCount: 0,
+      cellCount: 0,
+      residentBytes: 0,
+      scopes: [],
+    });
   });
 
   it("rejects ambiguous scope metadata before mutating the cache", () => {
@@ -261,5 +288,46 @@ describe("ContactTileResolutionLru", () => {
       cache.merge(scope("same-scope", 25_000), [tile("b")]);
     }).toThrow(/changed resolution/);
     expect([...cache.toMap().keys()]).toEqual(["a"]);
+  });
+});
+
+describe("completed viewport residency history", () => {
+  it("keeps the newest two distinct footprints and promotes a revisited one", () => {
+    let history = retainContactTileViewportFootprint([], ["a", "b"]);
+    history = retainContactTileViewportFootprint(history, ["c", "d"]);
+    history = retainContactTileViewportFootprint(history, ["e", "f"]);
+    expect([...contactTileViewportHistoryKeys(history)].sort()).toEqual(["c", "d", "e", "f"]);
+
+    history = retainContactTileViewportFootprint(history, ["c", "d"]);
+    expect(history.map((footprint) => [...footprint])).toEqual([
+      ["e", "f"],
+      ["c", "d"],
+    ]);
+  });
+
+  it("does not record an incomplete empty footprint", () => {
+    const history = retainContactTileViewportFootprint([], ["visible"]);
+    expect(retainContactTileViewportFootprint(history, [])).toBe(history);
+  });
+
+  it("evicts unrelated prefetch before either recent viewport footprint", () => {
+    const cache = new ContactTileResolutionLru<TestTile>({
+      maxTiles: 4,
+      maxCells: 100,
+      maxBytes: 10_000,
+    });
+    const activeScope = scope("current", 10_000);
+    let history = retainContactTileViewportFootprint([], ["a-1", "a-2"]);
+    cache.merge(activeScope, [tile("a-1"), tile("a-2")]);
+    cache.merge(activeScope, [tile("prefetch-1"), tile("prefetch-2")], {
+      recency: "background",
+    });
+
+    history = retainContactTileViewportFootprint(history, ["b-1", "b-2"]);
+    cache.merge(activeScope, [tile("b-1"), tile("b-2")], {
+      keys: contactTileViewportHistoryKeys(history),
+    });
+
+    expect([...cache.toMap().keys()].sort()).toEqual(["a-1", "a-2", "b-1", "b-2"]);
   });
 });

@@ -241,6 +241,33 @@ describe("contact tile presentation buffer", () => {
     )).toBe(coarse.contactMap.viewport);
   });
 
+  it("never restores the source GPU camera while a committed pan target arrives", () => {
+    const presented = contactTileFrame(1, 1_000);
+    const target = contactTileFrame(2, 1_000, 10, false);
+    target.contactMap.viewport = {
+      xStart: 128_000,
+      xEnd: 384_000,
+      yStart: 64_000,
+      yEnd: 320_000,
+    };
+    const committedCamera = { ...target.contactMap.viewport };
+
+    expect(contactTileViewportForBufferedSurface(
+      "presented",
+      presented,
+      target,
+      presented.contactMap.viewport,
+      committedCamera,
+    )).toBe(committedCamera);
+    expect(contactTileViewportForBufferedSurface(
+      "staging",
+      target,
+      target,
+      committedCamera,
+      committedCamera,
+    )).toBe(target.contactMap.viewport);
+  });
+
   it("stages a selected-resolution change even when both choices reuse one LOD resolution", () => {
     const fineChoice = contactTileFrame(1, 500_000);
     fineChoice.contactMap.requestedResolution = 1_000;

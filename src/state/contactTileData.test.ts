@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   appendContactTileCounts,
   contactTileCellCount,
+  contactTileRetainedValueBytes,
   forEachContactTileCell,
   materializeContactTileCells,
   type ContactTileData,
@@ -39,6 +40,8 @@ describe("contact tile cell access", () => {
     expect(appendContactTileCounts(objectTile, objectCounts)).toBe(objectCounts);
     expect(appendContactTileCounts(packedTile, packedCounts)).toBe(packedCounts);
     expect(packedCounts).toEqual(objectCounts);
+    expect(contactTileRetainedValueBytes(objectTile)).toBe(2 * 48);
+    expect(contactTileRetainedValueBytes(packedTile)).toBe(2 * (2 + 2 + 8));
   });
 
   it("iterates packed local coordinates as global bins without cell allocation", () => {
@@ -70,6 +73,7 @@ describe("contact tile cell access", () => {
       { xBin: 11, yBin: 15, count: 8 },
     ]);
     expect(appendContactTileCounts(dense, [])).toEqual([4.5, 8]);
+    expect(contactTileRetainedValueBytes(dense)).toBe(values.byteLength);
   });
 
   it("reads dense R16F tiles without expanding their retained storage", () => {
@@ -92,6 +96,7 @@ describe("contact tile cell access", () => {
     ]);
     expect(appendContactTileCounts(dense, [])).toEqual([4.5, 8]);
     expect(values.byteLength).toBe(16 * 2);
+    expect(contactTileRetainedValueBytes(dense)).toBe(values.byteLength);
   });
 
   it("uses packed arrays as the authority during a transitional mixed payload", () => {

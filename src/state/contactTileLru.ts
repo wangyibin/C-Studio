@@ -2,18 +2,22 @@ export interface ContactTileLruLimits {
   maxScopes: number;
   maxTiles: number;
   maxCells: number;
+  maxBytes: number;
 }
 
 /**
  * Three scopes retain the active resolution and its two nearest idle-prefetch
- * candidates. The tile and cell budgets preserve the frontend limits that
- * predate the scope-aware LRU.
+ * candidates. Real retained bytes are the primary memory budget; tile and cell
+ * limits remain independent safety valves for pathological inputs.
  */
 export const defaultContactTileLruLimits: Readonly<ContactTileLruLimits> = Object.freeze({
   maxScopes: 3,
-  maxTiles: 96,
-  maxCells: 750_000,
+  maxTiles: 192,
+  maxCells: 12_000_000,
+  maxBytes: 32 * 1024 * 1024,
 });
+
+const contactTileLruEntryOverheadBytes = 160;
 
 export interface ContactTileLruScope {
   /** Opaque render/data scope. Do not derive this by parsing a tile cache key. */
@@ -26,6 +30,8 @@ export interface ContactTileLruEntry<T> {
   key: string;
   value: T;
   cellCount: number;
+  /** Retained bytes owned by the tile value, excluding the cache key/record. */
+  valueBytes: number;
 }
 
 export interface ContactTileLruProtection {
@@ -43,13 +49,18 @@ export interface ContactTileLruMergeOptions extends ContactTileLruProtection {
   recency?: "foreground" | "background";
 }
 
-export type ContactTileLruEvictionReason = "scope-limit" | "tile-limit" | "cell-limit";
+export type ContactTileLruEvictionReason =
+  | "scope-limit"
+  | "tile-limit"
+  | "cell-limit"
+  | "byte-limit";
 
 export interface ContactTileLruEviction {
   key: string;
   scope: string;
   resolution: number;
   cellCount: number;
+  residentBytes: number;
   reason: ContactTileLruEvictionReason;
 }
 
@@ -58,11 +69,13 @@ export interface ContactTileLruScopeStats {
   resolution: number;
   tileCount: number;
   cellCount: number;
+  residentBytes: number;
 }
 
 export interface ContactTileLruStats {
   tileCount: number;
   cellCount: number;
+  residentBytes: number;
   /** Least-recently-used scope first. */
   scopes: readonly ContactTileLruScopeStats[];
 }
@@ -87,10 +100,38 @@ export function contactTileRenderCache<T>(
   return renderCache;
 }
 
+export const contactTileBacktrackViewportLimit = 2;
+export type ContactTileViewportResidencyHistory = readonly ReadonlySet<string>[];
+
+/** Keep the newest distinct completed viewport footprints for soft LRU protection. */
+export function retainContactTileViewportFootprint(
+  history: ContactTileViewportResidencyHistory,
+  keys: Iterable<string>,
+  limit = contactTileBacktrackViewportLimit,
+): ContactTileViewportResidencyHistory {
+  if (!Number.isSafeInteger(limit) || limit < 1) {
+    throw new Error("contact tile viewport history limit must be a positive safe integer");
+  }
+  const footprint = new Set(keys);
+  if (footprint.size === 0) {
+    return history;
+  }
+  const withoutDuplicate = history.filter((candidate) => !sameKeySet(candidate, footprint));
+  return [...withoutDuplicate, footprint].slice(-limit);
+}
+
+export function contactTileViewportHistoryKeys(
+  history: ContactTileViewportResidencyHistory,
+): ReadonlySet<string> {
+  return new Set(history.flatMap((footprint) => [...footprint]));
+}
+
 interface StoredContactTile<T> {
   key: string;
   value: T;
   cellCount: number;
+  valueBytes: number;
+  residentBytes: number;
   scope: string;
   resolution: number;
 }
@@ -103,12 +144,12 @@ interface StoredContactTileScope {
 }
 
 /**
- * A scope-aware, in-memory contact tile LRU with strict tile and cell budgets.
+ * A scope-aware, in-memory contact tile LRU with strict byte, tile, and cell budgets.
  *
  * Scope and resolution are explicit metadata because contact tile keys contain
  * paths and projection fingerprints and therefore must not be reverse-parsed.
  * The cache first removes whole least-recently-used scopes, then individual
- * least-recently-used tiles when the global tile or cell budget is exceeded.
+ * least-recently-used tiles when a global budget is exceeded.
  */
 export class ContactTileResolutionLru<T> {
   readonly limits: Readonly<ContactTileLruLimits>;
@@ -116,6 +157,7 @@ export class ContactTileResolutionLru<T> {
   private readonly records = new Map<string, StoredContactTile<T>>();
   private readonly scopes = new Map<string, StoredContactTileScope>();
   private totalCells = 0;
+  private totalBytes = 0;
 
   constructor(limits: Partial<ContactTileLruLimits> = {}) {
     this.limits = Object.freeze(validateLimits({
@@ -130,6 +172,10 @@ export class ContactTileResolutionLru<T> {
 
   get cellCount() {
     return this.totalCells;
+  }
+
+  get residentBytes() {
+    return this.totalBytes;
   }
 
   get scopeCount() {
@@ -214,11 +260,14 @@ export class ContactTileResolutionLru<T> {
       if (existing) {
         const movedToAnotherScope = existing.scope !== scope.id;
         this.totalCells -= existing.cellCount;
+        this.totalBytes -= existing.residentBytes;
         if (foreground || movedToAnotherScope) {
           this.removeRecordFromScope(existing);
         }
         existing.value = entry.value;
         existing.cellCount = entry.cellCount;
+        existing.valueBytes = entry.valueBytes;
+        existing.residentBytes = contactTileLruResidentBytes(entry);
         existing.scope = scope.id;
         existing.resolution = scope.resolution;
         if (foreground) {
@@ -232,6 +281,7 @@ export class ContactTileResolutionLru<T> {
       } else {
         const record: StoredContactTile<T> = {
           ...entry,
+          residentBytes: contactTileLruResidentBytes(entry),
           scope: scope.id,
           resolution: scope.resolution,
         };
@@ -239,6 +289,7 @@ export class ContactTileResolutionLru<T> {
         targetScope.keys.set(entry.key, true);
       }
       this.totalCells += entry.cellCount;
+      this.totalBytes += contactTileLruResidentBytes(entry);
     }
 
     this.removeEmptyScopes(scope.id);
@@ -275,6 +326,7 @@ export class ContactTileResolutionLru<T> {
     this.records.clear();
     this.scopes.clear();
     this.totalCells = 0;
+    this.totalBytes = 0;
   }
 
   /** A detached Map suitable for React state and existing tile-world helpers. */
@@ -291,16 +343,20 @@ export class ContactTileResolutionLru<T> {
     return {
       tileCount: this.records.size,
       cellCount: this.totalCells,
+      residentBytes: this.totalBytes,
       scopes: [...this.scopes.values()].map((scope) => {
         let cellCount = 0;
+        let residentBytes = 0;
         for (const key of scope.keys.keys()) {
           cellCount += this.records.get(key)?.cellCount ?? 0;
+          residentBytes += this.records.get(key)?.residentBytes ?? 0;
         }
         return {
           id: scope.id,
           resolution: scope.resolution,
           tileCount: scope.keys.size,
           cellCount,
+          residentBytes,
         };
       }),
     };
@@ -325,6 +381,7 @@ export class ContactTileResolutionLru<T> {
     while (
       this.records.size > this.limits.maxTiles
       || this.totalCells > this.limits.maxCells
+      || this.totalBytes > this.limits.maxBytes
     ) {
       const record = this.recordForEviction(protection);
       if (!record) {
@@ -332,7 +389,9 @@ export class ContactTileResolutionLru<T> {
       }
       const reason = this.records.size > this.limits.maxTiles
         ? "tile-limit"
-        : "cell-limit";
+        : this.totalBytes > this.limits.maxBytes
+          ? "byte-limit"
+          : "cell-limit";
       evicted.push(this.evictRecord(record, reason));
     }
 
@@ -448,6 +507,7 @@ export class ContactTileResolutionLru<T> {
       scope: record.scope,
       resolution: record.resolution,
       cellCount: record.cellCount,
+      residentBytes: record.residentBytes,
       reason,
     };
     this.deleteRecord(record);
@@ -459,6 +519,7 @@ export class ContactTileResolutionLru<T> {
     const scope = this.scopes.get(record.scope);
     scope?.keys.delete(record.key);
     this.totalCells -= record.cellCount;
+    this.totalBytes -= record.residentBytes;
     if (scope?.keys.size === 0) {
       this.scopes.delete(scope.id);
     }
@@ -493,11 +554,32 @@ function validateEntries<T>(entries: Iterable<ContactTileLruEntry<T>>) {
     if (!Number.isSafeInteger(entry.cellCount) || entry.cellCount < 0) {
       throw new Error("contact tile cell count must be a non-negative safe integer");
     }
+    if (!Number.isSafeInteger(entry.valueBytes) || entry.valueBytes < 0) {
+      throw new Error("contact tile value bytes must be a non-negative safe integer");
+    }
     // Last write wins, and its position becomes the newest one in the batch.
     byKey.delete(entry.key);
     byKey.set(entry.key, { ...entry });
   }
   return [...byKey.values()];
+}
+
+function contactTileLruResidentBytes<T>(entry: ContactTileLruEntry<T>) {
+  return entry.valueBytes
+    + entry.key.length * 2
+    + contactTileLruEntryOverheadBytes;
+}
+
+function sameKeySet(left: ReadonlySet<string>, right: ReadonlySet<string>) {
+  if (left.size !== right.size) {
+    return false;
+  }
+  for (const key of left) {
+    if (!right.has(key)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function uniqueExistingRecords<T>(
