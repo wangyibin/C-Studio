@@ -36,6 +36,7 @@ function mockWebGlCanvas() {
   const drawArraysInstanced = vi.fn();
   const bufferData = vi.fn();
   const clear = vi.fn();
+  const clearColor = vi.fn();
   const scissor = vi.fn();
   const uniform4f = vi.fn();
   const blitFramebuffer = vi.fn();
@@ -138,7 +139,7 @@ function mockWebGlCanvas() {
     pixelStorei: vi.fn(),
     isContextLost: vi.fn(() => false),
     viewport: vi.fn(),
-    clearColor: vi.fn(),
+    clearColor,
     clear,
     scissor,
     useProgram: vi.fn(),
@@ -176,6 +177,7 @@ function mockWebGlCanvas() {
     clientWaitSync,
     bufferData,
     clear,
+    clearColor,
     clientHeightRead,
     clientWidthRead,
     drawArrays,
@@ -224,6 +226,18 @@ function mockFrameScheduler() {
 }
 
 describe("contactTileFloatTextureData", () => {
+  it("initializes an unpresented GPU surface as a clean white loading plane", () => {
+    const { canvas, clear, clearColor } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+
+    expect(clearColor).toHaveBeenCalledWith(1, 1, 1, 1);
+    expect(clear).toHaveBeenCalledWith(26);
+    renderer?.destroy();
+  });
+
   it("compacts sparse source tile ids into one NxN page table", () => {
     const tile = {
       tileX: 7,
@@ -748,6 +762,75 @@ describe("contactTileFloatTextureData", () => {
 
     expect(presented).toHaveBeenCalledWith(true);
     expect(blitFramebuffer).toHaveBeenCalledTimes(presentations + 1);
+    renderer?.destroy();
+  });
+
+  it("retains the exact front when a visible page exists only in the overview", () => {
+    const { canvas, blitFramebuffer, fenceSync } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const tile00 = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 0, yBin: 0, count: 4 }],
+    };
+    const tile10 = {
+      tileX: 1,
+      tileY: 0,
+      cells: [{ xBin: 4, yBin: 0, count: 7 }],
+    };
+    const overview = contactOverviewFloatTextureData({
+      resolution: 100,
+      viewport: { xStart: 0, xEnd: 800, yStart: 0, yEnd: 400 },
+      cells: [{ xBin: 0, yBin: 0, count: 35 }],
+    }, 4);
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 35 },
+    };
+    const frontScene = {
+      descriptors: [{ key: "0:0:source", tile: tile00, transpose: false }],
+      generation: 1,
+      overview,
+      resolution: 100,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
+      renderStyle,
+    };
+    expect(renderer?.setScene(frontScene)).toBe(true);
+    const frontPresentations = blitFramebuffer.mock.calls.length;
+    const frontFences = fenceSync.mock.calls.length;
+    const incompletePresented = vi.fn();
+
+    // Page (1, 0) intersects the finite genome/overview rectangle but has no
+    // exact page-table entry. It must not expose the magnified coarse texel.
+    expect(renderer?.stageScene({
+      ...frontScene,
+      generation: 2,
+      viewport: { xStart: 0, xEnd: 800, yStart: 0, yEnd: 400 },
+    }, incompletePresented)).toBe(true);
+
+    expect(incompletePresented).toHaveBeenCalledWith(false);
+    expect(fenceSync).toHaveBeenCalledTimes(frontFences);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(frontPresentations);
+
+    const completePresented = vi.fn();
+    expect(renderer?.stageScene({
+      ...frontScene,
+      descriptors: [
+        { key: "0:0:source", tile: tile00, transpose: false },
+        { key: "1:0:source", tile: tile10, transpose: false },
+      ],
+      generation: 2,
+      viewport: { xStart: 0, xEnd: 800, yStart: 0, yEnd: 400 },
+    }, completePresented)).toBe(true);
+
+    expect(completePresented).toHaveBeenCalledWith(true);
+    expect(fenceSync).toHaveBeenCalledTimes(frontFences + 1);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(frontPresentations + 1);
     renderer?.destroy();
   });
 

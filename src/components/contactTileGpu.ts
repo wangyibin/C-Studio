@@ -1594,6 +1594,16 @@ export function createContactTileGpuRenderer(
     ? createVirtualTextureRendererResources(gl)
     : null;
 
+  // A first streamed generation may intentionally have no presentable front
+  // yet. Initialize the opaque WebGL surface to the same white loading plane
+  // as its container so the atomic gate cannot expose the context's default
+  // black buffer while it waits for complete exact coverage.
+  resizeCanvasToDisplaySize(canvas, gl);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(1, 1, 1, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
   const texturePreference = options.texturePreference ?? contactTileGpuTexturePreference();
   const performanceEnabled = options.performanceEnabled ?? isContactTilePerformanceEnabled();
   const emitPerformance = options.emitPerformance ?? ((line: string) => console.info(line));
@@ -2303,12 +2313,13 @@ export function createContactTileGpuRenderer(
     const lastX = Math.ceil(viewport.xEnd / tileSpan) - 1;
     const firstY = Math.floor(viewport.yStart / tileSpan);
     const lastY = Math.ceil(viewport.yEnd / tileSpan) - 1;
-    // The overview shader validates UVs per fragment and returns white outside
-    // its finite genome rectangle. It is therefore a safe fallback even when
-    // an aspect-preserving viewport extends beyond that rectangle; requiring
-    // the overview to contain the *entire* viewport rejects legitimate blank
-    // margins and leaves the retained canvas in an endless staging retry.
-    const hasOverviewFallback = overview !== null;
+    // The overview establishes the finite genome rectangle, but it is not a
+    // presentable substitute for a missing exact page inside that rectangle.
+    // Magnifying one coarse overview texel across a fine viewport is what
+    // produces the large solid colour blocks during loading. Pages whose
+    // *visible portion* lies wholly beyond the overview remain legal white
+    // aspect-ratio margins.
+    const overviewViewport = overview?.viewport ?? null;
     for (let pageY = firstY; pageY <= lastY; pageY += 1) {
       for (let pageX = firstX; pageX <= lastX; pageX += 1) {
         const localX = pageX - state.plan.originX;
@@ -2320,7 +2331,23 @@ export function createContactTileGpuRenderer(
         const flags = pageInRange
           ? state.pageTableData[(localY * state.plan.width + localX) * 2 + 1]
           : 0;
-        if ((flags & contactTileVirtualPageExactFlag) === 0 && !hasOverviewFallback) {
+        if ((flags & contactTileVirtualPageExactFlag) !== 0) {
+          continue;
+        }
+        if (!overviewViewport) {
+          return false;
+        }
+        const visiblePageXStart = Math.max(viewport.xStart, pageX * tileSpan);
+        const visiblePageXEnd = Math.min(viewport.xEnd, (pageX + 1) * tileSpan);
+        const visiblePageYStart = Math.max(viewport.yStart, pageY * tileSpan);
+        const visiblePageYEnd = Math.min(viewport.yEnd, (pageY + 1) * tileSpan);
+        const visiblePageIntersectsOverview = (
+          visiblePageXEnd > overviewViewport.xStart
+          && visiblePageXStart < overviewViewport.xEnd
+          && visiblePageYEnd > overviewViewport.yStart
+          && visiblePageYStart < overviewViewport.yEnd
+        );
+        if (visiblePageIntersectsOverview) {
           return false;
         }
       }

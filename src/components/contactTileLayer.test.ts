@@ -186,6 +186,28 @@ describe("contact tile paint epochs", () => {
 });
 
 describe("contact tile presentation buffer", () => {
+  it("keeps an initial streamed partial layer off the presented surface", () => {
+    const partial = contactTileFrame(1, 1_000, 10, false);
+    const initial = createContactTileLayerBufferState(partial);
+
+    expect(initial.slots).toEqual([null, null]);
+    expect(initial.frontSlot).toBeNull();
+    expect(initial.stagingSlot).toBeNull();
+
+    const complete = contactTileFrame(1, 1_000, 10, true);
+    const ready = syncContactTileLayerBuffer(initial, complete, false);
+    expect(ready.slots).toEqual([complete, null]);
+    expect(ready.frontSlot).toBe(0);
+  });
+
+  it("retains a complete same-viewport front while its replacement is partial", () => {
+    const presented = contactTileFrame(1, 1_000);
+    const partial = contactTileFrame(2, 1_000, 10, false);
+    const initial = createContactTileLayerBufferState(presented);
+
+    expect(syncContactTileLayerBuffer(initial, partial, false)).toBe(initial);
+  });
+
   it("reserves one persistent back slot for a retained delta generation", () => {
     const presented = contactTileFrame(1, 1_000);
     const target = contactTileFrame(2, 1_000_000);
@@ -385,7 +407,7 @@ describe("contact tile presentation buffer", () => {
     expect(frozen.stagingSlot).toBeNull();
   });
 
-  it("restores a complete compatible map during a freeze without adopting the target style", () => {
+  it("uses the first complete map when a freeze begins before any frame was presented", () => {
     const partial = contactTileFrame(2, 1_000, 10, false);
     const completeFallback = contactTileFrame(1, 1_000, 99, true);
     const restored = syncContactTileLayerBuffer(
@@ -397,8 +419,8 @@ describe("contact tile presentation buffer", () => {
     expect(restored.frontSlot).toBe(0);
     expect(restored.stagingSlot).toBeNull();
     expect(restored.slots[0]?.contactMap).toBe(completeFallback.contactMap);
-    expect(restored.slots[0]?.renderStyle).toBe(partial.renderStyle);
-    expect(restored.slots[0]?.renderStyle.colorScale.max).toBe(10);
+    expect(restored.slots[0]?.renderStyle).toBe(completeFallback.renderStyle);
+    expect(restored.slots[0]?.renderStyle.colorScale.max).toBe(99);
   });
 
   it("keeps an incomplete resolution in the back end and stages only a complete frame", () => {

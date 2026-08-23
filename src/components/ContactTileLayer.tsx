@@ -269,13 +269,27 @@ export function contactVisibleTileIdentitySignature(
 export function createContactTileLayerBufferState(
   frame: ContactTileLayerFrame | null,
 ): ContactTileLayerBufferState {
+  const presentableFrame = frame && contactTileLayerFrameCanPresent(frame)
+    ? frame
+    : null;
   return {
-    slots: [frame, null],
-    frontSlot: frame ? 0 : null,
+    slots: [presentableFrame, null],
+    frontSlot: presentableFrame ? 0 : null,
     stagingSlot: null,
     revealRevision: 0,
     revealEvent: null,
   };
+}
+
+/**
+ * A streamed projected layer is not a presentation surface until every
+ * visible tile is present. An exact source-layout projection is the exception:
+ * its source pages are complete and the GPU coverage gate still verifies them
+ * before the atomic framebuffer swap.
+ */
+function contactTileLayerFrameCanPresent(frame: ContactTileLayerFrame) {
+  return frame.contactMap.visibleLayerComplete !== false
+    || frame.contactMap.sourceLayout !== undefined;
 }
 
 /**
@@ -298,6 +312,19 @@ export function syncContactTileLayerBuffer(
           stagingSlot: null,
           revealEvent: null,
         };
+  }
+
+  if (!contactTileLayerFrameCanPresent(incoming)) {
+    if (state.stagingSlot === null) {
+      return state;
+    }
+    const front = state.frontSlot === null ? null : state.slots[state.frontSlot];
+    return {
+      ...state,
+      slots: state.frontSlot === 0 ? [front, null] : [null, front],
+      stagingSlot: null,
+      revealEvent: null,
+    };
   }
 
   if (state.frontSlot === null) {
@@ -358,26 +385,7 @@ export function syncContactTileLayerBuffer(
         };
   }
 
-  const viewportChanged = !sameContactTileViewport(
-    front.contactMap.viewport,
-    incoming.contactMap.viewport,
-  );
-  // A pan target may stream progressively, but the live camera must stay on
-  // the existing front surface until a complete replacement is available.
-  // Once complete, promote its descriptors in the same slot/canvas rather
-  // than swapping compositor surfaces.
-  if (
-    viewportChanged
-    && !requiresAtomicContactTileSwap(front, incoming)
-    && incoming.contactMap.visibleLayerComplete === false
-  ) {
-    return state;
-  }
-
   if (requiresAtomicContactTileSwap(front, incoming)) {
-    if (incoming.contactMap.visibleLayerComplete === false) {
-      return state;
-    }
     if (
       promoteViewportInPlace
       && canPromoteContactTilePanInPlace(front, incoming)
