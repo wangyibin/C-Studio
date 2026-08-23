@@ -118,6 +118,10 @@ function mockWebGlCanvas() {
     getAttribLocation: vi.fn(() => 0),
     getUniformLocation: vi.fn(() => ({})),
     getParameter: vi.fn(() => 256),
+    getContextAttributes: vi.fn(() => ({
+      desynchronized: false,
+      preserveDrawingBuffer: true,
+    })),
     deleteBuffer: vi.fn(),
     deleteTexture: vi.fn(),
     deleteFramebuffer: vi.fn(),
@@ -289,6 +293,62 @@ describe("contactTileFloatTextureData", () => {
       sourceLayoutUploads: 1,
       sourceLayoutBytes: map.addressData.byteLength * 2 + map.weightData.byteLength * 2,
     });
+    renderer?.destroy();
+  });
+
+  it("renders a white aspect-ratio margin beyond a finite source layout", () => {
+    const { canvas, blitFramebuffer } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024);
+    const addressSpace = buildContactSourceAddressSpace([{ name: "a", length: 4_000 }]);
+    const layoutBlocks = [{
+      id: "a",
+      objectId: "chr1",
+      sourceId: "a",
+      sourceStart: 0,
+      sourceEnd: 4_000,
+      visualStart: 0,
+      visualEnd: 4_000,
+      orientation: "+" as const,
+    }];
+    const map = buildContactGpuLayoutMap({
+      addressSpace,
+      layoutBlocks,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: 4_000 },
+    });
+    const tile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 1, yBin: 0, count: 8 }],
+    };
+    const presented = vi.fn();
+
+    expect(renderer?.setScene({
+      descriptors: [],
+      generation: 10,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      // The X camera is wider than the finite address map. The shader paints
+      // the out-of-map half white and must not reject the complete exact page.
+      viewport: { xStart: 0, xEnd: 8_000, yStart: 0, yEnd: 4_000 },
+      visibleLayerComplete: false,
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+      sourceLayout: {
+        dataScope: "source-margin-test",
+        descriptors: [{ key: "source", tile, transpose: false }],
+        generation: 10,
+        sourceTiles: [0],
+        xMap: map,
+        yMap: map,
+      },
+    }, presented)).toBe(true);
+
+    expect(presented).toHaveBeenCalledWith(true);
+    expect(blitFramebuffer).toHaveBeenCalledOnce();
     renderer?.destroy();
   });
 
@@ -510,6 +570,184 @@ describe("contactTileFloatTextureData", () => {
       uploadFenceSignals: 1,
       uploadFenceFailures: 0,
     });
+    renderer?.destroy();
+  });
+
+  it("re-blits the stable front while a staging fence blocks pointer camera draws", () => {
+    const {
+      canvas,
+      blitFramebuffer,
+      clientWaitSync,
+      fenceSync,
+    } = mockWebGlCanvas();
+    const frames = mockFrameScheduler();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
+    });
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 10 },
+    };
+    const frontScene = {
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 4 }] },
+        transpose: false,
+      }],
+      generation: 1,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle,
+    };
+    expect(renderer?.setScene(frontScene)).toBe(true);
+    expect(blitFramebuffer).toHaveBeenCalledOnce();
+
+    clientWaitSync.mockReturnValueOnce(53).mockReturnValue(52);
+    const targetScene = {
+      ...frontScene,
+      descriptors: [{
+        key: "1:0:source",
+        tile: { tileX: 1, tileY: 0, cells: [{ xBin: 4, yBin: 0, count: 7 }] },
+        transpose: false,
+      }],
+      generation: 2,
+      viewport: { xStart: 4_000, xEnd: 8_000, yStart: 0, yEnd: 4_000 },
+    };
+    const firstPresented = vi.fn();
+    const secondPresented = vi.fn();
+    expect(renderer?.stageScene(targetScene, firstPresented)).toBe(true);
+    expect(fenceSync).toHaveBeenCalledTimes(2);
+    expect(blitFramebuffer).toHaveBeenCalledOnce();
+
+    // A duplicate React candidate joins the same upload/fence transaction.
+    expect(renderer?.stageScene(targetScene, secondPresented)).toBe(true);
+    expect(fenceSync).toHaveBeenCalledTimes(2);
+
+    // Resizing the canvas while the staging fence is pending must restore the
+    // retained front instead of exposing WebKit's discarded black buffer. The
+    // source rectangle remains the old FBO size while the destination expands.
+    canvas.width = 512;
+    canvas.height = 384;
+    expect(renderer?.redraw()).toBe(true);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(2);
+    expect(blitFramebuffer).toHaveBeenLastCalledWith(
+      0,
+      0,
+      256,
+      256,
+      0,
+      0,
+      512,
+      384,
+      26,
+      19,
+    );
+
+    renderer?.setPanViewport(targetScene.viewport);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(3);
+    expect(firstPresented).not.toHaveBeenCalled();
+    expect(secondPresented).not.toHaveBeenCalled();
+
+    frames.flushOne();
+    expect(blitFramebuffer).toHaveBeenCalledTimes(4);
+    expect(firstPresented).toHaveBeenCalledWith(true);
+    expect(secondPresented).toHaveBeenCalledWith(true);
+    renderer?.destroy();
+  });
+
+  it("re-blits the retained front for a same-viewport camera publication", () => {
+    const { canvas, blitFramebuffer } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const viewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 4 }] },
+        transpose: false,
+      }],
+      generation: 1,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport,
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+    expect(blitFramebuffer).toHaveBeenCalledOnce();
+
+    renderer?.setPanViewport(viewport);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(2);
+    renderer?.destroy();
+  });
+
+  it("presents a viewport whose aspect-ratio margin extends beyond the overview", () => {
+    const { canvas, blitFramebuffer } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const tile00 = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 0, yBin: 0, count: 4 }],
+    };
+    const tile10 = {
+      tileX: 1,
+      tileY: 0,
+      cells: [{ xBin: 4, yBin: 0, count: 7 }],
+    };
+    const tile11 = {
+      tileX: 1,
+      tileY: 1,
+      cells: [{ xBin: 4, yBin: 4, count: 5 }],
+    };
+    const overview = contactOverviewFloatTextureData({
+      resolution: 100,
+      viewport: { xStart: 0, xEnd: 650, yStart: 0, yEnd: 650 },
+      cells: [{ xBin: 0, yBin: 0, count: 4 }],
+    }, 4);
+    const frontScene = {
+      descriptors: [
+        { key: "0:0:source", tile: tile00, transpose: false },
+        { key: "1:0:source", tile: tile10, transpose: false },
+        { key: "0:1:source", tile: tile10, transpose: true },
+        { key: "1:1:source", tile: tile11, transpose: false },
+      ],
+      generation: 1,
+      overview,
+      resolution: 100,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 650, yStart: 0, yEnd: 650 },
+      renderStyle: {
+        colormap: "Reds" as const,
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    };
+    expect(renderer?.setScene(frontScene)).toBe(true);
+    const presentations = blitFramebuffer.mock.calls.length;
+    const presented = vi.fn();
+
+    // The third X page (800-1200) is outside both the exact page table and the
+    // 0-650 overview range. It is an intentional white margin, not a missing tile.
+    expect(renderer?.stageScene({
+      ...frontScene,
+      generation: 2,
+      viewport: { xStart: 0, xEnd: 1_000, yStart: 0, yEnd: 650 },
+    }, presented)).toBe(true);
+
+    expect(presented).toHaveBeenCalledWith(true);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentations + 1);
     renderer?.destroy();
   });
 
@@ -780,6 +1018,16 @@ describe("contactTileFloatTextureData", () => {
     expect(contactTileGpuVirtualTextureEnabled("")).toBe(true);
     expect(contactTileGpuVirtualTextureEnabled("?cstudioVirtualTexture=1")).toBe(true);
     expect(contactTileGpuVirtualTextureEnabled("?cstudioVirtualTexture=0")).toBe(false);
+  });
+
+  it("preserves the final canvas surface for WKWebView compositing", () => {
+    const { canvas, getContext } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas);
+    expect(getContext).toHaveBeenCalledWith("webgl2", expect.objectContaining({
+      desynchronized: false,
+      preserveDrawingBuffer: true,
+    }));
+    renderer?.destroy();
   });
 
   it("accepts finite half-float values and rejects overflow or non-finite values", () => {
@@ -1661,18 +1909,19 @@ describe("contactTileFloatTextureData", () => {
     expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
 
     // Clearing the retained pan transform rebases to this same authoritative
-    // viewport. It must not submit a second draw/blit after promotion.
+    // viewport. It must not redraw or upload, but it must re-blit the retained
+    // FBO because WebKit may already have discarded the default framebuffer.
     const drawsBeforeRebase = drawArrays.mock.calls.length;
     renderer?.setPanViewport(targetScene.viewport);
     expect(drawArrays).toHaveBeenCalledTimes(drawsBeforeRebase);
-    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 2);
 
     // React publishes the promoted frame after the imperative commit. The
     // child setScene call recognizes it and performs no second GPU paint.
     expect(renderer?.setScene(targetScene)).toBe(true);
     expect(texImage2D).toHaveBeenCalledTimes(imageUploadsBeforePromotion + 1);
     expect(texSubImage3D).toHaveBeenCalledTimes(atlasUploadsBeforePromotion);
-    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 1);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforePromotion + 2);
     renderer?.destroy();
   });
 

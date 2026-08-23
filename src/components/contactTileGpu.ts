@@ -1554,16 +1554,26 @@ export function createContactTileGpuRenderer(
     alpha: false,
     antialias: false,
     depth: false,
-    desynchronized: true,
+    // The retained front/staging FBOs make scene replacement atomic, but they
+    // do not keep WebKit's final default framebuffer alive after compositing.
+    // WKWebView can discard that opaque surface as solid black after a load or
+    // resize unless it is preserved, even though the authoritative front FBO
+    // is still valid.
+    desynchronized: false,
     failIfMajorPerformanceCaveat: false,
     powerPreference: "high-performance",
     premultipliedAlpha: true,
-    preserveDrawingBuffer: false,
+    preserveDrawingBuffer: true,
     stencil: false,
   });
   if (!gl) {
     return null;
   }
+  const actualContextAttributes = gl.getContextAttributes();
+  traceContactPanCamera("gpu_context_created", {
+    desynchronized: actualContextAttributes?.desynchronized ?? null,
+    preserveDrawingBuffer: actualContextAttributes?.preserveDrawingBuffer ?? null,
+  });
 
   const resources = createRendererResources(gl);
   if (!resources) {
@@ -1632,6 +1642,7 @@ export function createContactTileGpuRenderer(
   let uploadedBoundaryCount = 0;
   let framePresentation: FramePresentationResources | null = null;
   let stagingFramePresentation: FramePresentationResources | null = null;
+  let hasPresentedFrontFrame = false;
   let virtualTextureState: VirtualTextureState | null = null;
   let sourceLayoutTextureState: SourceLayoutTextureState | null = null;
   let scheduledUploadFrame: number | null = null;
@@ -2235,11 +2246,17 @@ export function createContactTileGpuRenderer(
         const last = Math.ceil(end / state.resolution) - 1;
         const localFirst = first - map.firstVisualBin;
         const localLast = last - map.firstVisualBin;
-        if (localFirst < 0 || localLast >= map.entries.length) {
-          return null;
-        }
+        // Aspect-preserving whole-genome views may extend beyond the finite
+        // AGP address map on one axis. The shader already paints those
+        // out-of-map fragments white, so only require exact pages for the
+        // portion that actually intersects the map.
+        const clampedFirst = Math.max(0, localFirst);
+        const clampedLast = Math.min(map.entries.length - 1, localLast);
         const pages = new Set<number>();
-        for (const entry of map.entries.slice(localFirst, localLast + 1)) {
+        if (clampedFirst > clampedLast) {
+          return pages;
+        }
+        for (const entry of map.entries.slice(clampedFirst, clampedLast + 1)) {
           if (!entry.valid) {
             continue;
           }
@@ -2286,13 +2303,12 @@ export function createContactTileGpuRenderer(
     const lastX = Math.ceil(viewport.xEnd / tileSpan) - 1;
     const firstY = Math.floor(viewport.yStart / tileSpan);
     const lastY = Math.ceil(viewport.yEnd / tileSpan) - 1;
-    const overviewCoversViewport = Boolean(
-      overview
-      && overview.viewport.xStart <= viewport.xStart
-      && overview.viewport.xEnd >= viewport.xEnd
-      && overview.viewport.yStart <= viewport.yStart
-      && overview.viewport.yEnd >= viewport.yEnd,
-    );
+    // The overview shader validates UVs per fragment and returns white outside
+    // its finite genome rectangle. It is therefore a safe fallback even when
+    // an aspect-preserving viewport extends beyond that rectangle; requiring
+    // the overview to contain the *entire* viewport rejects legitimate blank
+    // margins and leaves the retained canvas in an endless staging retry.
+    const hasOverviewFallback = overview !== null;
     for (let pageY = firstY; pageY <= lastY; pageY += 1) {
       for (let pageX = firstX; pageX <= lastX; pageX += 1) {
         const localX = pageX - state.plan.originX;
@@ -2304,7 +2320,7 @@ export function createContactTileGpuRenderer(
         const flags = pageInRange
           ? state.pageTableData[(localY * state.plan.width + localX) * 2 + 1]
           : 0;
-        if ((flags & contactTileVirtualPageExactFlag) === 0 && !overviewCoversViewport) {
+        if ((flags & contactTileVirtualPageExactFlag) === 0 && !hasOverviewFallback) {
           return false;
         }
       }
@@ -2491,6 +2507,9 @@ export function createContactTileGpuRenderer(
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
     if (present) {
       presentFramePresentation(gl, presentation, canvas.width, canvas.height);
+      if (presentation === framePresentation) {
+        hasPresentedFrontFrame = true;
+      }
     }
     uploadContext.performance.virtualTextureDraws += 1;
     if (sourceLayout) {
@@ -2534,6 +2553,9 @@ export function createContactTileGpuRenderer(
       return false;
     }
     if (target === "front") {
+      if (presentation !== framePresentation) {
+        hasPresentedFrontFrame = false;
+      }
       framePresentation = presentation;
       stagingFramePresentation = ensureFramePresentationResources(
         gl,
@@ -2767,6 +2789,9 @@ export function createContactTileGpuRenderer(
     if (panOnly) {
       if (present) {
         presentFramePresentation(gl, presentation, canvas.width, canvas.height);
+        if (presentation === framePresentation) {
+          hasPresentedFrontFrame = true;
+        }
       }
       return true;
     }
@@ -2788,6 +2813,9 @@ export function createContactTileGpuRenderer(
     }
     if (present) {
       presentFramePresentation(gl, presentation, canvas.width, canvas.height);
+      if (presentation === framePresentation) {
+        hasPresentedFrontFrame = true;
+      }
     }
     return true;
   };
@@ -2818,6 +2846,9 @@ export function createContactTileGpuRenderer(
       return false;
     }
     if (target === "front") {
+      if (presentation !== framePresentation) {
+        hasPresentedFrontFrame = false;
+      }
       framePresentation = presentation;
       // Allocate the paired presentation surface during the initial load, not
       // on the first cache-hit pan. Promotion then remains allocation-free and
@@ -2864,6 +2895,7 @@ export function createContactTileGpuRenderer(
     framePresentation = stagingFramePresentation;
     stagingFramePresentation = previousFrontPresentation;
     presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+    hasPresentedFrontFrame = true;
     uploadContext.performance.framebufferSwaps += 1;
     traceContactPanCamera("gpu_fbo_present", {
       sceneViewport: scene?.viewport,
@@ -2917,6 +2949,7 @@ export function createContactTileGpuRenderer(
     deltaBuffers = new Map();
     pendingAppendedDescriptors.clear();
     presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+    hasPresentedFrontFrame = true;
     uploadContext.performance.uploadFenceSignals += 1;
     pending.onPresented?.(true);
     pendingPrefetchScene = contactTileGpuUploadPlan(pending.scene)
@@ -3039,6 +3072,47 @@ export function createContactTileGpuRenderer(
     if (!virtualResources || (!nextScene.sourceLayout && nextScene.visibleLayerComplete !== true)) {
       return false;
     }
+    const attachPresentedCallback = (
+      pending: PendingVirtualPresentation,
+      callback: typeof onPresented,
+    ) => {
+      if (!callback || pending.onPresented === callback) {
+        return;
+      }
+      const previous = pending.onPresented;
+      pending.onPresented = (presented) => {
+        previous?.(presented);
+        callback(presented);
+      };
+    };
+    if (
+      pendingVirtualPresentation
+      && pendingVirtualPresentation.target === target
+      && sameContactTileGpuScene(pendingVirtualPresentation.scene, nextScene)
+    ) {
+      attachPresentedCallback(pendingVirtualPresentation, onPresented);
+      traceContactPanCamera("gpu_scene_single_flight", {
+        phase: "upload",
+        target,
+        viewport: nextScene.viewport,
+        generation: nextScene.generation,
+      });
+      return true;
+    }
+    if (
+      pendingPresentationFence
+      && pendingPresentationFence.target === target
+      && sameContactTileGpuScene(pendingPresentationFence.scene, nextScene)
+    ) {
+      attachPresentedCallback(pendingPresentationFence, onPresented);
+      traceContactPanCamera("gpu_scene_single_flight", {
+        phase: "fence",
+        target,
+        viewport: nextScene.viewport,
+        generation: nextScene.generation,
+      });
+      return true;
+    }
     pendingVirtualPresentation?.onPresented?.(false);
     if (pendingPresentationFence) {
       gl.deleteSync(pendingPresentationFence.sync);
@@ -3081,7 +3155,28 @@ export function createContactTileGpuRenderer(
       // The retained front FBO is authoritative while atlas layers/page-table
       // entries are in flight. Sampling a half-updated atlas would be worse
       // than holding the already-painted surface for this frame.
-      traceContactPanCamera("gpu_camera_blocked", { requestedViewport: viewport });
+      const pendingTarget = pendingPresentationFence?.target
+        ?? pendingVirtualPresentation?.target;
+      if (
+        hasPresentedFrontFrame
+        && framePresentation
+        && pendingTarget !== "front"
+      ) {
+        // A resize can invalidate the default surface even when its contents
+        // are preserved. Re-blit the stable front while hidden staging/fence
+        // work is still running.
+        presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+        traceContactPanCamera("gpu_camera_represent", {
+          requestedViewport: viewport,
+          pendingTarget,
+        });
+      } else {
+        traceContactPanCamera("gpu_camera_blocked", {
+          requestedViewport: viewport,
+          pendingTarget,
+          hasPresentedFrontFrame,
+        });
+      }
       return;
     }
     const activeViewport = deltaScene?.viewport ?? scene?.viewport;
@@ -3091,7 +3186,19 @@ export function createContactTileGpuRenderer(
       && activeViewport
       && sameContactTileGpuViewport(activeViewport, viewport)
     ) {
-      traceContactPanCamera("gpu_camera_noop", { requestedViewport: viewport });
+      if (hasPresentedFrontFrame && framePresentation) {
+        // React publishes the committed viewport once more after the staged
+        // front has painted. Re-present the authoritative FBO on that final
+        // same-camera publication without redrawing the heatmap or uploading
+        // any texture.
+        presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+        traceContactPanCamera("gpu_camera_represent", {
+          requestedViewport: viewport,
+          reason: "same-viewport",
+        });
+      } else {
+        traceContactPanCamera("gpu_camera_noop", { requestedViewport: viewport });
+      }
       return;
     }
     if (deltaScene) {
@@ -3781,6 +3888,20 @@ export function createContactTileGpuRenderer(
     },
     redraw: () => {
       if (pendingVirtualPresentation || pendingPresentationFence) {
+        if (hasPresentedFrontFrame && framePresentation) {
+          // A ResizeObserver callback can arrive while a target scene is still
+          // uploading or waiting on its GPU fence. WebKit may discard the
+          // opaque default framebuffer as the canvas layer changes size, even
+          // though the authoritative front FBO is still valid. Re-present that
+          // stable surface now; the pending scene will replace it atomically
+          // once its fence signals.
+          presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+          traceContactPanCamera("gpu_redraw_represent", {
+            pendingTarget: pendingPresentationFence?.target
+              ?? pendingVirtualPresentation?.target,
+            viewport: scene?.viewport,
+          });
+        }
         return true;
       }
       if (scene && pendingPrefetchScene) {
@@ -4784,8 +4905,8 @@ function presentFramePresentation(
   gl.blitFramebuffer(
     0,
     0,
-    width,
-    height,
+    frame.width,
+    frame.height,
     0,
     0,
     width,
