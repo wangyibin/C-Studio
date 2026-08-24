@@ -191,6 +191,11 @@ export interface ContactTileGpuRenderer {
     resolution: number;
     tileSizeBins: number;
   }) => boolean;
+  /**
+   * Drop only speculative cross-resolution uploads. The authoritative scene,
+   * its page table, and already-resident pages stay untouched.
+   */
+  discardPrefetchedPages: () => void;
   /** Present newly appended or refreshed pan-prefetch descriptors in place. */
   presentAppendedSceneDescriptors: () => boolean;
   setDeltaScene: (scene: ContactTileGpuDeltaScene) => boolean;
@@ -3119,9 +3124,22 @@ export function createContactTileGpuRenderer(
         key,
       )
     )));
-    if (protectedKeys.has(page.atlasKey)) {
+    const protectedLayers = new Set<number>();
+    for (let offset = 0; offset < current.pageTableData.length; offset += 2) {
+      const layerPlusOne = current.pageTableData[offset];
+      if (layerPlusOne > 0) {
+        protectedLayers.add(layerPlusOne - 1);
+      }
+    }
+    const existingLayer = current.layerByTileKey.get(page.atlasKey);
+    if (
+      protectedKeys.has(page.atlasKey)
+      || (existingLayer !== undefined && protectedLayers.has(existingLayer))
+    ) {
       // Never replace a page sampled by the current page table, even if a
       // speculative batch happens to carry a newer object for the same key.
+      // Protecting the actual layer as well as the reconstructed atlas key is
+      // essential while source-layout scope or resolution metadata changes.
       return 0;
     }
 
@@ -3146,7 +3164,12 @@ export function createContactTileGpuRenderer(
       }
       if (layer >= current.capacity) {
         evictedKey = [...current.layerByTileKey.keys()]
-          .filter((key) => !protectedKeys.has(key))
+          .filter((key) => {
+            const mappedLayer = current.layerByTileKey.get(key);
+            return !protectedKeys.has(key)
+              && mappedLayer !== undefined
+              && !protectedLayers.has(mappedLayer);
+          })
           .sort((left, right) => (
             (current.lastUsedByTileKey.get(left) ?? 0)
             - (current.lastUsedByTileKey.get(right) ?? 0)
@@ -3309,6 +3332,14 @@ export function createContactTileGpuRenderer(
       emitPerformanceIfChanged();
     }
   }
+
+  const discardResidentPrefetchPages = () => {
+    const discarded = pendingResidentPages.size;
+    pendingResidentPages.clear();
+    if (discarded > 0) {
+      traceContactPanCamera("gpu_resident_prefetch_discard", { discarded });
+    }
+  };
 
   const enqueueVirtualPresentation = (
     nextScene: ContactTileGpuScene,
@@ -3899,6 +3930,13 @@ export function createContactTileGpuRenderer(
       }
       return accepted;
     },
+    discardPrefetchedPages: () => {
+      // A gesture or resolution handoff owns the next animation frame. Pages
+      // that have not reached the atlas yet are only latency insurance, so
+      // discard them instead of letting an old-generation upload contend with
+      // the retained-front camera or a staging presentation.
+      discardResidentPrefetchPages();
+    },
     appendSceneDescriptors: (input) => {
       if (
         destroyed
@@ -4176,6 +4214,7 @@ export function createContactTileGpuRenderer(
     setPanViewport: setActivePanViewport,
     retainPanViewport: (viewport) => {
       traceContactPanCamera("gpu_retain_camera", { viewport });
+      discardResidentPrefetchPages();
       retainedPanViewport = viewport;
       setActivePanViewport(viewport);
     },

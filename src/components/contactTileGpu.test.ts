@@ -1980,6 +1980,50 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
+  it("discards queued neighboring-resolution uploads before an interactive frame", () => {
+    const { canvas, texSubImage3D } = mockWebGlCanvas();
+    const frames = mockFrameScheduler();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
+    });
+    expect(renderer?.setScene({
+      dataScope: "active-layout|raw",
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+    frames.flushAll();
+    const uploadsBefore = texSubImage3D.mock.calls.length;
+
+    expect(renderer?.ingestPrefetchedPages({
+      tiles: [{ tileX: 1, tileY: 1, cells: [{ xBin: 4, yBin: 4, count: 5 }] }],
+      dataScope: "neighbor-layout|raw",
+      generation: 7,
+      resolution: 2_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    expect(frames.pending()).toBe(1);
+
+    renderer?.discardPrefetchedPages();
+    frames.flushAll();
+    expect(texSubImage3D).toHaveBeenCalledTimes(uploadsBefore);
+    renderer?.destroy();
+  });
+
   it("atomically promotes a fully prefetched pan scene with zero new tile uploads", () => {
     const {
       canvas,

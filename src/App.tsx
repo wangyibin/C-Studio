@@ -455,7 +455,7 @@ function emitContactPanPrefetchPerformance(
   emitContactFrontendPerformanceLine(formatContactPanPrefetchPerformanceLog(record));
 }
 
-function buildContactPanPrefetchPlan({
+export function buildContactPanPrefetchPlan({
   availableResolutions,
   coolPath,
   normalization,
@@ -1942,7 +1942,7 @@ export function App() {
       && selectedResolution === 2_500_000
       && contactCoolPath.toLowerCase().endsWith(".mcool")
     );
-    const sourceMainLodPlan = (
+    const candidateSourceMainLodPlan = (
       contactMainLodEnabled || usesAdaptiveMcoolExactPolicy
     ) ? buildContactMainLodPlan({
         viewport,
@@ -1955,7 +1955,26 @@ export function App() {
           : maxExactMainContactTiles,
       }, contactAvailableResolutions)
       : null;
-    const resolution = sourceMainLodPlan?.targetResolution ?? selectedResolution;
+    const sourceMainLodPlan = candidateSourceMainLodPlan
+      && (
+        usesAdaptiveMcoolExactPolicy
+        || contactMainLodPlanChangesSampling(
+          candidateSourceMainLodPlan,
+          selectedResolution,
+        )
+      )
+      ? candidateSourceMainLodPlan
+      : null;
+    if (sourceMainLodPlan) {
+      // A screen-scale LOD already owns a small, exact projected tile set.
+      // Building the source-layout replacement would scan the same stored
+      // Cooler level a second time during a resolution switch, then replace
+      // the already complete projected frame. Keep source-space remapping for
+      // local exact views where it avoids projection reloads.
+      setContactGpuSourceLayout(null);
+      return;
+    }
+    const resolution = selectedResolution;
     const tileSizeBins = contactTileSizeBins;
     const sourceLayoutBlocks = contactSourceIdentityLayout(
       contactSourceAddressSpace,
@@ -2054,7 +2073,6 @@ export function App() {
             purpose: "visible",
             coolPath: contactCoolPath,
             baseResolution: 1_000,
-            sourceResolution: sourceMainLodPlan?.sourceResolution,
             targetResolution: resolution,
             tileSizeBins,
             normalization,
@@ -3265,16 +3283,6 @@ export function App() {
               }
 
               const candidateTargetResolution = resolutionToBasePairs(candidateResolution);
-              if (
-                normalization === "raw"
-                && contactIsMcool
-                && candidateTargetResolution === 2_500_000
-              ) {
-                // Never seed the exact main cache with a non-adaptive 2.5 Mb
-                // background result; a later local view requires 1 kb boundary
-                // refinement and must own that cache entry.
-                return [];
-              }
               const candidateTotalSpanBp = Math.max(
                 candidateTargetResolution,
                 viewAssemblyLayout.totalSpan,
@@ -3288,37 +3296,53 @@ export function App() {
                 viewportWidthPx: candidateUiState.contact.viewportWidthPx,
                 viewportHeightPx: candidateUiState.contact.viewportHeightPx,
               });
+              const candidatePlan = buildContactPanPrefetchPlan({
+                availableResolutions: contactAvailableResolutions,
+                coolPath: contactCoolPath,
+                normalization,
+                selectedResolution: candidateTargetResolution,
+                totalSpanBp: candidateTotalSpanBp,
+                viewport: candidateViewport,
+                viewportHeightPx: candidateUiState.contact.viewportHeightPx,
+                viewportWidthPx: candidateUiState.contact.viewportWidthPx,
+              });
+              const candidateDisplayResolution = candidatePlan.targetResolution;
+              const candidateTileSizeBins = candidatePlan.tileSizeBins;
               const candidateTileScope = contactTileScope(
                 contactCoolPath,
-                candidateTargetResolution,
-                tileSizeBins,
+                candidateDisplayResolution,
+                candidateTileSizeBins,
                 normalization,
                 viewAssemblyLayout.projectionBlocks,
               );
               const candidateLayerScope = {
-                id: contactTileDataScope(
+                id: `${candidatePlan.usesMainLod ? "main-lod|" : ""}${contactTileDataScope(
                   contactCoolPath,
-                  candidateTargetResolution,
-                  tileSizeBins,
+                  candidateDisplayResolution,
+                  candidateTileSizeBins,
                   normalization,
-                ),
-                resolution: candidateTargetResolution,
+                )}`,
+                resolution: candidateDisplayResolution,
               };
-              adjacentLayerScopeIds.add(candidateLayerScope.id);
+              if (!candidatePlan.usesMainLod) {
+                adjacentLayerScopeIds.add(candidateLayerScope.id);
+              }
               const candidateCacheKeyForTile = createContactTileCacheKeyResolver(
                 contactCoolPath,
-                candidateTargetResolution,
-                tileSizeBins,
+                candidateDisplayResolution,
+                candidateTileSizeBins,
                 normalization,
                 viewAssemblyLayout.projectionBlocks,
               );
               const candidateWorld = buildContactTileWorld({
                 viewport: candidateViewport,
-                resolution: candidateTargetResolution,
-                tileSizeBins,
+                resolution: candidateDisplayResolution,
+                tileSizeBins: candidateTileSizeBins,
                 totalSpanBp: candidateTotalSpanBp,
                 scope: candidateTileScope,
-                cache: contactTileCacheLru.toMap(),
+                cache: candidatePlan.usesMainLod
+                  ? contactMainLodTileCacheLru.toMap()
+                  : contactTileCacheLru.toMap(),
                 cacheKeyForTile: candidateCacheKeyForTile,
               });
               const candidateGpuDataScope = `${candidateTileScope}|${normalization}`;
@@ -3326,8 +3350,8 @@ export function App() {
                 tiles: candidateWorld.cachedVisibleTiles,
                 dataScope: candidateGpuDataScope,
                 generation,
-                resolution: candidateTargetResolution,
-                tileSizeBins,
+                resolution: candidateDisplayResolution,
+                tileSizeBins: candidateTileSizeBins,
               });
 
               return buildContactTileLoadPlan(
@@ -3337,7 +3361,12 @@ export function App() {
                 idleAdjacentContactTileBatchSize,
               ).visibleBatches.map((tiles) => ({
                 tiles,
-                targetResolution: candidateTargetResolution,
+                adaptiveRefinement: candidatePlan.adaptiveRefinement,
+                baseResolution: candidatePlan.baseResolution,
+                sourceResolution: candidatePlan.sourceResolution,
+                targetResolution: candidateDisplayResolution,
+                tileSizeBins: candidateTileSizeBins,
+                usesMainLod: candidatePlan.usesMainLod,
                 tileScope: candidateTileScope,
                 layerScope: candidateLayerScope,
                 gpuDataScope: candidateGpuDataScope,
@@ -3374,6 +3403,7 @@ export function App() {
               }
               if (
                 contactTileFlightsRef.current.size > 0
+                || contactMainLodTileFlightsRef.current.size > 0
                 || normalizationPrewarmRequestIdRef.current !== null
               ) {
                 scheduleNextIdleJob();
@@ -3384,9 +3414,12 @@ export function App() {
               if (!job) {
                 return;
               }
+              const tileCacheLru = job.usesMainLod
+                ? contactMainLodTileCacheLru
+                : contactTileCacheLru;
               const pendingTiles = job.tiles.filter((tile) => {
                 const key = job.cacheKeyForTile(tile);
-                return !contactTileCacheLru.has(key) && !attemptedKeys.has(key);
+                return !tileCacheLru.has(key) && !attemptedKeys.has(key);
               });
               for (const tile of pendingTiles) {
                 attemptedKeys.add(job.cacheKeyForTile(tile));
@@ -3397,7 +3430,10 @@ export function App() {
               }
 
               try {
-                const tiles = await contactTileFlightsRef.current.loadBatch({
+                const tileFlights = job.usesMainLod
+                  ? contactMainLodTileFlightsRef.current
+                  : contactTileFlightsRef.current;
+                const tiles = await tileFlights.loadBatch({
                   scope: job.tileScope,
                   tiles: pendingTiles,
                   cacheKeyForTile: job.cacheKeyForTile,
@@ -3415,18 +3451,20 @@ export function App() {
                         generation,
                         purpose: "adjacent_prefetch",
                         coolPath: contactCoolPath,
-                        baseResolution: 1000,
+                        baseResolution: job.baseResolution,
+                        sourceResolution: job.sourceResolution,
                         targetResolution: job.targetResolution,
-                        tileSizeBins,
+                        tileSizeBins: job.tileSizeBins,
                         normalization,
                         tiles: requestedTiles,
+                        adaptiveRefinement: job.adaptiveRefinement,
                       },
                     ),
                 });
                 if (cancelled || generation !== contactTileGenerationRef.current) {
                   return;
                 }
-                contactTileCacheLru.merge(
+                tileCacheLru.merge(
                   job.layerScope,
                   tiles.map((tile) => ({
                     key: job.cacheKeyForTile(tile),
@@ -3436,23 +3474,31 @@ export function App() {
                   })),
                   {
                     recency: "background",
-                    keys: foregroundProtectedKeys,
+                    keys: job.usesMainLod
+                      ? new Set(pendingTiles.map(job.cacheKeyForTile))
+                      : foregroundProtectedKeys,
                     // Retain the newly useful neighbor long enough to replace a
                     // stale non-adjacent scope when the three-scope budget is
                     // already full. Tile/cell pressure still evicts its cold
                     // records before the protected foreground keys.
-                    scopes: adjacentLayerScopeIds,
+                    scopes: job.usesMainLod
+                      ? new Set([job.layerScope.id])
+                      : adjacentLayerScopeIds,
                   },
                 );
                 // Background work deliberately avoids React state, status, and
                 // performance markers. A later resolution switch reads this ref.
-                contactTileCacheRef.current = contactTileCacheLru.toMap();
+                if (job.usesMainLod) {
+                  contactMainLodTileCacheRef.current = contactMainLodTileCacheLru.toMap();
+                } else {
+                  contactTileCacheRef.current = contactTileCacheLru.toMap();
+                }
                 contactPanPrefetchBridge.publishGpuResident({
                   tiles,
                   dataScope: job.gpuDataScope,
                   generation,
                   resolution: job.targetResolution,
-                  tileSizeBins,
+                  tileSizeBins: job.tileSizeBins,
                 });
               } catch {
                 if (cancelled || generation !== contactTileGenerationRef.current) {

@@ -1186,6 +1186,12 @@ export function ContactMapViewport({
       ingestContactGpuResidentPrefetchBatch(renderer, batch);
     }
   }), [contactPanPrefetchBridge]);
+  usePrePaintEffect(() => {
+    // Resolution/normalization controls update before the replacement heatmap
+    // has reached the staging FBO. Do not let an earlier neighbor-prewarm frame
+    // compete with that atomic handoff.
+    contactTilePanRendererRef.current?.discardPrefetchedPages();
+  }, [uiState.contact.resolution, uiState.normalization]);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const assemblySelectionBandsRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -2055,6 +2061,7 @@ export function ContactMapViewport({
 
       if (!panLoadingSuspendedRef.current) {
         panLoadingSuspendedRef.current = true;
+        contactTilePanRendererRef.current?.discardPrefetchedPages();
         onContactPanGestureStart?.();
       }
 
@@ -2283,6 +2290,7 @@ export function ContactMapViewport({
 
     if (!panLoadingSuspendedRef.current) {
       panLoadingSuspendedRef.current = true;
+      contactTilePanRendererRef.current?.discardPrefetchedPages();
       onContactPanGestureStart?.();
     }
 
@@ -2592,6 +2600,7 @@ export function ContactMapViewport({
     });
     if (!panLoadingSuspendedRef.current) {
       panLoadingSuspendedRef.current = true;
+      contactTilePanRendererRef.current?.discardPrefetchedPages();
       onContactPanGestureStart?.();
     }
     preparePanViewport(previewViewport);

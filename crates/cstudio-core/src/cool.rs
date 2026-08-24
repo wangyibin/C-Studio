@@ -469,16 +469,17 @@ pub struct CoolContactVisitTimings {
 }
 
 /// Controls whether a contact scan may materialize or reuse the complete
-/// `pixels/bin2_id` and `pixels/count` columns. Background neighbor requests
-/// use `Bin1OffsetRangesOnly` so their memory cost is bounded by the selected
-/// `indexes/bin1_offset` ranges instead of the size of the Cooler level.
+/// `pixels/bin2_id` and `pixels/count` columns. Normal production scans default
+/// to bounded `indexes/bin1_offset` ranges; background neighbor requests use
+/// the stricter `Bin1OffsetRangesOnly` policy so they never bridge unselected
+/// gaps. Complete resident columns are opt-in for diagnostics only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CoolPixelColumnReadPolicy {
-    #[default]
     PreferResidentColumns,
     /// Read selected bin1 rows in bounded HDF5 slices, while allowing nearby
     /// ranges to share one I/O operation. No complete pixel column is built or
     /// reused.
+    #[default]
     Bin1OffsetRanges,
     Bin1OffsetRangesOnly,
 }
@@ -710,9 +711,8 @@ pub fn prewarm_contact_reader_at_resolution_cancellable(
     })
 }
 
-/// Build the bounded resident secondary index for one displayed Cooler level.
-/// The app schedules this only after the first visible layer has painted, so
-/// later pans can select bin2 and count values without touching HDF5 again.
+/// Explicitly build the bounded resident secondary index for diagnostics.
+/// Production readers use `bin1_offset` ranges and do not call this helper.
 /// Returns false for levels that exceed the configured resident-memory caps.
 pub fn prewarm_contact_pixels_at_resolution_cancellable(
     path: &str,
@@ -1055,7 +1055,7 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
         source_ranges,
         resolution,
         normalization,
-        CoolPixelColumnReadPolicy::PreferResidentColumns,
+        CoolPixelColumnReadPolicy::Bin1OffsetRanges,
         should_cancel,
     )
 }
@@ -1117,7 +1117,7 @@ where
         source_ranges,
         resolution,
         normalization,
-        CoolPixelColumnReadPolicy::PreferResidentColumns,
+        CoolPixelColumnReadPolicy::Bin1OffsetRanges,
         should_cancel,
         MAX_COOL_STREAM_PIXEL_READ_CHUNK,
         None,
@@ -1152,7 +1152,7 @@ where
         source_ranges,
         resolution,
         normalization,
-        CoolPixelColumnReadPolicy::PreferResidentColumns,
+        CoolPixelColumnReadPolicy::Bin1OffsetRanges,
         should_cancel,
         MAX_COOL_STREAM_PIXEL_READ_CHUNK,
         None,
@@ -1185,7 +1185,7 @@ where
         source_ranges,
         resolution,
         normalization,
-        CoolPixelColumnReadPolicy::PreferResidentColumns,
+        CoolPixelColumnReadPolicy::Bin1OffsetRanges,
         should_cancel,
         timings,
         visit,
@@ -1250,7 +1250,7 @@ where
         source_ranges,
         resolution,
         normalization,
-        CoolPixelColumnReadPolicy::PreferResidentColumns,
+        CoolPixelColumnReadPolicy::Bin1OffsetRanges,
         should_cancel,
         timings,
         visit,
@@ -4214,6 +4214,7 @@ mod tests {
         cached_normalization_vector, cool_index_cache_key, list_contact_resolutions,
         list_contact_sources, normalized_contact_count, pixel_ranges_for_selected_bin_ranges,
         prewarm_available_contact_normalization_at_resolution_cancellable,
+        prewarm_contact_pixels_at_resolution_cancellable,
         read_cool_contacts_for_source_ranges_at_resolution,
         read_cool_contacts_for_source_ranges_at_resolution_cancellable,
         read_cool_contacts_for_source_ranges_at_resolution_with_policy_cancellable,
@@ -4743,6 +4744,11 @@ mod tests {
             expected_tuples,
         );
 
+        assert!(
+            prewarm_contact_pixels_at_resolution_cancellable(file.path(), None, &|| false)
+                .expect("diagnostic resident prewarm should work"),
+        );
+
         let mut profiled_control = Vec::new();
         let mut control_timings = CoolContactVisitTimings::default();
         let profiled_control_visited = visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
@@ -4767,7 +4773,10 @@ mod tests {
         .expect("profiled string visitor should work");
         assert_eq!(profiled_control_visited, expected.len());
         assert_eq!(profiled_control, expected_tuples);
-        assert_eq!(control_timings.hdf5_chunks, 0);
+        assert!(
+            control_timings.hdf5_chunks > 0,
+            "default string visitor must use bounded HDF5 slices"
+        );
         assert!(control_timings.scanned_pixels >= expected.len());
 
         let mut profiled_indexed = Vec::new();
@@ -4795,7 +4804,10 @@ mod tests {
         )
         .expect("profiled indexed visitor should work");
         assert_eq!(profiled_indexed_visited, expected.len());
-        assert_eq!(indexed_timings.hdf5_chunks, 0);
+        assert!(
+            indexed_timings.hdf5_chunks > 0,
+            "default indexed visitor must use bounded HDF5 slices"
+        );
         assert_eq!(
             indexed_timings.scanned_pixels,
             control_timings.scanned_pixels
