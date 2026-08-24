@@ -293,12 +293,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../../user-guide/project-data/" class="md-tabs__link">
+        <a href="../../user-guide/input-preparation/" class="md-tabs__link">
           
   
   用户指南
@@ -511,6 +513,8 @@
       
         
       
+        
+      
     
     
     
@@ -553,6 +557,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  准备输入文件
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1039,17 +1070,6 @@
   
 </li>
       
-        <li class="md-nav__item">
-  <a href="#github-pages" class="md-nav__link">
-    <span class="md-ellipsis">
-      <span class="md-typeset">
-        多版本 GitHub Pages
-      </span>
-    </span>
-  </a>
-  
-</li>
-      
     </ul>
   
 </nav>
@@ -1150,17 +1170,6 @@
   
 </li>
       
-        <li class="md-nav__item">
-  <a href="#github-pages" class="md-nav__link">
-    <span class="md-ellipsis">
-      <span class="md-typeset">
-        多版本 GitHub Pages
-      </span>
-    </span>
-  </a>
-  
-</li>
-      
     </ul>
   
 </nav>
@@ -1180,9 +1189,8 @@
 
 
 <h1 id="_1">构建文档<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
-<p>文档沿用当前 C-Phasing 的双语模式，英文与中文使用独立源目录和配置文件。构建器
-为 Zensical；保留 <code>mkdocs_*.yml</code> 格式，是因为 Zensical 原生兼容 Material for
-MkDocs 配置。</p>
+<p>文档的英文与中文使用独立源目录和配置文件。Zensical 使用
+<code>mkdocs_*.yml</code> 配置构建两种语言的站点。</p>
 <h2 id="_2">目录结构<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>docs/
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── en/                 # 英文源文件
@@ -1192,15 +1200,14 @@ MkDocs 配置。</p>
 </span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>pixi.toml               # 文档环境与可复用任务
 </span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>pixi.lock               # Conda 与 PyPI 依赖的精确锁定
 </span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>scripts/build-docs.sh   # Pixi 任务的兼容包装脚本
-</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>.github/workflows/docs.yml
 </span></code></pre></div>
 <h2 id="_3">安装文档环境<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
 <p>先安装 <a href="https://pixi.sh/latest/installation/">Pixi</a>，再创建已锁定的 <code>docs</code>
 环境：</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>docs
 </span></code></pre></div>
-<p>Pixi 会安装 Python、Git、Zensical，以及固定到指定提交的 Zensical 兼容版 Mike。
-无需再为这些工具创建独立虚拟环境。</p>
+<p>Pixi 会安装 Python、Git、Zensical 和已锁定的文档依赖。无需再为这些工具
+创建独立虚拟环境。</p>
 <h2 id="_4">构建两种语言<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h2>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>docs-build
 </span></code></pre></div>
@@ -1229,64 +1236,6 @@ MkDocs 配置。</p>
 </ol>
 <p>不要把不确定性翻译成确定性。平台支持、生物学验证、发布可用性和性能，都应明确
 说明真正验证过的内容。</p>
-<h2 id="github-pages">多版本 GitHub Pages<a class="headerlink" href="#github-pages" title="Permanent link">&para;</a></h2>
-<p>发布采用与 C-Phasing 一致的 Mike 目录结构。英文和中文在同一个 <code>gh-pages</code>
-分支上分别维护版本索引：</p>
-<table>
-<thead>
-<tr>
-<th>来源事件</th>
-<th>英文 URL</th>
-<th>中文 URL</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>推送到 <code>main</code></td>
-<td><code>/C-Studio/dev/</code></td>
-<td><code>/C-Studio/zh/dev/</code></td>
-</tr>
-<tr>
-<td><code>v0.2.0</code> 等标签</td>
-<td><code>/C-Studio/v0.2.0/</code></td>
-<td><code>/C-Studio/zh/v0.2.0/</code></td>
-</tr>
-<tr>
-<td>最新正式版别名</td>
-<td><code>/C-Studio/latest/</code></td>
-<td><code>/C-Studio/zh/latest/</code></td>
-</tr>
-</tbody>
-</table>
-<p>第一次发布 <code>main</code> 时，站点根目录会跳转到 <code>dev</code>；第一次发布版本标签后，两种
-语言的根目录都会改为跳转到 <code>latest</code>。旧版本继续保留在 <code>gh-pages</code>，重新发布
-某个版本只会替换该版本。</p>
-<p>工作流提供两个可选的手动输入：</p>
-<ul>
-<li><code>backfill_tags</code> 发布一个或多个历史标签中保存的文档。每个标签必须同时包含
-  <code>docs/en/index.md</code> 与 <code>docs/zh/index.md</code>。</li>
-<li><code>update_docs_version</code> 用运行工作流时所选 ref 的文档覆盖一个已有版本。它只
-  用于修订已发布文档，不会重新构建应用程序版本。</li>
-</ul>
-<p>两个输入都留空时，会发布所选标签，或从所选分支刷新 <code>dev</code>。工作流会拒绝同时
-使用两个输入。</p>
-<p>Mike 固定到 <code>pixi.lock</code> 中记录的 Zensical 兼容分支及提交。每次发布前，工作流
-先运行严格的 <code>docs-build</code> 双语构建任务；随后 Mike 把各版本产物提交到
-<code>gh-pages</code>。</p>
-<p>在 <strong>Settings → Pages → Source</strong> 中选择 <strong>Deploy from a branch</strong>，分支选择
-<code>gh-pages</code>，目录选择 <code>/ (root)</code>。只有规范仓库 <code>wangyibin/C-Studio</code> 的发布任务
-具有写权限；拉取请求只执行严格构建，不发布页面。</p>
-<p>如需本地检查完整版本站点，请在一次性克隆中运行不带 <code>--push</code> 的命令：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>deploy<span class="w"> </span>-F<span class="w"> </span>mkdocs_en.yml<span class="w"> </span>v0.0.0-test<span class="w"> </span>latest
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>deploy<span class="w"> </span>-F<span class="w"> </span>mkdocs_zh.yml<span class="w"> </span>--deploy-prefix<span class="w"> </span>zh<span class="w"> </span>v0.0.0-test<span class="w"> </span>latest
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>set-default<span class="w"> </span>-F<span class="w"> </span>mkdocs_en.yml<span class="w"> </span>latest
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>set-default<span class="w"> </span>-F<span class="w"> </span>mkdocs_zh.yml<span class="w"> </span>--deploy-prefix<span class="w"> </span>zh<span class="w"> </span>latest
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>serve
-</span></code></pre></div>
-<p>这些命令会在本地创建 <code>gh-pages</code> 提交。仅测试时不要添加 <code>--push</code>。</p>
-<p>当前配置假定仓库和站点地址为 <code>wangyibin/C-Studio</code> 与
-<code>wangyibin.github.io/C-Studio</code>。如果发布到其他位置，需要同步修改 <code>repo_url</code>、
-<code>site_url</code>、工作流中的规范仓库条件和两个语言切换链接。</p>
 
 
 

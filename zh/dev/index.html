@@ -295,12 +295,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="./user-guide/project-data/" class="md-tabs__link">
+        <a href="./user-guide/input-preparation/" class="md-tabs__link">
           
   
   用户指南
@@ -591,6 +593,8 @@
       
         
       
+        
+      
     
     
     
@@ -633,6 +637,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="./user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  准备输入文件
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1135,7 +1166,7 @@
 并由用户主动编辑 AGP。当前应用由 Tauri 2、React、TypeScript 和 Rust 构建。</p>
 <div class="admonition important">
 <p class="admonition-title">当前范围</p>
-<p>本文档描述当前磁盘中的 <code>0.1.0</code> 实现。C-Studio 提供证据辅助的校订工作流，
+<p>本文档描述当前 <code>0.3.5</code> 实现。C-Studio 提供证据辅助的校订工作流，
 但<strong>不会</strong>替用户判断生物学上正确的断点、方向、分组或拷贝数。</p>
 </div>
 <h2 id="c-studio_1">C-Studio 汇集的内容<a class="headerlink" href="#c-studio_1" title="Permanent link">&para;</a></h2>
@@ -1146,6 +1177,7 @@
 <li>depth 或 bedGraph 覆盖度轨道</li>
 <li>GFA 组装图拓扑及可选的端点级三维接触证据</li>
 <li>感知拷贝的选择、编辑、历史、撤销、重做和 AGP 导出</li>
+<li>与编辑后 AGP 一同保存、可兼容恢复的操作历史 sidecar</li>
 </ul>
 <pre class="mermaid"><code>flowchart LR
     A["AGP 组装"] --&gt; W["同步工作区"]
@@ -1163,6 +1195,7 @@
 <h2 id="_2">从这里开始<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
 <ol>
 <li><a href="installation/">安装或构建 C-Studio</a>。</li>
+<li><a href="user-guide/input-preparation/">准备 AGP 和证据文件</a>。</li>
 <li>按照<a href="getting-started/">首个项目流程</a>操作。</li>
 <li>加载真实数据前阅读<a href="user-guide/project-data/">项目文件发现规则</a>。</li>
 <li>启用自动保存或删除拷贝前阅读<a href="user-guide/assembly-editing/">组装编辑</a>。</li>

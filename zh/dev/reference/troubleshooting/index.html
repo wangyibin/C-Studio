@@ -295,12 +295,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../../user-guide/project-data/" class="md-tabs__link">
+        <a href="../../user-guide/input-preparation/" class="md-tabs__link">
           
   
   用户指南
@@ -513,6 +515,8 @@
       
         
       
+        
+      
     
     
     
@@ -555,6 +559,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  准备输入文件
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -910,10 +941,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#only-implemented-for-macos" class="md-nav__link">
+  <a href="#_2" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        选择器报告 “only implemented for macOS”
+        文件或目录选择器没有打开
       </span>
     </span>
   </a>
@@ -932,7 +963,7 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_2" class="md-nav__link">
+  <a href="#_3" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
         热图或轨道为空
@@ -965,7 +996,7 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_3" class="md-nav__link">
+  <a href="#_4" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
         同源布局缺失或无效
@@ -976,7 +1007,7 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_4" class="md-nav__link">
+  <a href="#_5" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
         自动保存不可用
@@ -987,7 +1018,18 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_5" class="md-nav__link">
+  <a href="#_6" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        已保存历史没有恢复
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_7" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
         无法打开打包应用
@@ -1153,10 +1195,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#only-implemented-for-macos" class="md-nav__link">
+  <a href="#_2" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        选择器报告 “only implemented for macOS”
+        文件或目录选择器没有打开
       </span>
     </span>
   </a>
@@ -1175,7 +1217,7 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_2" class="md-nav__link">
+  <a href="#_3" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
         热图或轨道为空
@@ -1208,7 +1250,7 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_3" class="md-nav__link">
+  <a href="#_4" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
         同源布局缺失或无效
@@ -1219,7 +1261,7 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_4" class="md-nav__link">
+  <a href="#_5" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
         自动保存不可用
@@ -1230,7 +1272,18 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_5" class="md-nav__link">
+  <a href="#_6" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        已保存历史没有恢复
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_7" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
         无法打开打包应用
@@ -1270,15 +1323,16 @@
 
 
 <h1 id="_1">故障排查<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
-<h2 id="only-implemented-for-macos">选择器报告 “only implemented for macOS”<a class="headerlink" href="#only-implemented-for-macos" title="Permanent link">&para;</a></h2>
-<p>原生项目目录、<code>.cool/.mcool</code>、PAF 和覆盖度选择器目前没有非 macOS 后端。这是
-当前实现限制，不代表文件格式错误。AGP 与 GFA 有 Web 文件输入，但完整 Windows
-工作流仍需要后端支持。</p>
+<h2 id="_2">文件或目录选择器没有打开<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
+<p>当前桌面版在 macOS 和 Windows 上使用 Tauri 原生对话框插件。如果旧版本报告
+“only implemented for macOS”，请更新到当前版本。否则，请确认应用具有
+所选目录的访问权限，并检查是否有原生对话框隐藏在主窗口后面。真实 Windows
+桌面行为仍应在发布 QA 中单独检查。</p>
 <h2 id="no-supported-project-files-found">“No supported project files found”<a class="headerlink" href="#no-supported-project-files-found" title="Permanent link">&para;</a></h2>
 <p>确认支持的文件是所选目录顶层的普通文件，并使用专用扩展名：<code>.agp</code>、
 <code>.gfa</code>/<code>.gfa1</code>、<code>.paf</code>、<code>.depth</code>/<code>.bedgraph</code>/<code>.bg</code>、<code>.cool</code> 或 <code>.mcool</code>。
 文本格式可以增加 <code>.gz</code>。目录扫描不会发现子目录和通用 <code>.txt</code> 文件。</p>
-<h2 id="_2">热图或轨道为空<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
+<h2 id="_3">热图或轨道为空<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
 <p>比较 AGP component ID 与接触矩阵 chromosome 名、PAF query 名、覆盖度
 chromosome 名和 GFA segment 名。只有源 ID 匹配且区间相交的证据才会被投影。</p>
 <p>同时检查视口、所选分辨率、颜色最大值、轨道可见性和归一化。可用 <strong>Fit</strong> 和
@@ -1293,14 +1347,19 @@ chromosome 名和 GFA segment 名。只有源 ID 匹配且区间相交的证据�
 <h2 id="gfa">GFA 导入后没有图<a class="headerlink" href="#gfa" title="Permanent link">&para;</a></h2>
 <p>C-Studio 需要有效的 <code>S</code> 记录。只包含其他记录类型的输入会报告没有找到 GFA
 <code>S</code> 记录。请检查制表符分隔、segment 名称、序列为 <code>*</code> 时的 <code>LN</code> 标签和解析警告。</p>
-<h2 id="_3">同源布局缺失或无效<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
+<h2 id="_4">同源布局缺失或无效<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h2>
 <p>修改 <strong>Homolog regex</strong>，使捕获组 1 标识同源组、捕获组 2 提供成员顺序。对于
 <code>Chr01g1</code> 这类名称，默认 <code>(Chr\d+)g(\d+)</code> 合适。表达式必须是有效的
 JavaScript 正则。</p>
-<h2 id="_4">自动保存不可用<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h2>
+<h2 id="_5">自动保存不可用<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h2>
 <p>自动保存需要可写的普通 AGP 目标。先手动保存一次以选择路径；<code>.agp.gz</code> 源文件
-不能被覆盖。如果源路径消失或不可写，C-Studio 会退回另存为或报告错误。</p>
-<h2 id="_5">无法打开打包应用<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h2>
+不能被覆盖；仅加载 AGP 不会建立保存目标。如果已选目标消失或不可写，
+C-Studio 会退回另存为或报告错误。</p>
+<h2 id="_6">已保存历史没有恢复<a class="headerlink" href="#_6" title="Permanent link">&para;</a></h2>
+<p>请把 <code>&lt;AGP-prefix&gt;.history.json</code> 与对应 AGP 放在同一目录。C-Studio 会拒绝
+格式错误的 sidecar，也会拒绝内嵌规范 AGP 与当前布局不匹配的 sidecar。
+AGP 仍会正常加载，应用日志会记录该 sidecar 已被忽略。</p>
+<h2 id="_7">无法打开打包应用<a class="headerlink" href="#_7" title="Permanent link">&para;</a></h2>
 <p>当前 macOS 包未公证；确认包来源后右键并选择<strong>打开</strong>。Windows 包没有签名，
 可能触发 SmartScreen。这些警告不能通过修改 C-Studio 设置消除。</p>
 <h2 id="load-example-project">安装包中 “Load example project” 失败<a class="headerlink" href="#load-example-project" title="Permanent link">&para;</a></h2>

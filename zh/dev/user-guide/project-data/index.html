@@ -13,7 +13,7 @@
         <link rel="canonical" href="https://wangyibin.github.io/C-Studio/zh/dev/user-guide/project-data/">
       
       
-        <link rel="prev" href="../../getting-started/">
+        <link rel="prev" href="../input-preparation/">
       
       
         <link rel="next" href="../interface/">
@@ -297,12 +297,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="././" class="md-tabs__link">
+        <a href="../input-preparation/" class="md-tabs__link">
           
   
   用户指南
@@ -515,6 +517,8 @@
       
         
       
+        
+      
     
     
     
@@ -560,6 +564,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  准备输入文件
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1182,6 +1213,7 @@
 
 
 <h1 id="_1">项目数据<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
+<p>AGP、COOL/MCOOL、PAF、覆盖度和 GFA 的生成命令见<a href="../input-preparation/">准备输入文件</a>。</p>
 <h2 id="_2">支持的输入<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1198,6 +1230,12 @@
 <td><code>.agp</code>、<code>.agp.gz</code></td>
 <td>权威且可编辑的布局</td>
 <td>是</td>
+</tr>
+<tr>
+<td>编辑历史</td>
+<td><code>&lt;AGP-prefix&gt;.history.json</code></td>
+<td>可兼容恢复的撤销/重做时间线</td>
+<td>否</td>
 </tr>
 <tr>
 <td>接触矩阵</td>
@@ -1226,7 +1264,9 @@
 </tbody>
 </table>
 <p>单文件入口还接受部分 AGP、GFA、PAF 和覆盖度的 <code>.txt</code>、<code>.txt.gz</code> 形式；项目
-目录自动发现只使用表中的专用扩展名。</p>
+目录自动发现只使用表中的专用扩展名。history sidecar 不会被独立选择；
+只有当它的前缀与所选 AGP 一致，且其内嵌的规范 AGP 与当前布局匹配时，
+C-Studio 才会加载。</p>
 <h2 id="_3">项目目录发现<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
 <p><strong>Load project folder…</strong> 只扫描所选目录顶层的普通文件，不递归进入子目录。</p>
 <p>每种证据类型都会：</p>
@@ -1237,6 +1277,9 @@
 </ol>
 <p>接触矩阵优先选择 <code>.mcool</code>，其次为 <code>.cool</code>；同类文件再按确定性文件名顺序决定。
 文本输入可以 gzip 压缩；<code>.cool</code> 和 <code>.mcool</code> 是 HDF5 容器，不能再用 gzip 包裹。</p>
+<p>如果选中的 AGP 为 <code>assembly.agp</code> 或 <code>assembly.agp.gz</code>，对应历史文件名为
+<code>assembly.history.json</code>。不兼容或格式错误的 sidecar 会被忽略，不会套用到
+其他布局。</p>
 <h2 id="_4">标识符兼容性<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h2>
 <p>AGP 的 component ID 是证据投影到编辑后可视布局时使用的不可变查询键。以下
 标识应一致：</p>
@@ -1255,9 +1298,9 @@ AGP；对应文件未加载前，其他证据面板保持为空或禁用。</p>
 <p>加载新项目目录会替换当前工作区。使用 <strong>Clear all loaded data…</strong> 明确移除全部
 来源；使用 <strong>Reload assembly…</strong> 恢复最初加载的 AGP，同时保留其他证据。</p>
 <h2 id="_6">平台说明<a class="headerlink" href="#_6" title="Permanent link">&para;</a></h2>
-<p>当前后端中的原生目录选择器，以及 <code>.cool/.mcool</code>、PAF 和覆盖度选择器，仅在
-macOS 实现。AGP 与 GFA 使用 Web 文件输入，但这并不意味着 Windows 上的完整
-项目加载流程已经等价。</p>
+<p>桌面应用在 macOS 和 Windows 上使用 Tauri 原生对话框插件选择项目目录和
+单项数据文件。完整的真实 Windows 点击验证仍是独立的发布 QA 步骤。浏览器预览
+可以使用 Web 文本文件入口，但不提供桌面端 HDF5 后端。</p>
 
 
 
@@ -1297,7 +1340,7 @@ macOS 实现。AGP 与 GFA 使用 Web 文件输入，但这并不意味着 Windo
       <nav class="md-footer__inner md-grid" aria-label="页脚" >
         
           
-          <a href="../../getting-started/" class="md-footer__link md-footer__link--prev" aria-label="上一页: 快速开始">
+          <a href="../input-preparation/" class="md-footer__link md-footer__link--prev" aria-label="上一页: 准备输入文件">
             <div class="md-footer__button md-icon">
               
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-arrow-left" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7M19 12H5"/></svg>
@@ -1307,7 +1350,7 @@ macOS 实现。AGP 与 GFA 使用 Web 文件输入，但这并不意味着 Windo
                 上一页
               </span>
               <div class="md-ellipsis">
-                快速开始
+                准备输入文件
               </div>
             </div>
           </a>
