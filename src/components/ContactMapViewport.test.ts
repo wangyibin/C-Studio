@@ -20,6 +20,9 @@ import {
   contactPanCommitAction,
   contactPanPrefetchChannel,
   contactPanPreviewTileSignature,
+  contactPanTransformOffsets,
+  contactVisibleInteractionViewport,
+  contactWheelPanSessionCameras,
   presentContactPanPrefetchBatches,
   contactCanvasBackingSizeFromBounds,
   committedPanTargetIsPainted,
@@ -302,7 +305,7 @@ describe("assemblySelectionProjectionBands", () => {
     });
   });
 
-  it("keeps the visible axis band when independent x/y viewports only overlap one axis", () => {
+  it("keeps both axis bands mounted when one projection is currently offscreen", () => {
     expect(assemblySelectionProjectionBands(100, 200, {
       xStart: 0,
       xEnd: 400,
@@ -310,7 +313,19 @@ describe("assemblySelectionProjectionBands", () => {
       yEnd: 500,
     })).toEqual({
       vertical: { left: "25%", width: "25%" },
-      horizontal: null,
+      horizontal: { top: "-100%", height: "50%" },
+    });
+  });
+
+  it("preserves the full band geometry instead of resizing it at a viewport edge", () => {
+    expect(assemblySelectionProjectionBands(-50, 50, {
+      xStart: 0,
+      xEnd: 200,
+      yStart: -100,
+      yEnd: 100,
+    })).toEqual({
+      vertical: { left: "-25%", width: "50%" },
+      horizontal: { top: "25%", height: "50%" },
     });
   });
 });
@@ -461,6 +476,59 @@ describe("committed pan front-surface handoff", () => {
       renderGeneration: 8,
       viewport: committedViewport,
     }, 7)).toBe(false);
+  });
+});
+
+describe("fast consecutive pan camera", () => {
+  it("keeps the accumulated transform relative to the still-rendered source camera", () => {
+    const renderedViewport = { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 };
+    const previousCommittedViewport = { xStart: 10, xEnd: 110, yStart: 20, yEnd: 120 };
+    const nextPreviewViewport = { xStart: 20, xEnd: 120, yStart: 30, yEnd: 130 };
+
+    expect(contactPanTransformOffsets(
+      renderedViewport,
+      nextPreviewViewport,
+      1_000,
+      500,
+    )).toEqual({ offsetX: -200, offsetY: -150 });
+    expect(contactPanTransformOffsets(
+      previousCommittedViewport,
+      nextPreviewViewport,
+      1_000,
+      500,
+    )).toEqual({ offsetX: -100, offsetY: -50 });
+  });
+
+  it("hit-tests against the camera currently visible during frame handoff", () => {
+    const displayViewport = { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 };
+    const pendingCommittedViewport = { xStart: 20, xEnd: 120, yStart: 30, yEnd: 130 };
+    const activePreviewViewport = { xStart: 40, xEnd: 140, yStart: 50, yEnd: 150 };
+
+    expect(contactVisibleInteractionViewport(
+      displayViewport,
+      pendingCommittedViewport,
+    )).toBe(pendingCommittedViewport);
+    expect(contactVisibleInteractionViewport(
+      displayViewport,
+      pendingCommittedViewport,
+      activePreviewViewport,
+    )).toBe(activePreviewViewport);
+    expect(contactVisibleInteractionViewport(displayViewport, null)).toBe(displayViewport);
+  });
+
+  it("accumulates a new wheel burst from the retained presentation camera", () => {
+    const retainedDisplayViewport = { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 };
+    const liveViewport = { xStart: 10, xEnd: 110, yStart: 20, yEnd: 120 };
+    const pendingCommittedViewport = { xStart: 15, xEnd: 115, yStart: 25, yEnd: 125 };
+
+    expect(contactWheelPanSessionCameras(
+      retainedDisplayViewport,
+      liveViewport,
+      pendingCommittedViewport,
+    )).toEqual({
+      startViewport: pendingCommittedViewport,
+      transformSourceViewport: retainedDisplayViewport,
+    });
   });
 });
 
@@ -1464,11 +1532,13 @@ describe("assembly overlay hierarchy", () => {
     expect(markup).toContain('data-block-id="Chr01_block_1"');
     expect(markup).toContain('title="Chr01_block_1 · 2 contigs"');
     expect(markup).not.toContain('data-contig-id="Chr01:4:ctg3"');
+    expect(markup.match(/assembly-selection-axis-bands/g)).toHaveLength(1);
     expect(markup.match(/assembly-selection-axis-band vertical/g)).toHaveLength(1);
     expect(markup.match(/assembly-selection-axis-band horizontal/g)).toHaveLength(1);
-    expect(markup).toMatch(
-      /class="assembly-selection-axis-band horizontal"[^>]*><\/span><div class="assembly-overlay-layer"/,
-    );
+    expect(markup.match(/assembly-selection-axis-outline vertical/g)).toHaveLength(1);
+    expect(markup.match(/assembly-selection-axis-outline horizontal/g)).toHaveLength(1);
+    expect(markup.indexOf("assembly-selection-axis-bands"))
+      .toBeLessThan(markup.indexOf("assembly-overlay-layer"));
 
     uiState.assembly.showBlockBoxes = false;
     const contigOnlyMarkup = renderToStaticMarkup(

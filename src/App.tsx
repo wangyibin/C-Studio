@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { message, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { AppShell } from "./components/AppShell";
 import { exportAgpText } from "./state/agpExport";
@@ -8,6 +9,13 @@ import {
   agpSavePlan,
   shouldScheduleAgpAutoSave,
 } from "./state/agpAutoSave";
+import {
+  shouldContinueClosing,
+  shouldPromptForUnsavedClose,
+  unsavedCloseButtons,
+  unsavedCloseDecision,
+  windowCloseRequestAction,
+} from "./state/windowCloseGuard";
 import {
   contactAutoColorScaleKey,
   contactCountSampleForColorScale,
@@ -1120,6 +1128,12 @@ export function App() {
   const savedAgpPathRef = useRef<string | null>(null);
   const [savedAgpPath, setSavedAgpPath] = useState<string | null>(null);
   const savingAgpRef = useRef(false);
+  const isAgpDirtyRef = useRef(false);
+  const allowWindowCloseRef = useRef(false);
+  const closePromptOpenRef = useRef(false);
+  const exportEditedAgpRef = useRef<(
+    options?: { automatic?: boolean; saveAs?: boolean },
+  ) => Promise<boolean>>(async () => false);
   const [savedAgpText, setSavedAgpText] = useState("");
   const [savedHistoryIdentity, setSavedHistoryIdentity] = useState("");
   const sourceAgpRef = useRef<SourceAgpSnapshot | null>(null);
@@ -1543,6 +1557,7 @@ export function App() {
   const isAgpDirty = assemblyLayout.blocks.length > 0 && (
     currentAgpText !== savedAgpText || currentHistoryIdentity !== savedHistoryIdentity
   );
+  isAgpDirtyRef.current = isAgpDirty;
   const backgroundAssemblyLayout = useDebouncedValue(viewAssemblyLayout, secondaryTrackRequestDelayMs);
   const handleContactPanTilePrefetch = useCallback((preview: ContactPanPreview) => {
     if (!contactCoolPath || viewAssemblyLayout.blocks.length === 0) {
@@ -5091,16 +5106,18 @@ export function App() {
     });
   }
 
-  async function exportEditedAgp(options: { automatic?: boolean; saveAs?: boolean } = {}) {
+  async function exportEditedAgp(
+    options: { automatic?: boolean; saveAs?: boolean } = {},
+  ): Promise<boolean> {
     if (assemblyLayout.blocks.length === 0) {
       setStatusMessage("No AGP layout to save");
       dispatchUi({ type: "appendLog", message: "No AGP layout to save" });
-      return;
+      return false;
     }
     if (savingAgpRef.current) {
       setStatusMessage("AGP save is already in progress");
       dispatchUi({ type: "appendLog", message: "AGP save request ignored: save already in progress" });
-      return;
+      return false;
     }
 
     savingAgpRef.current = true;
@@ -5130,7 +5147,7 @@ export function App() {
           const message = agpBundleSavedMessage(savedStatus, existingPath);
           setStatusMessage(message);
           dispatchUi({ type: "appendLog", message });
-          return;
+          return true;
         }
         savedAgpPathRef.current = null;
         setSavedAgpPath(null);
@@ -5140,12 +5157,12 @@ export function App() {
         });
         if (automatic) {
           setStatusMessage("AGP auto-save target is unavailable; use Save to choose a new path");
-          return;
+          return false;
         }
       }
       if (plan === "unavailable") {
         setStatusMessage("AGP auto-save target is unavailable; use Save to choose a new path");
-        return;
+        return false;
       }
 
       setStatusMessage("Opening AGP save dialog…");
@@ -5161,7 +5178,7 @@ export function App() {
 
       if (!selectedPath) {
         setStatusMessage("AGP save canceled");
-        return;
+        return false;
       }
 
       const savedPath = await invoke<string>("write_agp_bundle", {
@@ -5178,11 +5195,12 @@ export function App() {
       const message = agpBundleSavedMessage(savedStatus, savedPath);
       setStatusMessage(message);
       dispatchUi({ type: "appendLog", message });
+      return true;
     } catch (error) {
       if (savedAgpPathRef.current) {
         setStatusMessage(`AGP save failed: ${String(error)}`);
         dispatchUi({ type: "appendLog", message: `AGP save failed: ${String(error)}` });
-        return;
+        return false;
       }
       downloadTextFile(filename, agpText, "text/plain;charset=utf-8");
       downloadTextFile(
@@ -5198,10 +5216,114 @@ export function App() {
         type: "appendLog",
         message: `AGP and history downloaded in browser preview: ${filename}, ${operationHistoryFilename(filename)}; native save failed: ${String(error)}`,
       });
+      return true;
     } finally {
       savingAgpRef.current = false;
     }
   }
+
+  useEffect(() => {
+    exportEditedAgpRef.current = exportEditedAgp;
+  });
+
+  useEffect(() => {
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!shouldPromptForUnsavedClose({
+        dirty: isAgpDirtyRef.current,
+        allowClose: allowWindowCloseRef.current,
+      })) {
+        return;
+      }
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+      return undefined;
+    }
+
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    const destroyWindow = async () => {
+      allowWindowCloseRef.current = true;
+      try {
+        await appWindow.destroy();
+      } catch (error) {
+        allowWindowCloseRef.current = false;
+        const closeError = `C-Studio could not close: ${String(error)}`;
+        setStatusMessage(closeError);
+        dispatchUi({ type: "appendLog", message: closeError });
+      }
+    };
+
+    void appWindow.onCloseRequested(async (event) => {
+      const action = windowCloseRequestAction({
+        dirty: isAgpDirtyRef.current,
+        allowClose: allowWindowCloseRef.current,
+        promptOpen: closePromptOpenRef.current,
+      });
+
+      // Own the close lifecycle explicitly. Relying on the listener wrapper to
+      // destroy a clean window made the no-changes path platform-dependent,
+      // while calling close() after a decision recursively emitted this event.
+      event.preventDefault();
+      if (action === "destroy") {
+        await destroyWindow();
+        return;
+      }
+      if (action === "wait") {
+        return;
+      }
+      closePromptOpenRef.current = true;
+
+      try {
+        const result = await message(
+          "This assembly has unsaved AGP or operation-history changes. Save before closing C-Studio?",
+          {
+            title: "Unsaved changes",
+            kind: "warning",
+            buttons: unsavedCloseButtons,
+          },
+        );
+        const decision = unsavedCloseDecision(result);
+        if (!(await shouldContinueClosing(
+          decision,
+          () => exportEditedAgpRef.current(),
+        ))) {
+          return;
+        }
+
+        await destroyWindow();
+      } catch (error) {
+        const promptError = `Could not open the unsaved-changes dialog: ${String(error)}`;
+        setStatusMessage(promptError);
+        dispatchUi({ type: "appendLog", message: promptError });
+      } finally {
+        closePromptOpenRef.current = false;
+      }
+    }).then((stopListening) => {
+      if (disposed) {
+        stopListening();
+      } else {
+        unlisten = stopListening;
+      }
+    }).catch((error) => {
+      const listenerError = `Could not enable the unsaved-changes close guard: ${String(error)}`;
+      setStatusMessage(listenerError);
+      dispatchUi({ type: "appendLog", message: listenerError });
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!shouldScheduleAgpAutoSave({

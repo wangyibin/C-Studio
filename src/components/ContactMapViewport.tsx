@@ -133,6 +133,7 @@ interface ContactMapViewportProps {
 interface DragState {
   pointerId: number;
   startViewport: ContactViewport;
+  transformSourceViewport: ContactViewport;
   startX: number;
   startY: number;
   currentX: number;
@@ -152,6 +153,7 @@ interface PendingPanFrame {
 interface WheelPanSession {
   sourceContactMap: ContactMapView;
   startViewport: ContactViewport;
+  transformSourceViewport: ContactViewport;
   previewViewport: ContactViewport;
   width: number;
   height: number;
@@ -222,11 +224,15 @@ interface PendingAssemblyPointerFrame {
 }
 
 export interface AssemblySelectionProjectionBands {
-  vertical: { left: string; width: string } | null;
-  horizontal: { top: string; height: string } | null;
+  vertical: { left: string; width: string };
+  horizontal: { top: string; height: string };
 }
 
-/** Project one selected assembly interval across both contact-map axes. */
+/**
+ * Project one selected assembly interval across both contact-map axes.
+ * Keep both bands mounted even while they are outside the viewport so an
+ * imperative pan can bring them back without losing either compositor layer.
+ */
 export function assemblySelectionProjectionBands(
   visualStart: number,
   visualEnd: number,
@@ -234,22 +240,17 @@ export function assemblySelectionProjectionBands(
 ): AssemblySelectionProjectionBands {
   const project = (start: number, end: number, viewportStart: number, viewportEnd: number) => {
     const span = Math.max(1, viewportEnd - viewportStart);
-    const clippedStart = Math.max(start, viewportStart);
-    const clippedEnd = Math.min(end, viewportEnd);
-    if (clippedStart >= clippedEnd) {
-      return null;
-    }
     return {
-      offset: `${((clippedStart - viewportStart) / span) * 100}%`,
-      size: `${((clippedEnd - clippedStart) / span) * 100}%`,
+      offset: `${((start - viewportStart) / span) * 100}%`,
+      size: `${((end - start) / span) * 100}%`,
     };
   };
 
   const x = project(visualStart, visualEnd, viewport.xStart, viewport.xEnd);
   const y = project(visualStart, visualEnd, viewport.yStart, viewport.yEnd);
   return {
-    vertical: x ? { left: x.offset, width: x.size } : null,
-    horizontal: y ? { top: y.offset, height: y.size } : null,
+    vertical: { left: x.offset, width: x.size },
+    horizontal: { top: y.offset, height: y.size },
   };
 }
 
@@ -336,6 +337,49 @@ export function contactPanCommitAction(
         viewport: previewViewport,
         totalSpanMb,
       };
+}
+
+/** Translate a retained presentation camera into the current drag preview. */
+export function contactPanTransformOffsets(
+  sourceViewport: ContactViewport,
+  previewViewport: ContactViewport,
+  width: number,
+  height: number,
+) {
+  const viewportWidth = Math.max(1, sourceViewport.xEnd - sourceViewport.xStart);
+  const viewportHeight = Math.max(1, sourceViewport.yEnd - sourceViewport.yStart);
+  return {
+    offsetX: -((previewViewport.xStart - sourceViewport.xStart) / viewportWidth) * width,
+    offsetY: -((previewViewport.yStart - sourceViewport.yStart) / viewportHeight) * height,
+  };
+}
+
+/**
+ * Resolve the camera that currently owns pointer coordinates.
+ *
+ * A committed pan keeps the previous presentation frame translated until the
+ * matching target frame paints. During that handoff, render geometry must stay
+ * in the old camera, while hit testing must use the translated camera the user
+ * can actually see.
+ */
+export function contactVisibleInteractionViewport(
+  displayViewport: ContactViewport,
+  pendingCommittedViewport: ContactViewport | null,
+  activePreviewViewport: ContactViewport | null = null,
+): ContactViewport {
+  return activePreviewViewport ?? pendingCommittedViewport ?? displayViewport;
+}
+
+/** Keep wheel semantics separate from the presentation frame being translated. */
+export function contactWheelPanSessionCameras(
+  displayViewport: ContactViewport,
+  liveViewport: ContactViewport,
+  pendingCommittedViewport: ContactViewport | null,
+) {
+  return {
+    startViewport: pendingCommittedViewport ?? liveViewport,
+    transformSourceViewport: displayViewport,
+  };
 }
 
 export function contactPanPreviewTileSignature(
@@ -1128,8 +1172,7 @@ export function ContactMapViewport({
     };
   }, [contactPanPrefetchBridge]);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
-  const assemblySelectionVerticalBandRef = useRef<HTMLSpanElement>(null);
-  const assemblySelectionHorizontalBandRef = useRef<HTMLSpanElement>(null);
+  const assemblySelectionBandsRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const latestContactMapRef = useRef<ContactMapView | null>(null);
   const latestDisplayContactMapRef = useRef<ContactMapView | null>(null);
@@ -1367,6 +1410,13 @@ export function ContactMapViewport({
     ? presentationContactMap.viewport
     : liveViewport;
   const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
+  const assemblyInteractionViewport = contactVisibleInteractionViewport(
+    displayViewport,
+    pendingCommittedPanViewportRef.current,
+    dragStateRef.current?.previewViewport
+      ?? wheelPanSessionRef.current?.previewViewport
+      ?? null,
+  );
   const displayedCutBinSizeBp = presentationContactMap?.resolution
     ?? contactResolutionToBasePairs(uiState.contact.resolution);
   usePrePaintEffect(() => {
@@ -1395,6 +1445,42 @@ export function ContactMapViewport({
         generation: presentationContactMap?.renderGeneration,
       });
       pendingCommittedPanViewportRef.current = null;
+    }
+    const activeDrag = dragStateRef.current;
+    if (activeDrag) {
+      cancelScheduledPanFrame();
+      dragStateRef.current = {
+        ...activeDrag,
+        transformSourceViewport: displayViewport,
+      };
+      if (activeDrag.previewViewport && presentationContactMap) {
+        // A previous committed frame can become authoritative during the next
+        // fast drag. Rebase the total transform in this layout phase so the
+        // selection bands and retained contact surface never paint in
+        // different cameras.
+        applyPanTransform(
+          { ...presentationContactMap, viewport: displayViewport },
+          { ...presentationContactMap, viewport: activeDrag.previewViewport },
+          activeDrag.width,
+          activeDrag.height,
+        );
+        return;
+      }
+    }
+    const activeWheelSession = wheelPanSessionRef.current;
+    if (activeWheelSession && presentationContactMap) {
+      cancelScheduledPanFrame();
+      activeWheelSession.transformSourceViewport = displayViewport;
+      // A prior wheel commit can paint while the next wheel burst is still
+      // active. Rebase its cumulative preview before clearing the retained
+      // transform, just as we do for a consecutive pointer drag.
+      applyPanTransform(
+        { ...presentationContactMap, viewport: displayViewport },
+        { ...presentationContactMap, viewport: activeWheelSession.previewViewport },
+        activeWheelSession.width,
+        activeWheelSession.height,
+      );
+      return;
     }
     resetPanTransform();
   }, [
@@ -1878,7 +1964,7 @@ export function ContactMapViewport({
       let wheelSession = wheelPanSessionRef.current;
       const startsWheelSession = wheelSession === null;
       if (!wheelSession) {
-        const startViewport = buildCenteredContactViewport({
+        const liveWheelViewport = buildCenteredContactViewport({
           centerMb: latestUiState.contact.viewportCenterMb,
           centerXMb: latestUiState.contact.viewportCenterXMb,
           centerYMb: latestUiState.contact.viewportCenterYMb,
@@ -1887,9 +1973,18 @@ export function ContactMapViewport({
           viewportWidthPx: latestUiState.contact.viewportWidthPx,
           viewportHeightPx: latestUiState.contact.viewportHeightPx,
         });
-        wheelSession = {
-          sourceContactMap: { ...sourceContactMap, viewport: startViewport },
+        const {
           startViewport,
+          transformSourceViewport,
+        } = contactWheelPanSessionCameras(
+          latestDisplayContactMapRef.current?.viewport ?? liveWheelViewport,
+          liveWheelViewport,
+          pendingCommittedPanViewportRef.current,
+        );
+        wheelSession = {
+          sourceContactMap,
+          startViewport,
+          transformSourceViewport,
           previewViewport: startViewport,
           width: Math.max(1, bounds.width),
           height: Math.max(1, bounds.height),
@@ -1953,7 +2048,7 @@ export function ContactMapViewport({
       wheelSession.height = Math.max(1, bounds.height);
       preparePanViewport(previewContactMap.viewport);
       schedulePanTransform(
-        wheelSession.sourceContactMap,
+        { ...wheelSession.sourceContactMap, viewport: wheelSession.transformSourceViewport },
         { ...wheelSession.sourceContactMap, viewport: previewContactMap.viewport },
         bounds.width,
         bounds.height,
@@ -2098,7 +2193,7 @@ export function ContactMapViewport({
 
     cancelScheduledPanFrame();
     applyPanTransform(
-      session.sourceContactMap,
+      { ...session.sourceContactMap, viewport: session.transformSourceViewport },
       { ...session.sourceContactMap, viewport: session.previewViewport },
       session.width,
       session.height,
@@ -2139,7 +2234,8 @@ export function ContactMapViewport({
     }
     const nextDragState = {
       pointerId: event.pointerId,
-      startViewport: liveViewport,
+      startViewport: pendingCommittedPanViewportRef.current ?? liveViewport,
+      transformSourceViewport: displayViewport,
       startX: event.clientX,
       startY: event.clientY,
       currentX: event.clientX,
@@ -2175,8 +2271,12 @@ export function ContactMapViewport({
       onContactPanGestureStart?.();
     }
 
+    const dragStartContactMap = {
+      ...liveContactMap,
+      viewport: currentDragState.startViewport,
+    };
     const previewContactMap = contactMapWithPannedViewport(
-      liveContactMap,
+      dragStartContactMap,
       deltaX,
       deltaY,
       currentDragState.width,
@@ -2191,7 +2291,7 @@ export function ContactMapViewport({
     };
     preparePanViewport(previewContactMap.viewport);
     schedulePanTransform(
-      liveContactMap,
+      { ...liveContactMap, viewport: currentDragState.transformSourceViewport },
       previewContactMap,
       currentDragState.width,
       currentDragState.height,
@@ -2208,7 +2308,7 @@ export function ContactMapViewport({
     // coordinates can lag by one WebView event, so recomputing here produces a
     // visible snap backwards. Commit that exact visible camera instead.
     const finalViewport = currentDragState.previewViewport ?? contactMapWithPannedViewport(
-      liveContactMap,
+      { ...liveContactMap, viewport: currentDragState.startViewport },
       event.clientX - currentDragState.startX,
       event.clientY - currentDragState.startY,
       currentDragState.width,
@@ -2229,7 +2329,7 @@ export function ContactMapViewport({
     }, true);
     cancelScheduledPanFrame();
     applyPanTransform(
-      liveContactMap,
+      { ...liveContactMap, viewport: currentDragState.transformSourceViewport },
       finalContactMap,
       currentDragState.width,
       currentDragState.height,
@@ -2340,10 +2440,15 @@ export function ContactMapViewport({
     width: number,
     height: number,
   ) {
-    const viewportWidth = Math.max(1, sourceContactMap.viewport.xEnd - sourceContactMap.viewport.xStart);
-    const viewportHeight = Math.max(1, sourceContactMap.viewport.yEnd - sourceContactMap.viewport.yStart);
-    const rawOffsetX = -((previewContactMap.viewport.xStart - sourceContactMap.viewport.xStart) / viewportWidth) * width;
-    const rawOffsetY = -((previewContactMap.viewport.yStart - sourceContactMap.viewport.yStart) / viewportHeight) * height;
+    const {
+      offsetX: rawOffsetX,
+      offsetY: rawOffsetY,
+    } = contactPanTransformOffsets(
+      sourceContactMap.viewport,
+      previewContactMap.viewport,
+      width,
+      height,
+    );
     // Keep the same floating-point camera on both sides of pointer release.
     // Device-pixel rounding here created a different final position from the
     // viewport projection used by the settled frame.
@@ -2372,11 +2477,9 @@ export function ContactMapViewport({
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = transform;
     }
-    if (assemblySelectionVerticalBandRef.current) {
-      assemblySelectionVerticalBandRef.current.style.transform = `translateX(${offsetX}px)`;
-    }
-    if (assemblySelectionHorizontalBandRef.current) {
-      assemblySelectionHorizontalBandRef.current.style.transform = `translateY(${offsetY}px)`;
+    if (assemblySelectionBandsRef.current) {
+      assemblySelectionBandsRef.current.style.setProperty("--selection-pan-x", `${offsetX}px`);
+      assemblySelectionBandsRef.current.style.setProperty("--selection-pan-y", `${offsetY}px`);
     }
   }
 
@@ -2436,11 +2539,9 @@ export function ContactMapViewport({
     if (assemblyOverlayLayerRef.current) {
       assemblyOverlayLayerRef.current.style.transform = "";
     }
-    if (assemblySelectionVerticalBandRef.current) {
-      assemblySelectionVerticalBandRef.current.style.transform = "";
-    }
-    if (assemblySelectionHorizontalBandRef.current) {
-      assemblySelectionHorizontalBandRef.current.style.transform = "";
+    if (assemblySelectionBandsRef.current) {
+      assemblySelectionBandsRef.current.style.removeProperty("--selection-pan-x");
+      assemblySelectionBandsRef.current.style.removeProperty("--selection-pan-y");
     }
   }
 
@@ -2546,6 +2647,16 @@ export function ContactMapViewport({
     setAssemblyPointerState(nextState);
   }
 
+  function currentAssemblyInteractionViewport() {
+    return contactVisibleInteractionViewport(
+      displayViewport,
+      pendingCommittedPanViewportRef.current,
+      dragStateRef.current?.previewViewport
+        ?? wheelPanSessionRef.current?.previewViewport
+        ?? null,
+    );
+  }
+
   function startAssemblyPointer(event: React.PointerEvent<HTMLDivElement>) {
     if (event.button !== 0 || assemblyModel.blocks.length === 0) {
       return;
@@ -2560,15 +2671,16 @@ export function ContactMapViewport({
     if (!bounds) {
       return;
     }
+    const interactionViewport = currentAssemblyInteractionViewport();
     const point = { x: pointer.clientX - bounds.left, y: pointer.clientY - bounds.top };
     const hit = hitTestAssemblyLayout(assemblyModel, point, {
       widthPx: Math.max(1, bounds.width),
       heightPx: Math.max(1, bounds.height),
       tolerancePx: event.shiftKey ? 10 : 6,
-      viewportXStart: displayViewport.xStart,
-      viewportXEnd: displayViewport.xEnd,
-      viewportYStart: displayViewport.yStart,
-      viewportYEnd: displayViewport.yEnd,
+      viewportXStart: interactionViewport.xStart,
+      viewportXEnd: interactionViewport.xEnd,
+      viewportYStart: interactionViewport.yStart,
+      viewportYEnd: interactionViewport.yEnd,
     }, assemblyHitTestIndex);
 
     const currentPointerState = assemblyPointerStateRef.current;
@@ -2582,10 +2694,10 @@ export function ContactMapViewport({
           point,
           widthPx: Math.max(1, bounds.width),
           heightPx: Math.max(1, bounds.height),
-          viewportXStart: displayViewport.xStart,
-          viewportXEnd: displayViewport.xEnd,
-          viewportYStart: displayViewport.yStart,
-          viewportYEnd: displayViewport.yEnd,
+          viewportXStart: interactionViewport.xStart,
+          viewportXEnd: interactionViewport.xEnd,
+          viewportYStart: interactionViewport.yStart,
+          viewportYEnd: interactionViewport.yEnd,
           selectionKind: uiState.assembly.selection?.kind,
         })
       : null;
@@ -2612,10 +2724,10 @@ export function ContactMapViewport({
         widthPx: Math.max(1, bounds.width),
         heightPx: Math.max(1, bounds.height),
         tolerancePx: 7,
-        viewportXStart: displayViewport.xStart,
-        viewportXEnd: displayViewport.xEnd,
-        viewportYStart: displayViewport.yStart,
-        viewportYEnd: displayViewport.yEnd,
+        viewportXStart: interactionViewport.xStart,
+        viewportXEnd: interactionViewport.xEnd,
+        viewportYStart: interactionViewport.yStart,
+        viewportYEnd: interactionViewport.yEnd,
         selectionKind: uiState.assembly.selection?.kind,
       },
       assemblyInteractionIndex,
@@ -2718,6 +2830,7 @@ export function ContactMapViewport({
       setAssemblyPointerStateIfChanged({ kind: "select", blockId: null, visualPosition: null });
       return;
     }
+    const interactionViewport = currentAssemblyInteractionViewport();
 
     setAssemblyPointerStateIfChanged(assemblyPointerStateAtScreenPoint({
       model: assemblyModel,
@@ -2733,10 +2846,10 @@ export function ContactMapViewport({
       },
       widthPx: bounds.width,
       heightPx: bounds.height,
-      viewportXStart: displayViewport.xStart,
-      viewportXEnd: displayViewport.xEnd,
-      viewportYStart: displayViewport.yStart,
-      viewportYEnd: displayViewport.yEnd,
+      viewportXStart: interactionViewport.xStart,
+      viewportXEnd: interactionViewport.xEnd,
+      viewportYStart: interactionViewport.yStart,
+      viewportYEnd: interactionViewport.yEnd,
       selectionKind: uiState.assembly.selection?.kind,
     }));
   }
@@ -2822,6 +2935,7 @@ export function ContactMapViewport({
           onUiAction({ type: "selectAssemblyChromosome", id: intent.id });
         }
       } else {
+        const interactionViewport = currentAssemblyInteractionViewport();
         const ids = contigIdsInScreenSelection(
           assemblyModel,
           {
@@ -2833,10 +2947,10 @@ export function ContactMapViewport({
             widthPx: Math.max(1, bounds.width),
             heightPx: Math.max(1, bounds.height),
             tolerancePx: 0,
-            viewportXStart: displayViewport.xStart,
-            viewportXEnd: displayViewport.xEnd,
-            viewportYStart: displayViewport.yStart,
-            viewportYEnd: displayViewport.yEnd,
+            viewportXStart: interactionViewport.xStart,
+            viewportXEnd: interactionViewport.xEnd,
+            viewportYStart: interactionViewport.yStart,
+            viewportYEnd: interactionViewport.yEnd,
           },
         );
         onUiAction({
@@ -2987,8 +3101,7 @@ export function ContactMapViewport({
           </div>
           {presentationReady ? <AssemblyOverlay
             overlayLayerRef={assemblyOverlayLayerRef}
-            selectionVerticalBandRef={assemblySelectionVerticalBandRef}
-            selectionHorizontalBandRef={assemblySelectionHorizontalBandRef}
+            selectionBandsRef={assemblySelectionBandsRef}
             viewportBoundsRef={canvasFrameBoundsRef}
             boundaryMountViewport={assemblyBoundaryMountViewport}
             renderVisualBoundaries={usesDomAssemblyBoundaries}
@@ -2997,6 +3110,7 @@ export function ContactMapViewport({
             viewportXEnd={displayViewport.xEnd}
             viewportYStart={displayViewport.yStart}
             viewportYEnd={displayViewport.yEnd}
+            interactionViewport={assemblyInteractionViewport}
             viewportWidthPx={uiState.contact.viewportWidthPx}
             viewportHeightPx={uiState.contact.viewportHeightPx}
             selection={uiState.assembly.selection}
@@ -3184,8 +3298,7 @@ function HistoryOperationPreview({
 
 interface AssemblyOverlayProps {
   overlayLayerRef: React.RefObject<HTMLDivElement>;
-  selectionVerticalBandRef: React.RefObject<HTMLSpanElement>;
-  selectionHorizontalBandRef: React.RefObject<HTMLSpanElement>;
+  selectionBandsRef: React.RefObject<HTMLDivElement>;
   viewportBoundsRef: React.MutableRefObject<CachedElementBounds | null>;
   boundaryMountViewport: ContactViewport;
   renderVisualBoundaries: boolean;
@@ -3194,6 +3307,7 @@ interface AssemblyOverlayProps {
   viewportXEnd: number;
   viewportYStart: number;
   viewportYEnd: number;
+  interactionViewport: ContactViewport;
   viewportWidthPx: number;
   viewportHeightPx: number;
   selection: UiState["assembly"]["selection"];
@@ -3217,8 +3331,7 @@ interface AssemblyOverlayProps {
 
 const AssemblyOverlay = memo(function AssemblyOverlay({
   overlayLayerRef,
-  selectionVerticalBandRef,
-  selectionHorizontalBandRef,
+  selectionBandsRef,
   viewportBoundsRef,
   boundaryMountViewport,
   renderVisualBoundaries,
@@ -3227,6 +3340,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
   viewportXEnd,
   viewportYStart,
   viewportYEnd,
+  interactionViewport,
   viewportWidthPx,
   viewportHeightPx,
   selection,
@@ -3351,8 +3465,12 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
       return;
     }
 
-    const visualPosition = viewportXStart
-      + ((event.clientX - bounds.left) / Math.max(1, bounds.width)) * viewportXSpan;
+    const interactionViewportXSpan = Math.max(
+      1,
+      interactionViewport.xEnd - interactionViewport.xStart,
+    );
+    const visualPosition = interactionViewport.xStart
+      + ((event.clientX - bounds.left) / Math.max(1, bounds.width)) * interactionViewportXSpan;
     const pointerIndex = nearestAssemblyBlockIndex(model, visualPosition);
     const startIndex = resizeState.side === "start"
       ? Math.min(pointerIndex, resizeState.fixedIndex)
@@ -3384,21 +3502,31 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
       onPointerCancel={onPointerCancel}
       onPointerLeave={onPointerLeave}
     >
-      {selectionProjectionBands?.vertical ? (
-        <span
-          ref={selectionVerticalBandRef}
+      {selectionProjectionBands ? (
+        <div
+          ref={selectionBandsRef}
           aria-hidden="true"
-          className="assembly-selection-axis-band vertical"
-          style={selectionProjectionBands.vertical}
-        />
-      ) : null}
-      {selectionProjectionBands?.horizontal ? (
-        <span
-          ref={selectionHorizontalBandRef}
-          aria-hidden="true"
-          className="assembly-selection-axis-band horizontal"
-          style={selectionProjectionBands.horizontal}
-        />
+          className="assembly-selection-axis-bands"
+        >
+          <div className="assembly-selection-axis-fill">
+            <span
+              className="assembly-selection-axis-band vertical"
+              style={selectionProjectionBands.vertical}
+            />
+            <span
+              className="assembly-selection-axis-band horizontal"
+              style={selectionProjectionBands.horizontal}
+            />
+          </div>
+          <span
+            className="assembly-selection-axis-outline vertical"
+            style={selectionProjectionBands.vertical}
+          />
+          <span
+            className="assembly-selection-axis-outline horizontal"
+            style={selectionProjectionBands.horizontal}
+          />
+        </div>
       ) : null}
       {selectionBox ? (
         <span

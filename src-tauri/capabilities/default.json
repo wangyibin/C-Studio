@@ -3,5 +3,9 @@
   "identifier": "default",
   "description": "Permissions for the C-Studio desktop window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-destroy",
+    "dialog:default"
+  ]
 }

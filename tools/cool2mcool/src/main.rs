@@ -84,7 +84,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "BP",
-        default_value_t = BASE_RESOLUTION,
+        default_value_t = 5000,
         value_parser = parse_kr_min_resolution
     )]
     kr_min_resolution: u64,
