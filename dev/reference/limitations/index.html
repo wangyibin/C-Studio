@@ -295,12 +295,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../../user-guide/project-data/" class="md-tabs__link">
+        <a href="../../user-guide/input-preparation/" class="md-tabs__link">
           
   
   User guide
@@ -513,6 +515,8 @@
       
         
       
+        
+      
     
     
     
@@ -555,6 +559,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Prepare input files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1204,7 +1235,7 @@
 
 
 <h1 id="current-limitations">Current limitations<a class="headerlink" href="#current-limitations" title="Permanent link">&para;</a></h1>
-<p>This page records boundaries of the current <code>0.1.0</code> checkout. It should be
+<p>This page records boundaries of the current <code>0.3.5</code> checkout. It should be
 updated whenever the corresponding implementation or validation changes.</p>
 <h2 id="distribution-and-platforms">Distribution and platforms<a class="headerlink" href="#distribution-and-platforms" title="Permanent link">&para;</a></h2>
 <ul>
@@ -1214,7 +1245,7 @@ updated whenever the corresponding implementation or validation changes.</p>
 <li>Project-directory, contact-map, PAF, and coverage selection now use Tauri's
   cross-platform dialog plugin. A real Windows desktop click-through remains a
   separate release QA requirement.</li>
-<li>No Linux packaging workflow is defined.</li>
+<li>Linux packages are not currently configured.</li>
 <li>Stable public releases, archival source/test-data URLs, and a citation record
   are not established by this checkout alone.</li>
 </ul>
@@ -1227,6 +1258,9 @@ from a packaged app has not been established.</p>
 when a dataset is loaded, but the current user interface does not expose a
 FASTA export action. Do not treat that readiness label as a completed FASTA
 export workflow.</p>
+<p>Operation history persistence uses a C-Studio-specific <code>.history.json</code> sidecar.
+The AGP remains independently usable, but other assembly tools do not consume
+the sidecar.</p>
 <h2 id="scientific-interpretation">Scientific interpretation<a class="headerlink" href="#scientific-interpretation" title="Permanent link">&para;</a></h2>
 <ul>
 <li>C-Studio does not automatically decide breakpoints, orientation, grouping,

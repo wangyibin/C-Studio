@@ -295,12 +295,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="./user-guide/project-data/" class="md-tabs__link">
+        <a href="./user-guide/input-preparation/" class="md-tabs__link">
           
   
   User guide
@@ -591,6 +593,8 @@
       
         
       
+        
+      
     
     
     
@@ -633,6 +637,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="./user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Prepare input files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1137,7 +1168,7 @@ edits. The current application is built with Tauri 2, React, TypeScript, and
 Rust.</p>
 <div class="admonition important">
 <p class="admonition-title">Current scope</p>
-<p>This documentation describes the on-disk <code>0.1.0</code> implementation. C-Studio
+<p>This documentation describes the current <code>0.3.5</code> implementation. C-Studio
 supports an evidence-guided curation workflow; it does <strong>not</strong> infer the
 biologically correct breakpoint, orientation, group, or copy number for the
 user.</p>
@@ -1150,6 +1181,7 @@ user.</p>
 <li>depth or bedGraph coverage tracks</li>
 <li>GFA assembly topology and optional endpoint-level 3D-contact evidence</li>
 <li>copy-aware selection, editing, history, undo, redo, and AGP export</li>
+<li>compatible operation-history sidecars saved alongside edited AGP files</li>
 </ul>
 <pre class="mermaid"><code>flowchart LR
     A["AGP assembly"] --&gt; W["Synchronized workspace"]
@@ -1168,6 +1200,7 @@ allowed to decide an edit.</p>
 <h2 id="start-here">Start here<a class="headerlink" href="#start-here" title="Permanent link">&para;</a></h2>
 <ol>
 <li><a href="installation/">Install or build C-Studio</a>.</li>
+<li><a href="user-guide/input-preparation/">Prepare AGP and evidence files</a>.</li>
 <li>Follow the <a href="getting-started/">first project walkthrough</a>.</li>
 <li>Review <a href="user-guide/project-data/">project file discovery</a> before loading a
    real dataset.</li>

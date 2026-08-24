@@ -13,7 +13,7 @@
         <link rel="canonical" href="https://wangyibin.github.io/C-Studio/dev/user-guide/project-data/">
       
       
-        <link rel="prev" href="../../getting-started/">
+        <link rel="prev" href="../input-preparation/">
       
       
         <link rel="next" href="../interface/">
@@ -297,12 +297,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="././" class="md-tabs__link">
+        <a href="../input-preparation/" class="md-tabs__link">
           
   
   User guide
@@ -515,6 +517,8 @@
       
         
       
+        
+      
     
     
     
@@ -560,6 +564,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Prepare input files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1182,6 +1213,8 @@
 
 
 <h1 id="project-data">Project data<a class="headerlink" href="#project-data" title="Permanent link">&para;</a></h1>
+<p>See <a href="../input-preparation/">Prepare input files</a> for commands that generate AGP,
+COOL/MCOOL, PAF, coverage, and GFA inputs.</p>
 <h2 id="supported-inputs">Supported inputs<a class="headerlink" href="#supported-inputs" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1198,6 +1231,12 @@
 <td><code>.agp</code>, <code>.agp.gz</code></td>
 <td>Authoritative editable layout</td>
 <td>Yes</td>
+</tr>
+<tr>
+<td>Edit history</td>
+<td><code>&lt;AGP-prefix&gt;.history.json</code></td>
+<td>Compatible undo/redo timeline</td>
+<td>No</td>
 </tr>
 <tr>
 <td>Contact map</td>
@@ -1227,7 +1266,9 @@
 </table>
 <p>Individual file inputs also accept selected <code>.txt</code> and <code>.txt.gz</code> forms for AGP,
 GFA, PAF, and coverage. Project-folder discovery uses the specific extensions in
-the table.</p>
+the table. A history sidecar is never selected independently: C-Studio loads it
+only when its prefix matches the selected AGP and its embedded canonical AGP
+matches the current layout.</p>
 <h2 id="project-folder-discovery">Project-folder discovery<a class="headerlink" href="#project-folder-discovery" title="Permanent link">&para;</a></h2>
 <p><strong>Load project folder…</strong> scans regular files in the selected directory's top
 level. It does not recurse into subdirectories.</p>
@@ -1241,6 +1282,9 @@ level. It does not recurse into subdirectories.</p>
 resolved by the deterministic filename ordering. Text inputs can be gzip
 compressed. <code>.cool</code> and <code>.mcool</code> are HDF5 containers and must not be gzip
 wrapped.</p>
+<p>If the selected AGP is <code>assembly.agp</code> or <code>assembly.agp.gz</code>, the corresponding
+history filename is <code>assembly.history.json</code>. An incompatible or malformed
+sidecar is ignored rather than applied to a different layout.</p>
 <h2 id="identifier-compatibility">Identifier compatibility<a class="headerlink" href="#identifier-compatibility" title="Permanent link">&para;</a></h2>
 <p>AGP component IDs provide the immutable lookup keys used to project evidence
 into the edited visual layout. The following identifiers should agree:</p>
@@ -1261,10 +1305,10 @@ empty or disabled until their corresponding files are loaded.</p>
 loaded data…</strong> to explicitly remove every source; use <strong>Reload assembly…</strong> to
 restore the initially loaded AGP while retaining other evidence sources.</p>
 <h2 id="platform-note">Platform note<a class="headerlink" href="#platform-note" title="Permanent link">&para;</a></h2>
-<p>The native folder picker and native <code>.cool/.mcool</code>, PAF, and coverage pickers
-are implemented only on macOS in the current backend. AGP and GFA use web file
-inputs, but that does not make the complete Windows project-loading workflow
-equivalent yet.</p>
+<p>The desktop application uses Tauri's native dialog plugin for project folders
+and individual data files on macOS and Windows. A complete real-Windows
+click-through remains a separate release QA step. Browser preview can fall back
+to web inputs for text files, but it does not provide the desktop HDF5 backend.</p>
 
 
 
@@ -1304,7 +1348,7 @@ equivalent yet.</p>
       <nav class="md-footer__inner md-grid" aria-label="Footer" >
         
           
-          <a href="../../getting-started/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Get started">
+          <a href="../input-preparation/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Prepare input files">
             <div class="md-footer__button md-icon">
               
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-arrow-left" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7M19 12H5"/></svg>
@@ -1314,7 +1358,7 @@ equivalent yet.</p>
                 Previous
               </span>
               <div class="md-ellipsis">
-                Get started
+                Prepare input files
               </div>
             </div>
           </a>

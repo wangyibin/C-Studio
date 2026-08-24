@@ -293,12 +293,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../../user-guide/project-data/" class="md-tabs__link">
+        <a href="../../user-guide/input-preparation/" class="md-tabs__link">
           
   
   User guide
@@ -511,6 +513,8 @@
       
         
       
+        
+      
     
     
     
@@ -553,6 +557,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Prepare input files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1039,17 +1070,6 @@
   
 </li>
       
-        <li class="md-nav__item">
-  <a href="#versioned-github-pages" class="md-nav__link">
-    <span class="md-ellipsis">
-      <span class="md-typeset">
-        Versioned GitHub Pages
-      </span>
-    </span>
-  </a>
-  
-</li>
-      
     </ul>
   
 </nav>
@@ -1150,17 +1170,6 @@
   
 </li>
       
-        <li class="md-nav__item">
-  <a href="#versioned-github-pages" class="md-nav__link">
-    <span class="md-ellipsis">
-      <span class="md-typeset">
-        Versioned GitHub Pages
-      </span>
-    </span>
-  </a>
-  
-</li>
-      
     </ul>
   
 </nav>
@@ -1180,10 +1189,9 @@
 
 
 <h1 id="build-the-documentation">Build the documentation<a class="headerlink" href="#build-the-documentation" title="Permanent link">&para;</a></h1>
-<p>The documentation follows the current C-Phasing bilingual pattern, with
-separate English and Chinese source trees and configuration files. Zensical is
-the builder; the <code>mkdocs_*.yml</code> format is retained because Zensical natively
-supports Material for MkDocs-compatible configuration.</p>
+<p>The documentation uses separate English and Chinese source trees and
+configuration files. Zensical builds both sites from the <code>mkdocs_*.yml</code>
+configuration.</p>
 <h2 id="layout">Layout<a class="headerlink" href="#layout" title="Permanent link">&para;</a></h2>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>docs/
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── en/                 # English source
@@ -1193,15 +1201,14 @@ supports Material for MkDocs-compatible configuration.</p>
 </span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>pixi.toml               # docs environment and reusable tasks
 </span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>pixi.lock               # exact Conda and PyPI dependency lock
 </span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>scripts/build-docs.sh   # compatibility wrapper around the Pixi task
-</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>.github/workflows/docs.yml
 </span></code></pre></div>
 <h2 id="install-the-documentation-environment">Install the documentation environment<a class="headerlink" href="#install-the-documentation-environment" title="Permanent link">&para;</a></h2>
 <p>Install <a href="https://pixi.sh/latest/installation/">Pixi</a>, then create the locked
 <code>docs</code> environment:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>docs
 </span></code></pre></div>
-<p>Pixi installs Python, Git, Zensical, and the pinned Zensical-compatible Mike
-commit. Do not install these tools into a separate virtual environment.</p>
+<p>Pixi installs Python, Git, Zensical, and the locked documentation dependencies.
+Do not install these tools into a separate virtual environment.</p>
 <h2 id="build-both-languages">Build both languages<a class="headerlink" href="#build-both-languages" title="Permanent link">&para;</a></h2>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>docs-build
 </span></code></pre></div>
@@ -1231,69 +1238,6 @@ validation is enabled, and strict mode turns warnings into build failures.</p>
 <p>Do not translate uncertainty into certainty. Platform support, biological
 validation, release availability, and performance should state what was
 actually verified.</p>
-<h2 id="versioned-github-pages">Versioned GitHub Pages<a class="headerlink" href="#versioned-github-pages" title="Permanent link">&para;</a></h2>
-<p>The deployment follows C-Phasing's Mike layout. English and Chinese have
-independent version indexes on the same <code>gh-pages</code> branch:</p>
-<table>
-<thead>
-<tr>
-<th>Source event</th>
-<th>English URL</th>
-<th>Chinese URL</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Push to <code>main</code></td>
-<td><code>/C-Studio/dev/</code></td>
-<td><code>/C-Studio/zh/dev/</code></td>
-</tr>
-<tr>
-<td>Tag such as <code>v0.2.0</code></td>
-<td><code>/C-Studio/v0.2.0/</code></td>
-<td><code>/C-Studio/zh/v0.2.0/</code></td>
-</tr>
-<tr>
-<td>Latest release alias</td>
-<td><code>/C-Studio/latest/</code></td>
-<td><code>/C-Studio/zh/latest/</code></td>
-</tr>
-</tbody>
-</table>
-<p>On the first <code>main</code> deployment, the site roots redirect to <code>dev</code>. The first
-version tag moves both roots to <code>latest</code>. Older generated versions remain on
-<code>gh-pages</code>; redeploying one version replaces only that version.</p>
-<p>The workflow provides two optional manual inputs:</p>
-<ul>
-<li><code>backfill_tags</code> publishes the documentation stored in one or more historical
-  tags. Every requested tag must contain both <code>docs/en/index.md</code> and
-  <code>docs/zh/index.md</code>.</li>
-<li><code>update_docs_version</code> intentionally publishes the documentation from the
-  selected workflow ref over an existing version. Use this only to correct
-  released documentation without rebuilding the application release.</li>
-</ul>
-<p>Leave both inputs empty to deploy the selected tag, or to refresh <code>dev</code> from
-the selected branch. The workflow rejects using the two inputs together.</p>
-<p>Mike is pinned to the Zensical-compatible fork and commit in <code>pixi.lock</code>. The
-workflow runs the strict <code>docs-build</code> task before any deployment, and Mike then
-commits each generated version to <code>gh-pages</code>.</p>
-<p>Configure <strong>Settings → Pages → Source</strong> as <strong>Deploy from a branch</strong>, choose
-<code>gh-pages</code>, and select <code>/ (root)</code>. The workflow has write permission only in
-the canonical <code>wangyibin/C-Studio</code> repository; pull requests run the strict
-build without publishing.</p>
-<p>To inspect a versioned site locally in a disposable clone, omit <code>--push</code>:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>deploy<span class="w"> </span>-F<span class="w"> </span>mkdocs_en.yml<span class="w"> </span>v0.0.0-test<span class="w"> </span>latest
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>deploy<span class="w"> </span>-F<span class="w"> </span>mkdocs_zh.yml<span class="w"> </span>--deploy-prefix<span class="w"> </span>zh<span class="w"> </span>v0.0.0-test<span class="w"> </span>latest
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>set-default<span class="w"> </span>-F<span class="w"> </span>mkdocs_en.yml<span class="w"> </span>latest
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>set-default<span class="w"> </span>-F<span class="w"> </span>mkdocs_zh.yml<span class="w"> </span>--deploy-prefix<span class="w"> </span>zh<span class="w"> </span>latest
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>docs<span class="w"> </span>mike<span class="w"> </span>serve
-</span></code></pre></div>
-<p>These commands create local <code>gh-pages</code> commits. Do not add <code>--push</code> when only
-testing.</p>
-<p>The current configuration assumes the repository and site locations
-<code>wangyibin/C-Studio</code> and <code>wangyibin.github.io/C-Studio</code>. Update <code>repo_url</code>,
-<code>site_url</code>, the repository guard in the workflow, and both language-switch
-links if the project is published elsewhere.</p>
 
 
 

@@ -16,7 +16,7 @@
         <link rel="prev" href="../installation/">
       
       
-        <link rel="next" href="../user-guide/project-data/">
+        <link rel="next" href="../user-guide/input-preparation/">
       
       
         
@@ -297,12 +297,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../user-guide/project-data/" class="md-tabs__link">
+        <a href="../user-guide/input-preparation/" class="md-tabs__link">
           
   
   User guide
@@ -626,6 +628,8 @@
       
         
       
+        
+      
     
     
     
@@ -668,6 +672,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Prepare input files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1201,22 +1232,26 @@
 <h1 id="get-started">Get started<a class="headerlink" href="#get-started" title="Permanent link">&para;</a></h1>
 <p>This walkthrough keeps the source AGP recoverable and makes the boundary
 between evidence and edits explicit.</p>
+<p>If the input files have not been generated yet, follow
+<a href="../user-guide/input-preparation/">Prepare input files</a> first.</p>
 <h2 id="1-prepare-a-project-directory">1. Prepare a project directory<a class="headerlink" href="#1-prepare-a-project-directory" title="Permanent link">&para;</a></h2>
 <p>For a real project, place copies of the inputs in one dedicated directory. An
 AGP is required for assembly editing. Other evidence is optional.</p>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>my-project/
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── assembly.agp
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── contacts.mcool
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>├── alignments.paf
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>├── coverage.depth
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>└── assembly.gfa
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── assembly.history.json
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>├── contacts.mcool
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>├── alignments.paf
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>├── coverage.depth
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>└── assembly.gfa
 </span></code></pre></div>
-<p>Only the top level is scanned. If a type has several candidates, C-Studio loads
-one deterministic candidate and reports the others as skipped. See
-<a href="../user-guide/project-data/">project data</a> for the exact rules.</p>
+<p>The history sidecar is optional. If present, its prefix must match the selected
+AGP. Only the top level is scanned. If a data type has several candidates,
+C-Studio loads one deterministic candidate and reports the others as skipped.
+See <a href="../user-guide/project-data/">project data</a> for the exact rules.</p>
 <h2 id="2-load-data">2. Load data<a class="headerlink" href="#2-load-data" title="Permanent link">&para;</a></h2>
-<p>On macOS, choose <strong>Add Data → Load project folder…</strong>. Alternatively, use the
-individual entries below <strong>Add Data</strong>.</p>
+<p>Choose <strong>Add Data → Load project folder…</strong>. Alternatively, use the individual
+entries below <strong>Add Data</strong>.</p>
 <p>To inspect the bundled development example, choose <strong>Load example project</strong>.
 That helper currently resolves files from the source checkout and should not be
 treated as verified packaged-app data.</p>
@@ -1252,15 +1287,18 @@ contact map, tracks, and evidence views reproject to the edited AGP layout.</p>
 Deletion requires confirmation and reports whether any source interval will
 have no copies left.</p>
 <h2 id="6-save-an-edited-agp">6. Save an edited AGP<a class="headerlink" href="#6-save-an-edited-agp" title="Permanent link">&para;</a></h2>
-<p>Press <span class="keys"><kbd class="key-command">Cmd</kbd><span>+</span><kbd class="key-s">S</kbd></span> on macOS or <span class="keys"><kbd class="key-control">Ctrl</kbd><span>+</span><kbd class="key-s">S</kbd></span> on Windows, or click the save icon.</p>
-<div class="admonition warning">
-<p class="admonition-title">Auto-save may overwrite a project AGP</p>
-<p>A plain <code>.agp</code> loaded through <strong>Load project folder…</strong> is treated as a
-writable save target. If auto-save is enabled, edits are written about five
-seconds after a change. Work on a copy if the input must remain immutable.</p>
+<p>Press <span class="keys"><kbd class="key-command">Cmd</kbd><span>+</span><kbd class="key-s">S</kbd></span> on macOS or <span class="keys"><kbd class="key-control">Ctrl</kbd><span>+</span><kbd class="key-s">S</kbd></span> on Windows, or click the save icon.
+C-Studio saves the edited AGP and a same-prefix <code>.history.json</code> sidecar that
+contains the compatible undo/redo timeline.</p>
+<div class="admonition important">
+<p class="admonition-title">The first save chooses a destination</p>
+<p>Loading an AGP does not make the source file the save destination. The first
+manual save asks where to write the edited AGP. After that destination is
+established, optional auto-save writes both the AGP and history sidecar
+about five seconds after a change.</p>
 </div>
-<p>Compressed <code>.agp.gz</code> input is never overwritten directly. A first <strong>Save As</strong>
-creates a plain AGP target and enables auto-save for that target.</p>
+<p>Compressed <code>.agp.gz</code> input is never overwritten directly. Save to a plain AGP
+target before enabling auto-save.</p>
 
 
 
@@ -1317,13 +1355,13 @@ creates a plain AGP target and enables auto-save for that target.</p>
         
         
           
-          <a href="../user-guide/project-data/" class="md-footer__link md-footer__link--next" aria-label="Next: Project data">
+          <a href="../user-guide/input-preparation/" class="md-footer__link md-footer__link--next" aria-label="Next: Prepare input files">
             <div class="md-footer__title">
               <span class="md-footer__direction">
                 Next
               </span>
               <div class="md-ellipsis">
-                Project data
+                Prepare input files
               </div>
             </div>
             <div class="md-footer__button md-icon">

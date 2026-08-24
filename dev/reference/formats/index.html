@@ -295,12 +295,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../../user-guide/project-data/" class="md-tabs__link">
+        <a href="../../user-guide/input-preparation/" class="md-tabs__link">
           
   
   User guide
@@ -513,6 +515,8 @@
       
         
       
+        
+      
     
     
     
@@ -555,6 +559,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Prepare input files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -833,6 +864,17 @@
     <span class="md-ellipsis">
       <span class="md-typeset">
         AGP
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#operation-history-sidecar" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Operation history sidecar
       </span>
     </span>
   </a>
@@ -1131,6 +1173,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#operation-history-sidecar" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Operation history sidecar
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#cool-and-mcool" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1220,6 +1273,13 @@ orientation. <code>N</code> and <code>U</code> rows provide gap length, type, li
 <p>On export, object coordinates and part numbers are regenerated from the current
 placement order. Source component coordinates remain tied to the edited source
 intervals.</p>
+<h2 id="operation-history-sidecar">Operation history sidecar<a class="headerlink" href="#operation-history-sidecar" title="Permanent link">&para;</a></h2>
+<p>Saving an edited AGP also writes <code>&lt;AGP-prefix&gt;.history.json</code>. The sidecar stores
+the applied and undone operation timeline plus the canonical AGP used to
+validate compatibility. C-Studio restores it only beside the matching AGP;
+malformed, stale, or mismatched sidecars are ignored.</p>
+<p>The sidecar supplements the AGP and does not replace it. AGP remains the
+authoritative assembly layout and the file used by other tools.</p>
 <h2 id="cool-and-mcool">COOL and MCOOL<a class="headerlink" href="#cool-and-mcool" title="Permanent link">&para;</a></h2>
 <p><code>.cool</code> and <code>.mcool</code> are Cooler-compatible HDF5 contact containers. C-Studio
 reads chromosome/bin identifiers, sparse pixels, stored resolutions, and

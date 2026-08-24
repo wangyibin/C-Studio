@@ -297,12 +297,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="../project-data/" class="md-tabs__link">
+        <a href="../input-preparation/" class="md-tabs__link">
           
   
   User guide
@@ -515,6 +517,8 @@
       
         
       
+        
+      
     
     
     
@@ -560,6 +564,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Prepare input files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1275,7 +1306,8 @@ on placements; neither claims a biological grouping or copy-number decision.</p>
 unsplit copies and reports how many copies remain for each selected source
 interval. If no copies will remain, the dialog highlights that loss.</p>
 <p>Deletion removes the placement from the assembly rather than moving it to
-debris. It can be recovered with Undo during the current session.</p>
+debris. It can be recovered with Undo and remains recoverable after reopening
+when a compatible saved history sidecar is present.</p>
 <h2 id="history-undo-and-redo">History, undo, and redo<a class="headerlink" href="#history-undo-and-redo" title="Permanent link">&para;</a></h2>
 <p>Every reducer edit records before/after assembly state and an impact summary.</p>
 <ul>
@@ -1286,14 +1318,18 @@ debris. It can be recovered with Undo during the current session.</p>
 <li>Right-click an applied item and choose <strong>Undo to here</strong> to roll back later
   operations in one step.</li>
 </ul>
-<p>Loading a new project, clearing all data, or reloading the source assembly
-clears the edit history.</p>
+<p>Loading a new project replaces the current timeline and restores the selected
+AGP's compatible history sidecar when one is present. Clearing all data or
+reloading the source assembly clears the edit history.</p>
 <h2 id="saving-and-auto-save">Saving and auto-save<a class="headerlink" href="#saving-and-auto-save" title="Permanent link">&para;</a></h2>
 <p>Manual save writes the canonical current layout as AGP, including retained
-<code>N</code>/<code>U</code> gap metadata and legal unknown orientations such as <code>0</code> or <code>na</code>.</p>
-<p>When a writable plain AGP path is known, auto-save writes roughly five seconds
-after a change. A project-folder <code>.agp</code> can therefore be overwritten. Gzip AGP
-is read-only as an input target; save to a new plain <code>.agp</code> first.</p>
+<code>N</code>/<code>U</code> gap metadata and legal unknown orientations such as <code>0</code> or <code>na</code>. It
+also writes a same-prefix <code>.history.json</code> sidecar containing applied and undone
+operations. The sidecar is restored only when it matches the saved AGP.</p>
+<p>Loading a source AGP does not authorize overwriting it. The first manual save
+always chooses a destination. Once a writable plain AGP save path is known,
+auto-save writes both files roughly five seconds after a change. Gzip AGP is
+read-only as an input target; save to a new plain <code>.agp</code> first.</p>
 <p>Use <strong>Reload assembly…</strong> only when you intend to discard every edit and restore
 the initially loaded source AGP. Other loaded evidence remains in the
 workspace.</p>
