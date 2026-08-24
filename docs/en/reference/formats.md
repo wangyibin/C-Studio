@@ -18,6 +18,16 @@ On export, object coordinates and part numbers are regenerated from the current
 placement order. Source component coordinates remain tied to the edited source
 intervals.
 
+## Operation history sidecar
+
+Saving an edited AGP also writes `<AGP-prefix>.history.json`. The sidecar stores
+the applied and undone operation timeline plus the canonical AGP used to
+validate compatibility. C-Studio restores it only beside the matching AGP;
+malformed, stale, or mismatched sidecars are ignored.
+
+The sidecar supplements the AGP and does not replace it. AGP remains the
+authoritative assembly layout and the file used by other tools.
+
 ## COOL and MCOOL
 
 `.cool` and `.mcool` are Cooler-compatible HDF5 contact containers. C-Studio
@@ -66,4 +76,3 @@ filtered.
 AGP, GFA, PAF, depth, and bedGraph text may use a final `.gz` suffix. C-Studio
 uses multi-member gzip decoding. Auto-save never overwrites compressed AGP;
 save to a plain `.agp` target instead.
-

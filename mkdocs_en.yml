@@ -89,6 +89,7 @@ nav:
   - Installation: installation.md
   - Get started: getting-started.md
   - User guide:
+      - Prepare input files: user-guide/input-preparation.md
       - Project data: user-guide/project-data.md
       - Interface: user-guide/interface.md
       - Navigation and selection: user-guide/navigation-selection.md

@@ -1,10 +1,14 @@
 # Project data
 
+See [Prepare input files](input-preparation.md) for commands that generate AGP,
+COOL/MCOOL, PAF, coverage, and GFA inputs.
+
 ## Supported inputs
 
 | Evidence | Extensions | Role | Required for editing? |
 | --- | --- | --- | --- |
 | Assembly | `.agp`, `.agp.gz` | Authoritative editable layout | Yes |
+| Edit history | `<AGP-prefix>.history.json` | Compatible undo/redo timeline | No |
 | Contact map | `.cool`, `.mcool` | Heatmap and 3D-contact evidence | No |
 | Assembly graph | `.gfa`, `.gfa1`, optional `.gz` | Topology and overlap evidence | No |
 | Synteny | `.paf`, optional `.gz` | Reference/query alignment view | No |
@@ -12,7 +16,9 @@
 
 Individual file inputs also accept selected `.txt` and `.txt.gz` forms for AGP,
 GFA, PAF, and coverage. Project-folder discovery uses the specific extensions in
-the table.
+the table. A history sidecar is never selected independently: C-Studio loads it
+only when its prefix matches the selected AGP and its embedded canonical AGP
+matches the current layout.
 
 ## Project-folder discovery
 
@@ -29,6 +35,10 @@ For contact maps, an `.mcool` candidate is preferred over `.cool`; ties are
 resolved by the deterministic filename ordering. Text inputs can be gzip
 compressed. `.cool` and `.mcool` are HDF5 containers and must not be gzip
 wrapped.
+
+If the selected AGP is `assembly.agp` or `assembly.agp.gz`, the corresponding
+history filename is `assembly.history.json`. An incompatible or malformed
+sidecar is ignored rather than applied to a different layout.
 
 ## Identifier compatibility
 
@@ -56,8 +66,7 @@ restore the initially loaded AGP while retaining other evidence sources.
 
 ## Platform note
 
-The native folder picker and native `.cool/.mcool`, PAF, and coverage pickers
-are implemented only on macOS in the current backend. AGP and GFA use web file
-inputs, but that does not make the complete Windows project-loading workflow
-equivalent yet.
-
+The desktop application uses Tauri's native dialog plugin for project folders
+and individual data files on macOS and Windows. A complete real-Windows
+click-through remains a separate release QA step. Browser preview can fall back
+to web inputs for text files, but it does not provide the desktop HDF5 backend.

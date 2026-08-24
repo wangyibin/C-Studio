@@ -3,6 +3,9 @@
 This walkthrough keeps the source AGP recoverable and makes the boundary
 between evidence and edits explicit.
 
+If the input files have not been generated yet, follow
+[Prepare input files](user-guide/input-preparation.md) first.
+
 ## 1. Prepare a project directory
 
 For a real project, place copies of the inputs in one dedicated directory. An
@@ -11,20 +14,22 @@ AGP is required for assembly editing. Other evidence is optional.
 ```text
 my-project/
 ├── assembly.agp
+├── assembly.history.json
 ├── contacts.mcool
 ├── alignments.paf
 ├── coverage.depth
 └── assembly.gfa
 ```
 
-Only the top level is scanned. If a type has several candidates, C-Studio loads
-one deterministic candidate and reports the others as skipped. See
-[project data](user-guide/project-data.md) for the exact rules.
+The history sidecar is optional. If present, its prefix must match the selected
+AGP. Only the top level is scanned. If a data type has several candidates,
+C-Studio loads one deterministic candidate and reports the others as skipped.
+See [project data](user-guide/project-data.md) for the exact rules.
 
 ## 2. Load data
 
-On macOS, choose **Add Data → Load project folder…**. Alternatively, use the
-individual entries below **Add Data**.
+Choose **Add Data → Load project folder…**. Alternatively, use the individual
+entries below **Add Data**.
 
 To inspect the bundled development example, choose **Load example project**.
 That helper currently resolves files from the source checkout and should not be
@@ -70,13 +75,15 @@ have no copies left.
 ## 6. Save an edited AGP
 
 Press ++cmd+s++ on macOS or ++ctrl+s++ on Windows, or click the save icon.
+C-Studio saves the edited AGP and a same-prefix `.history.json` sidecar that
+contains the compatible undo/redo timeline.
 
-!!! warning "Auto-save may overwrite a project AGP"
+!!! important "The first save chooses a destination"
 
-    A plain `.agp` loaded through **Load project folder…** is treated as a
-    writable save target. If auto-save is enabled, edits are written about five
-    seconds after a change. Work on a copy if the input must remain immutable.
+    Loading an AGP does not make the source file the save destination. The first
+    manual save asks where to write the edited AGP. After that destination is
+    established, optional auto-save writes both the AGP and history sidecar
+    about five seconds after a change.
 
-Compressed `.agp.gz` input is never overwritten directly. A first **Save As**
-creates a plain AGP target and enables auto-save for that target.
-
+Compressed `.agp.gz` input is never overwritten directly. Save to a plain AGP
+target before enabling auto-save.

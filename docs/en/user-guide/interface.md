@@ -7,7 +7,13 @@ The top row contains project-wide actions:
 - the current AGP name and **Auto-save** setting;
 - **Add Data** for project folders and individual evidence files;
 - the global **Homolog regex** used to arrange GFA homolog groups;
-- undo, redo, AGP save, inspector visibility, and application information.
+- the **Chromosomes** display filter shared by the heatmap, synteny, coverage,
+  and GFA views without modifying the AGP;
+- undo, redo, AGP save/Save As, inspector visibility, and application
+  information.
+
+Saving writes both the edited AGP and its same-prefix operation-history
+sidecar.
 
 The information menu also lists the active keyboard shortcuts and the core's
 coordinate convention.
@@ -60,4 +66,3 @@ here**.
 The bottom status bar reports resolution, normalization, matrix, assembly,
 selected tool, X/Y centers, and the latest status message. Diagnostic timing
 text appears only when performance logging is explicitly enabled.
-

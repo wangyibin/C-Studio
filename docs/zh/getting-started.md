@@ -2,6 +2,8 @@
 
 下面的流程会保留可恢复的源 AGP，并明确区分证据与编辑操作。
 
+如果尚未生成输入文件，请先按[准备输入文件](user-guide/input-preparation.md)操作。
+
 ## 1. 准备项目目录
 
 处理真实项目时，建议把输入文件的副本放到一个独立目录中。组装编辑需要 AGP，
@@ -10,19 +12,21 @@
 ```text
 my-project/
 ├── assembly.agp
+├── assembly.history.json
 ├── contacts.mcool
 ├── alignments.paf
 ├── coverage.depth
 └── assembly.gfa
 ```
 
-程序只扫描目录顶层。同一类型存在多个候选文件时，C-Studio 会按确定性规则加载
+history sidecar 为可选文件；如果存在，其前缀必须与选中的 AGP 一致。程序只
+扫描目录顶层。同一类型存在多个候选文件时，C-Studio 会按确定性规则加载
 一个，并把其他候选报告为已跳过。精确规则见[项目数据](user-guide/project-data.md)。
 
 ## 2. 加载数据
 
-在 macOS 上选择 **Add Data → Load project folder…**。也可以使用 **Add Data** 下
-的单文件入口逐个加载。
+选择 **Add Data → Load project folder…**。也可以使用 **Add Data** 下的
+单文件入口逐个加载。
 
 若要检查随源码提供的开发示例，选择 **Load example project**。当前该功能从源码
 检出目录解析文件，不能视为已经验证过的安装包内置数据。
@@ -62,12 +66,14 @@ my-project/
 ## 6. 保存编辑后的 AGP
 
 macOS 按 ++cmd+s++，Windows 按 ++ctrl+s++，也可以点击保存图标。
+C-Studio 会同时保存编辑后的 AGP 和同前缀 `.history.json` sidecar，后者记录
+可兼容恢复的撤销/重做时间线。
 
-!!! warning "自动保存可能覆盖项目 AGP"
+!!! important "首次保存会选择目标路径"
 
-    通过 **Load project folder…** 加载的普通 `.agp` 会被视为可写保存目标。
-    启用自动保存后，编辑约在变更五秒后写回。若输入必须保持不变，请先复制。
+    加载 AGP 不会把源文件自动设为保存目标。首次手动保存会询问写入
+    位置。建立目标后，可选自动保存会在变更约五秒后同时写入 AGP 和
+    history sidecar。
 
-压缩的 `.agp.gz` 不会被直接覆盖。首次 **Save As** 会创建普通 AGP 目标，之后
-才能为该目标启用自动保存。
-
+压缩的 `.agp.gz` 不会被直接覆盖。请先保存到普通 AGP 目标，再启用自动
+保存。

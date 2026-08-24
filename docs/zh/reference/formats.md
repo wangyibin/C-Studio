@@ -15,6 +15,15 @@ C-Studio 期望制表符分隔的九列 AGP。component 行提供 object 坐标�
 导出时，object 坐标与 part number 会按当前放置顺序重新生成；源 component 坐标
 仍与编辑后的源区间绑定。
 
+## 操作历史 sidecar
+
+保存编辑后 AGP 时还会写入 `<AGP-prefix>.history.json`。sidecar 保存已应用和
+已撤销操作时间线，以及用于验证兼容性的规范 AGP。C-Studio 只会恢复与
+对应 AGP 匹配的 sidecar；格式错误、过期或不匹配的 sidecar 会被忽略。
+
+sidecar 是 AGP 的补充，不会取代 AGP。AGP 仍是权威组装布局，也是供其他
+工具使用的文件。
+
 ## COOL 与 MCOOL
 
 `.cool`、`.mcool` 是 Cooler 兼容的 HDF5 接触矩阵容器。C-Studio 读取
@@ -58,4 +67,3 @@ link 会被警告或过滤。
 
 AGP、GFA、PAF、depth 和 bedGraph 文本可使用最终 `.gz` 后缀。C-Studio 支持
 多成员 gzip 解码。自动保存不会覆盖压缩 AGP，请另存到普通 `.agp` 目标。
-

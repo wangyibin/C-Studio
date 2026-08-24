@@ -1,11 +1,13 @@
 # Troubleshooting
 
-## A picker reports “only implemented for macOS”
+## A file or folder picker does not open
 
-The native project-directory, `.cool/.mcool`, PAF, and coverage pickers have no
-non-macOS backend yet. This is a current implementation limit, not a malformed
-file. AGP and GFA have web file inputs, but a complete Windows workflow still
-requires backend work.
+Current desktop builds use Tauri's native dialog plugin on macOS and Windows.
+If an older build reports “only implemented for macOS,” update to the current
+release. Otherwise, confirm that the application is allowed to access the
+selected folder and that no other native dialog is hidden behind the main
+window. Real Windows desktop behavior should still be checked during release
+QA.
 
 ## “No supported project files found”
 
@@ -53,8 +55,16 @@ expression.
 ## Auto-save is unavailable
 
 Auto-save requires a writable plain AGP target. Use manual save once to choose
-a path. A `.agp.gz` source cannot be overwritten. If a source path disappears
+a destination; loading an AGP alone does not establish a save target. A
+`.agp.gz` source cannot be overwritten. If the chosen destination disappears
 or becomes unwritable, C-Studio falls back to Save As or reports the error.
+
+## Saved history is not restored
+
+Keep `<AGP-prefix>.history.json` beside the matching AGP. C-Studio rejects a
+malformed sidecar or one whose embedded canonical AGP does not match the loaded
+layout. The AGP still loads normally; the application log records that the
+sidecar was ignored.
 
 ## I cannot open a packaged app
 
@@ -67,4 +77,3 @@ SmartScreen. These warnings cannot be removed by changing a C-Studio setting.
 The current helper expects the source checkout's `examples/` directory and is
 not verified as a packaged resource. Run from a source checkout or load the
 example files individually until bundling is implemented.
-

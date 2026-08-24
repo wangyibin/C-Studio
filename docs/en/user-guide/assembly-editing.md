@@ -46,7 +46,8 @@ unsplit copies and reports how many copies remain for each selected source
 interval. If no copies will remain, the dialog highlights that loss.
 
 Deletion removes the placement from the assembly rather than moving it to
-debris. It can be recovered with Undo during the current session.
+debris. It can be recovered with Undo and remains recoverable after reopening
+when a compatible saved history sidecar is present.
 
 ## History, undo, and redo
 
@@ -59,19 +60,22 @@ Every reducer edit records before/after assembly state and an impact summary.
 - Right-click an applied item and choose **Undo to here** to roll back later
   operations in one step.
 
-Loading a new project, clearing all data, or reloading the source assembly
-clears the edit history.
+Loading a new project replaces the current timeline and restores the selected
+AGP's compatible history sidecar when one is present. Clearing all data or
+reloading the source assembly clears the edit history.
 
 ## Saving and auto-save
 
 Manual save writes the canonical current layout as AGP, including retained
-`N`/`U` gap metadata and legal unknown orientations such as `0` or `na`.
+`N`/`U` gap metadata and legal unknown orientations such as `0` or `na`. It
+also writes a same-prefix `.history.json` sidecar containing applied and undone
+operations. The sidecar is restored only when it matches the saved AGP.
 
-When a writable plain AGP path is known, auto-save writes roughly five seconds
-after a change. A project-folder `.agp` can therefore be overwritten. Gzip AGP
-is read-only as an input target; save to a new plain `.agp` first.
+Loading a source AGP does not authorize overwriting it. The first manual save
+always chooses a destination. Once a writable plain AGP save path is known,
+auto-save writes both files roughly five seconds after a change. Gzip AGP is
+read-only as an input target; save to a new plain `.agp` first.
 
 Use **Reload assembly…** only when you intend to discard every edit and restore
 the initially loaded source AGP. Other loaded evidence remains in the
 workspace.
-

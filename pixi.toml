@@ -45,8 +45,8 @@ mike = { git = "https://github.com/squidfunk/mike.git", rev = "2d4ad799442f4592d
 [feature.docs.tasks]
 docs-build = "zensical build --strict --clean -f mkdocs_en.yml && zensical build --strict --clean -f mkdocs_zh.yml"
 docs-serve = "python -m http.server --directory site 8000"
-docs-serve-en = "zensical serve -f mkdocs_en.yml"
-docs-serve-zh = "zensical serve -f mkdocs_zh.yml"
+docs-serve-en = "zensical serve -f mkdocs_en.yml -a localhost:1212"
+docs-serve-zh = "zensical serve -f mkdocs_zh.yml -a localhost:1212"
 
 [environments]
 package = { features = ["package"], no-default-feature = true }

@@ -1,4 +1,4 @@
-name: Package desktop apps
+name: Package desktop apps and cool2mcool
 
 on:
   workflow_dispatch:
@@ -87,3 +87,138 @@ jobs:
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           if-no-files-found: error
           retention-days: 7
+
+  package-cool2mcool:
+    name: cool2mcool ${{ matrix.platform_name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform_name: Linux x64
+            runner: ubuntu-22.04
+            asset_suffix: linux-x86_64
+          - platform_name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            asset_suffix: linux-aarch64
+          - platform_name: macOS Apple Silicon
+            runner: macos-15
+            asset_suffix: macos-arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Pixi cool2mcool environment
+        uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          pixi-version: v0.75.0
+          working-directory: tools/cool2mcool
+          locked: true
+          cache: true
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./tools/cool2mcool -> target"
+
+      - name: Test and build cool2mcool
+        working-directory: tools/cool2mcool
+        run: |
+          pixi run --locked check
+          pixi run --locked build
+          ./target/release/cool2mcool --version
+
+      - name: Package cool2mcool
+        id: package
+        working-directory: tools/cool2mcool
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          if [[ -z "$version" ]]; then
+            echo "Unable to determine cool2mcool version from Cargo.toml."
+            exit 1
+          fi
+
+          archive="cool2mcool-v${version}-${{ matrix.asset_suffix }}"
+          mkdir -p "dist/$archive"
+          cp target/release/cool2mcool "dist/$archive/"
+          cp README.md "dist/$archive/"
+          tar -C dist -czf "dist/$archive.tar.gz" "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload cool2mcool package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cool2mcool-${{ matrix.asset_suffix }}-${{ github.run_number }}
+          path: tools/cool2mcool/dist/${{ steps.package.outputs.archive }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - package-macos
+      - package-windows
+      - package-cool2mcool
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-${{ github.run_number }}"
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare release assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir release-files
+          while IFS= read -r -d '' source; do
+            name=$(basename "$source")
+            if [[ -e "release-files/$name" ]]; then
+              echo "Duplicate release asset name: $name"
+              exit 1
+            fi
+            cp "$source" "release-files/$name"
+          done < <(find release-assets -type f -print0)
+
+          for pattern in \
+            '*.zip' \
+            '*.dmg' \
+            '*.exe' \
+            '*.msi' \
+            'cool2mcool-*-linux-x86_64.tar.gz' \
+            'cool2mcool-*-linux-aarch64.tar.gz' \
+            'cool2mcool-*-macos-arm64.tar.gz'; do
+            if ! compgen -G "release-files/$pattern" >/dev/null; then
+              echo "Missing required release asset: $pattern"
+              exit 1
+            fi
+          done
+
+          cd release-files
+          sha256sum ./* > SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-files/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-files/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi

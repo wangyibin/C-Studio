@@ -1,10 +1,11 @@
 # 故障排查
 
-## 选择器报告 “only implemented for macOS”
+## 文件或目录选择器没有打开
 
-原生项目目录、`.cool/.mcool`、PAF 和覆盖度选择器目前没有非 macOS 后端。这是
-当前实现限制，不代表文件格式错误。AGP 与 GFA 有 Web 文件输入，但完整 Windows
-工作流仍需要后端支持。
+当前桌面版在 macOS 和 Windows 上使用 Tauri 原生对话框插件。如果旧版本报告
+“only implemented for macOS”，请更新到当前版本。否则，请确认应用具有
+所选目录的访问权限，并检查是否有原生对话框隐藏在主窗口后面。真实 Windows
+桌面行为仍应在发布 QA 中单独检查。
 
 ## “No supported project files found”
 
@@ -47,7 +48,14 @@ JavaScript 正则。
 ## 自动保存不可用
 
 自动保存需要可写的普通 AGP 目标。先手动保存一次以选择路径；`.agp.gz` 源文件
-不能被覆盖。如果源路径消失或不可写，C-Studio 会退回另存为或报告错误。
+不能被覆盖；仅加载 AGP 不会建立保存目标。如果已选目标消失或不可写，
+C-Studio 会退回另存为或报告错误。
+
+## 已保存历史没有恢复
+
+请把 `<AGP-prefix>.history.json` 与对应 AGP 放在同一目录。C-Studio 会拒绝
+格式错误的 sidecar，也会拒绝内嵌规范 AGP 与当前布局不匹配的 sidecar。
+AGP 仍会正常加载，应用日志会记录该 sidecar 已被忽略。
 
 ## 无法打开打包应用
 
@@ -58,4 +66,3 @@ JavaScript 正则。
 
 当前辅助功能依赖源码检出目录中的 `examples/`，尚未验证为安装包资源。在完成
 bundling 前，请从源码运行或逐个加载示例文件。
-

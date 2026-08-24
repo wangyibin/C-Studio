@@ -7,7 +7,7 @@ Rust.
 
 !!! important "Current scope"
 
-    This documentation describes the on-disk `0.1.0` implementation. C-Studio
+    This documentation describes the current `0.3.5` implementation. C-Studio
     supports an evidence-guided curation workflow; it does **not** infer the
     biologically correct breakpoint, orientation, group, or copy number for the
     user.
@@ -20,6 +20,7 @@ Rust.
 - depth or bedGraph coverage tracks
 - GFA assembly topology and optional endpoint-level 3D-contact evidence
 - copy-aware selection, editing, history, undo, redo, and AGP export
+- compatible operation-history sidecars saved alongside edited AGP files
 
 ```mermaid
 flowchart LR
@@ -43,12 +44,12 @@ allowed to decide an edit.
 ## Start here
 
 1. [Install or build C-Studio](installation.md).
-2. Follow the [first project walkthrough](getting-started.md).
-3. Review [project file discovery](user-guide/project-data.md) before loading a
+2. [Prepare AGP and evidence files](user-guide/input-preparation.md).
+3. Follow the [first project walkthrough](getting-started.md).
+4. Review [project file discovery](user-guide/project-data.md) before loading a
    real dataset.
-4. Read [assembly editing](user-guide/assembly-editing.md) before enabling
+5. Read [assembly editing](user-guide/assembly-editing.md) before enabling
    auto-save or deleting copies.
 
 The [current limitations](reference/limitations.md) page distinguishes working
 features from packaging, platform, and validation gaps.
-

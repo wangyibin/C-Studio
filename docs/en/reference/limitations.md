@@ -1,6 +1,6 @@
 # Current limitations
 
-This page records boundaries of the current `0.1.0` checkout. It should be
+This page records boundaries of the current `0.3.5` checkout. It should be
 updated whenever the corresponding implementation or validation changes.
 
 ## Distribution and platforms
@@ -11,7 +11,7 @@ updated whenever the corresponding implementation or validation changes.
 - Project-directory, contact-map, PAF, and coverage selection now use Tauri's
   cross-platform dialog plugin. A real Windows desktop click-through remains a
   separate release QA requirement.
-- No Linux packaging workflow is defined.
+- Linux packages are not currently configured.
 - Stable public releases, archival source/test-data URLs, and a citation record
   are not established by this checkout alone.
 
@@ -27,6 +27,10 @@ Edited AGP saving is implemented. The inspector can display FASTA as “Ready”
 when a dataset is loaded, but the current user interface does not expose a
 FASTA export action. Do not treat that readiness label as a completed FASTA
 export workflow.
+
+Operation history persistence uses a C-Studio-specific `.history.json` sidecar.
+The AGP remains independently usable, but other assembly tools do not consume
+the sidecar.
 
 ## Scientific interpretation
 
