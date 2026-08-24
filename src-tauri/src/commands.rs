@@ -15,6 +15,13 @@ use std::{
 };
 
 use cstudio_core::contact_cache::{ContactCache, ContactCacheKey};
+use cstudio_core::cool::{
+    prewarm_available_contact_normalization_at_resolution_cancellable,
+    read_cool_contacts_for_source_ranges_at_resolution_with_policy_cancellable,
+    visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_policy_cancellable,
+    visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_policy_cancellable,
+    CoolPixelColumnReadPolicy,
+};
 use cstudio_core::coverage_cache::{CoverageCache, CoverageCacheKey};
 use cstudio_core::source_contact_cache::{
     source_windows_for_ranges_with_limit, SourceContactCache, DEFAULT_SOURCE_CONTACT_CACHE_BYTES,
@@ -669,6 +676,25 @@ impl ContactTileRequestPurpose {
             Self::EndpointEvidence => "endpoint_evidence",
         }
     }
+}
+
+fn contact_tile_pixel_read_policy(purpose: ContactTileRequestPurpose) -> CoolPixelColumnReadPolicy {
+    match purpose {
+        ContactTileRequestPurpose::AdjacentPrefetch => {
+            CoolPixelColumnReadPolicy::Bin1OffsetRangesOnly
+        }
+        _ => CoolPixelColumnReadPolicy::Bin1OffsetRanges,
+    }
+}
+
+fn contact_tile_source_cache_enabled(
+    purpose: ContactTileRequestPurpose,
+    source_resolution: Option<u64>,
+    adaptive_requested: bool,
+) -> bool {
+    !adaptive_requested
+        && source_resolution.is_none()
+        && purpose != ContactTileRequestPurpose::AdjacentPrefetch
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -2555,45 +2581,23 @@ pub async fn prewarm_contact_normalizations(
         let mut prepared = 0_usize;
         let mut failed = 0_usize;
         let mut cancelled = false;
-        let pixels_prepared = match resolutions.first().copied() {
-            Some(resolution) => {
-                match cstudio_core::cool::prewarm_contact_pixels_at_resolution_cancellable(
-                    &cool_path,
-                    Some(resolution),
-                    &should_cancel,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(cstudio_core::CStudioError::RequestCancelled) => {
-                        cancelled = true;
-                        false
-                    }
-                    Err(error) => {
-                        failed = failed.saturating_add(1);
-                        if contact_tile_perf_logging_enabled() {
-                            eprintln!(
-                                "CSTUDIO_PERF event=contact_pixel_prewarm status=error request_id={} generation={} resolution={} error={:?}",
-                                request_id, generation, resolution, error,
-                            );
-                        }
-                        false
-                    }
-                }
-            }
-            None => false,
-        };
+        // Tile scans now use bounded bin1-offset slices. Do not recreate the
+        // complete resident bin2/count columns from this idle task.
+        let pixels_prepared = false;
 
         'resolutions: for resolution in resolutions {
             if cancelled {
                 break;
             }
             for normalization in normalizations {
-                match cstudio_core::cool::prewarm_contact_normalization_at_resolution_cancellable(
+                match prewarm_available_contact_normalization_at_resolution_cancellable(
                     &cool_path,
                     Some(resolution),
                     normalization,
                     &should_cancel,
                 ) {
-                    Ok(()) => prepared = prepared.saturating_add(1),
+                    Ok(true) => prepared = prepared.saturating_add(1),
+                    Ok(false) => {}
                     Err(cstudio_core::CStudioError::RequestCancelled) => {
                         cancelled = true;
                         break 'resolutions;
@@ -3793,6 +3797,7 @@ where
     let source_resolution = request
         .source_resolution
         .unwrap_or(request.target_resolution);
+    let pixel_read_policy = contact_tile_pixel_read_policy(request.purpose);
     if source_resolution == 0 || request.target_resolution % source_resolution != 0 {
         return Err(format!(
             "contact tile delta source resolution {} must divide target resolution {}",
@@ -3840,11 +3845,12 @@ where
 
     let mut visit_timings = cstudio_core::cool::CoolContactVisitTimings::default();
     let visited_contacts = if indexed_visitor {
-        cstudio_core::cool::visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
+        visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_policy_cancellable(
             &request.cool_path,
             &source_ranges,
             Some(source_resolution),
             request.normalization.into(),
+            pixel_read_policy,
             should_cancel,
             &mut visit_timings,
             |source1_index, source1, start1, source2_index, source2, start2, count| {
@@ -3872,11 +3878,12 @@ where
             },
         )
     } else {
-        cstudio_core::cool::visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
+        visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_policy_cancellable(
             &request.cool_path,
             &source_ranges,
             Some(source_resolution),
             request.normalization.into(),
+            pixel_read_policy,
             should_cancel,
             &mut visit_timings,
             |source1, start1, source2, start2, count| {
@@ -4242,6 +4249,7 @@ fn get_contact_map_tiles_from_cool_inner(
     let source_resolution = request
         .source_resolution
         .unwrap_or(request.target_resolution);
+    let pixel_read_policy = contact_tile_pixel_read_policy(request.purpose);
     if request.base_resolution == 0
         || source_resolution == 0
         || source_resolution % request.base_resolution != 0
@@ -4423,14 +4431,18 @@ fn get_contact_map_tiles_from_cool_inner(
         // deliberately wide or very fragmented viewport cannot first allocate a
         // huge source-window vector only to bypass the cache afterwards.
         const MAX_CACHE_WINDOWS_PER_REQUEST: usize = 180;
-        let source_windows = if adaptive_requested || request.source_resolution.is_some() {
-            None
-        } else {
+        let source_windows = if contact_tile_source_cache_enabled(
+            request.purpose,
+            request.source_resolution,
+            adaptive_requested,
+        ) {
             source_windows_for_ranges_with_limit(
                 &source_ranges,
                 tile_span,
                 MAX_CACHE_WINDOWS_PER_REQUEST,
             )
+        } else {
+            None
         };
         ensure_contact_tile_request_active(should_cancel)?;
         let source_cache_path = fs::metadata(&request.cool_path)
@@ -4546,11 +4558,12 @@ fn get_contact_map_tiles_from_cool_inner(
             timings
                 .cool_reads
                 .set(timings.cool_reads.get().saturating_add(1));
-            cstudio_core::cool::visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable(
+            visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_policy_cancellable(
                 &request.cool_path,
                 &source_ranges,
                 Some(source_resolution),
                 request.normalization.into(),
+                pixel_read_policy,
                 should_cancel,
                 &mut visit_timings,
                 |source1_index, source1, start1, source2_index, source2, start2, count| {
@@ -4636,14 +4649,15 @@ fn get_contact_map_tiles_from_cool_inner(
                     .set(timings.cool_reads.get().saturating_add(1));
                 let contacts = {
                     let _stage = ContactTileStageSpan::new(&timings.cool_read);
-                    cstudio_core::cool::read_cool_contacts_for_source_ranges_at_resolution_with_normalization_cancellable(
-                &request.cool_path,
-                read_ranges,
-                Some(source_resolution),
-                request.normalization.into(),
-                should_cancel,
-            )
-            .map_err(|error| error.to_string())?
+                    read_cool_contacts_for_source_ranges_at_resolution_with_policy_cancellable(
+                        &request.cool_path,
+                        read_ranges,
+                        Some(source_resolution),
+                        request.normalization.into(),
+                        pixel_read_policy,
+                        should_cancel,
+                    )
+                    .map_err(|error| error.to_string())?
                 };
                 ensure_contact_tile_request_active(should_cancel)?;
 
@@ -5999,6 +6013,7 @@ mod tests {
     use cstudio_core::{
         contact_cache::ContactCache,
         contact_map::{ContactMapCell, ContactMapView, Viewport},
+        cool::CoolPixelColumnReadPolicy,
         coverage_cache::CoverageCache,
         source_contact_cache::SourceContactCache,
     };
@@ -7664,6 +7679,49 @@ mod tests {
             assert_eq!(parsed.scenario_key(), wire_value);
         }
         assert!(serde_json::from_str::<ContactTileRequestPurpose>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn adjacent_prefetch_reads_only_selected_bin1_offset_ranges() {
+        assert_eq!(
+            super::contact_tile_pixel_read_policy(ContactTileRequestPurpose::AdjacentPrefetch),
+            CoolPixelColumnReadPolicy::Bin1OffsetRangesOnly,
+        );
+        for purpose in [
+            ContactTileRequestPurpose::Visible,
+            ContactTileRequestPurpose::SpatialPrefetch,
+            ContactTileRequestPurpose::Overview,
+            ContactTileRequestPurpose::EndpointEvidence,
+        ] {
+            assert_eq!(
+                super::contact_tile_pixel_read_policy(purpose),
+                CoolPixelColumnReadPolicy::Bin1OffsetRanges,
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_prefetch_does_not_duplicate_tiles_in_the_source_contact_cache() {
+        assert!(!super::contact_tile_source_cache_enabled(
+            ContactTileRequestPurpose::AdjacentPrefetch,
+            None,
+            false,
+        ));
+        assert!(super::contact_tile_source_cache_enabled(
+            ContactTileRequestPurpose::Visible,
+            None,
+            false,
+        ));
+        assert!(!super::contact_tile_source_cache_enabled(
+            ContactTileRequestPurpose::Visible,
+            Some(10_000),
+            false,
+        ));
+        assert!(!super::contact_tile_source_cache_enabled(
+            ContactTileRequestPurpose::Visible,
+            None,
+            true,
+        ));
     }
 
     #[test]

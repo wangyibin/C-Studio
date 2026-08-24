@@ -11,7 +11,7 @@ use crate::{
     CStudioResult,
 };
 
-pub const DEFAULT_SOURCE_CONTACT_CACHE_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_SOURCE_CONTACT_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceWindow {

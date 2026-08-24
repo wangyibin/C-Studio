@@ -8,6 +8,7 @@ use cool2mcool::zoomify::{AggregationMode, DEFAULT_COMPRESSION_LEVEL, MAX_COMPRE
 /// comma-separated argument. Generation canonicalizes them to increasing order.
 const DEFAULT_RESOLUTION_ARGUMENT: &str =
     "2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000";
+const DEFAULT_KR_MIN_RESOLUTION: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliAggregationMode {
@@ -84,7 +85,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "BP",
-        default_value_t = 5000,
+        default_value_t = DEFAULT_KR_MIN_RESOLUTION,
         value_parser = parse_kr_min_resolution
     )]
     kr_min_resolution: u64,
@@ -262,8 +263,8 @@ mod tests {
 
     use super::{
         default_threads, parse_compression_level, parse_kr_min_resolution, parse_level_parallelism,
-        parse_positive_usize, Cli, CliAggregationMode, BASE_RESOLUTION, DEFAULT_COMPRESSION_LEVEL,
-        DEFAULT_RESOLUTION_ARGUMENT,
+        parse_positive_usize, Cli, CliAggregationMode, DEFAULT_COMPRESSION_LEVEL,
+        DEFAULT_KR_MIN_RESOLUTION, DEFAULT_RESOLUTION_ARGUMENT,
     };
     use cool2mcool::mcool::DEFAULT_RESOLUTIONS;
     use cool2mcool::zoomify::AggregationMode;
@@ -312,7 +313,7 @@ mod tests {
             .options;
         assert_eq!(options.resolutions, DEFAULT_RESOLUTIONS);
         assert_eq!(options.compression_level, DEFAULT_COMPRESSION_LEVEL);
-        assert_eq!(options.kr_min_resolution, BASE_RESOLUTION);
+        assert_eq!(options.kr_min_resolution, DEFAULT_KR_MIN_RESOLUTION);
     }
 
     #[test]
@@ -320,7 +321,7 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains(&format!("[default: {DEFAULT_RESOLUTION_ARGUMENT}]")));
         assert!(help.contains("--kr-min-resolution <BP>"));
-        assert!(help.contains("[default: 1000]"));
+        assert!(help.contains(&format!("[default: {DEFAULT_KR_MIN_RESOLUTION}]")));
         assert!(help.contains("--compression-level <LEVEL>"));
         assert!(help.contains(&format!("[default: {DEFAULT_COMPRESSION_LEVEL}]")));
     }

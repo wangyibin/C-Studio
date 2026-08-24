@@ -161,14 +161,14 @@ but it need not be included in the output: for example, `--resolutions 5000,1000
 writes only `/resolutions/5000` and `/resolutions/10000`. Every value must be a
 positive multiple of 1,000 bp.
 
-KR is generated at every level by default. To skip the expensive 1 kb KR phase
-while retaining true KR at 5 kb and coarser levels, set its minimum resolution:
+KR is generated at 5 kb and coarser levels by default, skipping the expensive
+1 kb KR phase. To include true KR at 1 kb, set its minimum resolution explicitly:
 
 ```sh
-cool2mcool --kr-min-resolution 5000 input.1k.cool output.mcool
+cool2mcool --kr-min-resolution 1000 input.1k.cool output.mcool
 ```
 
-`--kr-min-resolution` defaults to `1000` for backward-compatible output and must
+`--kr-min-resolution` defaults to `5000` and must
 be a positive multiple of 1,000 bp. Levels below the threshold retain their
 standard ICE `weight`, VC, and VC_SQRT columns but do not contain `bins/KR`;
 ICE is never relabeled as KR. Consumers should select ICE at those levels rather

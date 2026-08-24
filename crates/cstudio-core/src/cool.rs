@@ -26,7 +26,7 @@ use crate::{
 };
 
 const MAX_COOL_INDEX_CACHE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_COOL_NORMALIZATION_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_COOL_NORMALIZATION_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const PERSISTENT_NORMALIZATION_MAGIC: [u8; 4] = *b"CSN1";
 const PERSISTENT_NORMALIZATION_VERSION: u16 = 1;
 const RUNTIME_NORMALIZATION_MEMORY_NUMERATOR: usize = 4;
@@ -43,7 +43,7 @@ const MAX_ADAPTIVE_CHILD_CACHE_BYTES: usize = 128 * 1024 * 1024;
 // the same chunks. Keep enough chunks resident for one viewport working set.
 // The budget is per opened pixel dataset and allocated lazily by HDF5.
 const COOL_PIXEL_CHUNK_CACHE_SLOTS: usize = 521;
-const COOL_PIXEL_CHUNK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const COOL_PIXEL_CHUNK_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const COOL_PIXEL_CHUNK_CACHE_PREEMPTION: f64 = 0.75;
 // A compact resident bin2 column is a bounded, in-memory secondary index. It
 // lets viewport reads identify the exact 2D pixel runs before touching the
@@ -468,6 +468,21 @@ pub struct CoolContactVisitTimings {
     pub scanned_pixels: usize,
 }
 
+/// Controls whether a contact scan may materialize or reuse the complete
+/// `pixels/bin2_id` and `pixels/count` columns. Background neighbor requests
+/// use `Bin1OffsetRangesOnly` so their memory cost is bounded by the selected
+/// `indexes/bin1_offset` ranges instead of the size of the Cooler level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CoolPixelColumnReadPolicy {
+    #[default]
+    PreferResidentColumns,
+    /// Read selected bin1 rows in bounded HDF5 slices, while allowing nearby
+    /// ranges to share one I/O operation. No complete pixel column is built or
+    /// reused.
+    Bin1OffsetRanges,
+    Bin1OffsetRangesOnly,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdaptiveEndpointDecision {
     Drop,
@@ -623,6 +638,51 @@ pub fn prewarm_contact_normalization_at_resolution_cancellable(
         should_cancel,
     )?;
     ensure_not_cancelled(should_cancel)
+}
+
+/// Prewarm a normalization only when the Cooler level already stores the
+/// vector (or a persistent KR vector already exists). Idle UI work must not
+/// launch a full-matrix runtime normalization: those temporary sparse matrices
+/// can exceed the steady-state tile memory by several gigabytes.
+pub fn prewarm_available_contact_normalization_at_resolution_cancellable(
+    path: &str,
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<bool> {
+    ensure_not_cancelled(should_cancel)?;
+    if normalization == ContactNormalization::Raw {
+        return Ok(false);
+    }
+    let reader = cached_cool_reader(path, resolution, should_cancel)?;
+    let key = CoolNormalizationCacheKey {
+        file: cool_index_cache_key(path, resolution),
+        normalization,
+    };
+    if touch_cached_normalization_vector(&key) {
+        return Ok(true);
+    }
+    let values = if let Some(values) = read_stored_normalization_weights(
+        &reader.file,
+        &reader.index.prefix,
+        reader.index.bin_count(),
+        normalization,
+        should_cancel,
+    )? {
+        values
+    } else if let Some(values) = load_persistent_normalization_vector(
+        path,
+        resolution,
+        normalization,
+        reader.index.bin_count(),
+    ) {
+        values
+    } else {
+        return Ok(false);
+    };
+    cached_normalization_vector(key, should_cancel, move || Ok(values))?;
+    ensure_not_cancelled(should_cancel)?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -990,12 +1050,31 @@ pub fn read_cool_contacts_for_source_ranges_at_resolution_with_normalization_can
     normalization: ContactNormalization,
     should_cancel: &dyn Fn() -> bool,
 ) -> CStudioResult<Vec<ContactBin>> {
+    read_cool_contacts_for_source_ranges_at_resolution_with_policy_cancellable(
+        path,
+        source_ranges,
+        resolution,
+        normalization,
+        CoolPixelColumnReadPolicy::PreferResidentColumns,
+        should_cancel,
+    )
+}
+
+pub fn read_cool_contacts_for_source_ranges_at_resolution_with_policy_cancellable(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    pixel_read_policy: CoolPixelColumnReadPolicy,
+    should_cancel: &dyn Fn() -> bool,
+) -> CStudioResult<Vec<ContactBin>> {
     let mut contacts = Vec::new();
     visit_cool_contact_chunks_with_limit(
         path,
         source_ranges,
         resolution,
         normalization,
+        pixel_read_policy,
         should_cancel,
         MAX_COOL_PIXEL_READ_CHUNK,
         None,
@@ -1038,6 +1117,7 @@ where
         source_ranges,
         resolution,
         normalization,
+        CoolPixelColumnReadPolicy::PreferResidentColumns,
         should_cancel,
         MAX_COOL_STREAM_PIXEL_READ_CHUNK,
         None,
@@ -1072,6 +1152,7 @@ where
         source_ranges,
         resolution,
         normalization,
+        CoolPixelColumnReadPolicy::PreferResidentColumns,
         should_cancel,
         MAX_COOL_STREAM_PIXEL_READ_CHUNK,
         None,
@@ -1092,6 +1173,37 @@ pub fn visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_n
     normalization: ContactNormalization,
     should_cancel: &dyn Fn() -> bool,
     timings: &mut CoolContactVisitTimings,
+    visit: Visit,
+    finish_chunk: Finish,
+) -> CStudioResult<usize>
+where
+    Visit: FnMut(&str, u64, &str, u64, f64) -> CStudioResult<()>,
+    Finish: FnMut() -> CStudioResult<()>,
+{
+    visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_policy_cancellable(
+        path,
+        source_ranges,
+        resolution,
+        normalization,
+        CoolPixelColumnReadPolicy::PreferResidentColumns,
+        should_cancel,
+        timings,
+        visit,
+        finish_chunk,
+    )
+}
+
+pub fn visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_policy_cancellable<
+    Visit,
+    Finish,
+>(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    pixel_read_policy: CoolPixelColumnReadPolicy,
+    should_cancel: &dyn Fn() -> bool,
+    timings: &mut CoolContactVisitTimings,
     mut visit: Visit,
     finish_chunk: Finish,
 ) -> CStudioResult<usize>
@@ -1104,6 +1216,7 @@ where
         source_ranges,
         resolution,
         normalization,
+        pixel_read_policy,
         should_cancel,
         MAX_COOL_STREAM_PIXEL_READ_CHUNK,
         Some(timings),
@@ -1132,11 +1245,43 @@ where
     Visit: FnMut(usize, &str, u64, usize, &str, u64, f64) -> CStudioResult<()>,
     Finish: FnMut() -> CStudioResult<()>,
 {
+    visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_policy_cancellable(
+        path,
+        source_ranges,
+        resolution,
+        normalization,
+        CoolPixelColumnReadPolicy::PreferResidentColumns,
+        should_cancel,
+        timings,
+        visit,
+        finish_chunk,
+    )
+}
+
+pub fn visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_policy_cancellable<
+    Visit,
+    Finish,
+>(
+    path: &str,
+    source_ranges: &[(String, u64, u64)],
+    resolution: Option<u64>,
+    normalization: ContactNormalization,
+    pixel_read_policy: CoolPixelColumnReadPolicy,
+    should_cancel: &dyn Fn() -> bool,
+    timings: &mut CoolContactVisitTimings,
+    visit: Visit,
+    finish_chunk: Finish,
+) -> CStudioResult<usize>
+where
+    Visit: FnMut(usize, &str, u64, usize, &str, u64, f64) -> CStudioResult<()>,
+    Finish: FnMut() -> CStudioResult<()>,
+{
     visit_cool_contact_chunks_with_limit(
         path,
         source_ranges,
         resolution,
         normalization,
+        pixel_read_policy,
         should_cancel,
         MAX_COOL_STREAM_PIXEL_READ_CHUNK,
         Some(timings),
@@ -1179,6 +1324,7 @@ fn visit_cool_contact_chunks_with_limit<Visit, Finish>(
     source_ranges: &[(String, u64, u64)],
     resolution: Option<u64>,
     normalization: ContactNormalization,
+    pixel_read_policy: CoolPixelColumnReadPolicy,
     should_cancel: &dyn Fn() -> bool,
     pixel_read_chunk: usize,
     mut timings: Option<&mut CoolContactVisitTimings>,
@@ -1203,8 +1349,14 @@ where
     )?;
     let source_range_index = SourceRangeIndex::new(source_ranges);
     let selected_bins = SelectedBinIndex::new(&index, &source_range_index, should_cancel)?;
-    let resident_bin2 = cached_resident_bin2(path, resolution, reader.as_ref(), should_cancel)?;
-    let resident_counts = cached_resident_counts(path, resolution, reader.as_ref(), should_cancel)?;
+    let (resident_bin2, resident_counts) = match pixel_read_policy {
+        CoolPixelColumnReadPolicy::PreferResidentColumns => (
+            cached_resident_bin2(path, resolution, reader.as_ref(), should_cancel)?,
+            cached_resident_counts(path, resolution, reader.as_ref(), should_cancel)?,
+        ),
+        CoolPixelColumnReadPolicy::Bin1OffsetRanges
+        | CoolPixelColumnReadPolicy::Bin1OffsetRangesOnly => (None, None),
+    };
 
     let mut visited_contacts = 0usize;
     ensure_not_cancelled(should_cancel)?;
@@ -1213,15 +1365,27 @@ where
         &index.bin1_offsets,
         should_cancel,
     )?;
-    let pixel_ranges = if let Some(resident_bin2) = resident_bin2.as_deref() {
-        selected_pixel_ranges_from_resident_bin2(
-            &bin1_pixel_ranges,
-            resident_bin2,
-            &selected_bins,
-            should_cancel,
-        )?
-    } else {
-        batch_nearby_pixel_ranges(&bin1_pixel_ranges, MAX_COOL_PIXEL_BATCH_GAP)
+    let pixel_ranges = match pixel_read_policy {
+        CoolPixelColumnReadPolicy::Bin1OffsetRangesOnly => {
+            // Keep the neighbor-prefetch contract exact: each HDF5 slice is
+            // the union of selected bin1 rows. Do not bridge unselected gaps.
+            bin1_pixel_ranges
+        }
+        CoolPixelColumnReadPolicy::Bin1OffsetRanges => {
+            batch_nearby_pixel_ranges(&bin1_pixel_ranges, MAX_COOL_PIXEL_BATCH_GAP)
+        }
+        CoolPixelColumnReadPolicy::PreferResidentColumns => {
+            if let Some(resident_bin2) = resident_bin2.as_deref() {
+                selected_pixel_ranges_from_resident_bin2(
+                    &bin1_pixel_ranges,
+                    resident_bin2,
+                    &selected_bins,
+                    should_cancel,
+                )?
+            } else {
+                batch_nearby_pixel_ranges(&bin1_pixel_ranges, MAX_COOL_PIXEL_BATCH_GAP)
+            }
+        }
     };
     if let Some(timings) = timings.as_deref_mut() {
         timings.prepare += prepare_started.elapsed();
@@ -3510,6 +3674,28 @@ where
     result
 }
 
+fn touch_cached_normalization_vector(key: &CoolNormalizationCacheKey) -> bool {
+    let Some(cache) = COOL_NORMALIZATION_CACHE.get() else {
+        return false;
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(position) = cache
+        .entries
+        .iter()
+        .position(|(entry_key, _)| entry_key == key)
+    else {
+        return false;
+    };
+    let entry = cache
+        .entries
+        .remove(position)
+        .expect("cached normalization position exists");
+    cache.entries.push_back(entry);
+    true
+}
+
 fn wait_for_normalization_flight(
     flight: &CoolNormalizationFlight,
     should_cancel: &dyn Fn() -> bool,
@@ -4027,8 +4213,10 @@ mod tests {
         batch_nearby_pixel_ranges, bin1_for_pixel_offset, cached_cool_reader,
         cached_normalization_vector, cool_index_cache_key, list_contact_resolutions,
         list_contact_sources, normalized_contact_count, pixel_ranges_for_selected_bin_ranges,
+        prewarm_available_contact_normalization_at_resolution_cancellable,
         read_cool_contacts_for_source_ranges_at_resolution,
         read_cool_contacts_for_source_ranges_at_resolution_cancellable,
+        read_cool_contacts_for_source_ranges_at_resolution_with_policy_cancellable,
         read_cool_contacts_for_sources,
         read_cool_contacts_for_sources_at_resolution_with_normalization, resolve_chrom_offsets,
         runtime_normalization_memory_budget_bytes, selected_pixel_ranges_from_resident_bin2,
@@ -4036,10 +4224,11 @@ mod tests {
         visit_cool_contact_chunks_for_source_ranges_at_resolution_with_normalization_cancellable,
         visit_cool_contact_chunks_indexed_for_source_ranges_at_resolution_with_normalization_cancellable,
         visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
+        visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_policy_cancellable,
         visit_cool_contact_chunks_profiled_for_source_ranges_at_resolution_with_normalization_cancellable,
         CoolBinLayout, CoolContactVisitTimings, CoolIndex, CoolIndexCacheKey,
-        CoolNormalizationCacheKey, CoolSourceMetadata, SelectedBinIndex, SelectedBinMembership,
-        SourceRangeIndex,
+        CoolNormalizationCacheKey, CoolPixelColumnReadPolicy, CoolSourceMetadata, SelectedBinIndex,
+        SelectedBinMembership, SourceRangeIndex,
     };
     use crate::{
         agp::Orientation,
@@ -4077,6 +4266,31 @@ mod tests {
             .expect("this supported desktop should report available memory");
         assert!(available > 0);
         assert!(runtime_normalization_memory_budget_bytes(available) <= available);
+    }
+
+    #[test]
+    fn idle_normalization_prewarm_never_computes_a_missing_runtime_vector() {
+        let missing = TestCoolFile::without_weights();
+        assert!(
+            !prewarm_available_contact_normalization_at_resolution_cancellable(
+                missing.path(),
+                None,
+                ContactNormalization::Ice,
+                &|| false,
+            )
+            .expect("missing stored normalization should be skipped")
+        );
+
+        let stored = TestCoolFile::with_weights(&[2.0, 3.0], &[2.0, 3.0]);
+        assert!(
+            prewarm_available_contact_normalization_at_resolution_cancellable(
+                stored.path(),
+                None,
+                ContactNormalization::Ice,
+                &|| false,
+            )
+            .expect("stored normalization should prewarm")
+        );
     }
 
     fn test_normalization_cache_key() -> CoolNormalizationCacheKey {
@@ -4594,6 +4808,91 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             expected_tuples,
+        );
+
+        let range_only_owned =
+            read_cool_contacts_for_source_ranges_at_resolution_with_policy_cancellable(
+                file.path(),
+                &ranges,
+                None,
+                ContactNormalization::Raw,
+                CoolPixelColumnReadPolicy::Bin1OffsetRangesOnly,
+                &|| false,
+            )
+            .expect("range-only owned reader should work");
+        assert_eq!(
+            range_only_owned
+                .into_iter()
+                .map(|contact| {
+                    (
+                        contact.source1,
+                        contact.start1,
+                        contact.source2,
+                        contact.start2,
+                        contact.count,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            expected_tuples,
+        );
+
+        let mut range_only_indexed = Vec::new();
+        let mut range_only_timings = CoolContactVisitTimings::default();
+        let range_only_visited = visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_policy_cancellable(
+            file.path(),
+            &ranges,
+            None,
+            ContactNormalization::Raw,
+            CoolPixelColumnReadPolicy::Bin1OffsetRangesOnly,
+            &|| false,
+            &mut range_only_timings,
+            |_, source1, start1, _, source2, start2, count| {
+                range_only_indexed.push((
+                    source1.to_string(),
+                    start1,
+                    source2.to_string(),
+                    start2,
+                    count,
+                ));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .expect("range-only profiled visitor should work");
+        assert_eq!(range_only_visited, expected.len());
+        assert_eq!(range_only_indexed, expected_tuples);
+        assert!(
+            range_only_timings.hdf5_chunks > 0,
+            "range-only policy must slice HDF5 even when full resident columns are cached"
+        );
+
+        let mut bounded_slice_contacts = Vec::new();
+        let mut bounded_slice_timings = CoolContactVisitTimings::default();
+        visit_cool_contact_chunks_indexed_profiled_for_source_ranges_at_resolution_with_policy_cancellable(
+            file.path(),
+            &ranges,
+            None,
+            ContactNormalization::Raw,
+            CoolPixelColumnReadPolicy::Bin1OffsetRanges,
+            &|| false,
+            &mut bounded_slice_timings,
+            |_, source1, start1, _, source2, start2, count| {
+                bounded_slice_contacts.push((
+                    source1.to_string(),
+                    start1,
+                    source2.to_string(),
+                    start2,
+                    count,
+                ));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .expect("bounded-slice profiled visitor should work");
+        assert_eq!(bounded_slice_contacts, expected_tuples);
+        assert!(
+            bounded_slice_timings.hdf5_chunks > 0,
+            "bounded-slice tile policy must not reuse complete resident columns"
         );
     }
 
