@@ -180,6 +180,17 @@ export interface ContactTileGpuRenderer {
     resolution: number;
     tileSizeBins: number;
   }) => boolean;
+  /**
+   * Queue exact pages in the shared atlas without changing the active scene or
+   * its page table. Visible and same-resolution pan uploads always run first.
+   */
+  ingestPrefetchedPages: (input: {
+    tiles: readonly ContactMapTile[];
+    dataScope: string;
+    generation: number;
+    resolution: number;
+    tileSizeBins: number;
+  }) => boolean;
   /** Present newly appended or refreshed pan-prefetch descriptors in place. */
   presentAppendedSceneDescriptors: () => boolean;
   setDeltaScene: (scene: ContactTileGpuDeltaScene) => boolean;
@@ -704,9 +715,22 @@ interface SourceLayoutTextureState {
   bytes: number;
 }
 
+function virtualTextureResidentKey(
+  dataScope: string,
+  resolution: number,
+  tileSizeBins: number,
+  tileKey: string,
+) {
+  return `${dataScope}|${resolution}|${tileSizeBins}|${tileKey}`;
+}
+
 function virtualTextureAtlasKey(scene: ContactTileGpuScene, tileKey: string) {
-  const dataScope = scene.sourceLayout?.dataScope ?? scene.dataScope ?? "";
-  return `${dataScope}|${scene.resolution}|${scene.tileSizeBins}|${tileKey}`;
+  return virtualTextureResidentKey(
+    scene.sourceLayout?.dataScope ?? scene.dataScope ?? "",
+    scene.resolution,
+    scene.tileSizeBins,
+    tileKey,
+  );
 }
 
 function virtualTexturePageLayers(
@@ -1677,6 +1701,14 @@ export function createContactTileGpuRenderer(
   let pendingPrefetchScene: ContactTileGpuScene | null = null;
   let pendingPrefetchGeneration: number | undefined;
   let pendingPrefetchPresentationRequested = false;
+  interface PendingResidentPage {
+    atlasKey: string;
+    generation: number;
+    resolution: number;
+    tileSizeBins: number;
+    tile: ContactMapTile;
+  }
+  const pendingResidentPages = new Map<string, PendingResidentPage>();
   const virtualTextureFormatByScene = new WeakMap<
     ContactTileGpuScene,
     ContactTileGpuTextureFormat
@@ -2065,6 +2097,15 @@ export function createContactTileGpuRenderer(
     const candidates = contactTileGpuUploadPlan(activeScene, current.format).filter((candidate) => (
       nextTiles.get(virtualTextureAtlasKey(activeScene, candidate.key)) !== candidate.tile
     ));
+    // A cross-resolution resident hit is already exact. Adopt it into this
+    // generation and refresh its LRU age even though no upload is required.
+    for (const { key, tile } of plan.populatedTiles) {
+      const atlasKey = virtualTextureAtlasKey(activeScene, key);
+      if (nextTiles.get(atlasKey) === tile) {
+        nextGenerations.set(atlasKey, generation);
+        nextLastUsed.set(atlasKey, ++useCounter);
+      }
+    }
     const selected = contactTileGpuUploadBatch(candidates, byteBudget);
     if (trackQueueFrame) {
       uploadContext.performance.uploadQueueFrames += 1;
@@ -3035,6 +3076,148 @@ export function createContactTileGpuRenderer(
     return true;
   };
 
+  const invalidateVirtualTextureLayer = (
+    current: VirtualTextureState,
+    layer: number,
+  ) => {
+    for (const [key, mappedLayer] of current.layerByTileKey) {
+      if (mappedLayer !== layer) {
+        continue;
+      }
+      current.layerByTileKey.delete(key);
+      current.tileByTileKey.delete(key);
+      current.generationByTileKey.delete(key);
+      current.lastUsedByTileKey.delete(key);
+    }
+    uploadContext.performance.virtualTextureLayers = current.layerByTileKey.size;
+  };
+
+  /** Upload one lowest-priority page without mutating the active page table. */
+  const uploadResidentPage = (page: PendingResidentPage) => {
+    const current = virtualTextureState;
+    const activeGeneration = scene?.sourceLayout?.generation ?? scene?.generation;
+    if (
+      !current
+      || !scene
+      || activeGeneration !== page.generation
+      || current.tileSizeBins !== page.tileSizeBins
+    ) {
+      return 0;
+    }
+    if (current.tileByTileKey.get(page.atlasKey) === page.tile) {
+      current.generationByTileKey.set(page.atlasKey, page.generation);
+      current.lastUsedByTileKey.set(page.atlasKey, ++useCounter);
+      return 0;
+    }
+
+    const activeDataScope = scene.sourceLayout?.dataScope ?? scene.dataScope ?? "";
+    const protectedKeys = new Set(current.plan.populatedTiles.map(({ key }) => (
+      virtualTextureResidentKey(
+        activeDataScope,
+        current.resolution,
+        current.tileSizeBins,
+        key,
+      )
+    )));
+    if (protectedKeys.has(page.atlasKey)) {
+      // Never replace a page sampled by the current page table, even if a
+      // speculative batch happens to carry a newer object for the same key.
+      return 0;
+    }
+
+    const textureData = contactTileGpuTextureData(page.tile, page.tileSizeBins);
+    if (
+      current.format === "r16f"
+      && textureData.format === "float32"
+      && !contactTileGpuFloatValuesFitR16f(textureData.values)
+    ) {
+      // Rebuilding the live atlas would invalidate the retained front. Let a
+      // later foreground scene perform the format transition atomically.
+      return 0;
+    }
+
+    let layer = current.layerByTileKey.get(page.atlasKey);
+    let evictedKey: string | undefined;
+    if (layer === undefined) {
+      const occupiedLayers = new Set(current.layerByTileKey.values());
+      layer = 0;
+      while (occupiedLayers.has(layer) && layer < current.capacity) {
+        layer += 1;
+      }
+      if (layer >= current.capacity) {
+        evictedKey = [...current.layerByTileKey.keys()]
+          .filter((key) => !protectedKeys.has(key))
+          .sort((left, right) => (
+            (current.lastUsedByTileKey.get(left) ?? 0)
+            - (current.lastUsedByTileKey.get(right) ?? 0)
+          ))[0];
+        if (evictedKey === undefined) {
+          return 0;
+        }
+        layer = current.layerByTileKey.get(evictedKey);
+        if (layer === undefined) {
+          return 0;
+        }
+      }
+    }
+
+    const uploadValues = current.format === "r32f" && textureData.format === "r16f"
+      ? contactTileR16fValuesToFloat32(textureData.values)
+      : textureData.values;
+    const uploadType = current.format === "r16f" && textureData.format === "r16f"
+      ? gl.HALF_FLOAT
+      : gl.FLOAT;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, current.tileArray);
+    gl.texSubImage3D(
+      gl.TEXTURE_2D_ARRAY,
+      0,
+      0,
+      0,
+      layer,
+      page.tileSizeBins,
+      page.tileSizeBins,
+      1,
+      gl.RED,
+      uploadType,
+      uploadValues,
+    );
+    const uploadError = gl.getError();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+    if (uploadError !== gl.NO_ERROR) {
+      // The layer contents are undefined after a rejected sub-upload. Remove
+      // any old mapping that pointed at it so no later page table can sample it.
+      invalidateVirtualTextureLayer(current, layer);
+      return 0;
+    }
+
+    if (evictedKey !== undefined) {
+      current.layerByTileKey.delete(evictedKey);
+      current.tileByTileKey.delete(evictedKey);
+      current.generationByTileKey.delete(evictedKey);
+      current.lastUsedByTileKey.delete(evictedKey);
+      uploadContext.performance.evictions += 1;
+      uploadContext.performance.evictedBytes += page.tileSizeBins
+        * page.tileSizeBins
+        * contactTileGpuBytesPerTexel(current.format);
+    }
+    current.layerByTileKey.set(page.atlasKey, layer);
+    current.tileByTileKey.set(page.atlasKey, page.tile);
+    current.generationByTileKey.set(page.atlasKey, page.generation);
+    current.lastUsedByTileKey.set(page.atlasKey, ++useCounter);
+    uploadContext.performance.virtualTextureUploads += 1;
+    uploadContext.performance.virtualTextureLayers = current.layerByTileKey.size;
+    traceContactPanCamera("gpu_resident_prefetch_upload", {
+      generation: page.generation,
+      resolution: page.resolution,
+      tileX: page.tile.tileX,
+      tileY: page.tile.tileY,
+    });
+    return page.tileSizeBins
+      * page.tileSizeBins
+      * contactTileGpuBytesPerTexel(current.format);
+  };
+
   function processUploadPump() {
     if (destroyed || gl!.isContextLost()) {
       return;
@@ -3063,6 +3246,9 @@ export function createContactTileGpuRenderer(
       } else {
         submitPresentationFence(pending);
       }
+      if (!pendingPresentationFence && pendingResidentPages.size > 0) {
+        scheduleUploadPump();
+      }
       return;
     }
     if (pendingPrefetchScene) {
@@ -3085,6 +3271,39 @@ export function createContactTileGpuRenderer(
         pendingPrefetchPresentationRequested = false;
       }
       if (result === "pending") {
+        scheduleUploadPump();
+      } else if (pendingResidentPages.size > 0) {
+        scheduleUploadPump();
+      }
+      emitPerformanceIfChanged();
+      return;
+    }
+    const residentPage = pendingResidentPages.values().next().value as
+      | PendingResidentPage
+      | undefined;
+    if (residentPage) {
+      const pendingDepth = pendingResidentPages.size;
+      pendingResidentPages.delete(residentPage.atlasKey);
+      const startedAt = uploadContext.clock();
+      const uploadedBytes = uploadResidentPage(residentPage);
+      const elapsed = Math.max(0, uploadContext.clock() - startedAt);
+      uploadContext.performance.uploadQueueFrames += 1;
+      uploadContext.performance.uploadQueueMaxDepth = Math.max(
+        uploadContext.performance.uploadQueueMaxDepth,
+        pendingDepth,
+      );
+      uploadContext.performance.uploadQueueBytes += uploadedBytes;
+      uploadContext.performance.uploadQueueMilliseconds += elapsed;
+      uploadContext.performance.uploadQueueMaxFrameBytes = Math.max(
+        uploadContext.performance.uploadQueueMaxFrameBytes,
+        uploadedBytes,
+      );
+      uploadContext.performance.uploadQueueMaxFrameMilliseconds = Math.max(
+        uploadContext.performance.uploadQueueMaxFrameMilliseconds,
+        elapsed,
+      );
+      if (pendingResidentPages.size > 0) {
+        uploadContext.performance.uploadQueueDeferredFrames += 1;
         scheduleUploadPump();
       }
       emitPerformanceIfChanged();
@@ -3625,6 +3844,61 @@ export function createContactTileGpuRenderer(
       });
       return true;
     },
+    ingestPrefetchedPages: (input) => {
+      const current = virtualTextureState;
+      const activeGeneration = scene?.sourceLayout?.generation ?? scene?.generation;
+      if (
+        destroyed
+        || !virtualResources
+        || !current
+        || !scene
+        || deltaScene
+        || gl.isContextLost()
+        || activeGeneration !== input.generation
+        || current.tileSizeBins !== input.tileSizeBins
+      ) {
+        return false;
+      }
+
+      let accepted = false;
+      let queued = false;
+      for (const tile of input.tiles) {
+        if (contactTileCellCount(tile) === 0) {
+          continue;
+        }
+        const atlasKey = virtualTextureResidentKey(
+          input.dataScope,
+          input.resolution,
+          input.tileSizeBins,
+          contactTileKey(tile),
+        );
+        if (current.tileByTileKey.get(atlasKey) === tile) {
+          current.generationByTileKey.set(atlasKey, input.generation);
+          current.lastUsedByTileKey.set(atlasKey, ++useCounter);
+          accepted = true;
+          continue;
+        }
+        if (
+          !pendingResidentPages.has(atlasKey)
+          && pendingResidentPages.size >= current.capacity
+        ) {
+          continue;
+        }
+        pendingResidentPages.set(atlasKey, {
+          atlasKey,
+          generation: input.generation,
+          resolution: input.resolution,
+          tileSizeBins: input.tileSizeBins,
+          tile,
+        });
+        accepted = true;
+        queued = true;
+      }
+      if (queued) {
+        scheduleUploadPump();
+      }
+      return accepted;
+    },
     appendSceneDescriptors: (input) => {
       if (
         destroyed
@@ -3957,6 +4231,7 @@ export function createContactTileGpuRenderer(
       pendingVirtualPresentation?.onPresented?.(false);
       pendingVirtualPresentation = null;
       pendingPrefetchScene = null;
+      pendingResidentPages.clear();
       if (pendingPresentationFence) {
         gl.deleteSync(pendingPresentationFence.sync);
         pendingPresentationFence.onPresented?.(false);

@@ -3321,6 +3321,14 @@ export function App() {
                 cache: contactTileCacheLru.toMap(),
                 cacheKeyForTile: candidateCacheKeyForTile,
               });
+              const candidateGpuDataScope = `${candidateTileScope}|${normalization}`;
+              contactPanPrefetchBridge.publishGpuResident({
+                tiles: candidateWorld.cachedVisibleTiles,
+                dataScope: candidateGpuDataScope,
+                generation,
+                resolution: candidateTargetResolution,
+                tileSizeBins,
+              });
 
               return buildContactTileLoadPlan(
                 candidateWorld,
@@ -3332,6 +3340,7 @@ export function App() {
                 targetResolution: candidateTargetResolution,
                 tileScope: candidateTileScope,
                 layerScope: candidateLayerScope,
+                gpuDataScope: candidateGpuDataScope,
                 cacheKeyForTile: candidateCacheKeyForTile,
               }));
             });
@@ -3438,6 +3447,13 @@ export function App() {
                 // Background work deliberately avoids React state, status, and
                 // performance markers. A later resolution switch reads this ref.
                 contactTileCacheRef.current = contactTileCacheLru.toMap();
+                contactPanPrefetchBridge.publishGpuResident({
+                  tiles,
+                  dataScope: job.gpuDataScope,
+                  generation,
+                  resolution: job.targetResolution,
+                  tileSizeBins,
+                });
               } catch {
                 if (cancelled || generation !== contactTileGenerationRef.current) {
                   return;

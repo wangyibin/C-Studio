@@ -11,6 +11,23 @@ export interface ContactPanPrefetchBatch {
 
 export type ContactPanPrefetchConsumer = (batch: ContactPanPrefetchBatch) => void;
 
+/**
+ * Exact tile pages that may be made resident without changing the live camera,
+ * page table, or presented framebuffer. The data scope includes the target
+ * layout and normalization, so one atlas can safely retain neighboring LODs.
+ */
+export interface ContactGpuResidentPrefetchBatch {
+  tiles: readonly ContactMapTile[];
+  dataScope: string;
+  generation: number;
+  resolution: number;
+  tileSizeBins: number;
+}
+
+export type ContactGpuResidentPrefetchConsumer = (
+  batch: ContactGpuResidentPrefetchBatch,
+) => void;
+
 export interface ContactPanTileLoadPriorityInput {
   /** True only while pointer or wheel input is still advancing the camera. */
   previewActive: boolean;
@@ -343,6 +360,7 @@ export function contactPanTileLoadPriority({
  */
 export class ContactPanPrefetchBridge {
   private consumers = new Set<ContactPanPrefetchConsumer>();
+  private gpuResidentConsumers = new Set<ContactGpuResidentPrefetchConsumer>();
 
   subscribe(consumer: ContactPanPrefetchConsumer) {
     this.consumers.add(consumer);
@@ -356,6 +374,22 @@ export class ContactPanPrefetchBridge {
       return;
     }
     for (const consumer of this.consumers) {
+      consumer(batch);
+    }
+  }
+
+  subscribeGpuResident(consumer: ContactGpuResidentPrefetchConsumer) {
+    this.gpuResidentConsumers.add(consumer);
+    return () => {
+      this.gpuResidentConsumers.delete(consumer);
+    };
+  }
+
+  publishGpuResident(batch: ContactGpuResidentPrefetchBatch) {
+    if (batch.tiles.length === 0) {
+      return;
+    }
+    for (const consumer of this.gpuResidentConsumers) {
       consumer(batch);
     }
   }

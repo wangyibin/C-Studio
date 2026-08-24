@@ -256,6 +256,30 @@ describe("ContactPanPrefetchBridge", () => {
     });
     expect(consumer).not.toHaveBeenCalled();
   });
+
+  it("keeps cross-resolution GPU residency on a separate non-React channel", () => {
+    const bridge = new ContactPanPrefetchBridge();
+    const panConsumer = vi.fn();
+    const gpuConsumer = vi.fn();
+    const unsubscribe = bridge.subscribeGpuResident(gpuConsumer);
+    bridge.subscribe(panConsumer);
+    const batch = {
+      tiles: [{ tileX: 1, tileY: 2, cells: [] }],
+      dataScope: "layout|ICE",
+      generation: 7,
+      resolution: 50_000,
+      tileSizeBins: 256,
+    };
+
+    bridge.publishGpuResident(batch);
+    expect(gpuConsumer).toHaveBeenCalledWith(batch);
+    expect(panConsumer).not.toHaveBeenCalled();
+
+    unsubscribe();
+    bridge.publishGpuResident(batch);
+    bridge.publishGpuResident({ ...batch, tiles: [] });
+    expect(gpuConsumer).toHaveBeenCalledOnce();
+  });
 });
 
 describe("contactPanTileLoadPriority", () => {

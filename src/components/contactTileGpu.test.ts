@@ -1863,6 +1863,123 @@ describe("contactTileFloatTextureData", () => {
     expect(blitFramebuffer.mock.calls.length).toBe(blitsBeforeAppend + 1);
   });
 
+  it("warms a neighboring resolution in the shared atlas without touching the current frame", () => {
+    const {
+      canvas,
+      blitFramebuffer,
+      drawArrays,
+      texImage2D,
+      texSubImage3D,
+    } = mockWebGlCanvas();
+    const frames = mockFrameScheduler();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
+    });
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 10 },
+    };
+    const activeTile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 0, yBin: 0, count: 9 }],
+    };
+    expect(renderer?.setScene({
+      dataScope: "active-layout|raw",
+      descriptors: [{ key: "0:0:source", tile: activeTile, transpose: false }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle,
+    })).toBe(true);
+    frames.flushAll();
+
+    const neighborTile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 0, yBin: 0, count: 6 }],
+    };
+    const pageTablesBeforeWarm = texImage2D.mock.calls.length;
+    const atlasUploadsBeforeWarm = texSubImage3D.mock.calls.length;
+    const drawsBeforeWarm = drawArrays.mock.calls.length;
+    const presentationsBeforeWarm = blitFramebuffer.mock.calls.length;
+    expect(renderer?.ingestPrefetchedPages({
+      tiles: [neighborTile],
+      dataScope: "neighbor-layout|raw",
+      generation: 7,
+      resolution: 2_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    expect(frames.pending()).toBe(1);
+    expect(texSubImage3D).toHaveBeenCalledTimes(atlasUploadsBeforeWarm);
+
+    frames.flushOne();
+    expect(texSubImage3D).toHaveBeenCalledTimes(atlasUploadsBeforeWarm + 1);
+    expect(texImage2D).toHaveBeenCalledTimes(pageTablesBeforeWarm);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforeWarm);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforeWarm);
+
+    const atlasUploadsBeforeSwitch = texSubImage3D.mock.calls.length;
+    expect(renderer?.setScene({
+      dataScope: "neighbor-layout|raw",
+      descriptors: [{ key: "0:0:source", tile: neighborTile, transpose: false }],
+      generation: 8,
+      resolution: 2_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 8_000, yStart: 0, yEnd: 8_000 },
+      renderStyle,
+    })).toBe(true);
+    expect(texSubImage3D).toHaveBeenCalledTimes(atlasUploadsBeforeSwitch);
+    renderer?.destroy();
+  });
+
+  it("drops stale neighboring-resolution batches before scheduling a GPU upload", () => {
+    const { canvas, texSubImage3D } = mockWebGlCanvas();
+    const frames = mockFrameScheduler();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
+    });
+    expect(renderer?.setScene({
+      dataScope: "active-layout|raw",
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 9 }] },
+        transpose: false,
+      }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+    frames.flushAll();
+    const uploadsBefore = texSubImage3D.mock.calls.length;
+
+    expect(renderer?.ingestPrefetchedPages({
+      tiles: [{ tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 5 }] }],
+      dataScope: "neighbor-layout|raw",
+      generation: 6,
+      resolution: 2_000,
+      tileSizeBins: 4,
+    })).toBe(false);
+    expect(frames.pending()).toBe(0);
+    expect(texSubImage3D).toHaveBeenCalledTimes(uploadsBefore);
+    renderer?.destroy();
+  });
+
   it("atomically promotes a fully prefetched pan scene with zero new tile uploads", () => {
     const {
       canvas,

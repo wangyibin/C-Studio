@@ -41,6 +41,7 @@ import { contactColorLut } from "../state/contactColor";
 import { traceContactPanCamera } from "../state/contactPanCameraTrace";
 import type { ContactPanPreview } from "../state/contactPanPerformance";
 import type {
+  ContactGpuResidentPrefetchBatch,
   ContactPanPrefetchBatch,
   ContactPanPrefetchBridge,
 } from "../state/contactPanPrefetch";
@@ -314,6 +315,14 @@ export function presentContactPanPrefetchBatches(
     }) || appended;
   }
   return appended ? renderer.presentAppendedSceneDescriptors() : false;
+}
+
+/** Keep adjacent-resolution pages off React's render path and out of the live page table. */
+export function ingestContactGpuResidentPrefetchBatch(
+  renderer: Pick<ContactTileGpuRenderer, "ingestPrefetchedPages">,
+  batch: ContactGpuResidentPrefetchBatch,
+) {
+  return renderer.ingestPrefetchedPages(batch);
 }
 
 export function contactWheelPanCommitDelta(
@@ -1171,6 +1180,12 @@ export function ContactMapViewport({
       pendingBatches = [];
     };
   }, [contactPanPrefetchBridge]);
+  useEffect(() => contactPanPrefetchBridge?.subscribeGpuResident((batch) => {
+    const renderer = contactTilePanRendererRef.current;
+    if (renderer) {
+      ingestContactGpuResidentPrefetchBatch(renderer, batch);
+    }
+  }), [contactPanPrefetchBridge]);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const assemblySelectionBandsRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);

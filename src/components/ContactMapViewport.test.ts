@@ -2,6 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { ExampleDatasetSummary } from "../App";
+import type { ContactGpuResidentPrefetchBatch } from "../state/contactPanPrefetch";
 import { createInitialUiState } from "../state/uiState";
 import {
   advanceContactCoveragePresentationFrame,
@@ -36,6 +37,7 @@ import {
   contactWheelPanMode,
   contactWheelPanIntent,
   historyPreviewBoxes,
+  ingestContactGpuResidentPrefetchBatch,
   limitAssemblyOverlayIntervals,
   maximumAssemblyOverlayIntervals,
   sameAssemblyOverlayPresentation,
@@ -72,6 +74,26 @@ describe("pan-prefetch GPU presentation", () => {
       { tiles: [tile], generation: 8, resolution: 1_000, tileSizeBins: 4, viewport },
     ])).toBe(true);
     expect(events).toEqual(["append:7", "append:8", "present"]);
+  });
+
+  it("forwards adjacent-resolution pages without creating descriptors or presenting", () => {
+    const events: string[] = [];
+    const batch: ContactGpuResidentPrefetchBatch = {
+      tiles: [{ tileX: 0, tileY: 0, cells: [] }],
+      dataScope: "neighbor-layout|raw",
+      generation: 7,
+      resolution: 2_000,
+      tileSizeBins: 4,
+    };
+    const renderer = {
+      ingestPrefetchedPages: (input: ContactGpuResidentPrefetchBatch) => {
+        events.push(`${input.dataScope}:${input.resolution}`);
+        return true;
+      },
+    };
+
+    expect(ingestContactGpuResidentPrefetchBatch(renderer, batch)).toBe(true);
+    expect(events).toEqual(["neighbor-layout|raw:2000"]);
   });
 });
 
