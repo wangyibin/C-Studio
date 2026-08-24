@@ -11,6 +11,7 @@ import {
   assemblyPointerStateAtScreenPoint,
   assemblyBoundaryViewportClipClassName,
   assemblySelectionProjectionBands,
+  assemblySelectionControlsVisible,
   assemblyShiftClickIntent,
   ContactMapViewport,
   contactBoundaryMountInterval,
@@ -228,6 +229,8 @@ describe("sameAssemblyOverlayPresentation", () => {
       viewportXEnd: 100,
       viewportYStart: 0,
       viewportYEnd: 100,
+      viewportWidthPx: 100,
+      viewportHeightPx: 100,
       selection: null,
       showChromosomeBoxes: true,
       showBlockBoxes: true,
@@ -252,6 +255,25 @@ describe("sameAssemblyOverlayPresentation", () => {
       ...base,
       visibleContigs: [],
     })).toBe(false);
+    expect(sameAssemblyOverlayPresentation(base, {
+      ...base,
+      viewportWidthPx: 200,
+    })).toBe(false);
+  });
+});
+
+describe("assemblySelectionControlsVisible", () => {
+  const viewport = { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 };
+
+  it("shows controls only when the visible selection reaches 32 px on both axes", () => {
+    expect(assemblySelectionControlsVisible(20, 60, viewport, 100, 100)).toBe(true);
+    expect(assemblySelectionControlsVisible(20, 60, viewport, 79, 100)).toBe(false);
+    expect(assemblySelectionControlsVisible(20, 60, viewport, 100, 79)).toBe(false);
+  });
+
+  it("uses the clipped on-screen interval instead of the full selection span", () => {
+    expect(assemblySelectionControlsVisible(-100, 40, viewport, 100, 100)).toBe(true);
+    expect(assemblySelectionControlsVisible(-100, 30, viewport, 100, 100)).toBe(false);
   });
 });
 
@@ -1066,9 +1088,10 @@ describe("assemblyCutTargetAtScreenPoint", () => {
     expect(assemblyCutTargetAtScreenPoint({
       model: buildAssemblyEditModel([compactContig]),
       selectedIds: new Set([compactContig.id]),
-      point: { x: 18, y: 18 },
-      widthPx: 100,
-      heightPx: 100,
+      binSizeBp: 1,
+      point: { x: 23, y: 23 },
+      widthPx: 128,
+      heightPx: 128,
       viewportXStart: 0,
       viewportXEnd: 100,
       viewportYStart: 0,
@@ -1076,11 +1099,92 @@ describe("assemblyCutTargetAtScreenPoint", () => {
     })).toEqual({ blockId: compactContig.id, visualPosition: 18 });
   });
 
+  it("requires three displayed bins before exposing an interior cut", () => {
+    const model = buildAssemblyEditModel([compactContig]);
+    const input = {
+      model,
+      selectedIds: new Set([compactContig.id]),
+      point: { x: 90, y: 90 },
+      widthPx: 200,
+      heightPx: 200,
+      viewportXStart: 0,
+      viewportXEnd: 40,
+      viewportYStart: 0,
+      viewportYEnd: 40,
+    };
+
+    expect(assemblyCutTargetAtScreenPoint({ ...input, binSizeBp: 10 })).toBeNull();
+    expect(assemblyCutTargetAtScreenPoint({ ...input, binSizeBp: 5 })).toEqual({
+      blockId: compactContig.id,
+      visualPosition: 18,
+    });
+  });
+
+  it("acquires only a legible interior and uses a smaller release threshold", () => {
+    const selectedContig = {
+      ...compactContig,
+      visualStart: 40,
+      visualEnd: 60,
+    };
+    const model = buildAssemblyEditModel([selectedContig]);
+    const input = {
+      model,
+      selectedIds: new Set([selectedContig.id]),
+      binSizeBp: 1,
+      heightPx: 72,
+      viewportXStart: 0,
+      viewportXEnd: 100,
+      viewportYStart: 0,
+      viewportYEnd: 100,
+    };
+
+    expect(assemblyCutTargetAtScreenPoint({
+      ...input,
+      widthPx: 72,
+      point: { x: 36, y: 36 },
+    })).toBeNull();
+    expect(assemblyCutTargetAtScreenPoint({
+      ...input,
+      lockedCutBlockId: selectedContig.id,
+      widthPx: 72,
+      point: { x: 36, y: 36 },
+    })).toEqual({ blockId: selectedContig.id, visualPosition: 50 });
+    expect(assemblyCutTargetAtScreenPoint({
+      ...input,
+      lockedCutBlockId: selectedContig.id,
+      widthPx: 60,
+      heightPx: 60,
+      point: { x: 30, y: 30 },
+    })).toBeNull();
+  });
+
+  it("requires a legible cut interval on both viewport axes", () => {
+    const selectedContig = {
+      ...compactContig,
+      visualStart: 40,
+      visualEnd: 60,
+    };
+
+    expect(assemblyCutTargetAtScreenPoint({
+      model: buildAssemblyEditModel([selectedContig]),
+      selectedIds: new Set([selectedContig.id]),
+      binSizeBp: 1,
+      point: { x: 100, y: 40 },
+      widthPx: 200,
+      heightPx: 80,
+      viewportXStart: 0,
+      viewportXEnd: 100,
+      viewportYStart: 0,
+      viewportYEnd: 100,
+    })).toBeNull();
+  });
+
   it("does not expose the cut affordance outside the diagonal or for an unselected contig", () => {
     const model = buildAssemblyEditModel([compactContig]);
     const input = {
       model,
       selectedIds: new Set([compactContig.id]),
+      binSizeBp: 1,
       widthPx: 100,
       heightPx: 100,
       viewportXStart: 0,
@@ -1107,6 +1211,7 @@ describe("assemblyCutTargetAtScreenPoint", () => {
     const input = {
       model,
       selectedIds: new Set([selectedContig.id]),
+      binSizeBp: 1,
       point: { x: 50, y: 50 },
       widthPx: 100,
       heightPx: 100,
@@ -1140,6 +1245,7 @@ describe("assemblyCutTargetAtScreenPoint", () => {
     expect(assemblyCutTargetAtScreenPoint({
       model: buildAssemblyEditModel([selectedContig]),
       selectedIds: new Set([selectedContig.id]),
+      binSizeBp: 1,
       point: { x: 100, y: 55 },
       widthPx: 200,
       heightPx: 100,
@@ -1159,6 +1265,7 @@ describe("assemblyCutTargetAtScreenPoint", () => {
     const input = {
       model: buildAssemblyEditModel([selectedContig]),
       selectedIds: new Set([selectedContig.id]),
+      binSizeBp: 1,
       widthPx: 100,
       heightPx: 100,
       viewportXStart: 0,
@@ -1205,12 +1312,13 @@ describe("assemblyCutTargetAtScreenPoint", () => {
     const baseInput = {
       model,
       selectedIds,
+      binSizeBp: 1,
       widthPx: 1_200,
-      heightPx: 700,
+      heightPx: 1_200,
       viewportXStart: 700,
-      viewportXEnd: 9_700,
-      viewportYStart: 200,
-      viewportYEnd: 10_000,
+      viewportXEnd: 1_100,
+      viewportYStart: 700,
+      viewportYEnd: 1_100,
     };
 
     for (let sample = 0; sample < 500; sample += 1) {

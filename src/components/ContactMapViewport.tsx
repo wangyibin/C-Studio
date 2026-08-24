@@ -187,6 +187,7 @@ interface AssemblyCutTargetInput {
   selectedIds: ReadonlySet<string>;
   interactionIndex?: AssemblyInteractionIndex;
   lockedCutBlockId?: string | null;
+  binSizeBp: number;
   point: { x: number; y: number };
   widthPx: number;
   heightPx: number;
@@ -256,10 +257,37 @@ const maxBufferedContactCells = 360_000;
 const contactMapImageDataCache = new WeakMap<HTMLCanvasElement, ImageData>();
 const shiftSelectionClassName = "shift-selection-active";
 const resolutionWheelCooldownMs = 140;
+const minimumCutAcquireSpanPx = 16;
+const minimumCutReleaseSpanPx = 12;
+const minimumAssemblySelectionControlSpanPx = 32;
 // Coalesce a physical wheel burst into one committed UI viewport. Preview
 // generations still start while the wheel is moving, so Windows WebView2 does
 // not repeatedly cancel the first visible-tile stream before it can paint.
 const wheelPanCommitDelayMs = 80;
+
+/** Keep large selection controls off intervals that are not legible on both axes. */
+export function assemblySelectionControlsVisible(
+  visualStart: number,
+  visualEnd: number,
+  viewport: ContactViewport,
+  widthPx: number,
+  heightPx: number,
+) {
+  const viewportXSpan = Math.max(1, viewport.xEnd - viewport.xStart);
+  const viewportYSpan = Math.max(1, viewport.yEnd - viewport.yStart);
+  const visibleXSpan = Math.max(
+    0,
+    Math.min(visualEnd, viewport.xEnd) - Math.max(visualStart, viewport.xStart),
+  );
+  const visibleYSpan = Math.max(
+    0,
+    Math.min(visualEnd, viewport.yEnd) - Math.max(visualStart, viewport.yStart),
+  );
+  const visibleWidthPx = (visibleXSpan / viewportXSpan) * Math.max(1, widthPx);
+  const visibleHeightPx = (visibleYSpan / viewportYSpan) * Math.max(1, heightPx);
+  return visibleWidthPx >= minimumAssemblySelectionControlSpanPx
+    && visibleHeightPx >= minimumAssemblySelectionControlSpanPx;
+}
 
 /** Upload every completed pan-prefetch batch, then present the updated page table once. */
 export function presentContactPanPrefetchBatches(
@@ -835,12 +863,13 @@ export function advancePaintedContactPresentationFrame(
   return currentForDataset;
 }
 
-/** Resolve a selected contig diagonal under the pointer, including compact boxes at whole-genome scale. */
+/** Resolve a selected contig diagonal only when its interior is legible at the displayed resolution. */
 export function assemblyCutTargetAtScreenPoint({
   model,
   selectedIds,
   interactionIndex,
   lockedCutBlockId = null,
+  binSizeBp,
   point,
   widthPx,
   heightPx,
@@ -853,9 +882,12 @@ export function assemblyCutTargetAtScreenPoint({
   const safeHeightPx = Math.max(1, heightPx);
   const viewportXSpan = Math.max(1, viewportXEnd - viewportXStart);
   const viewportYSpan = Math.max(1, viewportYEnd - viewportYStart);
-  const maxEdgeGuardPx = 18;
   const acquireTolerancePx = 12;
   const releaseTolerancePx = 36;
+  if (!Number.isFinite(binSizeBp) || binSizeBp <= 0) {
+    return null;
+  }
+  const terminalBinGuardBp = Math.max(1, binSizeBp);
   const compatibleInteractionIndex = interactionIndex?.model === model
     && interactionIndex.selectedIds === selectedIds
     ? interactionIndex
@@ -870,29 +902,16 @@ export function assemblyCutTargetAtScreenPoint({
   const candidateForBlock = (
     block: ContactMapLayoutBlock,
     tolerancePx: number,
+    minimumSpanPx: number,
   ): CutCandidate | null => {
     const blockSpan = block.visualEnd - block.visualStart;
-    if (blockSpan <= 0) {
+    // Two terminal bins are protected and at least one interior bin must remain.
+    if (blockSpan < terminalBinGuardBp * 3) {
       return null;
     }
 
-    // Use one genomic coordinate for both axes. This is the real x=y contig
-    // diagonal even when the contact viewport is rectangular or independently
-    // panned on X and Y.
-    const fullDiagonalLengthPx = Math.hypot(
-      (blockSpan / viewportXSpan) * safeWidthPx,
-      (blockSpan / viewportYSpan) * safeHeightPx,
-    );
-    const edgeGuardPx = Math.min(
-      maxEdgeGuardPx,
-      Math.max(1, fullDiagonalLengthPx * 0.2),
-    );
-    const edgeGuardFraction = Math.min(
-      0.2,
-      edgeGuardPx / Math.max(1, fullDiagonalLengthPx),
-    );
-    const safeVisualStart = block.visualStart + blockSpan * edgeGuardFraction;
-    const safeVisualEnd = block.visualEnd - blockSpan * edgeGuardFraction;
+    const safeVisualStart = block.visualStart + terminalBinGuardBp;
+    const safeVisualEnd = block.visualEnd - terminalBinGuardBp;
     const visibleStart = Math.max(
       safeVisualStart,
       viewportXStart,
@@ -913,6 +932,11 @@ export function assemblyCutTargetAtScreenPoint({
     const endY = ((visibleEnd - viewportYStart) / viewportYSpan) * safeHeightPx;
     const diagonalX = endX - startX;
     const diagonalY = endY - startY;
+    // A diagonal can be long while remaining imperceptibly thin on one axis in
+    // a rectangular viewport. Require a legible interior on both axes.
+    if (Math.abs(diagonalX) < minimumSpanPx || Math.abs(diagonalY) < minimumSpanPx) {
+      return null;
+    }
     const diagonalLengthSquared = diagonalX * diagonalX + diagonalY * diagonalY;
     if (diagonalLengthSquared <= 0) {
       return null;
@@ -945,7 +969,11 @@ export function assemblyCutTargetAtScreenPoint({
     const lockedBlock = compatibleInteractionIndex?.blocksById.get(lockedCutBlockId)
       ?? model.blocks.find((block) => block.id === lockedCutBlockId);
     if (lockedBlock) {
-      const lockedCandidate = candidateForBlock(lockedBlock, releaseTolerancePx);
+      const lockedCandidate = candidateForBlock(
+        lockedBlock,
+        releaseTolerancePx,
+        minimumCutReleaseSpanPx,
+      );
       if (lockedCandidate) {
         return {
           blockId: lockedCandidate.blockId,
@@ -977,7 +1005,11 @@ export function assemblyCutTargetAtScreenPoint({
     if (!selectedIds.has(block.id)) {
       continue;
     }
-    const candidate = candidateForBlock(block, acquireTolerancePx);
+    const candidate = candidateForBlock(
+      block,
+      acquireTolerancePx,
+      minimumCutAcquireSpanPx,
+    );
     if (candidate && (!closestCandidate || candidate.distancePx < closestCandidate.distancePx)) {
       closestCandidate = candidate;
     }
@@ -1335,6 +1367,8 @@ export function ContactMapViewport({
     ? presentationContactMap.viewport
     : liveViewport;
   const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
+  const displayedCutBinSizeBp = presentationContactMap?.resolution
+    ?? contactResolutionToBasePairs(uiState.contact.resolution);
   usePrePaintEffect(() => {
     // The retained front, axes, and annotations stay in the source camera until
     // the painted presentation frame reaches this target viewport. Only this
@@ -2544,6 +2578,7 @@ export function ContactMapViewport({
           selectedIds: selectedAssemblyBlockIds,
           interactionIndex: assemblyInteractionIndex,
           lockedCutBlockId: currentPointerState.blockId,
+          binSizeBp: displayedCutBinSizeBp,
           point,
           widthPx: Math.max(1, bounds.width),
           heightPx: Math.max(1, bounds.height),
@@ -2691,6 +2726,7 @@ export function ContactMapViewport({
       lockedCutBlockId: assemblyPointerStateRef.current.kind === "cut"
         ? assemblyPointerStateRef.current.blockId
         : null,
+      binSizeBp: displayedCutBinSizeBp,
       point: {
         x: pointer.clientX - bounds.left,
         y: pointer.clientY - bounds.top,
@@ -2721,6 +2757,7 @@ export function ContactMapViewport({
     displayViewport.xStart,
     displayViewport.yEnd,
     displayViewport.yStart,
+    displayedCutBinSizeBp,
     dragState,
     selectedAssemblyBlockIds,
     uiState.assembly.selection?.kind,
@@ -2960,6 +2997,8 @@ export function ContactMapViewport({
             viewportXEnd={displayViewport.xEnd}
             viewportYStart={displayViewport.yStart}
             viewportYEnd={displayViewport.yEnd}
+            viewportWidthPx={uiState.contact.viewportWidthPx}
+            viewportHeightPx={uiState.contact.viewportHeightPx}
             selection={uiState.assembly.selection}
             showChromosomeBoxes={uiState.assembly.showChromosomeBoxes}
             showBlockBoxes={uiState.assembly.showBlockBoxes}
@@ -3155,6 +3194,8 @@ interface AssemblyOverlayProps {
   viewportXEnd: number;
   viewportYStart: number;
   viewportYEnd: number;
+  viewportWidthPx: number;
+  viewportHeightPx: number;
   selection: UiState["assembly"]["selection"];
   showChromosomeBoxes: boolean;
   showBlockBoxes: boolean;
@@ -3186,6 +3227,8 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
   viewportXEnd,
   viewportYStart,
   viewportYEnd,
+  viewportWidthPx,
+  viewportHeightPx,
   selection,
   showChromosomeBoxes,
   showBlockBoxes,
@@ -3258,6 +3301,20 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
         viewportYSpan,
       )
     : null;
+  const selectionControlsVisible = selectedInterval
+    ? assemblySelectionControlsVisible(
+        selectedInterval.start,
+        selectedInterval.end,
+        {
+          xStart: viewportXStart,
+          xEnd: viewportXEnd,
+          yStart: viewportYStart,
+          yEnd: viewportYEnd,
+        },
+        viewportWidthPx,
+        viewportHeightPx,
+      )
+    : false;
 
   function startResizeSelection(
     event: React.PointerEvent<HTMLButtonElement>,
@@ -3513,6 +3570,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
         })() : null}
         {(showBlockBoxes || showContigBoxes) && selectedGroupBox ? (
           <span className="assembly-selected-group" style={selectedGroupBox}>
+            {selectionControlsVisible ? <>
             <button
               className="assembly-resize-handle start"
               type="button"
@@ -3553,6 +3611,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
             >
               <RotateCcw size={14} />
             </button>
+            </> : null}
           </span>
         ) : null}
       </div>
@@ -3574,6 +3633,8 @@ export function sameAssemblyOverlayPresentation(
     && previous.viewportXEnd === next.viewportXEnd
     && previous.viewportYStart === next.viewportYStart
     && previous.viewportYEnd === next.viewportYEnd
+    && previous.viewportWidthPx === next.viewportWidthPx
+    && previous.viewportHeightPx === next.viewportHeightPx
     && previous.selection === next.selection
     && previous.showChromosomeBoxes === next.showChromosomeBoxes
     && previous.showBlockBoxes === next.showBlockBoxes
