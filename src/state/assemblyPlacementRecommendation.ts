@@ -455,6 +455,48 @@ export function applyPlacementRecommendation(
   return moved === oriented ? blocks : moved;
 }
 
+export interface PlacementRecommendationPreviewLayout {
+  blocks: ContactMapLayoutBlock[];
+  selectedStart: number;
+  selectedEnd: number;
+  centerBp: number;
+}
+
+/**
+ * Build the proposed layout without committing it to assembly history.
+ * Resolve the selected interval again after the move because removing it from
+ * its current chromosome can shift the recommended boundary.
+ */
+export function buildPlacementRecommendationPreviewLayout(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+  recommendation: Pick<
+    PlacementRecommendationCandidate,
+    "targetObjectId" | "targetBlockId" | "orientation"
+  > & { selectedBlockIds: string[] },
+): PlacementRecommendationPreviewLayout | null {
+  const previewBlocks = applyPlacementRecommendation(blocks, selection, recommendation);
+  if (previewBlocks === blocks) {
+    return null;
+  }
+  const selectedIds = new Set(recommendation.selectedBlockIds);
+  const previewSelection = previewBlocks.filter((block) => selectedIds.has(block.id));
+  if (previewSelection.length !== selectedIds.size || previewSelection.length === 0) {
+    return null;
+  }
+  const selectedStart = Math.min(...previewSelection.map((block) => block.visualStart));
+  const selectedEnd = Math.max(...previewSelection.map((block) => block.visualEnd));
+  if (!Number.isFinite(selectedStart) || !Number.isFinite(selectedEnd) || selectedEnd <= selectedStart) {
+    return null;
+  }
+  return {
+    blocks: previewBlocks,
+    selectedStart,
+    selectedEnd,
+    centerBp: (selectedStart + selectedEnd) / 2,
+  };
+}
+
 function makeBoundary({
   objectId,
   targetBlockId,

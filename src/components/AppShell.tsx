@@ -13,7 +13,7 @@ import {
   Trash2,
   Undo2,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
@@ -28,7 +28,10 @@ import {
 import type { CoverageView } from "../state/coverageView";
 import type { GfaEvidenceDocument } from "../state/gfa";
 import type { GfaBandageLayoutLoader } from "../state/gfaBandageLayout";
-import type { PlacementRecommendationCandidate } from "../state/assemblyPlacementRecommendation";
+import {
+  buildPlacementRecommendationPreviewLayout,
+  type PlacementRecommendation,
+} from "../state/assemblyPlacementRecommendation";
 import type {
   GfaEndpointHiCBatchLoader,
   GfaEndpointHiCLoader,
@@ -97,6 +100,7 @@ interface AppShellProps {
   chromosomeFilterPattern: string;
   includeUnanchoredInChromosomeFilter: boolean;
   viewAssemblyBlocks: ContactMapLayoutBlock[];
+  onPlacementPreviewChange?: (candidate: PlacementRecommendation | null) => void;
   onHiddenChromosomeIdsChange: (ids: Set<string>) => void;
   onChromosomeFilterPatternChange: (pattern: string) => void;
   onIncludeUnanchoredInChromosomeFilterChange: (include: boolean) => void;
@@ -131,6 +135,7 @@ interface AppShellProps {
   onUiAction: (action: UiAction) => void;
   onContactPanGestureStart?: () => void;
   onContactPanTilePrefetch?: (preview: ContactPanPreview) => void;
+  contactViewportPreview?: ContactPanPreview | null;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   onContactResolutionPreview?: (resolution: ContactResolution | null) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
@@ -199,6 +204,7 @@ export function AppShell({
   chromosomeFilterPattern,
   includeUnanchoredInChromosomeFilter,
   viewAssemblyBlocks,
+  onPlacementPreviewChange,
   onHiddenChromosomeIdsChange,
   onChromosomeFilterPatternChange,
   onIncludeUnanchoredInChromosomeFilterChange,
@@ -229,6 +235,7 @@ export function AppShell({
   onContactTileLayerPaintComplete,
   onContactPanGestureStart,
   onContactPanTilePrefetch,
+  contactViewportPreview = null,
   onContactViewportPreview,
   onContactResolutionPreview,
   contactPanPrefetchBridge,
@@ -259,8 +266,9 @@ export function AppShell({
   const [confirmingClearData, setConfirmingClearData] = useState(false);
   const [confirmingReloadAssembly, setConfirmingReloadAssembly] = useState(false);
   const [placementPreview, setPlacementPreview] = useState<
-    PlacementRecommendationCandidate | null
+    PlacementRecommendation | null
   >(null);
+  const placementPreviewSequenceRef = useRef(0);
   const [chromosomeFilterPatternDraft, setChromosomeFilterPatternDraft] = useState(
     chromosomeFilterPattern,
   );
@@ -357,9 +365,6 @@ export function AppShell({
     : uiState.assembly.selection?.kind === "chromosome"
       ? `chromosome:${uiState.assembly.selection.id}`
       : "none";
-  useEffect(() => {
-    setPlacementPreview(null);
-  }, [activeAssemblyBlocks, placementSelectionKey, uiState.normalization]);
   const heatmapViewport = buildCenteredContactViewport({
     centerMb: uiState.contact.viewportCenterMb,
     centerXMb: uiState.contact.viewportCenterXMb,
@@ -369,6 +374,77 @@ export function AppShell({
     viewportWidthPx: uiState.contact.viewportWidthPx,
     viewportHeightPx: uiState.contact.viewportHeightPx,
   });
+  const placementPreviewContextRef = useRef({
+    blocks: activeAssemblyBlocks,
+    totalSpanBp: activeAssemblyTotalBp,
+    selection: uiState.assembly.selection,
+    heatmapViewport,
+    viewportWidthPx: uiState.contact.viewportWidthPx,
+    viewportHeightPx: uiState.contact.viewportHeightPx,
+  });
+  placementPreviewContextRef.current = {
+    blocks: activeAssemblyBlocks,
+    totalSpanBp: activeAssemblyTotalBp,
+    selection: uiState.assembly.selection,
+    heatmapViewport,
+    viewportWidthPx: uiState.contact.viewportWidthPx,
+    viewportHeightPx: uiState.contact.viewportHeightPx,
+  };
+  const changePlacementPreview = useCallback((candidate: PlacementRecommendation | null) => {
+    if (!candidate) {
+      setPlacementPreview(null);
+      onPlacementPreviewChange?.(null);
+      onContactViewportPreview?.(null);
+      return;
+    }
+    const context = placementPreviewContextRef.current;
+    const preview = buildPlacementRecommendationPreviewLayout(
+      context.blocks,
+      context.selection,
+      candidate,
+    );
+    if (!preview) {
+      setPlacementPreview(null);
+      onPlacementPreviewChange?.(null);
+      onContactViewportPreview?.(null);
+      return;
+    }
+    const currentWindowSizeBp = Math.max(
+      context.heatmapViewport.xEnd - context.heatmapViewport.xStart,
+      context.heatmapViewport.yEnd - context.heatmapViewport.yStart,
+    );
+    const previewWindowSizeBp = Math.min(
+      Math.max(1, context.totalSpanBp),
+      Math.max(currentWindowSizeBp, (preview.selectedEnd - preview.selectedStart) * 1.5),
+    );
+    const viewport = buildCenteredContactViewport({
+      centerMb: preview.centerBp / 1_000_000,
+      totalSpanBp: Math.max(1, context.totalSpanBp),
+      windowSizeBp: previewWindowSizeBp,
+      viewportWidthPx: context.viewportWidthPx,
+      viewportHeightPx: context.viewportHeightPx,
+    });
+    const displayedCandidate = {
+      ...candidate,
+      visualPosition: preview.selectedStart,
+    };
+    placementPreviewSequenceRef.current += 1;
+    setPlacementPreview(displayedCandidate);
+    onPlacementPreviewChange?.(displayedCandidate);
+    onContactViewportPreview?.({
+      viewport,
+      prefetchViewport: viewport,
+      presentationMode: "replacement",
+      sequence: placementPreviewSequenceRef.current,
+      pointerTimestamp: performance.now(),
+    });
+  }, [
+    onContactViewportPreview,
+    onPlacementPreviewChange,
+  ]);
+  useEffect(() => {
+    changePlacementPreview(null);
+  }, [activeAssemblyBlocks, changePlacementPreview, placementSelectionKey, uiState.normalization]);
   const gfaHomologs = classifyGfaScaffolds(
     [...new Set(activeAssemblyBlocks.map((block) => block.objectId))],
     gfaHomologPattern,
@@ -1264,6 +1340,7 @@ export function AppShell({
                   useStoredResolutionOptions={contactIsMcool}
                   availableResolutionBasePairs={contactAvailableResolutions}
                   placementPreview={placementPreview}
+                  contactViewportPreview={contactViewportPreview}
                   onClosePanel={closeHeatmapPanel}
                   onExpandPanel={expandHeatmapPanel}
                   onUiAction={onUiAction}
@@ -1409,7 +1486,7 @@ export function AppShell({
               gfaChromosomeFilterActive={chromosomeVisibility.active}
               onLoadGfaEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
               placementPreview={placementPreview}
-              onPlacementPreviewChange={setPlacementPreview}
+              onPlacementPreviewChange={changePlacementPreview}
               onExpandHeatmap={expandHeatmapPanel}
               onOpenGfaPanel={() => setGfaPanelOpen(true)}
             />

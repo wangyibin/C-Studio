@@ -227,6 +227,81 @@ export function reprojectContactMapLayout(
 }
 
 /**
+ * Builds the complete presentation frame used while Hold Preview is active.
+ *
+ * The whole-assembly overview is already resident, so its rows and columns can
+ * be permuted synchronously without pairing a new camera/annotation layout
+ * with the retained pixels from the old layout. Authoritative projected tiles
+ * may continue loading in the background, but this frame is independently
+ * presentable and never enters the contact-tile cache.
+ */
+export function buildContactLayoutReplacementPreview({
+  sourceMap,
+  nextBlocks,
+  viewport,
+  layoutScope,
+  requestedResolution,
+}: {
+  sourceMap: ContactMapView;
+  nextBlocks: ContactMapLayoutBlock[];
+  viewport: ContactMapView["viewport"];
+  layoutScope: string;
+  requestedResolution?: number;
+}): ContactMapView | null {
+  const previousBlocks = sourceMap.layoutBlocks;
+  if (
+    sourceMap.visibleLayerComplete !== true
+    || !previousBlocks
+    || !contactMapCoversLayout(sourceMap, previousBlocks)
+  ) {
+    return null;
+  }
+  const reprojected = reprojectContactMapLayout(
+    sourceMap,
+    previousBlocks,
+    nextBlocks,
+  );
+  if (!reprojected) {
+    return null;
+  }
+  return {
+    ...reprojected,
+    requestedResolution: requestedResolution ?? sourceMap.requestedResolution,
+    normalization: sourceMap.normalization,
+    viewport,
+    layoutBlocks: nextBlocks,
+    layoutScope,
+    visibleLayerComplete: true,
+    // Although this frame reuses the coarser resident overview, it is already
+    // the complete pixel source for Hold Preview and fulfils the currently
+    // requested resolution as a terminal screen LOD. Marking it transient
+    // makes ContactMapViewport freeze the canonical front surface, which
+    // pairs moved annotations with unchanged heatmap pixels.
+    isTransientResolutionPreview: false,
+    // This is a synchronous display-only frame, not a backend tile
+    // generation. Omitting the generation prevents it from completing or
+    // perturbing backend performance accounting.
+    renderGeneration: undefined,
+  };
+}
+
+/** A synchronous replacement may only claim completeness from a whole-layout source. */
+function contactMapCoversLayout(
+  contactMap: ContactMapView,
+  blocks: ContactMapLayoutBlock[],
+) {
+  if (blocks.length === 0) {
+    return false;
+  }
+  const layoutStart = Math.min(...blocks.map((block) => block.visualStart));
+  const layoutEnd = Math.max(...blocks.map((block) => block.visualEnd));
+  return contactMap.viewport.xStart <= layoutStart
+    && contactMap.viewport.yStart <= layoutStart
+    && contactMap.viewport.xEnd >= layoutEnd
+    && contactMap.viewport.yEnd >= layoutEnd;
+}
+
+/**
  * Composes one display layer without contaminating the authoritative cache.
  * Exact tiles always win, including exact empty tiles, so each backend arrival
  * replaces only the matching preview canvas.

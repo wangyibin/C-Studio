@@ -30,6 +30,7 @@ import {
   contactResolutionWheelIntent,
   lockedContactResolutionWheelZoomIntent,
   contactViewportForAxisNavigator,
+  contactViewportForPlacementPreview,
   contactViewportSizePxFromBounds,
   contactTileOverscanDirectionForViewports,
   contactWheelNavigationMode,
@@ -482,6 +483,72 @@ describe("shouldRetainPresentedContactViewport", () => {
       normalization: "raw",
       viewport,
     }, 100_000, "raw", viewport)).toBe(false);
+  });
+});
+
+describe("placement replacement viewport", () => {
+  const committedViewport = {
+    xStart: 0,
+    xEnd: 10_000_000,
+    yStart: 0,
+    yEnd: 10_000_000,
+  };
+  const replacementViewport = {
+    xStart: 20_000_000,
+    xEnd: 30_000_000,
+    yStart: 20_000_000,
+    yEnd: 30_000_000,
+  };
+  const preview = {
+    viewport: replacementViewport,
+    presentationMode: "replacement" as const,
+    sequence: 1,
+    pointerTimestamp: 100,
+  };
+
+  it("makes the temporary placement camera authoritative while Hold Preview is active", () => {
+    const liveViewport = contactViewportForPlacementPreview(
+      committedViewport,
+      preview,
+      true,
+    );
+    expect(liveViewport).toBe(replacementViewport);
+    expect(shouldRetainPresentedContactViewport({
+      resolution: 100_000,
+      normalization: "raw",
+      viewport: replacementViewport,
+    }, 100_000, "raw", liveViewport)).toBe(false);
+  });
+
+  it("does not freeze a complete coarse replacement frame that fulfils the selected LOD", () => {
+    expect(shouldRetainPresentedContactViewport({
+      resolution: 5_000_000,
+      requestedResolution: 100_000,
+      normalization: "raw",
+      viewport: replacementViewport,
+      isTransientResolutionPreview: false,
+    }, 100_000, "raw", replacementViewport)).toBe(false);
+  });
+
+  it("keeps ordinary pan previews and released placement previews non-authoritative", () => {
+    expect(contactViewportForPlacementPreview(
+      committedViewport,
+      { ...preview, presentationMode: "pan" },
+      true,
+    )).toBe(committedViewport);
+    expect(contactViewportForPlacementPreview(
+      committedViewport,
+      preview,
+      false,
+    )).toBe(committedViewport);
+  });
+
+  it("does not move the camera before the replacement heatmap frame is ready", () => {
+    expect(contactViewportForPlacementPreview(
+      committedViewport,
+      preview,
+      false,
+    )).toBe(committedViewport);
   });
 });
 

@@ -23,7 +23,7 @@ import {
 import type { ContactMapLayoutBlock } from "../state/importers";
 import type { GfaEvidenceDocument } from "../state/gfa";
 import type { GfaEndpointHiCBatchLoader } from "../state/gfaEndpointHiC";
-import type { PlacementRecommendationCandidate } from "../state/assemblyPlacementRecommendation";
+import type { PlacementRecommendation } from "../state/assemblyPlacementRecommendation";
 import { buildCenteredContactViewport } from "../state/contactViewport";
 import {
   SyntenyDotplot,
@@ -61,8 +61,8 @@ interface InspectorPanelProps {
   gfaPreviewScaffoldIds?: ReadonlySet<string>;
   gfaChromosomeFilterActive?: boolean;
   onLoadGfaEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
-  placementPreview?: PlacementRecommendationCandidate | null;
-  onPlacementPreviewChange?: (candidate: PlacementRecommendationCandidate | null) => void;
+  placementPreview?: PlacementRecommendation | null;
+  onPlacementPreviewChange?: (candidate: PlacementRecommendation | null) => void;
 }
 
 export function InspectorPanel({
@@ -942,7 +942,7 @@ function ChromosomeGroupList({
                           id: childContigs[0]?.id ?? blockId,
                         })}
                   >
-                    <span className={block.isComposite ? undefined : "selection-contig-label"}>
+                    <span className={block.isComposite ? "selection-block-label" : "selection-contig-label"}>
                       {label}
                     </span>
                     <small>{block.isComposite ? `${block.contigIds.length} contigs` : "contig"}</small>

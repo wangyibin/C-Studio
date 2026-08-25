@@ -37,6 +37,7 @@ import {
   type ContactTileDeltaRenderStream,
 } from "./state/contactTileDelta";
 import {
+  buildContactLayoutReplacementPreview,
   displayContactMapForPendingLayer,
   contactTileDeltaStreamMode,
   shouldHoldPreviousContactMapFrame,
@@ -44,6 +45,8 @@ import {
   shouldRetainPreviousContactMapFrame,
 } from "./state/contactMapView";
 import {
+  contactViewportPreviewIsPan,
+  contactViewportPreviewIsReplacement,
   createContactPanPerformanceTracker,
   type ContactPanPreview,
 } from "./state/contactPanPerformance";
@@ -134,6 +137,10 @@ import {
   type ContactMapLayoutBlock,
   summarizeAgpText,
 } from "./state/importers";
+import {
+  applyPlacementRecommendation,
+  type PlacementRecommendation,
+} from "./state/assemblyPlacementRecommendation";
 import {
   resolveContactLayoutSources,
   type ContactSourceMetadata,
@@ -1022,6 +1029,9 @@ export function App() {
   const [contactTilePreviewViewport, setContactTilePreviewViewport] = useState<
     ContactPanPreview | null
   >(null);
+  const [placementPreview, setPlacementPreview] = useState<
+    PlacementRecommendation | null
+  >(null);
   const pendingPanPerformancePreviewRef = useRef<ContactPanPreview | null>(null);
   const contactPanPrefetchBridgeRef = useRef<ContactPanPrefetchBridge | null>(null);
   if (contactPanPrefetchBridgeRef.current === null) {
@@ -1071,6 +1081,8 @@ export function App() {
   );
   const autoColorScaleCacheRef = useRef<Map<string, ContactColorScale>>(new Map());
   const lastCompleteContactMapRef = useRef<ContactMapView | null>(null);
+  const placementPreviewRestoreFrameRef = useRef<ContactMapView | null>(null);
+  const placementReplacementPreviewActiveRef = useRef(false);
   // The Rust process can outlive a WebView reload, so start both monotonic
   // counters from a wall-clock epoch instead of resetting them to zero.
   const contactTileGenerationRef = useRef(Date.now() * 1_000);
@@ -1227,8 +1239,27 @@ export function App() {
     void beginContactPanGeneration().promise;
   }, [beginContactPanGeneration]);
   const handleContactViewportPreview = useCallback((preview: ContactPanPreview | null) => {
-    if (preview) {
+    if (contactViewportPreviewIsPan(preview)) {
       pendingPanPerformancePreviewRef.current = preview;
+    } else if (contactViewportPreviewIsReplacement(preview)) {
+      if (!placementReplacementPreviewActiveRef.current) {
+        placementPreviewRestoreFrameRef.current = lastCompleteContactMapRef.current;
+      }
+      placementReplacementPreviewActiveRef.current = true;
+      pendingPanPerformancePreviewRef.current = null;
+    } else if (placementReplacementPreviewActiveRef.current) {
+      placementReplacementPreviewActiveRef.current = false;
+      const restoreFrame = placementPreviewRestoreFrameRef.current;
+      placementPreviewRestoreFrameRef.current = null;
+      if (restoreFrame) {
+        lastCompleteContactMapRef.current = restoreFrame;
+        setContactMap(restoreFrame);
+      }
+      // Never pair a restored canonical frame with source-layout maps from the
+      // temporary placement generation. The canonical generation may attach
+      // its own exact source-space map after it becomes ready.
+      setContactGpuSourceLayout(null);
+      setContactTileDeltaStream(null);
     }
     setContactTilePreviewViewport(preview);
   }, []);
@@ -1477,9 +1508,23 @@ export function App() {
     includeUnanchoredInChromosomeFilter,
     unanchoredObjectIds,
   ]);
-  const viewAssemblyLayout = useMemo(
+  const canonicalViewAssemblyLayout = useMemo(
     () => buildChromosomeViewLayout(assemblyLayout.blocks, chromosomeVisibility),
     [assemblyLayout.blocks, chromosomeVisibility],
+  );
+  const placementPreviewBlocks = useMemo(() => placementPreview
+    ? applyPlacementRecommendation(
+      assemblyLayout.blocks,
+      uiState.assembly.selection,
+      placementPreview,
+    )
+    : assemblyLayout.blocks,
+  [assemblyLayout.blocks, placementPreview, uiState.assembly.selection]);
+  const viewAssemblyLayout = useMemo(
+    () => placementPreviewBlocks === assemblyLayout.blocks
+      ? canonicalViewAssemblyLayout
+      : buildChromosomeViewLayout(placementPreviewBlocks, chromosomeVisibility),
+    [assemblyLayout.blocks, canonicalViewAssemblyLayout, chromosomeVisibility, placementPreviewBlocks],
   );
   const chromosomeDisplayScopeKey = chromosomeVisibility.active
     ? [
@@ -1496,9 +1541,9 @@ export function App() {
     setContactTilePreviewViewport(null);
     dispatchUi({
       type: "fitContactViewport",
-      totalSpanMb: Math.max(0.000001, viewAssemblyLayout.totalSpan / 1_000_000),
+      totalSpanMb: Math.max(0.000001, canonicalViewAssemblyLayout.totalSpan / 1_000_000),
     });
-  }, [chromosomeDisplayScopeKey, viewAssemblyLayout.totalSpan]);
+  }, [canonicalViewAssemblyLayout.totalSpan, chromosomeDisplayScopeKey]);
   const contactSourceResolution = useMemo(
     () => resolveContactLayoutSources(assemblyLayout.blocks, contactSources),
     [assemblyLayout.blocks, contactSources],
@@ -1507,6 +1552,13 @@ export function App() {
   const viewContactLayoutBlocks = useMemo(
     () => resolveContactLayoutSources(viewAssemblyLayout.projectionBlocks, contactSources).blocks,
     [contactSources, viewAssemblyLayout.projectionBlocks],
+  );
+  const canonicalViewContactLayoutBlocks = useMemo(
+    () => resolveContactLayoutSources(
+      canonicalViewAssemblyLayout.projectionBlocks,
+      contactSources,
+    ).blocks,
+    [canonicalViewAssemblyLayout.projectionBlocks, contactSources],
   );
   const contactSourceAddressSpace = useMemo(() => {
     try {
@@ -1893,6 +1945,10 @@ export function App() {
     setContactGpuSourceLayout(null);
     autoColorScaleCacheRef.current.clear();
     lastCompleteContactMapRef.current = null;
+    placementPreviewRestoreFrameRef.current = null;
+    placementReplacementPreviewActiveRef.current = false;
+    setPlacementPreview(null);
+    setContactTilePreviewViewport(null);
   }, [
     contactCoolPath,
     contactMainLodTileCacheLru,
@@ -2253,7 +2309,10 @@ export function App() {
     ?.targetResolution ?? effectiveContactTileResolution;
   const effectiveContactTilePrefetchViewport = contactTilePreviewViewport
     ?.prefetchViewport ?? effectiveContactTileViewport;
-  const contactTilePanPreviewActive = contactTilePreviewViewport !== null;
+  const contactTileReplacementPreviewActive = contactViewportPreviewIsReplacement(
+    contactTilePreviewViewport,
+  );
+  const contactTilePanPreviewActive = contactViewportPreviewIsPan(contactTilePreviewViewport);
   const effectiveContactTileViewportRequestKey = contactTileViewportRequestKey(
     effectiveContactTileViewport,
     effectiveContactTilePrefetchViewport,
@@ -2315,7 +2374,9 @@ export function App() {
       ));
     }
     contactTilePerformance.supersedeBefore(generation);
-    if (!contactTilePreviewViewport) {
+    if (contactTileReplacementPreviewActive) {
+      contactPanPerformance.supersedeBefore(generation);
+    } else if (!contactTilePreviewViewport) {
       contactPanPerformance.continueGeneration(generation);
     }
     const presentationSchedule = contactTilePresentationScheduleRef.current;
@@ -2393,8 +2454,9 @@ export function App() {
     const totalSpanBp = Math.max(targetResolution, viewAssemblyLayout.totalSpan);
     const viewport = effectiveContactTileViewport;
     const prefetchViewport = contactTilePreviewViewport?.prefetchViewport ?? viewport;
-    const panPerformancePreview = contactTilePreviewViewport
-      ?? pendingPanPerformancePreviewRef.current;
+    const panPerformancePreview = contactTileReplacementPreviewActive
+      ? null
+      : contactTilePreviewViewport ?? pendingPanPerformancePreviewRef.current;
     const tileSizeBins = contactTileSizeBins;
     const normalization = contactNormalizationForBackend(uiState.normalization);
     const publishPanPrefetchTiles = (
@@ -2674,7 +2736,11 @@ export function App() {
         uiState.contact.colorScale.log,
       );
       const applyMainLodAutoColorScale = (map: ContactMapView) => {
-        if (!uiState.contact.colorScale.auto || !hasContactMapData(map)) {
+        if (
+          contactTileReplacementPreviewActive
+          || !uiState.contact.colorScale.auto
+          || !hasContactMapData(map)
+        ) {
           return;
         }
         const cachedScale = autoColorScaleCacheRef.current.get(mainLodAutoColorScaleKey);
@@ -2713,6 +2779,9 @@ export function App() {
         });
       };
       const reuseMainLodAsOverview = (map: ContactMapView) => {
+        if (contactTileReplacementPreviewActive) {
+          return;
+        }
         const reusableOverview = wholeAssemblyOverviewFromCoveringMap(
           map,
           viewAssemblyLayout.totalSpan,
@@ -3168,7 +3237,11 @@ export function App() {
       uiState.contact.colorScale.log,
     );
     const applyAutoColorScale = (map: ContactMapView) => {
-      if (!uiState.contact.colorScale.auto || !hasContactMapData(map)) {
+      if (
+        contactTileReplacementPreviewActive
+        || !uiState.contact.colorScale.auto
+        || !hasContactMapData(map)
+      ) {
         return;
       }
 
@@ -4109,6 +4182,7 @@ export function App() {
     uiState.contact.viewportHeightPx,
     effectiveContactTileViewportRequestKey,
     contactTilePanPreviewActive,
+    contactTileReplacementPreviewActive,
     contactPanPrefetchBridge,
     contactPanPrefetchQueue,
     uiState.contact.colorScale.auto,
@@ -4124,13 +4198,13 @@ export function App() {
       overviewContactMapRef.current = null;
       setOverviewContactMap(null);
     };
-    if (!contactCoolPath || viewAssemblyLayout.blocks.length === 0) {
+    if (!contactCoolPath || canonicalViewAssemblyLayout.blocks.length === 0) {
       clearStaleOverview();
       return;
     }
     const overviewCoolPath = contactCoolPath;
 
-    const totalSpanBp = Math.max(1, viewAssemblyLayout.totalSpan);
+    const totalSpanBp = Math.max(1, canonicalViewAssemblyLayout.totalSpan);
     const plan = buildContactOverviewTilePlan(
       totalSpanBp,
       contactAvailableResolutions,
@@ -4141,11 +4215,11 @@ export function App() {
       plan.targetResolution,
       plan.targetBins,
       normalization,
-      viewAssemblyLayout.projectionBlocks,
+      canonicalViewAssemblyLayout.projectionBlocks,
     );
     const currentOverview = overviewContactMapRef.current;
     const currentOverviewUsesCurrentLayout = currentOverview?.layoutBlocks
-      === viewAssemblyLayout.blocks;
+      === canonicalViewAssemblyLayout.blocks;
     if (
       currentOverview
       && currentOverview.normalization === normalization
@@ -4215,7 +4289,7 @@ export function App() {
       try {
         const response = await loadContactOverviewWithLayoutHandle(
           contactLayoutHandleRegistry,
-          viewContactLayoutBlocks,
+          canonicalViewContactLayoutBlocks,
           {
             requestId: nextRequestId,
             generation,
@@ -4234,7 +4308,7 @@ export function App() {
           normalization,
           viewport: response.viewport,
           cells: response.cells,
-          layoutBlocks: viewAssemblyLayout.blocks,
+          layoutBlocks: canonicalViewAssemblyLayout.blocks,
           layoutScope: overviewScope,
           visibleLayerComplete: true,
         };
@@ -4286,10 +4360,10 @@ export function App() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [
-    viewAssemblyLayout,
+    canonicalViewAssemblyLayout,
+    canonicalViewContactLayoutBlocks,
     contactAvailableResolutions,
     contactCoolPath,
-    viewContactLayoutBlocks,
     uiState.normalization,
   ]);
 
@@ -5086,6 +5160,8 @@ export function App() {
     contactMainLodTileFlightsRef.current.clear();
     autoColorScaleCacheRef.current.clear();
     lastCompleteContactMapRef.current = null;
+    placementPreviewRestoreFrameRef.current = null;
+    placementReplacementPreviewActiveRef.current = false;
     overviewContactMapRef.current = null;
     contactLayoutHandleRegistryRef.current = new ContactLayoutHandleRegistry();
 
@@ -5099,6 +5175,7 @@ export function App() {
     setContactSources([]);
     setContactMap(null);
     setOverviewContactMap(null);
+    setPlacementPreview(null);
     setContactTilePreviewViewport(null);
     setBackendStartedContactTileGeneration(null);
     setPaintedContactTileGeneration(null);
@@ -5599,24 +5676,105 @@ export function App() {
     reason: "Endpoint 3D contact query produced no result.",
   }), [loadGfaEndpointHiCBatch]);
 
+  const placementPreviewContactMap = useMemo(() => {
+    const normalization = contactNormalizationForBackend(uiState.normalization);
+    const sourceMaps = [
+      overviewContactMap,
+      placementPreviewRestoreFrameRef.current,
+    ].filter((map): map is ContactMapView => Boolean(
+      map?.layoutBlocks
+      && (map.normalization ?? "raw") === normalization
+    ));
+    if (
+      !contactTileReplacementPreviewActive
+      || !contactTilePreviewViewport
+      || !contactCoolPath
+      || sourceMaps.length === 0
+      || placementPreviewBlocks === assemblyLayout.blocks
+    ) {
+      return null;
+    }
+    for (const sourceMap of sourceMaps) {
+      const preview = buildContactLayoutReplacementPreview({
+        sourceMap,
+        nextBlocks: viewAssemblyLayout.blocks,
+        viewport: contactTilePreviewViewport.viewport,
+        layoutScope: contactTileScope(
+          contactCoolPath,
+          sourceMap.resolution,
+          sourceMap.tileSizeBins ?? contactTileSizeBins,
+          normalization,
+          viewAssemblyLayout.projectionBlocks,
+        ),
+        requestedResolution: resolutionToBasePairs(uiState.contact.resolution),
+      });
+      if (preview) {
+        return preview;
+      }
+    }
+    return null;
+  }, [
+    assemblyLayout.blocks,
+    contactCoolPath,
+    contactTilePreviewViewport,
+    contactTileReplacementPreviewActive,
+    overviewContactMap,
+    placementPreviewBlocks,
+    uiState.contact.resolution,
+    uiState.normalization,
+    viewAssemblyLayout.blocks,
+    viewAssemblyLayout.projectionBlocks,
+  ]);
+
   const contactMapWithSourceLayout = useMemo(() => {
+    if (contactTileReplacementPreviewActive) {
+      // Hold Preview must never pair the replacement camera/boundaries with a
+      // retained canonical matrix. Start with the synchronously permuted
+      // overview, then replace it only with a complete authoritative frame.
+      const authoritativePreviewReady = Boolean(
+        contactMap?.visibleLayerComplete === true
+        && contactMap.layoutBlocks === viewAssemblyLayout.blocks
+        && contactTilePreviewViewport
+        && contactMap.viewport.xStart === contactTilePreviewViewport.viewport.xStart
+        && contactMap.viewport.xEnd === contactTilePreviewViewport.viewport.xEnd
+        && contactMap.viewport.yStart === contactTilePreviewViewport.viewport.yStart
+        && contactMap.viewport.yEnd === contactTilePreviewViewport.viewport.yEnd
+      );
+      return authoritativePreviewReady
+        ? contactMap
+        : placementPreviewContactMap
+          ?? placementPreviewRestoreFrameRef.current
+          ?? contactMap;
+    }
     if (
       !contactMap
       || !contactGpuSourceLayout
       || contactGpuSourceLayout.resolution !== contactMap.resolution
+      || contactMap.renderGeneration === undefined
+      || contactGpuSourceLayout.generation !== contactMap.renderGeneration
       || (contactMap.normalization ?? "raw")
         !== contactNormalizationForBackend(uiState.normalization)
     ) {
       return contactMap;
     }
     return { ...contactMap, sourceLayout: contactGpuSourceLayout };
-  }, [contactGpuSourceLayout, contactMap, uiState.normalization]);
+  }, [
+    contactGpuSourceLayout,
+    contactMap,
+    contactTilePreviewViewport,
+    contactTileReplacementPreviewActive,
+    placementPreviewContactMap,
+    uiState.normalization,
+    viewAssemblyLayout.blocks,
+  ]);
 
   return (
     <AppShell
       dataset={dataset}
       contactMap={contactMapWithSourceLayout}
-      contactTileDeltaStream={contactTileDeltaStream}
+      contactTileDeltaStream={contactTileReplacementPreviewActive
+        ? null
+        : contactTileDeltaStream}
       contactIsMcool={contactIsMcool}
       contactAvailableResolutions={contactAvailableResolutions}
       overviewContactMap={overviewContactMap}
@@ -5635,6 +5793,8 @@ export function App() {
       chromosomeFilterPattern={chromosomeFilterPattern}
       includeUnanchoredInChromosomeFilter={includeUnanchoredInChromosomeFilter}
       viewAssemblyBlocks={viewAssemblyLayout.blocks}
+      onPlacementPreviewChange={setPlacementPreview}
+      contactViewportPreview={contactTilePreviewViewport}
       onHiddenChromosomeIdsChange={setHiddenChromosomeIds}
       onChromosomeFilterPatternChange={setChromosomeFilterPattern}
       onIncludeUnanchoredInChromosomeFilterChange={setIncludeUnanchoredInChromosomeFilter}

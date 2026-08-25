@@ -184,13 +184,40 @@ describe("confirmed contact map layout styles", () => {
 
   it("reflows selected chromosome contigs without hiding their names", () => {
     expect(styles).toMatch(
+      /\.selection-contig-label\s*\{[^}]*font-size:\s*10px;/,
+    );
+    expect(styles).toMatch(
       /\.selection-group\.selected \.selection-group-list\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit, minmax\(84px, 1fr\)\);/,
     );
     expect(styles).toMatch(
-      /\.selection-group\.selected \.selection-contig-label\s*\{[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*normal;/,
+      /\.selection-group\.selected \.selection-contig-label\s*\{[^}]*font-size:\s*10px;[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*normal;/,
     );
     expect(styles).toMatch(
       /\.selection-group\.selected \.selection-chip\s*\{[^}]*height:\s*auto;[^}]*padding:\s*5px;/,
+    );
+  });
+
+  it("uses the compact size for chromosome counts and block names", () => {
+    expect(styles).toMatch(
+      /\.selection-group-header strong\s*\{[^}]*font-size:\s*14px;/,
+    );
+    expect(styles).toMatch(
+      /\.selection-block-label\s*\{[^}]*font-size:\s*14px;/,
+    );
+    expect(inspectorSource).toContain(
+      'block.isComposite ? "selection-block-label" : "selection-contig-label"',
+    );
+  });
+
+  it("uses the compact contig-name size in the contig information heading", () => {
+    expect(styles).toMatch(
+      /\.contig-occurrences:not\(\.block-details\) \.contig-occurrence-heading button span\s*\{[^}]*font-size:\s*12px;/,
+    );
+  });
+
+  it("uses the compact contig-name size in copy and segment lists", () => {
+    expect(styles).toMatch(
+      /\.contig-other-locations button span\s*\{[^}]*font-size:\s*12px;/,
     );
   });
 

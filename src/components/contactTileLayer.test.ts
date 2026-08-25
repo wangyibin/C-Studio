@@ -526,7 +526,7 @@ describe("contact tile presentation buffer", () => {
     expect(next.slots).toEqual([updated, null]);
   });
 
-  it("keeps layout-preview publication on the existing front surface", () => {
+  it("stages a layout-preview pixel replacement before swapping the front surface", () => {
     const presented = contactTileFrame(1, 1_000);
     const nextGeneration = contactTileFrame(2, 1_000);
     const updated: ContactTileLayerFrame = {
@@ -544,8 +544,8 @@ describe("contact tile presentation buffer", () => {
     );
 
     expect(next.frontSlot).toBe(0);
-    expect(next.stagingSlot).toBeNull();
-    expect(next.slots).toEqual([updated, null]);
+    expect(next.stagingSlot).toBe(1);
+    expect(next.slots).toEqual([presented, updated]);
   });
 
   it("discards an in-flight staging surface when presentation freezing resumes", () => {

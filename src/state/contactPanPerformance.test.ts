@@ -1,9 +1,38 @@
 import { describe, expect, it } from "vitest";
 import {
   ContactPanPerformanceTracker,
+  contactViewportPreviewIsPan,
+  contactViewportPreviewIsReplacement,
   formatContactPanPerformanceLog,
   type ContactPanPerformanceOutput,
 } from "./contactPanPerformance";
+
+describe("contact viewport preview presentation", () => {
+  const basePreview = {
+    viewport: { xStart: 0, xEnd: 10, yStart: 0, yEnd: 10 },
+    sequence: 1,
+    pointerTimestamp: 100,
+  };
+
+  it("keeps legacy and explicit pan previews on the prefetch-only path", () => {
+    expect(contactViewportPreviewIsPan(basePreview)).toBe(true);
+    expect(contactViewportPreviewIsPan({
+      ...basePreview,
+      presentationMode: "pan",
+    })).toBe(true);
+    expect(contactViewportPreviewIsReplacement(basePreview)).toBe(false);
+  });
+
+  it("routes replacement previews to complete-frame presentation", () => {
+    const preview = {
+      ...basePreview,
+      presentationMode: "replacement" as const,
+    };
+    expect(contactViewportPreviewIsReplacement(preview)).toBe(true);
+    expect(contactViewportPreviewIsPan(preview)).toBe(false);
+    expect(contactViewportPreviewIsPan(null)).toBe(false);
+  });
+});
 
 describe("ContactPanPerformanceTracker", () => {
   it("correlates pointer, IPC, cache merge, and GPU paint", () => {

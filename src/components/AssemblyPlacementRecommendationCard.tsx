@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ContactMapView } from "../App";
 import {
   assemblyContigDisplayName,
@@ -6,10 +6,10 @@ import {
 } from "../state/assemblyEditing";
 import {
   buildPlacementRecommendationPlan,
+  buildPlacementRecommendationPreviewLayout,
   placementEndpointRequestKey,
   rankPlacementRecommendations,
   type PlacementRecommendation,
-  type PlacementRecommendationCandidate,
 } from "../state/assemblyPlacementRecommendation";
 import {
   buildGfaAssemblyGraph,
@@ -39,7 +39,7 @@ interface AssemblyPlacementRecommendationCardProps {
   gfaDocument?: GfaEvidenceDocument | null;
   onLoadEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
   activePreviewId?: string | null;
-  onPreviewChange?: (candidate: PlacementRecommendationCandidate | null) => void;
+  onPreviewChange?: (candidate: PlacementRecommendation | null) => void;
   onUiAction: (action: UiAction) => void;
 }
 
@@ -119,9 +119,13 @@ export function AssemblyPlacementRecommendationCard({
     status: "idle",
     resultsByRequest: new Map(),
   });
+  const [previewedRecommendationIds, setPreviewedRecommendationIds] = useState<Set<string>>(
+    () => new Set(),
+  );
 
   useEffect(() => {
     onPreviewChange(null);
+    setPreviewedRecommendationIds(new Set());
   }, [onPreviewChange, planKey]);
 
   useEffect(() => {
@@ -283,27 +287,28 @@ export function AssemblyPlacementRecommendationCard({
               recommendation={recommendation}
               blocks={blocks}
               active={activePreviewId === recommendation.id}
-              onPreview={() => {
-                if (activePreviewId === recommendation.id) {
-                  onPreviewChange(null);
-                  return;
-                }
+              previewed={previewedRecommendationIds.has(recommendation.id)}
+              onPreviewStart={() => {
                 onPreviewChange(recommendation);
-                const totalSpanMb = Math.max(
-                  0.000001,
-                  ...blocks.map((block) => block.visualEnd / 1_000_000),
-                );
-                onUiAction({
-                  type: "jumpContactViewportToRegions",
-                  xCenterBp: recommendation.visualPosition,
-                  yCenterBp: recommendation.visualPosition,
-                  selectedBlockIds: recommendation.selectedBlockIds,
-                  totalSpanMb,
-                  label: `placement candidate ${recommendation.rank}`,
-                  transient: true,
+              }}
+              onPreviewEnd={() => {
+                onPreviewChange(null);
+                setPreviewedRecommendationIds((current) => {
+                  if (current.has(recommendation.id)) {
+                    return current;
+                  }
+                  const next = new Set(current);
+                  next.add(recommendation.id);
+                  return next;
                 });
               }}
               onApply={() => {
+                onPreviewChange(null);
+                const preview = buildPlacementRecommendationPreviewLayout(
+                  blocks,
+                  selection,
+                  recommendation,
+                );
                 onUiAction({
                   type: "applyAssemblyPlacementRecommendation",
                   selectedBlockIds: recommendation.selectedBlockIds,
@@ -311,14 +316,26 @@ export function AssemblyPlacementRecommendationCard({
                   targetObjectId: recommendation.targetObjectId,
                   orientation: recommendation.orientation,
                 });
-                onPreviewChange(null);
+                const totalSpanMb = Math.max(
+                  0.000001,
+                  ...blocks.map((block) => block.visualEnd / 1_000_000),
+                );
+                onUiAction({
+                  type: "jumpContactViewportToRegions",
+                  xCenterBp: preview?.centerBp ?? recommendation.visualPosition,
+                  yCenterBp: preview?.centerBp ?? recommendation.visualPosition,
+                  selectedBlockIds: recommendation.selectedBlockIds,
+                  totalSpanMb,
+                  label: `applied placement candidate ${recommendation.rank}`,
+                  transient: true,
+                });
               }}
             />
           ))}
         </ol>
       )}
       <p className="placement-recommendation-caveat">
-        Evidence ranking only. Preview does not edit the AGP; Apply creates one undoable operation.
+        Hold Preview to inspect the proposed layout; release to return. Only Apply edits the AGP and creates one undoable operation.
       </p>
     </div>
   );
@@ -328,17 +345,33 @@ function PlacementRecommendationItem({
   recommendation,
   blocks,
   active,
-  onPreview,
+  previewed,
+  onPreviewStart,
+  onPreviewEnd,
   onApply,
 }: {
   recommendation: PlacementRecommendation;
   blocks: ContactMapLayoutBlock[];
   active: boolean;
-  onPreview: () => void;
+  previewed: boolean;
+  onPreviewStart: () => void;
+  onPreviewEnd: () => void;
   onApply: () => void;
 }) {
+  const previewPointerIdRef = useRef<number | null>(null);
+  const keyboardPreviewActiveRef = useRef(false);
   const blocksById = new Map(blocks.map((block) => [block.id, block]));
   const boundary = placementBoundaryLabel(recommendation, blocksById);
+  const stopPointerPreview = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (previewPointerIdRef.current !== event.pointerId) {
+      return;
+    }
+    previewPointerIdRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    onPreviewEnd();
+  };
   return (
     <li className={`${active ? "active" : ""}${recommendation.isCurrent ? " current" : ""}`}>
       <div className="placement-recommendation-title">
@@ -367,17 +400,73 @@ function PlacementRecommendationItem({
         ) : null}
       </div>
       <div className="placement-recommendation-actions">
-        <button type="button" onClick={onPreview}>
-          {active ? "Hide preview" : "Preview"}
+        <button
+          type="button"
+          className="placement-preview-hold"
+          disabled={recommendation.isCurrent}
+          aria-pressed={active}
+          title={recommendation.isCurrent
+            ? "This recommendation is already the current placement"
+            : "Hold to show the proposed heatmap layout; release to return"}
+          onPointerDown={(event) => {
+            if (event.button !== 0 || previewPointerIdRef.current !== null) {
+              return;
+            }
+            event.preventDefault();
+            previewPointerIdRef.current = event.pointerId;
+            event.currentTarget.setPointerCapture(event.pointerId);
+            onPreviewStart();
+          }}
+          onPointerUp={stopPointerPreview}
+          onPointerCancel={stopPointerPreview}
+          onLostPointerCapture={(event) => {
+            if (previewPointerIdRef.current === event.pointerId) {
+              previewPointerIdRef.current = null;
+              onPreviewEnd();
+            }
+          }}
+          onKeyDown={(event) => {
+            if (
+              (event.key === " " || event.key === "Enter")
+              && !event.repeat
+              && !keyboardPreviewActiveRef.current
+            ) {
+              event.preventDefault();
+              keyboardPreviewActiveRef.current = true;
+              onPreviewStart();
+            }
+          }}
+          onKeyUp={(event) => {
+            if (
+              (event.key === " " || event.key === "Enter")
+              && keyboardPreviewActiveRef.current
+            ) {
+              event.preventDefault();
+              keyboardPreviewActiveRef.current = false;
+              onPreviewEnd();
+            }
+          }}
+          onBlur={() => {
+            if (keyboardPreviewActiveRef.current) {
+              keyboardPreviewActiveRef.current = false;
+              onPreviewEnd();
+            }
+          }}
+        >
+          {recommendation.isCurrent
+            ? "Already current"
+            : active ? "Release to return" : "Hold Preview"}
         </button>
         {recommendation.isCurrent ? (
           <strong>Current placement</strong>
-        ) : active ? (
+        ) : previewed ? (
           <button type="button" className="primary" onClick={onApply}>
             Apply placement
           </button>
         ) : (
-          <small>Preview before applying</small>
+          <small>{active
+            ? "Placement temporarily applied to heatmap…"
+            : "Hold Preview before applying"}</small>
         )}
       </div>
     </li>

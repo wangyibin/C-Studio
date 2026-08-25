@@ -4,6 +4,7 @@ import type { GfaGraphEdge } from "./gfa";
 import type { GfaHiCLink } from "./gfaHiCLinks";
 import {
   applyPlacementRecommendation,
+  buildPlacementRecommendationPreviewLayout,
   buildPlacementRecommendationPlan,
   enumeratePlacementBoundaries,
   placementEndpointRequestKey,
@@ -359,6 +360,44 @@ describe("assembly placement recommendation", () => {
         ["b", "Chr02", "-"],
         ["d", "Chr02", "+"],
       ]);
+
+    const original = multiBlocks.map((candidate) => ({ ...candidate }));
+    const preview = buildPlacementRecommendationPreviewLayout(
+      multiBlocks,
+      multiSelection,
+      {
+        selectedBlockIds: ["b", "c"],
+        targetObjectId: "Chr02",
+        targetBlockId: "d",
+        orientation: "-",
+      },
+    );
+    expect(preview).not.toBeNull();
+    expect(preview?.blocks).toEqual(moved);
+    expect(preview?.blocks).not.toBe(multiBlocks);
+    expect(preview?.selectedEnd).toBeGreaterThan(preview?.selectedStart ?? 0);
+    expect(preview?.centerBp).toBe(
+      ((preview?.selectedStart ?? 0) + (preview?.selectedEnd ?? 0)) / 2,
+    );
+    expect(multiBlocks).toEqual(original);
+  });
+
+  it("does not advertise a temporary preview for the unchanged current placement", () => {
+    const currentBlocks = [
+      block("a", "Chr01", 0),
+      block("b", "Chr01", 1_000_000),
+      block("c", "Chr01", 2_000_000),
+    ];
+    expect(buildPlacementRecommendationPreviewLayout(
+      currentBlocks,
+      { kind: "contigs", ids: ["b", "c"], exact: true },
+      {
+        selectedBlockIds: ["b", "c"],
+        targetObjectId: "Chr01",
+        targetBlockId: null,
+        orientation: "+",
+      },
+    )).toBeNull();
   });
 
   it("refuses cross-chromosome and non-consecutive multi-selection", () => {

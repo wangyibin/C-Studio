@@ -33,29 +33,58 @@ awk 'BEGIN { OFS="\t" } { print $1, 1, $2, 1, "W", $1, 1, $2, "+" }' \
 [pairtools](https://pairtools.readthedocs.io/en/latest/) 提供 parse、sort、select 和
 dedup，但比对与过滤参数必须根据建库方式和 MAPQ 策略确定。
 
-从与 AGP 一致的源 contig FASTA 生成 chromosome sizes：
+=== "C-Phasing"
 
-```bash
-samtools faidx source-contigs.fa
-cut -f1,2 source-contigs.fa.fai > source-contigs.chrom.sizes
-```
+    C-Phasing 可以直接从 `.pairs.pqs` 数据集或压缩的 `.pairs.gz` 文件生成
+    相同的源 contig 级 COOL。按照官方
+    [C-Phasing `pairs2cool` 流程](https://wangyibin.github.io/CPhasing/zh/latest/CLI/plot/)，
+    先生成 contig size，并明确指定 `cool2mcool` 所需的 1 kb 分辨率：
 
-标准 4DN pairs 的第 2/3 列和第 4/5 列分别是 `chrom1/pos1` 和
-`chrom2/pos2`。使用
-[`cooler cload pairs`](https://cooler.readthedocs.io/en/latest/cli.html#cooler-cload-pairs)
-生成固定 1 kb、symmetric-upper 的 COOL：
+    ```bash
+    cphasing-rs contigsizes source-contigs.fa > source-contigs.contigsizes
+    cphasing pairs2cool \
+      contacts.pairs.pqs \
+      source-contigs.contigsizes \
+      contacts.1k.cool \
+      --binsize 1k \
+      --min-mapq 1 \
+      --threads 16
+    ```
 
-```bash
-cooler cload pairs \
-  -c1 2 -p1 3 -c2 4 -p2 5 \
-  source-contigs.chrom.sizes:1000 \
-  contacts.pairs.gz \
-  contacts.1k.cool
-```
+    如果输入是标准压缩 pairs 文件，将 `contacts.pairs.pqs` 替换为
+    `contacts.pairs.gz` 即可。应根据建库、比对与过滤策略设置 `--min-mapq`；
+    常规转换超出可用内存时可增加 `--low-memory`。
 
-标准 pairs 位点是 1-based。只有当实际输入位点为 0-based 时才添加
-`--zero-based`。应在构建 COOL 前决定 MAPQ 过滤标准；已聚合计数无法恢复
-之前丢弃的接触。
+    FASTA、contig size 和 pairs 数据必须与 AGP 第 6 列使用相同的源 contig
+    名称。C-Studio 的主矩阵应停在 `pairs2cool` 这一步，不要使用
+    `cphasing plot -a` 生成的 chromosome-level `*.chrom.cool`，因为 AGP
+    投影由 C-Studio 自己完成。
+
+=== "Cooler"
+
+    从与 AGP 一致的源 contig FASTA 生成 chromosome sizes：
+
+    ```bash
+    samtools faidx source-contigs.fa
+    cut -f1,2 source-contigs.fa.fai > source-contigs.chrom.sizes
+    ```
+
+    标准 4DN pairs 的第 2/3 列和第 4/5 列分别是 `chrom1/pos1` 和
+    `chrom2/pos2`。使用
+    [`cooler cload pairs`](https://cooler.readthedocs.io/en/latest/cli.html#cooler-cload-pairs)
+    生成固定 1 kb、symmetric-upper 的 COOL：
+
+    ```bash
+    cooler cload pairs \
+      -c1 2 -p1 3 -c2 4 -p2 5 \
+      source-contigs.chrom.sizes:1000 \
+      contacts.pairs.gz \
+      contacts.1k.cool
+    ```
+
+    标准 pairs 位点是 1-based。只有当实际输入位点为 0-based 时才添加
+    `--zero-based`。应在构建 COOL 前决定 MAPQ 过滤标准；已聚合计数无法恢复
+    之前丢弃的接触。
 
 ## 使用 cool2mcool 转换为 MCOOL
 

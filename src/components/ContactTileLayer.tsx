@@ -512,6 +512,7 @@ function requiresAtomicContactTileSwap(
     || current.contactMap.requestedResolution !== incoming.contactMap.requestedResolution
     || (current.contactMap.tileSizeBins ?? 256) !== (incoming.contactMap.tileSizeBins ?? 256)
     || current.contactMap.normalization !== incoming.contactMap.normalization
+    || !sameContactTileDataSurface(current.contactMap, incoming.contactMap)
     || !sameContactTileRenderStyle(current.renderStyle, incoming.renderStyle);
 }
 

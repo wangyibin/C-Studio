@@ -3,10 +3,27 @@ import type { ContactViewport } from "./contactViewport";
 export interface ContactPanPreview {
   viewport: ContactViewport;
   prefetchViewport?: ContactViewport;
+  /**
+   * Pan previews only warm tiles for the compositor transform. Replacement
+   * previews load and present a complete temporary contact-map frame.
+   */
+  presentationMode?: "pan" | "replacement";
   /** Leading tiles promoted from background warming while a fast pan is active. */
   urgentPrefetchTileCount?: number;
   sequence: number;
   pointerTimestamp: number;
+}
+
+export function contactViewportPreviewIsReplacement(
+  preview: ContactPanPreview | null,
+): boolean {
+  return preview?.presentationMode === "replacement";
+}
+
+export function contactViewportPreviewIsPan(
+  preview: ContactPanPreview | null,
+): boolean {
+  return preview !== null && !contactViewportPreviewIsReplacement(preview);
 }
 
 export interface ContactPanPerformanceStart {

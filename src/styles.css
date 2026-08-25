@@ -1641,41 +1641,6 @@ button {
   pointer-events: none;
 }
 
-.assembly-placement-preview-marker {
-  position: absolute;
-  z-index: 16;
-  display: grid;
-  place-items: center;
-  width: 24px;
-  height: 24px;
-  color: #075985;
-  transform: translate(-50%, -50%);
-  pointer-events: none;
-}
-
-.assembly-placement-preview-guide {
-  position: absolute;
-  width: 68px;
-  height: 3px;
-  border-radius: 999px;
-  background: #38bdf8;
-  box-shadow: 0 0 0 1px rgb(255 255 255 / 88%), 0 2px 8px rgb(3 105 161 / 35%);
-  transform: rotate(45deg);
-}
-
-.assembly-placement-preview-marker strong {
-  position: relative;
-  display: grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  border: 2px solid white;
-  border-radius: 50%;
-  background: #bae6fd;
-  box-shadow: 0 2px 10px rgb(3 105 161 / 32%);
-  font-size: 13px;
-}
-
 .assembly-chromosome-end-target {
   position: absolute;
   z-index: 13;
@@ -3203,6 +3168,30 @@ button {
   color: white;
 }
 
+.placement-recommendation-actions button.placement-preview-hold[aria-pressed="true"] {
+  border-color: #0284c7;
+  background: color-mix(in srgb, #0284c7 12%, white);
+  color: #075985;
+}
+
+.assembly-placement-preview-status {
+  position: absolute;
+  z-index: 12;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 9px;
+  border: 1px solid rgb(2 132 199 / 45%);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 90%);
+  box-shadow: 0 2px 8px rgb(15 23 42 / 12%);
+  color: #075985;
+  font-size: 10px;
+  font-weight: 700;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
 .placement-recommendation-actions strong,
 .placement-recommendation-actions small {
   color: var(--muted);
@@ -3242,6 +3231,10 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.contig-occurrences:not(.block-details) .contig-occurrence-heading button span {
+  font-size: 12px;
 }
 
 .contig-occurrence-heading button svg {
@@ -3463,6 +3456,10 @@ button {
   white-space: nowrap;
 }
 
+.contig-other-locations button span {
+  font-size: 12px;
+}
+
 .contig-other-locations button small,
 .contig-other-locations > small {
   color: var(--muted);
@@ -3490,6 +3487,10 @@ button {
   background: transparent;
   color: var(--text);
   box-shadow: none;
+}
+
+.selection-group-header strong {
+  font-size: 14px;
 }
 
 .selection-group-heading {
@@ -3577,6 +3578,14 @@ button {
   color: var(--muted);
   font-size: 9px;
   font-weight: 500;
+}
+
+.selection-contig-label {
+  font-size: 10px;
+}
+
+.selection-block-label {
+  font-size: 14px;
 }
 
 .selection-group.selected .selection-contig-label {

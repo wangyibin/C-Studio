@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ContactMapTile, ContactMapView } from "../App";
 import {
+  buildContactLayoutReplacementPreview,
   contactCellsForViewport,
   contactPreviewTilesForMissing,
   contactTilesWithPreviewFallback,
@@ -566,5 +567,88 @@ describe("reprojectContactMapLayout", () => {
 
     const preview = reprojectContactMapLayout(view, blocks, reversed);
     expect(preview?.cells).toEqual([{ xBin: 7, yBin: 18, count: 7 }]);
+  });
+
+  it("builds an independently presentable replacement frame for Hold Preview", () => {
+    const sourceMap: ContactMapView = {
+      resolution: 10,
+      requestedResolution: 1,
+      normalization: "ice",
+      viewport: { xStart: 0, xEnd: 200, yStart: 0, yEnd: 200 },
+      cells: [{ xBin: 1, yBin: 12, count: 7 }],
+      tileSizeBins: 10,
+      layoutBlocks: blocks,
+      layoutScope: "canonical-layout",
+      visibleLayerComplete: true,
+      renderGeneration: 41,
+    };
+    const moved = [
+      { ...blocks[1], visualStart: 0, visualEnd: 100 },
+      { ...blocks[0], visualStart: 100, visualEnd: 200 },
+    ];
+    const viewport = { xStart: 50, xEnd: 150, yStart: 50, yEnd: 150 };
+
+    const preview = buildContactLayoutReplacementPreview({
+      sourceMap,
+      nextBlocks: moved,
+      viewport,
+      layoutScope: "preview-layout",
+    });
+
+    expect(preview).toMatchObject({
+      resolution: 10,
+      requestedResolution: 1,
+      normalization: "ice",
+      viewport,
+      layoutBlocks: moved,
+      layoutScope: "preview-layout",
+      visibleLayerComplete: true,
+      isTransientResolutionPreview: false,
+      renderGeneration: undefined,
+    });
+    expect(preview?.cells).toEqual([{ xBin: 2, yBin: 11, count: 7 }]);
+    expect(preview?.previewTiles).toEqual([
+      { tileX: 0, tileY: 1, cells: [{ xBin: 2, yBin: 11, count: 7 }] },
+    ]);
+  });
+
+  it("rejects a cropped source instead of presenting an incomplete placement preview", () => {
+    const sourceMap: ContactMapView = {
+      resolution: 10,
+      normalization: "raw",
+      viewport: { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 },
+      cells: [{ xBin: 1, yBin: 2, count: 7 }],
+      layoutBlocks: blocks,
+      visibleLayerComplete: true,
+    };
+    const moved = [
+      { ...blocks[1], visualStart: 0, visualEnd: 100 },
+      { ...blocks[0], visualStart: 100, visualEnd: 200 },
+    ];
+
+    expect(buildContactLayoutReplacementPreview({
+      sourceMap,
+      nextBlocks: moved,
+      viewport: { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 },
+      layoutScope: "preview-layout",
+    })).toBeNull();
+  });
+
+  it("rejects a whole-layout source that has not finished loading", () => {
+    const sourceMap: ContactMapView = {
+      resolution: 10,
+      normalization: "raw",
+      viewport: { xStart: 0, xEnd: 200, yStart: 0, yEnd: 200 },
+      cells: [{ xBin: 1, yBin: 2, count: 7 }],
+      layoutBlocks: blocks,
+      visibleLayerComplete: false,
+    };
+
+    expect(buildContactLayoutReplacementPreview({
+      sourceMap,
+      nextBlocks: [...blocks].reverse(),
+      viewport: sourceMap.viewport,
+      layoutScope: "preview-layout",
+    })).toBeNull();
   });
 });

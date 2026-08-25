@@ -110,6 +110,16 @@ import { TrackPanel } from "./TrackPanel";
 
 const usePrePaintEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
+export function contactViewportForPlacementPreview(
+  committedViewport: ContactViewport,
+  preview: ContactPanPreview | null,
+  replacementHeatmapReady: boolean,
+): ContactViewport {
+  return replacementHeatmapReady && preview?.presentationMode === "replacement"
+    ? preview.viewport
+    : committedViewport;
+}
+
 interface ContactMapViewportProps {
   dataset: ExampleDatasetSummary | null;
   assemblyBlocks?: ContactMapLayoutBlock[];
@@ -123,6 +133,7 @@ interface ContactMapViewportProps {
   useStoredResolutionOptions?: boolean;
   availableResolutionBasePairs?: number[];
   placementPreview?: PlacementRecommendationCandidate | null;
+  contactViewportPreview?: ContactPanPreview | null;
   onClosePanel?: () => void;
   onExpandPanel?: () => void;
   onContactPanGestureStart?: () => void;
@@ -1145,6 +1156,7 @@ export function ContactMapViewport({
   useStoredResolutionOptions = false,
   availableResolutionBasePairs = [],
   placementPreview = null,
+  contactViewportPreview = null,
   onClosePanel,
   onExpandPanel,
   uiState,
@@ -1335,7 +1347,7 @@ export function ContactMapViewport({
         || dataset?.agp_layout.totalSpan
         || uiState.contact.totalSpanMb * 1_000_000,
   );
-  const liveViewport = useMemo(() => buildCenteredContactViewport({
+  const committedLiveViewport = useMemo(() => buildCenteredContactViewport({
     centerMb: uiState.contact.viewportCenterMb,
     centerXMb: uiState.contact.viewportCenterXMb,
     centerYMb: uiState.contact.viewportCenterYMb,
@@ -1352,6 +1364,13 @@ export function ContactMapViewport({
     uiState.contact.viewportSpanMb,
     uiState.contact.viewportWidthPx,
   ]);
+  const replacementHeatmapReady = placementPreview !== null
+    && incomingContactMap?.layoutBlocks === activeAssemblyBlocks;
+  const liveViewport = contactViewportForPlacementPreview(
+    committedLiveViewport,
+    contactViewportPreview,
+    replacementHeatmapReady,
+  );
   const presentationDatasetKey = `${dataset?.mcool_path ?? ""}|${dataset?.coverage_path ?? ""}`;
   usePrePaintEffect(() => {
     setPresentedContactCoverageFrame((current) => advanceContactCoveragePresentationFrame(
@@ -1369,16 +1388,19 @@ export function ContactMapViewport({
     ? presentedContactCoverageFrame
     : null;
   const usesAtomicCoverageFrame = Boolean(
-    hasCoverageTrack
+    !replacementHeatmapReady
+    && hasCoverageTrack
     && uiState.tracks.coverageVisible
     && synchronizedFrame,
   );
   const contactMap = usesAtomicCoverageFrame
     ? synchronizedFrame!.contactMap
     : incomingContactMap;
-  const coverageView = usesAtomicCoverageFrame
-    ? synchronizedFrame!.coverageView
-    : incomingCoverageView;
+  const coverageView = replacementHeatmapReady
+    ? null
+    : usesAtomicCoverageFrame
+      ? synchronizedFrame!.coverageView
+      : incomingCoverageView;
   const renderGeneration = contactMap?.renderGeneration;
   const freezePresentedTileStyle = shouldRetainPresentedContactViewport(
     contactMap,
@@ -3154,7 +3176,7 @@ export function ContactMapViewport({
               height: Math.abs(assemblySelectionDrag.currentLocalY - assemblySelectionDrag.startLocalY),
             } : null}
             pointerState={assemblyPointerState}
-            placementPreview={placementPreview}
+            placementPreview={replacementHeatmapReady ? placementPreview : null}
             onReverseSelection={() => onUiAction({ type: "reverseAssemblySelection" })}
             onResizeSelection={(ids) => onUiAction({ type: "selectAssemblyContigs", ids })}
             onDoubleClick={handleAssemblyDoubleClick}
@@ -3570,24 +3592,11 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
         />
       ) : null}
       <div ref={overlayLayerRef} className="assembly-overlay-layer">
-        {placementPreview
-          && placementPreview.visualPosition >= viewportXStart
-          && placementPreview.visualPosition <= viewportXEnd
-          && placementPreview.visualPosition >= viewportYStart
-          && placementPreview.visualPosition <= viewportYEnd ? (() => {
-            const left = ((placementPreview.visualPosition - viewportXStart) / viewportXSpan) * 100;
-            const top = ((placementPreview.visualPosition - viewportYStart) / viewportYSpan) * 100;
-            return (
-              <span
-                className="assembly-placement-preview-marker"
-                style={{ left: `${left}%`, top: `${top}%` }}
-                title={`Recommended insertion on ${placementPreview.targetObjectId}, orientation ${placementPreview.orientation}`}
-              >
-                <span className="assembly-placement-preview-guide" aria-hidden="true" />
-                <strong>{placementPreview.orientation}</strong>
-              </span>
-            );
-          })() : null}
+        {placementPreview ? (
+          <span className="assembly-placement-preview-status" role="status">
+            Placement temporarily applied to heatmap · release to restore original
+          </span>
+        ) : null}
         {renderVisualBoundaries && showChromosomeBoxes
           ? visibleChromosomes.map((chromosome) => {
           const boundary = overscannedBoundaryIntervalBox(
