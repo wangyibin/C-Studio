@@ -28,7 +28,9 @@ import {
   contactCanvasBackingSizeFromBounds,
   committedPanTargetIsPainted,
   contactResolutionWheelIntent,
-  lockedContactResolutionWheelZoomIntent,
+  contactResolutionWheelSession,
+  contactResolutionWheelZoomIntent,
+  contactViewportWheelZoomIntent,
   contactViewportForAxisNavigator,
   contactViewportForPlacementPreview,
   contactViewportSizePxFromBounds,
@@ -425,6 +427,81 @@ describe("contactResolutionWheelIntent", () => {
       resolutionOptions,
     })).toBeNull();
   });
+
+  it("anchors an unlocked trackpad resolution step to both pointer axes", () => {
+    expect(contactResolutionWheelZoomIntent({
+      deltaX: 0,
+      deltaY: -24,
+      ctrlKey: true,
+      metaKey: false,
+      currentResolution: "500 kb",
+      resolutionOptions,
+      clientX: 200,
+      clientY: 175,
+      bounds: { left: 100, top: 25, width: 400, height: 200 },
+      viewport: {
+        xStart: 10_000_000,
+        xEnd: 410_000_000,
+        yStart: 20_000_000,
+        yEnd: 220_000_000,
+      },
+    })).toEqual({
+      type: "setContactResolution",
+      resolution: "100 kb",
+      focusRatioX: 0.25,
+      focusRatioY: 0.75,
+      focusXMb: 110,
+      focusYMb: 170,
+    });
+  });
+
+  it("keeps one visible-camera anchor across a retained-frame pinch burst", () => {
+    const bounds = { left: 100, top: 25, width: 400, height: 200 };
+    const first = contactResolutionWheelSession({
+      current: null,
+      clientX: 200,
+      clientY: 175,
+      bounds,
+      viewport: {
+        xStart: 10_000_000,
+        xEnd: 410_000_000,
+        yStart: 20_000_000,
+        yEnd: 220_000_000,
+      },
+      eventAt: 1_000,
+    });
+    const retained = contactResolutionWheelSession({
+      current: first,
+      clientX: 202,
+      clientY: 174,
+      bounds,
+      viewport: {
+        xStart: 100_000_000,
+        xEnd: 300_000_000,
+        yStart: 100_000_000,
+        yEnd: 200_000_000,
+      },
+      eventAt: 1_120,
+    });
+    const nextGesture = contactResolutionWheelSession({
+      current: retained,
+      clientX: 202,
+      clientY: 174,
+      bounds,
+      viewport: {
+        xStart: 100_000_000,
+        xEnd: 300_000_000,
+        yStart: 100_000_000,
+        yEnd: 200_000_000,
+      },
+      eventAt: 1_500,
+    });
+
+    expect(retained.focusXMb).toBe(110);
+    expect(retained.focusYMb).toBe(170);
+    expect(nextGesture.focusXMb).toBe(151);
+    expect(nextGesture.focusYMb).toBe(174.5);
+  });
 });
 
 describe("shouldRetainPresentedContactViewport", () => {
@@ -799,28 +876,32 @@ describe("contact and coverage presentation frames", () => {
   });
 });
 
-describe("lockedContactResolutionWheelZoomIntent", () => {
+describe("contactViewportWheelZoomIntent", () => {
   it("turns a modified wheel into pointer-anchored viewport zoom without a resolution action", () => {
-    expect(lockedContactResolutionWheelZoomIntent(
+    expect(contactViewportWheelZoomIntent(
       0,
       -100,
       300,
       75,
       { left: 100, top: 25, width: 400, height: 200 },
       500,
+      { xStart: 0, xEnd: 400_000_000, yStart: 0, yEnd: 200_000_000 },
     )).toEqual({
       type: "zoomContactViewport",
       direction: "in",
       focusRatioX: 0.5,
       focusRatioY: 0.25,
+      focusXMb: 200,
+      focusYMb: 50,
       scaleFactor: Math.exp(0.2),
       totalSpanMb: 500,
     });
   });
 
   it("ignores a zero wheel gesture", () => {
-    expect(lockedContactResolutionWheelZoomIntent(
+    expect(contactViewportWheelZoomIntent(
       0, 0, 0, 0, { left: 0, top: 0, width: 100, height: 100 }, 500,
+      { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 },
     )).toBeNull();
   });
 });

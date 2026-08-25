@@ -1368,6 +1368,108 @@ describe("reduceUiState", () => {
     expect(Math.abs(afterAnchoredYMb - anchoredYMb)).toBeLessThanOrEqual(0.000001);
   });
 
+  it("keeps both genome coordinates under a trackpad focus stable when resolution changes", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = {
+      ...state,
+      contact: {
+        ...state.contact,
+        totalSpanMb: 1_000,
+        viewportSizePx: 400,
+        viewportWidthPx: 800,
+        viewportHeightPx: 400,
+        viewportSpanMb: 200,
+        viewportCenterMb: 400,
+        viewportCenterXMb: 300,
+        viewportCenterYMb: 500,
+        resolution: "1 Mb",
+      },
+    };
+
+    state = reduceUiState(state, {
+      type: "setContactResolution",
+      resolution: "250 kb",
+      focusRatioX: 0.25,
+      focusRatioY: 0.75,
+    });
+
+    expect(state.contact.resolution).toBe("250 kb");
+    expect(state.contact.viewportSpanMb).toBe(100);
+    expect(state.contact.viewportCenterXMb).toBe(250);
+    expect(state.contact.viewportCenterYMb).toBe(525);
+    expect(state.contact.viewportCenterMb).toBe(387.5);
+    expect(150 + 200 * 0.25).toBe(100 + 400 * 0.25);
+    expect(475 + 100 * 0.75).toBe(400 + 200 * 0.75);
+  });
+
+  it("uses the retained visible-camera anchor during a later pinch step", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = {
+      ...state,
+      contact: {
+        ...state.contact,
+        totalSpanMb: 1_000,
+        viewportSizePx: 400,
+        viewportWidthPx: 800,
+        viewportHeightPx: 400,
+        viewportSpanMb: 100,
+        viewportCenterMb: 387.5,
+        viewportCenterXMb: 260,
+        viewportCenterYMb: 515,
+        resolution: "250 kb",
+      },
+    };
+
+    state = reduceUiState(state, {
+      type: "setContactResolution",
+      resolution: "50 kb",
+      focusRatioX: 0.25,
+      focusRatioY: 0.75,
+      focusXMb: 200,
+      focusYMb: 550,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(20);
+    expect(state.contact.viewportCenterXMb).toBe(210);
+    expect(state.contact.viewportCenterYMb).toBe(545);
+  });
+
+  it("uses the retained visible-camera anchor for locked continuous zoom", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = {
+      ...state,
+      contact: {
+        ...state.contact,
+        totalSpanMb: 1_000,
+        viewportSizePx: 400,
+        viewportWidthPx: 800,
+        viewportHeightPx: 400,
+        viewportSpanMb: 100,
+        viewportCenterMb: 387.5,
+        viewportCenterXMb: 260,
+        viewportCenterYMb: 515,
+        resolution: "250 kb",
+        resolutionLocked: true,
+      },
+    };
+
+    state = reduceUiState(state, {
+      type: "zoomContactViewport",
+      direction: "in",
+      focusRatioX: 0.25,
+      focusRatioY: 0.75,
+      focusXMb: 200,
+      focusYMb: 550,
+      scaleFactor: 2,
+      totalSpanMb: 1_000,
+    });
+
+    expect(state.contact.viewportSpanMb).toBe(50);
+    expect(state.contact.viewportCenterXMb).toBe(225);
+    expect(state.contact.viewportCenterYMb).toBe(537.5);
+    expect(state.contact.resolution).toBe("250 kb");
+  });
+
   it("selects contact resolution by bp per pixel and restores its color scale", () => {
     let state = createInitialUiState("Browser preview mode");
 

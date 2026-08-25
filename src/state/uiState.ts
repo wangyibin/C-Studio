@@ -199,6 +199,12 @@ export type UiAction =
       resolution: ContactResolution;
       /** Automatic dataset reconciliation may retain the current local window. */
       preserveViewport?: boolean;
+      /** Keep the genomic coordinates under a wheel/pinch focus point stable. */
+      focusRatioX?: number;
+      focusRatioY?: number;
+      /** Absolute anchors captured from the camera that is actually visible. */
+      focusXMb?: number;
+      focusYMb?: number;
     }
   | { type: "toggleContactResolutionLock" }
   | {
@@ -232,6 +238,9 @@ export type UiAction =
       focusRatio?: number;
       focusRatioX?: number;
       focusRatioY?: number;
+      /** Absolute anchors captured from the camera that is actually visible. */
+      focusXMb?: number;
+      focusYMb?: number;
       /** Juicebox-style scale: greater than 1 zooms in; less than 1 zooms out. */
       scaleFactor?: number;
       /** Step to the adjacent data resolution and reset it to its default pixels-per-bin. */
@@ -731,6 +740,10 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         state,
         action.resolution,
         action.preserveViewport ?? false,
+        action.focusRatioX,
+        action.focusRatioY,
+        action.focusXMb,
+        action.focusYMb,
       );
       const viewportNarrowed = nextState.contact.viewportSpanMb
         < state.contact.viewportSpanMb - 0.000001;
@@ -1127,30 +1140,13 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
       const focusRatioY = action.focusRatioY === undefined
         ? null
         : clamp(action.focusRatioY, 0, 1);
-      const centerAtFocus = (
-        currentCenterMb: number,
-        currentAxisSpanMb: number,
-        nextAxisSpanMb: number,
-        focusRatio: number,
-      ) => {
-        const currentStartMb = clamp(
-          currentCenterMb - currentAxisSpanMb / 2,
-          0,
-          Math.max(0, totalSpanMb - currentAxisSpanMb),
-        );
-        const focusMb = currentStartMb + currentAxisSpanMb * focusRatio;
-        const nextStartMb = clamp(
-          focusMb - nextAxisSpanMb * focusRatio,
-          0,
-          Math.max(0, totalSpanMb - nextAxisSpanMb),
-        );
-        return roundContactViewportMb(nextStartMb + nextAxisSpanMb / 2);
-      };
-      const viewportCenterXMb = centerAtFocus(
+      const viewportCenterXMb = contactViewportCenterAtFocus(
         state.contact.viewportCenterXMb,
         currentAxisSpans.xSpanMb,
         nextAxisSpans.xSpanMb,
         focusRatioX,
+        action.focusXMb,
+        totalSpanMb,
       );
       // Legacy actions supplied one X focus ratio and intentionally left the
       // off-diagonal Y viewport alone. Pointer interactions now provide Y too.
@@ -1160,11 +1156,13 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
             nextAxisSpans.ySpanMb,
             totalSpanMb,
           )
-        : centerAtFocus(
+        : contactViewportCenterAtFocus(
             state.contact.viewportCenterYMb,
             currentAxisSpans.ySpanMb,
             nextAxisSpans.ySpanMb,
             focusRatioY,
+            action.focusYMb,
+            totalSpanMb,
           );
       const viewportCenterMb = roundContactViewportMb(
         (viewportCenterXMb + viewportCenterYMb) / 2,
@@ -2081,6 +2079,10 @@ function setContactResolution(
   state: UiState,
   requestedResolution: ContactResolution,
   preserveViewport = false,
+  focusRatioX?: number,
+  focusRatioY?: number,
+  focusXMb?: number,
+  focusYMb?: number,
 ): UiState {
   const totalSpanMb = sanitizeContactTotalSpanMb(state.contact.totalSpanMb);
   const wholeGenomeViewportSpanMb = maximumContactViewportSpanMb(
@@ -2107,14 +2109,26 @@ function setContactResolution(
       state.contact.viewportWidthPx,
       state.contact.viewportHeightPx,
     );
-    const viewportCenterXMb = clampContactViewportCenter(
+    const currentAxisSpans = contactViewportAxisSpansMb(
+      state.contact.viewportSpanMb,
+      totalSpanMb,
+      state.contact.viewportWidthPx,
+      state.contact.viewportHeightPx,
+    );
+    const viewportCenterXMb = contactViewportCenterAtFocus(
       state.contact.viewportCenterXMb,
+      currentAxisSpans.xSpanMb,
       xSpanMb,
+      focusRatioX,
+      focusXMb,
       totalSpanMb,
     );
-    const viewportCenterYMb = clampContactViewportCenter(
+    const viewportCenterYMb = contactViewportCenterAtFocus(
       state.contact.viewportCenterYMb,
+      currentAxisSpans.ySpanMb,
       ySpanMb,
+      focusRatioY,
+      focusYMb,
       totalSpanMb,
     );
     const colorScale = resolution === state.contact.resolution
@@ -2164,14 +2178,26 @@ function setContactResolution(
     state.contact.viewportWidthPx,
     state.contact.viewportHeightPx,
   );
-  const viewportCenterXMb = clampContactViewportCenter(
+  const currentAxisSpans = contactViewportAxisSpansMb(
+    state.contact.viewportSpanMb,
+    totalSpanMb,
+    state.contact.viewportWidthPx,
+    state.contact.viewportHeightPx,
+  );
+  const viewportCenterXMb = contactViewportCenterAtFocus(
     state.contact.viewportCenterXMb,
+    currentAxisSpans.xSpanMb,
     xSpanMb,
+    focusRatioX,
+    focusXMb,
     totalSpanMb,
   );
-  const viewportCenterYMb = clampContactViewportCenter(
+  const viewportCenterYMb = contactViewportCenterAtFocus(
     state.contact.viewportCenterYMb,
+    currentAxisSpans.ySpanMb,
     ySpanMb,
+    focusRatioY,
+    focusYMb,
     totalSpanMb,
   );
   const colorScale = resolution === state.contact.resolution
@@ -2280,6 +2306,39 @@ function clampContactViewportCenter(centerMb: number, viewportSpanMb: number, to
       safeTotalSpanMb - safeViewportSpanMb / 2,
     ),
   );
+}
+
+function contactViewportCenterAtFocus(
+  currentCenterMb: number,
+  currentAxisSpanMb: number,
+  nextAxisSpanMb: number,
+  focusRatio: number | undefined,
+  absoluteFocusMb: number | undefined,
+  totalSpanMb: number,
+) {
+  if (!Number.isFinite(focusRatio)) {
+    return clampContactViewportCenter(currentCenterMb, nextAxisSpanMb, totalSpanMb);
+  }
+
+  const safeTotalSpanMb = sanitizeContactTotalSpanMb(totalSpanMb);
+  const safeCurrentSpanMb = Math.max(0.000001, currentAxisSpanMb);
+  const safeNextSpanMb = Math.max(0.000001, nextAxisSpanMb);
+  const boundedFocusRatio = clamp(focusRatio!, 0, 1);
+  const currentStartMb = clamp(
+    currentCenterMb - safeCurrentSpanMb / 2,
+    0,
+    Math.max(0, safeTotalSpanMb - safeCurrentSpanMb),
+  );
+  const focusMb = Number.isFinite(absoluteFocusMb)
+    ? absoluteFocusMb!
+    : currentStartMb + safeCurrentSpanMb * boundedFocusRatio;
+  const nextStartMb = clamp(
+    focusMb - safeNextSpanMb * boundedFocusRatio,
+    0,
+    Math.max(0, safeTotalSpanMb - safeNextSpanMb),
+  );
+
+  return roundContactViewportMb(nextStartMb + safeNextSpanMb / 2);
 }
 
 function nextContactResolution(state: UiState, direction: "decrease" | "increase") {

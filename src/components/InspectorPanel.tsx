@@ -24,7 +24,10 @@ import type { ContactMapLayoutBlock } from "../state/importers";
 import type { GfaEvidenceDocument } from "../state/gfa";
 import type { GfaEndpointHiCBatchLoader } from "../state/gfaEndpointHiC";
 import type { PlacementRecommendation } from "../state/assemblyPlacementRecommendation";
-import { buildCenteredContactViewport } from "../state/contactViewport";
+import {
+  buildCenteredContactViewport,
+  type ContactViewport,
+} from "../state/contactViewport";
 import {
   SyntenyDotplot,
 } from "./SyntenyDotplot";
@@ -43,6 +46,7 @@ interface InspectorPanelProps {
   dataset: ExampleDatasetSummary | null;
   contactMap: ContactMapView | null;
   overviewContactMap: ContactMapView | null;
+  presentedContactViewport?: ContactViewport | null;
   status: AppStatus;
   statusMessage: string;
   isAgpDirty?: boolean;
@@ -69,6 +73,7 @@ export function InspectorPanel({
   dataset,
   contactMap,
   overviewContactMap,
+  presentedContactViewport = null,
   status,
   statusMessage,
   isAgpDirty = false,
@@ -188,6 +193,7 @@ export function InspectorPanel({
           <ContactOverview
             contactMap={contactMap}
             overviewContactMap={overviewContactMap}
+            presentedContactViewport={presentedContactViewport}
             totalSpanBp={Math.max(
               1,
               viewAssemblyBlocks.length > 0
@@ -1009,6 +1015,7 @@ function formatCount(count: number, singular: string, plural = `${singular}s`) {
 interface ContactOverviewProps {
   contactMap: ContactMapView | null;
   overviewContactMap: ContactMapView | null;
+  presentedContactViewport: ContactViewport | null;
   totalSpanBp: number;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
@@ -1025,9 +1032,39 @@ export function contactOverviewMapForDisplayedNormalization(
   return null;
 }
 
+/** Keep the overview window on the camera already presented by the main heatmap. */
+export function contactOverviewWindowViewport(
+  presentedViewport: ContactViewport | null,
+  totalSpanBp: number,
+  uiState: UiState,
+): ContactViewport {
+  if (
+    presentedViewport
+    && Number.isFinite(presentedViewport.xStart)
+    && Number.isFinite(presentedViewport.xEnd)
+    && Number.isFinite(presentedViewport.yStart)
+    && Number.isFinite(presentedViewport.yEnd)
+    && presentedViewport.xEnd > presentedViewport.xStart
+    && presentedViewport.yEnd > presentedViewport.yStart
+  ) {
+    return presentedViewport;
+  }
+
+  return buildCenteredContactViewport({
+    centerMb: uiState.contact.viewportCenterMb,
+    centerXMb: uiState.contact.viewportCenterXMb,
+    centerYMb: uiState.contact.viewportCenterYMb,
+    totalSpanBp,
+    windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
+    viewportWidthPx: uiState.contact.viewportWidthPx,
+    viewportHeightPx: uiState.contact.viewportHeightPx,
+  });
+}
+
 function ContactOverview({
   contactMap,
   overviewContactMap,
+  presentedContactViewport,
   totalSpanBp,
   uiState,
   onUiAction,
@@ -1047,15 +1084,11 @@ function ContactOverview({
   const totalSpanMb = Math.max(1, Math.round(displayedTotalSpanBp / 1_000_000));
   const [dragRatio, setDragRatio] = useState<{ x: number; y: number } | null>(null);
   const dragRatioRef = useRef<{ x: number; y: number } | null>(null);
-  const overviewWindowViewport = buildCenteredContactViewport({
-    centerMb: uiState.contact.viewportCenterMb,
-    centerXMb: uiState.contact.viewportCenterXMb,
-    centerYMb: uiState.contact.viewportCenterYMb,
-    totalSpanBp: displayedTotalSpanBp,
-    windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
-    viewportWidthPx: uiState.contact.viewportWidthPx,
-    viewportHeightPx: uiState.contact.viewportHeightPx,
-  });
+  const overviewWindowViewport = contactOverviewWindowViewport(
+    presentedContactViewport,
+    displayedTotalSpanBp,
+    uiState,
+  );
   const viewportXStartRatio = Math.min(1, Math.max(0, overviewWindowViewport.xStart / displayedTotalSpanBp));
   const viewportXEndRatio = Math.min(1, Math.max(0, overviewWindowViewport.xEnd / displayedTotalSpanBp));
   const viewportYStartRatio = Math.min(1, Math.max(0, overviewWindowViewport.yStart / displayedTotalSpanBp));

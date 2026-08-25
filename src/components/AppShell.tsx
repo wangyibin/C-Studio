@@ -262,6 +262,9 @@ export function AppShell({
   const [inspectorWidth, setInspectorWidth] = useState<number | null>(null);
   const [gfaPanelOpen, setGfaPanelOpen] = useState(false);
   const [heatmapPanelOpen, setHeatmapPanelOpen] = useState(true);
+  const [presentedContactViewport, setPresentedContactViewport] = useState<ContactViewport | null>(
+    null,
+  );
   const [gfaPanelHeight, setGfaPanelHeight] = useState<number | null>(null);
   const [confirmingClearData, setConfirmingClearData] = useState(false);
   const [confirmingReloadAssembly, setConfirmingReloadAssembly] = useState(false);
@@ -1347,6 +1350,7 @@ export function AppShell({
                   onContactPanGestureStart={onContactPanGestureStart}
                   onContactPanTilePrefetch={onContactPanTilePrefetch}
                   onContactViewportPreview={onContactViewportPreview}
+                  onPresentedViewportChange={setPresentedContactViewport}
                   contactPanPrefetchBridge={contactPanPrefetchBridge}
                   onContactTileLayerCommit={onContactTileLayerCommit}
                   onContactTileLayerPaintComplete={onContactTileLayerPaintComplete}
@@ -1469,6 +1473,7 @@ export function AppShell({
               dataset={dataset}
               contactMap={contactMap}
               overviewContactMap={overviewContactMap}
+              presentedContactViewport={presentedContactViewport}
               status={status}
               statusMessage={statusMessage}
               isAgpDirty={isAgpDirty}

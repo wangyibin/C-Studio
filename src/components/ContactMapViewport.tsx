@@ -139,6 +139,7 @@ interface ContactMapViewportProps {
   onContactPanGestureStart?: () => void;
   onContactPanTilePrefetch?: (preview: ContactPanPreview) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
+  onPresentedViewportChange?: (viewport: ContactViewport | null) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
   onContactTileLayerPaintComplete?: (event: ContactTileRenderMilestone) => void;
@@ -272,6 +273,8 @@ const maxBufferedContactCells = 360_000;
 const contactMapImageDataCache = new WeakMap<HTMLCanvasElement, ImageData>();
 const shiftSelectionClassName = "shift-selection-active";
 const resolutionWheelCooldownMs = 140;
+const resolutionWheelGestureGapMs = 260;
+const resolutionWheelPointerResetPx = 8;
 const minimumCutAcquireSpanPx = 16;
 const minimumCutReleaseSpanPx = 12;
 const minimumAssemblySelectionControlSpanPx = 32;
@@ -594,23 +597,139 @@ export function contactResolutionWheelIntent({
     : resolutionOptions[nextIndex] ?? null;
 }
 
-export function lockedContactResolutionWheelZoomIntent(
+interface ContactResolutionWheelZoomInput extends ContactResolutionWheelInput {
+  clientX: number;
+  clientY: number;
+  bounds: Pick<DOMRect, "left" | "top" | "width" | "height">;
+  viewport: ContactViewport;
+  focus?: ContactResolutionWheelFocus;
+}
+
+export interface ContactResolutionWheelFocus {
+  focusRatioX: number;
+  focusRatioY: number;
+  focusXMb: number;
+  focusYMb: number;
+}
+
+export interface ContactResolutionWheelSession extends ContactResolutionWheelFocus {
+  clientX: number;
+  clientY: number;
+  bounds: Pick<DOMRect, "left" | "top" | "width" | "height">;
+  lastEventAt: number;
+}
+
+interface ContactResolutionWheelSessionInput {
+  current: ContactResolutionWheelSession | null;
+  clientX: number;
+  clientY: number;
+  bounds: Pick<DOMRect, "left" | "top" | "width" | "height">;
+  viewport: ContactViewport;
+  eventAt: number;
+}
+
+function contactResolutionFocusAtScreenPoint(
+  clientX: number,
+  clientY: number,
+  bounds: Pick<DOMRect, "left" | "top" | "width" | "height">,
+  viewport: ContactViewport,
+): ContactResolutionWheelFocus {
+  const focusRatioX = bounds.width > 0
+    ? clamp01((clientX - bounds.left) / bounds.width)
+    : 0.5;
+  const focusRatioY = bounds.height > 0
+    ? clamp01((clientY - bounds.top) / bounds.height)
+    : 0.5;
+  return {
+    focusRatioX,
+    focusRatioY,
+    focusXMb: (
+      viewport.xStart + (viewport.xEnd - viewport.xStart) * focusRatioX
+    ) / 1_000_000,
+    focusYMb: (
+      viewport.yStart + (viewport.yEnd - viewport.yStart) * focusRatioY
+    ) / 1_000_000,
+  };
+}
+
+/** Hold one visible-camera genomic anchor for an entire trackpad pinch burst. */
+export function contactResolutionWheelSession({
+  current,
+  clientX,
+  clientY,
+  bounds,
+  viewport,
+  eventAt,
+}: ContactResolutionWheelSessionInput): ContactResolutionWheelSession {
+  const sameBounds = current !== null
+    && current.bounds.left === bounds.left
+    && current.bounds.top === bounds.top
+    && current.bounds.width === bounds.width
+    && current.bounds.height === bounds.height;
+  const continuesGesture = current !== null
+    && Number.isFinite(eventAt)
+    && eventAt - current.lastEventAt >= 0
+    && eventAt - current.lastEventAt <= resolutionWheelGestureGapMs
+    && Math.hypot(clientX - current.clientX, clientY - current.clientY)
+      <= resolutionWheelPointerResetPx
+    && sameBounds;
+  if (continuesGesture) {
+    return {
+      ...current,
+      lastEventAt: eventAt,
+    };
+  }
+
+  return {
+    ...contactResolutionFocusAtScreenPoint(clientX, clientY, bounds, viewport),
+    clientX,
+    clientY,
+    bounds: { ...bounds },
+    lastEventAt: Number.isFinite(eventAt) ? eventAt : 0,
+  };
+}
+
+/** Step to the adjacent stored level while keeping the gesture focus fixed. */
+export function contactResolutionWheelZoomIntent({
+  clientX,
+  clientY,
+  bounds,
+  viewport,
+  focus,
+  ...resolutionInput
+}: ContactResolutionWheelZoomInput): UiAction | null {
+  const resolution = contactResolutionWheelIntent(resolutionInput);
+  if (!resolution) {
+    return null;
+  }
+
+  const resolvedFocus = focus
+    ?? contactResolutionFocusAtScreenPoint(clientX, clientY, bounds, viewport);
+  return {
+    type: "setContactResolution",
+    resolution,
+    ...resolvedFocus,
+  };
+}
+
+export function contactViewportWheelZoomIntent(
   deltaX: number,
   deltaY: number,
   clientX: number,
   clientY: number,
   bounds: Pick<DOMRect, "left" | "top" | "width" | "height">,
   totalSpanMb: number,
+  viewport: ContactViewport,
+  focus?: ContactResolutionWheelFocus,
 ): UiAction | null {
   const wheelDelta = Math.abs(deltaY) >= Math.abs(deltaX) ? deltaY : deltaX;
   if (!Number.isFinite(wheelDelta) || wheelDelta === 0) return null;
-  const focusRatioX = bounds.width > 0 ? clamp01((clientX - bounds.left) / bounds.width) : 0.5;
-  const focusRatioY = bounds.height > 0 ? clamp01((clientY - bounds.top) / bounds.height) : 0.5;
+  const resolvedFocus = focus
+    ?? contactResolutionFocusAtScreenPoint(clientX, clientY, bounds, viewport);
   return {
     type: "zoomContactViewport",
     direction: wheelDelta < 0 ? "in" : "out",
-    focusRatioX,
-    focusRatioY,
+    ...resolvedFocus,
     scaleFactor: Math.min(2, Math.max(0.5, Math.exp(-wheelDelta * 0.002))),
     totalSpanMb,
   };
@@ -1152,6 +1271,7 @@ export function ContactMapViewport({
   onContactPanGestureStart,
   onContactPanTilePrefetch,
   onContactViewportPreview,
+  onPresentedViewportChange,
   contactPanPrefetchBridge,
   useStoredResolutionOptions = false,
   availableResolutionBasePairs = [],
@@ -1215,6 +1335,7 @@ export function ContactMapViewport({
   const latestUiStateRef = useRef(uiState);
   latestUiStateRef.current = uiState;
   const resolutionWheelReadyAtRef = useRef(0);
+  const resolutionWheelSessionRef = useRef<ContactResolutionWheelSession | null>(null);
   const [contextMenu, setContextMenu] = useState<AssemblyContextMenuState | null>(null);
   const contextMenuRef = useRef(contextMenu);
   contextMenuRef.current = contextMenu;
@@ -1456,6 +1577,16 @@ export function ContactMapViewport({
     ? presentationContactMap.viewport
     : liveViewport;
   const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
+  usePrePaintEffect(() => {
+    onPresentedViewportChange?.(displayViewport);
+  }, [
+    displayViewport.xEnd,
+    displayViewport.xStart,
+    displayViewport.yEnd,
+    displayViewport.yStart,
+    onPresentedViewportChange,
+  ]);
+  useEffect(() => () => onPresentedViewportChange?.(null), [onPresentedViewportChange]);
   const assemblyInteractionViewport = contactVisibleInteractionViewport(
     displayViewport,
     pendingCommittedPanViewportRef.current,
@@ -1949,21 +2080,42 @@ export function ContactMapViewport({
         event.preventDefault();
         event.stopPropagation();
         if (!sourceContactMap) {
+          resolutionWheelSessionRef.current = null;
           return;
         }
         const latestUiState = latestUiStateRef.current;
+        const bounds = currentCanvasFrameBounds(stage);
+        if (!bounds) {
+          resolutionWheelSessionRef.current = null;
+          return;
+        }
+        const displayedViewport = contactVisibleInteractionViewport(
+          latestDisplayContactMapRef.current?.viewport ?? sourceContactMap.viewport,
+          pendingCommittedPanViewportRef.current,
+          dragStateRef.current?.previewViewport
+            ?? wheelPanSessionRef.current?.previewViewport
+            ?? null,
+        );
+        const now = performance.now();
+        const resolutionWheelSession = contactResolutionWheelSession({
+          current: resolutionWheelSessionRef.current,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          bounds,
+          viewport: displayedViewport,
+          eventAt: now,
+        });
+        resolutionWheelSessionRef.current = resolutionWheelSession;
         if (latestUiState.contact.resolutionLocked) {
-          const bounds = currentCanvasFrameBounds(stage);
-          if (!bounds) {
-            return;
-          }
-          const zoomAction = lockedContactResolutionWheelZoomIntent(
+          const zoomAction = contactViewportWheelZoomIntent(
             event.deltaX,
             event.deltaY,
             event.clientX,
             event.clientY,
             bounds,
             totalSpanMb,
+            displayedViewport,
+            resolutionWheelSession,
           );
           if (zoomAction) onUiAction(zoomAction);
           return;
@@ -1979,25 +2131,27 @@ export function ContactMapViewport({
         const resolutionOptions = useStoredResolutionOptions
           ? storedContactResolutionsForDataset(availableResolutionBasePairs)
           : viewportResolutionOptions;
-        const nextResolution = contactResolutionWheelIntent({
+        const zoomAction = contactResolutionWheelZoomIntent({
           deltaX: event.deltaX,
           deltaY: event.deltaY,
           ctrlKey: event.ctrlKey,
           metaKey: event.metaKey,
           currentResolution: latestUiState.contact.resolution,
           resolutionOptions,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          bounds,
+          viewport: displayedViewport,
+          focus: resolutionWheelSession,
         });
-        const now = performance.now();
-        if (!nextResolution || now < resolutionWheelReadyAtRef.current) {
+        if (!zoomAction || now < resolutionWheelReadyAtRef.current) {
           return;
         }
         resolutionWheelReadyAtRef.current = now + resolutionWheelCooldownMs;
-        onUiAction({
-          type: "setContactResolution",
-          resolution: nextResolution,
-        });
+        onUiAction(zoomAction);
         return;
       }
+      resolutionWheelSessionRef.current = null;
       if (!sourceContactMap) {
         return;
       }

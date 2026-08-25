@@ -73,6 +73,8 @@ describe("reference synteny allele pruning", () => {
 
     expect(result.groups.map((group) => group.members.map((member) => member.blockId)))
       .toEqual([["a1", "a2"], ["b1", "b2"]]);
+    expect(result.alleleEdges.map((edge) => [edge.left.blockId, edge.right.blockId]))
+      .toEqual([["a1", "a2"], ["b1", "b2"]]);
     expect(result.maskByPair.get(syntenyAllelePairKey("a1", "a2"))?.reason)
       .toBe("direct-allele");
     expect(result.maskByPair.get(syntenyAllelePairKey("b1", "b2"))?.reason)
@@ -84,6 +86,104 @@ describe("reference synteny allele pruning", () => {
     expect(result.maskByPair.has(syntenyAllelePairKey("a1", "b1"))).toBe(false);
     expect(result.maskByPair.has(syntenyAllelePairKey("a2", "b2"))).toBe(false);
     expect(result.matchedPairCount).toBe(2);
+  });
+
+  it("keeps every direct edge when one long anchor overlaps two non-overlapping anchors", () => {
+    const blocks = [block("long"), block("short-left"), block("short-right")];
+    const records = [
+      paf("long", "Ref01", 1_000_000, 3_000_000),
+      paf("short-left", "Ref01", 1_000_000, 2_000_000),
+      paf("short-right", "Ref01", 2_000_000, 3_000_000),
+    ];
+    const result = buildReferenceSyntenyAllelePruning(records, blocks, []);
+
+    expect(result.alleleEdges.map((edge) => [edge.left.blockId, edge.right.blockId]))
+      .toEqual([
+        ["long", "short-left"],
+        ["long", "short-right"],
+      ]);
+    expect(result.groups.map((group) => group.members.map((member) => member.blockId)))
+      .toEqual([["short-left", "long"]]);
+    expect(result.pairwiseAlleleOccurrencePairCount).toBe(2);
+    expect(result.directAllelePairCount).toBe(1);
+    expect(result.shadowOnlyAlleleOccurrencePairCount).toBe(1);
+    expect(result.legacyOnlyAlleleOccurrencePairCount).toBe(0);
+  });
+
+  it("does not add transitive edges across a chain of pairwise overlaps", () => {
+    const blocks = [block("a"), block("b"), block("c")];
+    const records = [
+      paf("a", "Ref01", 1_000_000, 2_000_000),
+      paf("b", "Ref01", 1_400_000, 2_400_000),
+      paf("c", "Ref01", 1_800_000, 2_800_000),
+    ];
+    const result = buildReferenceSyntenyAllelePruning(records, blocks, []);
+    const edgePairs = new Set(result.alleleEdges.map((edge) => (
+      syntenyAllelePairKey(edge.left.blockId, edge.right.blockId)
+    )));
+
+    expect(edgePairs).toEqual(new Set([
+      syntenyAllelePairKey("a", "b"),
+      syntenyAllelePairKey("b", "c"),
+    ]));
+    expect(edgePairs.has(syntenyAllelePairKey("a", "c"))).toBe(false);
+  });
+
+  it("uses exact target intervals instead of bounding-box overlap", () => {
+    const blocks = [block("split-target"), block("gap-target")];
+    const records = [
+      paf("split-target", "Ref01", 1_000_000, 1_400_000, {
+        queryEnd: 500_000,
+        alignmentBlockLen: 500_000,
+        residueMatches: 475_000,
+      }),
+      paf("split-target", "Ref01", 1_600_000, 2_000_000, {
+        queryStart: 500_000,
+        alignmentBlockLen: 500_000,
+        residueMatches: 475_000,
+      }),
+      paf("gap-target", "Ref01", 1_400_000, 1_600_000),
+    ];
+    const result = buildReferenceSyntenyAllelePruning(records, blocks, [], {
+      maxTargetLocusGap: 300_000,
+    });
+
+    expect(result.anchors).toHaveLength(2);
+    expect(result.anchors.find((anchor) => anchor.sourceId === "split-target")?.targetIntervals)
+      .toEqual([[1_000_000, 1_400_000], [1_600_000, 2_000_000]]);
+    expect(result.alleleEdges).toEqual([]);
+  });
+
+  it("retains the dominant PAF strand for orientation-aware adjacency", () => {
+    const result = buildReferenceSyntenyAllelePruning([
+      paf("reverse", "Ref01", 1_000_000, 2_000_000, { strand: "-" }),
+    ], [block("reverse")], []);
+
+    expect(result.anchors[0]).toMatchObject({
+      targetStrand: "-",
+      strandDominance: 1,
+      targetStart: 1_000_000,
+      targetEnd: 2_000_000,
+    });
+  });
+
+  it("produces the same edge graph regardless of input order", () => {
+    const blocks = [block("a"), block("b"), block("c")];
+    const records = [
+      paf("a", "Ref01", 1_000_000, 2_000_000),
+      paf("b", "Ref01", 1_400_000, 2_400_000),
+      paf("c", "Ref01", 1_800_000, 2_800_000),
+    ];
+    const forward = buildReferenceSyntenyAllelePruning(records, blocks, []);
+    const reversed = buildReferenceSyntenyAllelePruning(
+      [...records].reverse(),
+      [...blocks].reverse(),
+      [],
+    );
+
+    expect(reversed.alleleEdges.map((edge) => edge.id))
+      .toEqual(forward.alleleEdges.map((edge) => edge.id));
+    expect(reversed.fingerprint).toBe(forward.fingerprint);
   });
 
   it("projects split source intervals onto the reference before grouping", () => {
@@ -159,6 +259,8 @@ describe("reference synteny allele pruning", () => {
     expect(result.groups[0].members[0].occurrenceBlockIds).toEqual(["copy-1", "copy-2"]);
     expect(result.matchedPairCount).toBe(2);
     expect(result.duplicateOccurrencePairCount).toBe(1);
+    expect(result.alleleEdges).toHaveLength(2);
+    expect(result.pairwiseAlleleOccurrencePairCount).toBe(3);
     expect(result.maskByPair.get(syntenyAllelePairKey("copy-1", "copy-2"))?.reason)
       .toBe("duplicate-occurrence");
     expect(result.maskByPair.has(syntenyAllelePairKey("copy-1", "b1"))).toBe(false);
@@ -189,6 +291,7 @@ describe("reference synteny allele pruning", () => {
     expect(result.anchors).toHaveLength(1);
     expect(result.anchors[0].occurrenceBlockIds).toEqual(["copy-1", "copy-2"]);
     expect(result.groups).toEqual([]);
+    expect(result.alleleEdges).toEqual([]);
     expect(result.maskByPair.get(syntenyAllelePairKey("copy-1", "copy-2"))?.reason)
       .toBe("duplicate-occurrence");
     expect(result.duplicateOccurrencePairCount).toBe(1);

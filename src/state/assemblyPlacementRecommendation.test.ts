@@ -13,6 +13,9 @@ import {
 import type { ContactMapLayoutBlock } from "./importers";
 import {
   syntenyAllelePairKey,
+  type ReferenceSyntenyAlleleEdge,
+  type ReferenceSyntenyAlleleGroup,
+  type ReferenceSyntenyAnchor,
   type SyntenyAlleleSignalMask,
 } from "./syntenyAllelePruning";
 
@@ -106,6 +109,61 @@ function directAlleleMask(first: string, second: string) {
   return new Map([[syntenyAllelePairKey(first, second), mask]]);
 }
 
+function syntenyAnchor(
+  nodeId: string,
+  blockId: string,
+  sourceId: string,
+  targetStart = 10_000_000,
+  targetStrand: "+" | "-" = "+",
+): ReferenceSyntenyAnchor {
+  return {
+    nodeId,
+    blockId,
+    occurrenceBlockIds: [blockId],
+    sourceId,
+    targetName: "Ref01",
+    targetStart,
+    targetEnd: targetStart + 1_000_000,
+    targetIntervals: [[targetStart, targetStart + 1_000_000]],
+    targetStrand,
+    strandDominance: 1,
+    queryCoverage: 0.95,
+    identity: 0.99,
+    meanMapq: 60,
+    targetDominance: 1,
+  };
+}
+
+function alleleEdge(
+  left: ReferenceSyntenyAnchor,
+  right: ReferenceSyntenyAnchor,
+): ReferenceSyntenyAlleleEdge {
+  return {
+    id: `edge:${left.nodeId}:${right.nodeId}`,
+    targetName: left.targetName,
+    left,
+    right,
+    targetOverlap: 1,
+    minQueryCoverage: 0.95,
+    minIdentity: 0.99,
+    minMeanMapq: 60,
+    minTargetDominance: 1,
+  };
+}
+
+function alleleGroup(firstBlockId: string, secondBlockId: string): ReferenceSyntenyAlleleGroup {
+  return {
+    id: "synteny:Ref01:10000000-11000000:1",
+    targetName: "Ref01",
+    targetStart: 10_000_000,
+    targetEnd: 11_000_000,
+    members: [
+      syntenyAnchor("selected-node", firstBlockId, firstBlockId),
+      syntenyAnchor("occupied-node", secondBlockId, secondBlockId),
+    ],
+  };
+}
+
 describe("assembly placement recommendation", () => {
   it("enumerates every legal boundary after removing the selected singleton", () => {
     const candidates = enumeratePlacementBoundaries(blocks, selection);
@@ -171,6 +229,259 @@ describe("assembly placement recommendation", () => {
       gfaMatchCount: 2,
     });
     expect(ranked).toHaveLength(3);
+  });
+
+  it("demotes exact-source conflicts without starving compatible chromosome groups", () => {
+    const copyBlocks = [
+      block("g1-left", "Chr03g1", 0),
+      {
+        ...block("collapsed-g1", "Chr03g1", 1_000_000),
+        sourceId: "collapsed-source",
+      },
+      {
+        ...block("collapsed-g2", "Chr03g2", 2_000_000),
+        sourceId: "collapsed-source",
+      },
+      {
+        ...block("collapsed-g3", "Chr03g3", 3_000_000),
+        sourceId: "collapsed-source",
+      },
+      {
+        ...block("partial-g4", "Chr03g4", 4_000_000),
+        sourceId: "collapsed-source",
+        sourceStart: 1_000_000,
+        sourceEnd: 2_000_000,
+      },
+      block("g4-anchor", "Chr03g4", 5_000_000),
+    ];
+    const plan = buildPlacementRecommendationPlan({
+      blocks: copyBlocks,
+      selection: { kind: "contigs", ids: ["collapsed-g2"], exact: true },
+      coarseLinks: [
+        coarse("collapsed-g2", "g1-left", 1_000),
+        coarse("collapsed-g2", "collapsed-g3", 500),
+        coarse("collapsed-g2", "partial-g4", 100),
+        coarse("collapsed-g2", "g4-anchor", 10),
+      ],
+      overviewPartnerLimit: 2,
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    expect(plan.occupancyConflicts).toEqual([
+      {
+        targetObjectId: "Chr03g1",
+        kind: "exact-source",
+        locusId: "collapsed-source\u00010\u00011000000",
+        selectedBlockIds: ["collapsed-g2"],
+        occupiedBlockIds: ["collapsed-g1"],
+      },
+      {
+        targetObjectId: "Chr03g3",
+        kind: "exact-source",
+        locusId: "collapsed-source\u00010\u00011000000",
+        selectedBlockIds: ["collapsed-g2"],
+        occupiedBlockIds: ["collapsed-g3"],
+      },
+    ]);
+    expect(plan.coarseLinks.map((link) => link.target)).toContain("g1-left");
+    expect(plan.coarseLinks.map((link) => link.target)).toContain("collapsed-g3");
+    expect(plan.candidates.some((candidate) => candidate.targetObjectId === "Chr03g1"))
+      .toBe(true);
+    expect(plan.candidates.some((candidate) => candidate.targetObjectId === "Chr03g3"))
+      .toBe(true);
+    expect(plan.requests.some((request) => request.targetBlockId === "g1-left")).toBe(true);
+    expect(plan.candidates.some((candidate) => candidate.targetObjectId === "Chr03g4"))
+      .toBe(true);
+
+    const ranked = rankPlacementRecommendations(plan, new Map([
+      [placementEndpointRequestKey({
+        sourceBlockId: "collapsed-g2",
+        targetBlockId: "g1-left",
+      }), endpointResult("g1-left", [900, 1_000, 800, 700], "collapsed-g2")],
+      [placementEndpointRequestKey({
+        sourceBlockId: "collapsed-g2",
+        targetBlockId: "collapsed-g3",
+      }), endpointResult("collapsed-g3", [600, 700, 500, 400], "collapsed-g2")],
+      [placementEndpointRequestKey({
+        sourceBlockId: "collapsed-g2",
+        targetBlockId: "partial-g4",
+      }), endpointResult("partial-g4", [5, 10, 4, 3], "collapsed-g2")],
+      [placementEndpointRequestKey({
+        sourceBlockId: "collapsed-g2",
+        targetBlockId: "g4-anchor",
+      }), endpointResult("g4-anchor", [4, 3, 8, 2], "collapsed-g2")],
+    ]), copyBlocks, 20);
+    const firstConflictIndex = ranked.findIndex(
+      (candidate) => candidate.occupancyConflicts.length > 0,
+    );
+    expect(ranked[0]?.targetObjectId).toBe("Chr03g4");
+    expect(firstConflictIndex).toBeGreaterThan(0);
+    expect(ranked.slice(0, firstConflictIndex).every(
+      (candidate) => candidate.occupancyConflicts.length === 0,
+    )).toBe(true);
+  });
+
+  it("demotes chromosome groups occupied by a high-confidence PAF allele locus", () => {
+    const plan = buildPlacementRecommendationPlan({
+      blocks,
+      selection,
+      coarseLinks: [coarse("b", "d", 1_000), coarse("b", "a", 100)],
+      syntenyAlleleGroups: [alleleGroup("b", "d")],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    expect(plan.occupancyConflicts).toEqual([{
+      targetObjectId: "Chr02",
+      kind: "paf-allele-locus",
+      locusId: "synteny:Ref01:10000000-11000000:1",
+      selectedBlockIds: ["b"],
+      occupiedBlockIds: ["d"],
+    }]);
+    expect(plan.coarseLinks.map((link) => [link.source, link.target])).toEqual([
+      ["b", "d"],
+      ["b", "a"],
+    ]);
+    expect(plan.candidates.some((candidate) => candidate.targetObjectId === "Chr02")).toBe(true);
+    expect(plan.requests.some((request) => request.targetBlockId === "d")).toBe(true);
+
+    const ranked = rankPlacementRecommendations(plan, new Map([
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "a" }), endpointResult("a", [1, 5, 2, 3])],
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "d" }), endpointResult("d", [800, 1_000, 700, 600])],
+    ]), blocks, 10);
+    const firstConflictIndex = ranked.findIndex(
+      (candidate) => candidate.occupancyConflicts.length > 0,
+    );
+    expect(ranked[0]?.targetObjectId).not.toBe("Chr02");
+    expect(firstConflictIndex).toBeGreaterThan(0);
+    expect(ranked[firstConflictIndex]?.targetObjectId).toBe("Chr02");
+  });
+
+  it("shortlists nearest PAF neighbors while excluding the selected allele locus", () => {
+    const adjacencyBlocks = [
+      block("upstream", "Chr01", 0),
+      block("selected", "Chr01", 1_000_000),
+      block("allele", "Chr01", 2_000_000),
+      block("downstream", "Chr01", 3_000_000),
+    ];
+    const upstream = syntenyAnchor("upstream-node", "upstream", "upstream", 9_000_000);
+    const selectedAnchor = syntenyAnchor("selected-node", "selected", "selected");
+    const allele = syntenyAnchor("allele-node", "allele", "allele");
+    const downstream = syntenyAnchor(
+      "downstream-node",
+      "downstream",
+      "downstream",
+      11_000_000,
+    );
+    const plan = buildPlacementRecommendationPlan({
+      blocks: adjacencyBlocks,
+      selection: { kind: "contigs", ids: ["selected"], exact: true },
+      coarseLinks: [],
+      syntenyAnchors: [upstream, selectedAnchor, allele, downstream],
+      syntenyAlleleEdges: [alleleEdge(selectedAnchor, allele)],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    expect(plan.syntenyAdjacencies.map((adjacency) => [
+      adjacency.partnerBlockId,
+      adjacency.direction,
+      adjacency.targetGap,
+    ])).toEqual([
+      ["downstream", "downstream", 0],
+      ["upstream", "upstream", 0],
+    ]);
+    expect(plan.syntenyAdjacencies.some(
+      (adjacency) => adjacency.partnerBlockId === "allele",
+    )).toBe(false);
+    expect(plan.candidates.some((candidate) => candidate.targetBlockId === "downstream"))
+      .toBe(true);
+  });
+
+  it("uses two-sided PAF adjacency to overcome a stronger unrelated contact boundary", () => {
+    const rankingBlocks = [
+      block("a", "Chr01", 0),
+      block("b", "Chr01", 1_000_000),
+      block("c", "Chr01", 2_000_000),
+      block("d", "Chr02", 3_000_000),
+      block("e", "Chr02", 4_000_000),
+    ];
+    const anchors = [
+      syntenyAnchor("a-node", "a", "a", 9_000_000),
+      syntenyAnchor("b-node", "b", "b"),
+      syntenyAnchor("c-node", "c", "c", 11_000_000),
+    ];
+    const plan = buildPlacementRecommendationPlan({
+      blocks: rankingBlocks,
+      selection: { kind: "contigs", ids: ["b"], exact: true },
+      coarseLinks: [coarse("b", "d", 1_000), coarse("b", "e", 900)],
+      syntenyAnchors: anchors,
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+    const results = new Map([
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "a" }), endpointResult("a", [8, 10, 9, 7])],
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "c" }), endpointResult("c", [8, 9, 10, 7])],
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "d" }), endpointResult("d", [10, 1_000, 20, 30])],
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "e" }), endpointResult("e", [10, 20, 900, 30])],
+    ]);
+    const legacy = rankPlacementRecommendations(plan, results, rankingBlocks, 10, "legacy");
+    const assisted = rankPlacementRecommendations(
+      plan,
+      results,
+      rankingBlocks,
+      10,
+      "paf-adjacency",
+    );
+
+    expect(legacy[0]).toMatchObject({ targetObjectId: "Chr02", targetBlockId: "e" });
+    expect(assisted[0]).toMatchObject({
+      targetObjectId: "Chr01",
+      targetBlockId: "c",
+      orientation: "+",
+      pafAdjacencyMatchCount: 2,
+    });
+  });
+
+  it("ranks endpoint enrichment ahead of absolute contact in assisted mode", () => {
+    const rankingBlocks = [
+      block("a", "Chr01", 0),
+      block("b", "Chr01", 1_000_000),
+      block("c", "Chr01", 2_000_000),
+      block("d", "Chr02", 3_000_000),
+      block("e", "Chr02", 4_000_000),
+    ];
+    const plan = buildPlacementRecommendationPlan({
+      blocks: rankingBlocks,
+      selection: { kind: "contigs", ids: ["b"], exact: true },
+      coarseLinks: [
+        coarse("b", "a", 100),
+        coarse("b", "c", 100),
+        coarse("b", "d", 1_000),
+        coarse("b", "e", 1_000),
+      ],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+    const results = new Map([
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "a" }), endpointResult("a", [1, 100, 1, 1])],
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "c" }), endpointResult("c", [1, 1, 100, 1])],
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "d" }), endpointResult("d", [900, 1_000, 900, 900])],
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "e" }), endpointResult("e", [900, 900, 1_000, 900])],
+    ]);
+    const legacy = rankPlacementRecommendations(plan, results, rankingBlocks, 10, "legacy");
+    const assisted = rankPlacementRecommendations(
+      plan,
+      results,
+      rankingBlocks,
+      10,
+      "synteny-assisted",
+    );
+
+    expect(legacy[0]).toMatchObject({ targetObjectId: "Chr02", targetBlockId: "e" });
+    expect(assisted[0]).toMatchObject({ targetObjectId: "Chr01", targetBlockId: "c" });
+    expect(assisted[0].backgroundScore).toBeGreaterThan(legacy[0].backgroundScore);
   });
 
   it("removes synteny-identified allele links before the coarse shortlist", () => {

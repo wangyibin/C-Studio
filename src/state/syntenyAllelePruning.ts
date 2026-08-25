@@ -18,6 +18,8 @@ export interface ReferenceSyntenyAnchor {
   targetStart: number;
   targetEnd: number;
   targetIntervals: Interval[];
+  targetStrand: "+" | "-";
+  strandDominance: number;
   queryCoverage: number;
   identity: number;
   meanMapq: number;
@@ -32,6 +34,22 @@ export interface ReferenceSyntenyAlleleGroup {
   members: ReferenceSyntenyAnchor[];
 }
 
+/**
+ * One directly observed, non-transitive co-synteny relationship. Unlike the
+ * legacy display groups, an anchor may participate in more than one edge.
+ */
+export interface ReferenceSyntenyAlleleEdge {
+  id: string;
+  targetName: string;
+  left: ReferenceSyntenyAnchor;
+  right: ReferenceSyntenyAnchor;
+  targetOverlap: number;
+  minQueryCoverage: number;
+  minIdentity: number;
+  minMeanMapq: number;
+  minTargetDominance: number;
+}
+
 export interface SyntenyAlleleSignalMask {
   sourceBlockId: string;
   targetBlockId: string;
@@ -43,9 +61,13 @@ export interface SyntenyAlleleSignalMask {
 
 export interface ReferenceSyntenyAllelePruning {
   anchors: ReferenceSyntenyAnchor[];
+  alleleEdges: ReferenceSyntenyAlleleEdge[];
   groups: ReferenceSyntenyAlleleGroup[];
   maskByPair: Map<string, SyntenyAlleleSignalMask>;
   directAllelePairCount: number;
+  pairwiseAlleleOccurrencePairCount: number;
+  shadowOnlyAlleleOccurrencePairCount: number;
+  legacyOnlyAlleleOccurrencePairCount: number;
   crossAllelePairCount: number;
   duplicateOccurrencePairCount: number;
   matchedPairCount: number;
@@ -66,6 +88,8 @@ interface ReferenceSyntenyAlleleOptions {
 interface TargetAnchorCandidate {
   targetName: string;
   targetIntervals: Interval[];
+  targetStrand: "+" | "-";
+  strandDominance: number;
   queryCoverage: number;
   identity: number;
   meanMapq: number;
@@ -83,6 +107,7 @@ interface SourceOccurrenceNode {
 interface AlignmentObservation {
   queryInterval: Interval;
   targetInterval: Interval;
+  strand: "+" | "-";
   identity: number;
   mapq: number;
   observedBp: number;
@@ -103,10 +128,10 @@ const defaultOptions = {
 };
 
 /**
- * Identify current AGP block occurrences that map to the same reference locus,
- * then reproduce Kprune's direct-allele and non-maximum cross-allele masking.
- * The returned factors affect recommendation evidence only; source PAF/Hi-C
- * data and the current AGP remain untouched.
+ * Identify direct pairwise co-synteny relationships, then preserve the legacy
+ * disjoint-group Kprune masks for a shadow-mode rollout. The returned factors
+ * affect recommendation evidence only; source PAF/Hi-C data and the current
+ * AGP remain untouched.
  */
 export function buildReferenceSyntenyAllelePruning(
   records: ReadonlyArray<PafPreviewRecord>,
@@ -145,6 +170,10 @@ export function buildReferenceSyntenyAllelePruning(
     }
   }
 
+  const alleleEdges = buildReferenceSyntenyAlleleEdges(
+    anchors,
+    resolvedOptions.minTargetOverlap,
+  );
   const groups = clusterReferenceAnchors(anchors, resolvedOptions.minTargetOverlap);
   const maskByPair = new Map<string, SyntenyAlleleSignalMask>();
 
@@ -257,9 +286,22 @@ export function buildReferenceSyntenyAllelePruning(
 
   const masks = [...maskByPair.entries()].sort(([left], [right]) => left.localeCompare(right));
   const directAllelePairCount = masks.filter(([, mask]) => mask.reason === "direct-allele").length;
+  const pairwiseAlleleOccurrencePairs = expandedAlleleEdgePairKeys(alleleEdges);
+  const legacyDirectAllelePairs = new Set(masks
+    .filter(([, mask]) => mask.reason === "direct-allele")
+    .map(([key]) => key));
+  const shadowOnlyAlleleOccurrencePairCount = [...pairwiseAlleleOccurrencePairs]
+    .filter((key) => !legacyDirectAllelePairs.has(key)).length;
+  const legacyOnlyAlleleOccurrencePairCount = [...legacyDirectAllelePairs]
+    .filter((key) => !pairwiseAlleleOccurrencePairs.has(key)).length;
   const crossAllelePairCount = masks.filter(([, mask]) => mask.reason === "cross-allele-nonmatch").length;
   const duplicateOccurrencePairCount = masks.filter(([, mask]) => mask.reason === "duplicate-occurrence").length;
   const fingerprint = [
+    ...anchors.map((anchor) => (
+      `${anchor.nodeId}:${anchor.targetName}:${anchor.targetStart}-${anchor.targetEnd}:`
+      + `${anchor.targetStrand}:${anchor.strandDominance}`
+    )),
+    ...alleleEdges.map((edge) => `${edge.id}:${edge.targetOverlap}`),
     ...groups.map((group) => `${group.id}:${group.members.map(
       (member) => `${member.nodeId}[${member.occurrenceBlockIds.join(",")}]`,
     ).join(",")}`),
@@ -268,9 +310,13 @@ export function buildReferenceSyntenyAllelePruning(
 
   return {
     anchors,
+    alleleEdges,
     groups,
     maskByPair,
     directAllelePairCount,
+    pairwiseAlleleOccurrencePairCount: pairwiseAlleleOccurrencePairs.size,
+    shadowOnlyAlleleOccurrencePairCount,
+    legacyOnlyAlleleOccurrencePairCount,
     crossAllelePairCount,
     duplicateOccurrencePairCount,
     matchedPairCount,
@@ -278,6 +324,55 @@ export function buildReferenceSyntenyAllelePruning(
     multiMappingBlockCount,
     fingerprint,
   };
+}
+
+/**
+ * Build the direct PAF relationship graph without transitive closure.
+ * A target-coordinate sweep avoids comparing anchors whose bounding intervals
+ * cannot overlap; the final decision always uses the exact merged intervals.
+ */
+export function buildReferenceSyntenyAlleleEdges(
+  anchors: ReadonlyArray<ReferenceSyntenyAnchor>,
+  minTargetOverlap: number,
+): ReferenceSyntenyAlleleEdge[] {
+  const anchorsByTarget = new Map<string, ReferenceSyntenyAnchor[]>();
+  for (const anchor of anchors) {
+    const values = anchorsByTarget.get(anchor.targetName) ?? [];
+    values.push(anchor);
+    anchorsByTarget.set(anchor.targetName, values);
+  }
+
+  const edges: ReferenceSyntenyAlleleEdge[] = [];
+  for (const [targetName, targetAnchors] of [...anchorsByTarget]
+    .sort(([left], [right]) => left.localeCompare(right))) {
+    const sorted = [...targetAnchors].sort(compareAnchorsByTarget);
+    let active: ReferenceSyntenyAnchor[] = [];
+    for (const anchor of sorted) {
+      active = active.filter((candidate) => candidate.targetEnd > anchor.targetStart);
+      for (const candidate of active) {
+        const overlap = targetOverlap(candidate, anchor);
+        if (overlap < minTargetOverlap) {
+          continue;
+        }
+        const [left, right] = candidate.nodeId.localeCompare(anchor.nodeId) <= 0
+          ? [candidate, anchor]
+          : [anchor, candidate];
+        edges.push({
+          id: `synteny-edge:${targetName}:${left.nodeId}:${right.nodeId}`,
+          targetName,
+          left,
+          right,
+          targetOverlap: overlap,
+          minQueryCoverage: Math.min(left.queryCoverage, right.queryCoverage),
+          minIdentity: Math.min(left.identity, right.identity),
+          minMeanMapq: Math.min(left.meanMapq, right.meanMapq),
+          minTargetDominance: Math.min(left.targetDominance, right.targetDominance),
+        });
+      }
+      active.push(anchor);
+    }
+  }
+  return edges.sort((left, right) => left.id.localeCompare(right.id));
 }
 
 export function syntenyAllelePairKey(first: string, second: string) {
@@ -362,6 +457,7 @@ function buildPrimaryAnchor(
     values.push({
       queryInterval: [queryStart, queryEnd],
       targetInterval,
+      strand: record.strand,
       identity,
       mapq: Math.max(0, record.mapq),
       observedBp,
@@ -392,9 +488,19 @@ function buildPrimaryAnchor(
           0,
         ) / observedBp
         : 0;
+      const strandBp = locus.reduce((totals, observation) => {
+        totals[observation.strand] += observation.observedBp;
+        return totals;
+      }, { "+": 0, "-": 0 } as Record<"+" | "-", number>);
+      const targetStrand = strandBp["-"] > strandBp["+"] ? "-" : "+";
+      const strandDominance = observedBp > 0
+        ? strandBp[targetStrand] / observedBp
+        : 0;
       candidates.push({
         targetName,
         targetIntervals,
+        targetStrand,
+        strandDominance,
         queryCoverage: queryAlignedBp / blockLength,
         identity,
         meanMapq,
@@ -431,6 +537,8 @@ function buildPrimaryAnchor(
       targetStart: primary.targetIntervals[0]?.[0] ?? 0,
       targetEnd: primary.targetIntervals[primary.targetIntervals.length - 1]?.[1] ?? 0,
       targetIntervals: primary.targetIntervals,
+      targetStrand: primary.targetStrand,
+      strandDominance: primary.strandDominance,
       queryCoverage: primary.queryCoverage,
       identity: primary.identity,
       meanMapq: primary.meanMapq,
@@ -497,9 +605,7 @@ function clusterReferenceAnchors(
   const groups: ReferenceSyntenyAlleleGroup[] = [];
   for (const [targetName, targetAnchors] of [...anchorsByTarget].sort(([left], [right]) => left.localeCompare(right))) {
     const clusters: ReferenceSyntenyAnchor[][] = [];
-    const sorted = [...targetAnchors].sort((left, right) => left.targetStart - right.targetStart
-      || left.targetEnd - right.targetEnd
-      || left.blockId.localeCompare(right.blockId));
+    const sorted = [...targetAnchors].sort(compareAnchorsByTarget);
     for (const anchor of sorted) {
       let bestCluster: ReferenceSyntenyAnchor[] | null = null;
       let bestScore = -1;
@@ -530,6 +636,15 @@ function clusterReferenceAnchors(
     }
   }
   return groups;
+}
+
+function compareAnchorsByTarget(
+  left: ReferenceSyntenyAnchor,
+  right: ReferenceSyntenyAnchor,
+) {
+  return left.targetStart - right.targetStart
+    || left.targetEnd - right.targetEnd
+    || left.nodeId.localeCompare(right.nodeId);
 }
 
 function targetOverlap(left: ReferenceSyntenyAnchor, right: ReferenceSyntenyAnchor) {
@@ -679,6 +794,22 @@ function setExpandedMask(
       });
     }
   }
+}
+
+function expandedAlleleEdgePairKeys(
+  edges: ReadonlyArray<ReferenceSyntenyAlleleEdge>,
+) {
+  const pairs = new Set<string>();
+  for (const edge of edges) {
+    for (const leftBlockId of edge.left.occurrenceBlockIds) {
+      for (const rightBlockId of edge.right.occurrenceBlockIds) {
+        if (leftBlockId !== rightBlockId) {
+          pairs.add(syntenyAllelePairKey(leftBlockId, rightBlockId));
+        }
+      }
+    }
+  }
+  return pairs;
 }
 
 function sourceOccurrenceNodeId(sourceId: string, sourceStart: number, sourceEnd: number) {

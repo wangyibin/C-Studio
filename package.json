@@ -1,7 +1,7 @@
 {
   "name": "c-studio",
   "private": true,
-  "version": "0.4.2",
+  "version": "0.4.3",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -13,6 +13,7 @@
     "benchmark:contact-shared-gpu": "vite-node scripts/benchmark-contact-shared-gpu.ts",
     "benchmark:contact-source-layout": "vite-node scripts/benchmark-contact-source-layout.ts",
     "benchmark:assembly-hit-test": "vite-node scripts/benchmark-assembly-hit-test.ts",
+    "benchmark:placement-recommendation": "vite-node scripts/benchmark-placement-recommendation.ts",
     "test": "vitest run",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "tauri": "tauri"

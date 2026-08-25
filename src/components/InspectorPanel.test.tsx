@@ -4,6 +4,7 @@ import { createInitialUiState } from "../state/uiState";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   contactOverviewMapForDisplayedNormalization,
+  contactOverviewWindowViewport,
   InspectorPanel,
 } from "./InspectorPanel";
 
@@ -82,6 +83,30 @@ describe("InspectorPanel", () => {
         lastCompleteOverview,
       ),
     ).toBe(lastCompleteOverview);
+  });
+
+  it("keeps the overview window on the main heatmap's presented camera", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.contact.viewportCenterXMb = 700;
+    uiState.contact.viewportCenterYMb = 650;
+    uiState.contact.viewportSpanMb = 100;
+    const presentedViewport = {
+      xStart: 100_000_000,
+      xEnd: 500_000_000,
+      yStart: 200_000_000,
+      yEnd: 400_000_000,
+    };
+
+    expect(contactOverviewWindowViewport(
+      presentedViewport,
+      1_000_000_000,
+      uiState,
+    )).toBe(presentedViewport);
+    expect(contactOverviewWindowViewport(
+      null,
+      1_000_000_000,
+      uiState,
+    )).not.toEqual(presentedViewport);
   });
 
   it("binds the overview to the active contact map", () => {
