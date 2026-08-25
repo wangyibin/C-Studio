@@ -343,6 +343,33 @@ describe("reduceUiState", () => {
     );
   });
 
+  it("previews a placement boundary without adding a log entry", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:1:ctg1",
+      additive: false,
+    });
+    const logCount = state.logEntries.length;
+
+    state = reduceUiState(state, {
+      type: "jumpContactViewportToRegions",
+      xCenterBp: 250,
+      yCenterBp: 250,
+      selectedBlockIds: ["Chr01:1:ctg1"],
+      totalSpanMb: 0.00033,
+      label: "placement candidate 1",
+      transient: true,
+    });
+
+    expect(state.assembly.selection).toEqual({
+      kind: "contigs",
+      ids: ["Chr01:1:ctg1"],
+    });
+    expect(state.logEntries).toHaveLength(logCount);
+  });
+
   it("centers and exactly selects a clicked contig segment from the inspector", () => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
@@ -1730,6 +1757,86 @@ describe("reduceUiState", () => {
       ["Chr01:2:ctg2", "Chr01"],
     ]);
     expect(state.assembly.selection).toBeNull();
+  });
+
+  it("applies a recommended orientation and move as one undoable operation", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContig",
+      id: "Chr01:1:ctg1",
+      additive: false,
+    });
+    state = reduceUiState(state, {
+      type: "applyAssemblyPlacementRecommendation",
+      selectedBlockIds: ["Chr01:1:ctg1"],
+      targetObjectId: "Chr02",
+      targetBlockId: "Chr02:1:ctg3",
+      orientation: "-",
+    });
+
+    expect(state.assembly.blocks.map((block) => [block.id, block.objectId, block.orientation]))
+      .toEqual([
+        ["Chr01:2:ctg2", "Chr01", "-"],
+        ["Chr01:1:ctg1", "Chr02", "-"],
+        ["Chr02:1:ctg3", "Chr02", "+"],
+      ]);
+    expect(state.operationHistory).toHaveLength(1);
+    expect(state.operationHistory[0]).toMatchObject({
+      type: "place_recommendation",
+      label: "Placed Chr01:1:ctg1 on Chr02 (-)",
+    });
+    expect(state.assembly.selection).toBeNull();
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks).toEqual(assemblyBlocks);
+  });
+
+  it("applies a recommended multi-contig block reversal and move as one undoable operation", () => {
+    let state = createInitialUiState("Browser preview mode");
+    const blocks = [
+      ...assemblyBlocks.slice(0, 2),
+      {
+        ...assemblyBlocks[1],
+        id: "Chr01:3:ctg4",
+        sourceId: "ctg4",
+        visualStart: 250,
+        visualEnd: 400,
+      },
+      {
+        ...assemblyBlocks[2],
+        visualStart: 400,
+        visualEnd: 480,
+      },
+    ];
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyOccurrences",
+      ids: ["Chr01:2:ctg2", "Chr01:3:ctg4"],
+    });
+    state = reduceUiState(state, {
+      type: "applyAssemblyPlacementRecommendation",
+      selectedBlockIds: ["Chr01:2:ctg2", "Chr01:3:ctg4"],
+      targetObjectId: "Chr02",
+      targetBlockId: "Chr02:1:ctg3",
+      orientation: "-",
+    });
+
+    expect(state.assembly.blocks.map((block) => [block.id, block.objectId, block.orientation]))
+      .toEqual([
+        ["Chr01:1:ctg1", "Chr01", "+"],
+        ["Chr01:3:ctg4", "Chr02", "+"],
+        ["Chr01:2:ctg2", "Chr02", "+"],
+        ["Chr02:1:ctg3", "Chr02", "+"],
+      ]);
+    expect(state.operationHistory).toHaveLength(1);
+    expect(state.operationHistory[0]).toMatchObject({
+      type: "place_recommendation",
+      label: "Placed 2-contig block on Chr02 (-)",
+    });
+
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.blocks).toEqual(blocks);
   });
 
   it("moves a selected chromosome before another chromosome and keeps both chromosome ids", () => {

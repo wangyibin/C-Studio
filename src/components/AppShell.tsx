@@ -28,6 +28,7 @@ import {
 import type { CoverageView } from "../state/coverageView";
 import type { GfaEvidenceDocument } from "../state/gfa";
 import type { GfaBandageLayoutLoader } from "../state/gfaBandageLayout";
+import type { PlacementRecommendationCandidate } from "../state/assemblyPlacementRecommendation";
 import type {
   GfaEndpointHiCBatchLoader,
   GfaEndpointHiCLoader,
@@ -257,6 +258,9 @@ export function AppShell({
   const [gfaPanelHeight, setGfaPanelHeight] = useState<number | null>(null);
   const [confirmingClearData, setConfirmingClearData] = useState(false);
   const [confirmingReloadAssembly, setConfirmingReloadAssembly] = useState(false);
+  const [placementPreview, setPlacementPreview] = useState<
+    PlacementRecommendationCandidate | null
+  >(null);
   const [chromosomeFilterPatternDraft, setChromosomeFilterPatternDraft] = useState(
     chromosomeFilterPattern,
   );
@@ -348,6 +352,14 @@ export function AppShell({
     activeAssemblyBlocks,
     uiState.assembly.selection,
   );
+  const placementSelectionKey = uiState.assembly.selection?.kind === "contigs"
+    ? `contigs:${selectedAssemblyBlockIds.join("\u0000")}`
+    : uiState.assembly.selection?.kind === "chromosome"
+      ? `chromosome:${uiState.assembly.selection.id}`
+      : "none";
+  useEffect(() => {
+    setPlacementPreview(null);
+  }, [activeAssemblyBlocks, placementSelectionKey, uiState.normalization]);
   const heatmapViewport = buildCenteredContactViewport({
     centerMb: uiState.contact.viewportCenterMb,
     centerXMb: uiState.contact.viewportCenterXMb,
@@ -1251,6 +1263,7 @@ export function AppShell({
                   homologPattern={gfaHomologPattern}
                   useStoredResolutionOptions={contactIsMcool}
                   availableResolutionBasePairs={contactAvailableResolutions}
+                  placementPreview={placementPreview}
                   onClosePanel={closeHeatmapPanel}
                   onExpandPanel={expandHeatmapPanel}
                   onUiAction={onUiAction}
@@ -1394,6 +1407,9 @@ export function AppShell({
               gfaHomologPattern={gfaHomologPattern}
               gfaPreviewScaffoldIds={gfaPreviewScaffoldIds}
               gfaChromosomeFilterActive={chromosomeVisibility.active}
+              onLoadGfaEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
+              placementPreview={placementPreview}
+              onPlacementPreviewChange={setPlacementPreview}
               onExpandHeatmap={expandHeatmapPanel}
               onOpenGfaPanel={() => setGfaPanelOpen(true)}
             />

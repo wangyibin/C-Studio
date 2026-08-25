@@ -37,6 +37,7 @@ import {
 import { contactViewportAxisSpans, type ContactViewport } from "./contactViewport";
 import type { ContactMapLayoutBlock } from "./importers";
 import type { GfaLinkEvidence } from "./gfa";
+import { applyPlacementRecommendation } from "./assemblyPlacementRecommendation";
 
 export type Tool = "select" | "split" | "move" | "flip" | "copy";
 export type EditMode = "normal" | "advanced";
@@ -82,7 +83,8 @@ export type ContextOperationType =
   | "rename"
   | "create_block"
   | "place_unplaced"
-  | "dissolve_block";
+  | "dissolve_block"
+  | "place_recommendation";
 
 export interface LogEntry {
   time: string;
@@ -215,6 +217,7 @@ export type UiAction =
       selectedBlockIds: string[];
       totalSpanMb: number;
       label: string;
+      transient?: boolean;
     }
   | { type: "panContactViewport"; deltaMb?: number; deltaXMb?: number; deltaYMb?: number }
   | {
@@ -277,6 +280,13 @@ export type UiAction =
       type: "moveAssemblySelectionBefore";
       targetBlockId: string | null;
       targetObjectId?: string;
+    }
+  | {
+      type: "applyAssemblyPlacementRecommendation";
+      selectedBlockIds: string[];
+      targetBlockId: string | null;
+      targetObjectId: string;
+      orientation: "+" | "-";
     }
   | { type: "moveAssemblySelectionToDebris" }
   | { type: "deleteAssemblySelection" }
@@ -894,25 +904,27 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         assemblyUnitIdForContig(state.assembly.blocks, id)
       )))];
 
-      return withLog(
-        {
-          ...state,
-          assembly: {
-            ...state.assembly,
-            selection: selectContigs(selectedUnitIds),
-          },
-          contact: {
-            ...state.contact,
-            totalSpanMb,
-            viewportSpanMb,
-            viewportCenterMb,
-            viewportCenterXMb,
-            viewportCenterYMb,
-            jumpTargetMb: viewportCenterXMb,
-          },
+      const nextState = {
+        ...state,
+        assembly: {
+          ...state.assembly,
+          selection: action.transient
+            ? state.assembly.selection
+            : selectContigs(selectedUnitIds),
         },
-        `Contact viewport jumped to ${action.label}`,
-      );
+        contact: {
+          ...state.contact,
+          totalSpanMb,
+          viewportSpanMb,
+          viewportCenterMb,
+          viewportCenterXMb,
+          viewportCenterYMb,
+          jumpTargetMb: viewportCenterXMb,
+        },
+      };
+      return action.transient
+        ? nextState
+        : withLog(nextState, `Contact viewport jumped to ${action.label}`);
     }
     case "panContactViewport": {
       const deltaXMb = action.deltaXMb ?? action.deltaMb ?? 0;
@@ -1672,6 +1684,22 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         },
         "Selection moved",
         "move",
+      );
+    case "applyAssemblyPlacementRecommendation":
+      return withAssemblyHistory(
+        state,
+        {
+          blocks: applyPlacementRecommendation(
+            state.assembly.blocks,
+            state.assembly.selection,
+            action,
+          ),
+          selection: null,
+        },
+        `Placed ${action.selectedBlockIds.length === 1
+          ? action.selectedBlockIds[0]
+          : `${action.selectedBlockIds.length}-contig block`} on ${action.targetObjectId} (${action.orientation})`,
+        "place_recommendation",
       );
     case "moveAssemblySelectionToDebris":
       return withAssemblyHistory(

@@ -1,5 +1,7 @@
 # C-Studio
 
+![](https://img.shields.io/github/v/tag/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/top/wangyibin/C-Studio) ![](https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio) ![](https://img.shields.io/github/last-commit/wangyibin/C-Studio) ![](https://img.shields.io/github/contributors/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/code-size/wangyibin/C-Studio) ![platforms](https://img.shields.io/badge/platforms-aarch64%20|%20x86-blue) [![](https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat)](https://github.com/wangyibin/C-Studio/releases)
+
 C-Studio is a desktop application for visual inspection and user-directed
 editing of chromosome-scale genome assemblies. It brings AGP layouts together
 with Hi-C contact maps, synteny alignments, coverage tracks, and assembly-graph

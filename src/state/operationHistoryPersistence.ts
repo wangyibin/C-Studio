@@ -26,6 +26,7 @@ const operationTypes = new Set<ContextOperationType>([
   "create_block",
   "place_unplaced",
   "dissolve_block",
+  "place_recommendation",
 ]);
 
 export interface OperationHistoryArchive {

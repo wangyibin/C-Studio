@@ -1641,6 +1641,41 @@ button {
   pointer-events: none;
 }
 
+.assembly-placement-preview-marker {
+  position: absolute;
+  z-index: 16;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: #075985;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.assembly-placement-preview-guide {
+  position: absolute;
+  width: 68px;
+  height: 3px;
+  border-radius: 999px;
+  background: #38bdf8;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 88%), 0 2px 8px rgb(3 105 161 / 35%);
+  transform: rotate(45deg);
+}
+
+.assembly-placement-preview-marker strong {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 2px solid white;
+  border-radius: 50%;
+  background: #bae6fd;
+  box-shadow: 0 2px 10px rgb(3 105 161 / 32%);
+  font-size: 13px;
+}
+
 .assembly-chromosome-end-target {
   position: absolute;
   z-index: 13;
@@ -2980,6 +3015,203 @@ button {
   border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border-soft));
   border-radius: 6px;
   background: color-mix(in srgb, var(--accent) 7%, var(--surface-2));
+}
+
+.placement-recommendation-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, #0284c7 40%, var(--border-soft));
+  border-radius: 7px;
+  background: color-mix(in srgb, #e0f2fe 55%, var(--surface-2));
+}
+
+.placement-recommendation-heading,
+.placement-recommendation-heading > span,
+.placement-recommendation-title,
+.placement-recommendation-actions {
+  display: flex;
+  align-items: center;
+}
+
+.placement-recommendation-heading {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.placement-recommendation-heading > span {
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.placement-recommendation-heading strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.placement-recommendation-heading small,
+.placement-recommendation-heading em {
+  color: var(--muted);
+  font-size: 9px;
+  font-style: normal;
+}
+
+.placement-recommendation-card > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.placement-recommendation-warning {
+  padding: 6px 7px;
+  border-radius: 5px;
+  background: color-mix(in srgb, #f59e0b 12%, white);
+  color: #92400e !important;
+}
+
+.placement-recommendation-status.error {
+  color: var(--danger) !important;
+}
+
+.placement-recommendation-list {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.placement-recommendation-list > li {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: color-mix(in srgb, white 88%, var(--surface-2));
+}
+
+.placement-recommendation-list > li.active {
+  border-color: #0284c7;
+  box-shadow: 0 0 0 2px rgb(2 132 199 / 10%);
+}
+
+.placement-recommendation-list > li.current {
+  background: color-mix(in srgb, #dcfce7 42%, white);
+}
+
+.placement-recommendation-title {
+  gap: 7px;
+  min-width: 0;
+}
+
+.placement-recommendation-title > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+
+.placement-recommendation-title strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.placement-recommendation-title small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.placement-recommendation-rank {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto !important;
+  border-radius: 50%;
+  background: #0284c7;
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.placement-recommendation-title > em {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.placement-recommendation-title > em.confidence-high {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.placement-recommendation-title > em.confidence-medium {
+  background: #e0f2fe;
+  color: #075985;
+}
+
+.placement-recommendation-title > em.confidence-ambiguous {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.placement-recommendation-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.placement-recommendation-evidence span {
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.placement-recommendation-actions {
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.placement-recommendation-actions button {
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: white;
+  color: var(--text);
+  font: inherit;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.placement-recommendation-actions button.primary {
+  border-color: #0284c7;
+  background: #0284c7;
+  color: white;
+}
+
+.placement-recommendation-actions strong,
+.placement-recommendation-actions small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.placement-recommendation-caveat {
+  padding-top: 7px;
+  border-top: 1px solid color-mix(in srgb, #0284c7 18%, var(--border-soft));
 }
 
 .contig-occurrence-heading {

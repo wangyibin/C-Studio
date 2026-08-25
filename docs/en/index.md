@@ -1,5 +1,5 @@
 # C-Studio
-
+![](https://img.shields.io/github/v/tag/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/top/wangyibin/C-Studio) ![](https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio) ![](https://img.shields.io/github/last-commit/wangyibin/C-Studio) ![](https://img.shields.io/github/contributors/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/code-size/wangyibin/C-Studio) ![platforms](https://img.shields.io/badge/platforms-aarch64%20|%20x86-blue) [![](https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat)](https://github.com/wangyibin/C-Studio/releases)
 C-Studio is an early-stage desktop application for inspecting chromosome-scale
 assemblies, comparing multiple evidence layers, and making user-directed AGP
 edits. The current application is built with Tauri 2, React, TypeScript, and

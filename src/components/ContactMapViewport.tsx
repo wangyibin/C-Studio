@@ -77,6 +77,7 @@ export {
 } from "../state/contactWheel";
 import type { CoverageView } from "../state/coverageView";
 import type { ContactMapLayoutBlock } from "../state/importers";
+import type { PlacementRecommendationCandidate } from "../state/assemblyPlacementRecommendation";
 import { defaultGfaHomologPattern } from "../state/gfaHomologLayout";
 import { isEditableShortcutTarget } from "../state/juiceboxShortcuts";
 import {
@@ -121,6 +122,7 @@ interface ContactMapViewportProps {
   onUiAction: (action: UiAction) => void;
   useStoredResolutionOptions?: boolean;
   availableResolutionBasePairs?: number[];
+  placementPreview?: PlacementRecommendationCandidate | null;
   onClosePanel?: () => void;
   onExpandPanel?: () => void;
   onContactPanGestureStart?: () => void;
@@ -1142,6 +1144,7 @@ export function ContactMapViewport({
   contactPanPrefetchBridge,
   useStoredResolutionOptions = false,
   availableResolutionBasePairs = [],
+  placementPreview = null,
   onClosePanel,
   onExpandPanel,
   uiState,
@@ -3151,6 +3154,7 @@ export function ContactMapViewport({
               height: Math.abs(assemblySelectionDrag.currentLocalY - assemblySelectionDrag.startLocalY),
             } : null}
             pointerState={assemblyPointerState}
+            placementPreview={placementPreview}
             onReverseSelection={() => onUiAction({ type: "reverseAssemblySelection" })}
             onResizeSelection={(ids) => onUiAction({ type: "selectAssemblyContigs", ids })}
             onDoubleClick={handleAssemblyDoubleClick}
@@ -3343,6 +3347,7 @@ interface AssemblyOverlayProps {
   visibleChromosomes: AssemblyEditModel["chromosomes"];
   selectionBox: { left: number; top: number; width: number; height: number } | null;
   pointerState: AssemblyPointerState;
+  placementPreview: PlacementRecommendationCandidate | null;
   onReverseSelection: () => void;
   onResizeSelection: (ids: string[]) => void;
   onDoubleClick: (event: React.MouseEvent<HTMLDivElement>) => void;
@@ -3376,6 +3381,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
   visibleChromosomes,
   selectionBox,
   pointerState,
+  placementPreview,
   onReverseSelection,
   onResizeSelection,
   onDoubleClick,
@@ -3564,6 +3570,24 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
         />
       ) : null}
       <div ref={overlayLayerRef} className="assembly-overlay-layer">
+        {placementPreview
+          && placementPreview.visualPosition >= viewportXStart
+          && placementPreview.visualPosition <= viewportXEnd
+          && placementPreview.visualPosition >= viewportYStart
+          && placementPreview.visualPosition <= viewportYEnd ? (() => {
+            const left = ((placementPreview.visualPosition - viewportXStart) / viewportXSpan) * 100;
+            const top = ((placementPreview.visualPosition - viewportYStart) / viewportYSpan) * 100;
+            return (
+              <span
+                className="assembly-placement-preview-marker"
+                style={{ left: `${left}%`, top: `${top}%` }}
+                title={`Recommended insertion on ${placementPreview.targetObjectId}, orientation ${placementPreview.orientation}`}
+              >
+                <span className="assembly-placement-preview-guide" aria-hidden="true" />
+                <strong>{placementPreview.orientation}</strong>
+              </span>
+            );
+          })() : null}
         {renderVisualBoundaries && showChromosomeBoxes
           ? visibleChromosomes.map((chromosome) => {
           const boundary = overscannedBoundaryIntervalBox(
@@ -3795,7 +3819,8 @@ export function sameAssemblyOverlayPresentation(
     && previous.visibleContigs === next.visibleContigs
     && previous.visibleChromosomes === next.visibleChromosomes
     && previous.selectionBox === next.selectionBox
-    && previous.pointerState === next.pointerState;
+    && previous.pointerState === next.pointerState
+    && previous.placementPreview === next.placementPreview;
 }
 
 function intervalBox(

@@ -265,6 +265,7 @@ describe("sameAssemblyOverlayPresentation", () => {
       visibleChromosomes,
       selectionBox: null,
       pointerState,
+      placementPreview: null,
       onPointerMove: () => undefined,
     } as unknown as Parameters<typeof sameAssemblyOverlayPresentation>[0];
 
@@ -283,6 +284,21 @@ describe("sameAssemblyOverlayPresentation", () => {
     expect(sameAssemblyOverlayPresentation(base, {
       ...base,
       viewportWidthPx: 200,
+    })).toBe(false);
+    expect(sameAssemblyOverlayPresentation(base, {
+      ...base,
+      placementPreview: {
+        id: "placement-preview",
+        targetObjectId: "Chr02",
+        targetBlockId: "block-2",
+        visualPosition: 50,
+        chromosomeEnd: null,
+        leftBlockId: "block-1",
+        rightBlockId: "block-2",
+        isCurrentBoundary: false,
+        orientation: "+",
+        isCurrent: false,
+      },
     })).toBe(false);
   });
 });

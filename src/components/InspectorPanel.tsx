@@ -22,14 +22,22 @@ import {
 } from "../state/assemblyEditing";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import type { GfaEvidenceDocument } from "../state/gfa";
+import type { GfaEndpointHiCBatchLoader } from "../state/gfaEndpointHiC";
+import type { PlacementRecommendationCandidate } from "../state/assemblyPlacementRecommendation";
 import { buildCenteredContactViewport } from "../state/contactViewport";
 import {
   SyntenyDotplot,
 } from "./SyntenyDotplot";
 import type { SyntenyView } from "../state/syntenyView";
-import type { OperationRecord, UiAction, UiState } from "../state/uiState";
+import {
+  contactNormalizationForBackend,
+  type OperationRecord,
+  type UiAction,
+  type UiState,
+} from "../state/uiState";
 import { fitContextMenuToViewport } from "./AssemblyContextMenu";
 import { GfaPreviewCard } from "./GfaGraphPanel";
+import { AssemblyPlacementRecommendationCard } from "./AssemblyPlacementRecommendationCard";
 
 interface InspectorPanelProps {
   dataset: ExampleDatasetSummary | null;
@@ -52,6 +60,9 @@ interface InspectorPanelProps {
   onOpenGfaPanel?: () => void;
   gfaPreviewScaffoldIds?: ReadonlySet<string>;
   gfaChromosomeFilterActive?: boolean;
+  onLoadGfaEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
+  placementPreview?: PlacementRecommendationCandidate | null;
+  onPlacementPreviewChange?: (candidate: PlacementRecommendationCandidate | null) => void;
 }
 
 export function InspectorPanel({
@@ -75,6 +86,9 @@ export function InspectorPanel({
   onOpenGfaPanel = () => undefined,
   gfaPreviewScaffoldIds = new Set<string>(),
   gfaChromosomeFilterActive = false,
+  onLoadGfaEndpointHiCBatch,
+  placementPreview = null,
+  onPlacementPreviewChange = () => undefined,
 }: InspectorPanelProps) {
   const [historyMenu, setHistoryMenu] = useState<{
     id: number;
@@ -214,6 +228,18 @@ export function InspectorPanel({
       <section>
         <h2>Selection</h2>
         <SelectionSummary uiState={uiState} onUiAction={onUiAction} />
+        <AssemblyPlacementRecommendationCard
+          blocks={assemblyBlocks}
+          selection={uiState.assembly.selection}
+          overviewContactMap={overviewContactMap}
+          expectedNormalization={contactNormalizationForBackend(uiState.normalization)}
+          pafText={pafText}
+          gfaDocument={gfaDocument}
+          onLoadEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
+          activePreviewId={placementPreview?.id ?? null}
+          onPreviewChange={onPlacementPreviewChange}
+          onUiAction={onUiAction}
+        />
       </section>
 
       <section>

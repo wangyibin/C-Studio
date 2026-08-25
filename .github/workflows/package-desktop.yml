@@ -2,9 +2,19 @@ name: Package desktop apps and cool2mcool
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
+    inputs:
+      target:
+        description: Packages to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+      release_tag:
+        description: Optional v* tag to publish, or to supplement with Windows packages
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -16,6 +26,7 @@ concurrency:
 jobs:
   package-macos:
     name: macOS Apple Silicon
+    if: inputs.target == 'all'
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -90,6 +101,7 @@ jobs:
 
   package-cool2mcool:
     name: cool2mcool ${{ matrix.platform_name }}
+    if: inputs.target == 'all'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -159,7 +171,20 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      ${{
+        always() &&
+        inputs.release_tag != '' &&
+        needs.package-windows.result == 'success' &&
+        (
+          inputs.target == 'windows' ||
+          (
+            inputs.target == 'all' &&
+            needs.package-macos.result == 'success' &&
+            needs.package-cool2mcool.result == 'success'
+          )
+        )
+      }}
     needs:
       - package-macos
       - package-windows
@@ -175,7 +200,22 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Download existing release assets
+        if: inputs.target == 'windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release view "$RELEASE_TAG" >/dev/null
+          mkdir existing-release-assets
+          gh release download "$RELEASE_TAG" --dir existing-release-assets
+
       - name: Prepare release assets and checksums
+        env:
+          PACKAGE_TARGET: ${{ inputs.target }}
         shell: bash
         run: |
           set -euo pipefail
@@ -190,35 +230,64 @@ jobs:
             cp "$source" "release-files/$name"
           done < <(find release-assets -type f -print0)
 
-          for pattern in \
-            '*.zip' \
-            '*.dmg' \
-            '*.exe' \
-            '*.msi' \
-            'cool2mcool-*-linux-x86_64.tar.gz' \
-            'cool2mcool-*-linux-aarch64.tar.gz' \
-            'cool2mcool-*-macos-arm64.tar.gz'; do
+          required_patterns=('*.exe' '*.msi')
+          if [[ "$PACKAGE_TARGET" == 'all' ]]; then
+            required_patterns+=(
+              '*.zip'
+              '*.dmg'
+              'cool2mcool-*-linux-x86_64.tar.gz'
+              'cool2mcool-*-linux-aarch64.tar.gz'
+              'cool2mcool-*-macos-arm64.tar.gz'
+            )
+          fi
+
+          for pattern in "${required_patterns[@]}"; do
             if ! compgen -G "release-files/$pattern" >/dev/null; then
               echo "Missing required release asset: $pattern"
               exit 1
             fi
           done
 
-          cd release-files
-          sha256sum ./* > SHA256SUMS
+          mkdir checksum-files
+          if [[ "$PACKAGE_TARGET" == 'windows' ]]; then
+            while IFS= read -r -d '' source; do
+              name=$(basename "$source")
+              if [[ "$name" != 'SHA256SUMS' ]]; then
+                cp "$source" "checksum-files/$name"
+              fi
+            done < <(find existing-release-assets -type f -print0)
+          fi
+          cp release-files/* checksum-files/
+
+          (
+            cd checksum-files
+            sha256sum ./*
+          ) > "$RUNNER_TEMP/SHA256SUMS"
+          cp "$RUNNER_TEMP/SHA256SUMS" release-files/SHA256SUMS
 
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_TARGET: ${{ inputs.target }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release-files/* --clobber
+          mapfile -d '' release_assets \
+            < <(find release-files -maxdepth 1 -type f ! -name 'SHA256SUMS' -print0)
+
+          if [[ "$PACKAGE_TARGET" == 'windows' ]]; then
+            gh release upload "$RELEASE_TAG" "${release_assets[@]}" --clobber
+            gh release upload "$RELEASE_TAG" release-files/SHA256SUMS --clobber
+          elif gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${release_assets[@]}" --clobber
+            gh release upload "$RELEASE_TAG" release-files/SHA256SUMS --clobber
           else
-            gh release create "$GITHUB_REF_NAME" release-files/* \
+            gh release create "$RELEASE_TAG" \
+              "${release_assets[@]}" \
+              release-files/SHA256SUMS \
               --verify-tag \
               --generate-notes \
-              --title "$GITHUB_REF_NAME"
+              --title "$RELEASE_TAG"
           fi

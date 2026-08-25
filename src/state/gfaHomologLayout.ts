@@ -446,6 +446,8 @@ export function layoutGfaNodesForCuration(
 
 /**
  * Deterministic topology layout inspired by Bandage's force-directed view.
+ * This is an independent C-Studio implementation and contains no Bandage or
+ * OGDF code.
  * Chromosome, homolog, and AGP block coordinates are ignored. Every displayed
  * GFA segment participates independently and only GFA links join topology
  * components; AGP adjacency and gap edges are display-only evidence. The force

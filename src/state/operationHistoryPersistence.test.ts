@@ -45,6 +45,24 @@ describe("operation history persistence", () => {
     });
   });
 
+  it("persists placement recommendation operations", () => {
+    const recommendationOperation: OperationRecord = {
+      ...operation,
+      type: "place_recommendation",
+      label: "Placed ctg1 on Chr02 (-)",
+    };
+    const canonicalAgp = exportAgpText(afterBlocks);
+    const text = serializeOperationHistory({
+      canonicalAgp,
+      operationHistory: [recommendationOperation],
+      redoStack: [],
+      nextOperationId: 2,
+    });
+
+    expect(parseOperationHistory(text, canonicalAgp).operationHistory[0]?.type)
+      .toBe("place_recommendation");
+  });
+
   it("round-trips the undone redo branch against its before snapshot", () => {
     const canonicalAgp = exportAgpText(beforeBlocks);
     const text = serializeOperationHistory({

@@ -384,8 +384,8 @@ export function gfaInitialBandagePathPoints(
 }
 
 /**
- * Move one Bandage unitig by its nearest control point. Adjacent control points
- * follow with Bandage's distance falloff, so the single Move interaction
+ * Move one topology-view unitig by its nearest control point. Adjacent control
+ * points follow with C-Studio's distance falloff, so the single Move interaction
  * naturally translates a short node or bends a longer one.
  */
 export function gfaMoveBandagePath(

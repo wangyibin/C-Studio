@@ -1,14 +1,15 @@
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 
 let command;
 let args;
 
 if (process.platform === "win32") {
-  command = "npm.cmd";
+  const require = createRequire(import.meta.url);
+  // Modern Node releases reject spawning Windows .cmd shims directly.
+  command = process.execPath;
   args = [
-    "run",
-    "tauri",
-    "--",
+    require.resolve("@tauri-apps/cli/tauri.js"),
     "build",
     "--target",
     "x86_64-pc-windows-msvc",
