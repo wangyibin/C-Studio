@@ -1235,48 +1235,63 @@
 
 
 <h1 id="current-limitations">Current limitations<a class="headerlink" href="#current-limitations" title="Permanent link">&para;</a></h1>
-<p>This page records boundaries of the current <code>0.3.5</code> checkout. It should be
-updated whenever the corresponding implementation or validation changes.</p>
+<p>This page records boundaries that matter when interpreting, distributing, or
+validating the current implementation. C-Studio is under active development,
+so these boundaries will change as the implementation and platform validation
+evolve.</p>
 <h2 id="distribution-and-platforms">Distribution and platforms<a class="headerlink" href="#distribution-and-platforms" title="Permanent link">&para;</a></h2>
 <ul>
+<li>The desktop packaging workflow targets macOS on Apple Silicon and Windows
+  x86-64. It can produce reproducible build artifacts, but does not by itself
+  establish a stable, signed public distribution.</li>
 <li>macOS packages use ad-hoc signing and are not notarized with an Apple
   Developer ID.</li>
-<li>Windows installers are unsigned and may trigger SmartScreen.</li>
-<li>Project-directory, contact-map, PAF, and coverage selection now use Tauri's
-  cross-platform dialog plugin. A real Windows desktop click-through remains a
-  separate release QA requirement.</li>
-<li>Linux packages are not currently configured.</li>
-<li>Stable public releases, archival source/test-data URLs, and a citation record
-  are not established by this checkout alone.</li>
+<li>Windows NSIS and MSI installers are unsigned and may trigger SmartScreen.</li>
+<li>Native file and folder dialogs support macOS and Windows, but a real Windows
+  desktop click-through and WebView2 interaction validation remain separate
+  release-QA work.</li>
+<li>There is no Linux desktop packaging or release-QA workflow. Linux artifacts
+  in the packaging workflow belong to the standalone <code>cool2mcool</code> converter,
+  not to the C-Studio desktop application.</li>
 </ul>
 <h2 id="example-data">Example data<a class="headerlink" href="#example-data" title="Permanent link">&para;</a></h2>
-<p><strong>Load example project</strong> resolves paths from the source checkout at build time.
-The example files are not declared as Tauri bundle resources, so successful use
-from a packaged app has not been established.</p>
+<p><strong>Load example project</strong> reads files from the source checkout's <code>examples/</code>
+directory. Those files are not declared as Tauri bundle resources, so this
+helper is not established for packaged applications. Run from a source checkout
+or load the example files individually.</p>
 <h2 id="export">Export<a class="headerlink" href="#export" title="Permanent link">&para;</a></h2>
-<p>Edited AGP saving is implemented. The inspector can display FASTA as “Ready”
-when a dataset is loaded, but the current user interface does not expose a
-FASTA export action. Do not treat that readiness label as a completed FASTA
-export workflow.</p>
-<p>Operation history persistence uses a C-Studio-specific <code>.history.json</code> sidecar.
-The AGP remains independently usable, but other assembly tools do not consume
-the sidecar.</p>
+<ul>
+<li>Saving writes the edited AGP and a same-prefix C-Studio <code>.history.json</code>
+  sidecar. The AGP remains independently usable, but other assembly tools do
+  not consume the sidecar.</li>
+<li>A malformed or layout-mismatched history sidecar is ignored; the AGP still
+  loads without restoring its undo/redo timeline.</li>
+<li>Auto-save requires a writable save target selected by the user. A compressed
+  <code>.agp.gz</code> source cannot be overwritten automatically.</li>
+<li>The inspector's FASTA <strong>Ready</strong> state only indicates that a dataset is
+  loaded. The user interface does not currently provide FASTA export.</li>
+</ul>
 <h2 id="scientific-interpretation">Scientific interpretation<a class="headerlink" href="#scientific-interpretation" title="Permanent link">&para;</a></h2>
 <ul>
+<li>The edited AGP layout remains the authority for ordering, orientation,
+  boundaries, and export. Contact maps, PAF, coverage, and GFA are synchronized
+  evidence views; they do not silently rewrite the layout.</li>
+<li>Evidence-guided placement recommendations are review aids. Applying a change
+  remains a user-approved edit and does not establish a biological correction.</li>
 <li>C-Studio does not automatically decide breakpoints, orientation, grouping,
   chromosome naming, or copy number.</li>
-<li>GFA and contact review candidates are evidence prompts, not biological calls.</li>
-<li>Passing unit tests does not validate an edited assembly on real biological
-  data.</li>
+<li>Passing automated tests does not validate an edited assembly on real
+  biological data.</li>
 <li>A complete curation should still be checked with independent continuity,
   copy-number, synteny, contact-map, and sequence-level validation.</li>
 </ul>
 <h2 id="performance-evidence">Performance evidence<a class="headerlink" href="#performance-evidence" title="Permanent link">&para;</a></h2>
-<p>Large plain <code>.cool</code> matrices can be substantially slower than <code>.mcool</code> with
-stored resolutions. Backend benchmarks do not by themselves establish desktop
-interaction latency: IPC, frontend merge, and GPU paint remain separate stages.
-Use <code>.mcool</code> for routine multi-scale work where possible, and measure the real
-desktop workflow before making performance claims.</p>
+<p>Large single-resolution <code>.cool</code> files can require expensive projection and
+aggregation at each new scale. Prefer an <code>.mcool</code> file with stored resolutions
+for routine multi-scale browsing. Backend or automated timings do not establish
+visible desktop interaction latency: IPC, frontend work, GPU presentation, and
+the platform webview are separate stages. Measure the target desktop workflow
+before making a performance claim.</p>
 <h2 id="gfa-parser-scope">GFA parser scope<a class="headerlink" href="#gfa-parser-scope" title="Permanent link">&para;</a></h2>
 <p>The current evidence parser recognizes <code>S</code>, <code>L</code>, and <code>A</code> records. Only explicit
 valid <code>L</code> records create graph edges. <code>A</code> record counts and <code>rd</code> tags remain
