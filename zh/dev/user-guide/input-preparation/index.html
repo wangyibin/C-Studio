@@ -1281,68 +1281,96 @@ object 的最小 identity AGP：</p>
 请先使用与实验类型匹配的 Hi-C/Pore-C 流程生成 pairs。
 <a href="https://pairtools.readthedocs.io/en/latest/">pairtools</a> 提供 parse、sort、select 和
 dedup，但比对与过滤参数必须根据建库方式和 MAPQ 策略确定。</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:2"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">C-Phasing</label><label for="__tabbed_1_2">Cooler</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<p>C-Phasing 可以直接从 <code>.pairs.pqs</code> 数据集或压缩的 <code>.pairs.gz</code> 文件生成
+相同的源 contig 级 COOL。按照官方
+<a href="https://wangyibin.github.io/CPhasing/zh/latest/CLI/plot/">C-Phasing <code>pairs2cool</code> 流程</a>，
+先生成 contig size，并明确指定 <code>cool2mcool</code> 所需的 1 kb 分辨率：</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>cphasing-rs<span class="w"> </span>contigsizes<span class="w"> </span>source-contigs.fa<span class="w"> </span>&gt;<span class="w"> </span>source-contigs.contigsizes
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>cphasing<span class="w"> </span>pairs2cool<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>contacts.pairs.pqs<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span>source-contigs.contigsizes<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span>contacts.1k.cool<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span>--binsize<span class="w"> </span>1k<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span>--min-mapq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">  </span>--threads<span class="w"> </span><span class="m">16</span>
+</span></code></pre></div>
+<p>如果输入是标准压缩 pairs 文件，将 <code>contacts.pairs.pqs</code> 替换为
+<code>contacts.pairs.gz</code> 即可。应根据建库、比对与过滤策略设置 <code>--min-mapq</code>；
+常规转换超出可用内存时可增加 <code>--low-memory</code>。</p>
+<p>FASTA、contig size 和 pairs 数据必须与 AGP 第 6 列使用相同的源 contig
+名称。C-Studio 的主矩阵应停在 <code>pairs2cool</code> 这一步，不要使用
+<code>cphasing plot -a</code> 生成的 chromosome-level <code>*.chrom.cool</code>，因为 AGP
+投影由 C-Studio 自己完成。</p>
+</div>
+<div class="tabbed-block">
 <p>从与 AGP 一致的源 contig FASTA 生成 chromosome sizes：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>samtools<span class="w"> </span>faidx<span class="w"> </span>source-contigs.fa
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>cut<span class="w"> </span>-f1,2<span class="w"> </span>source-contigs.fa.fai<span class="w"> </span>&gt;<span class="w"> </span>source-contigs.chrom.sizes
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>samtools<span class="w"> </span>faidx<span class="w"> </span>source-contigs.fa
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>cut<span class="w"> </span>-f1,2<span class="w"> </span>source-contigs.fa.fai<span class="w"> </span>&gt;<span class="w"> </span>source-contigs.chrom.sizes
 </span></code></pre></div>
 <p>标准 4DN pairs 的第 2/3 列和第 4/5 列分别是 <code>chrom1/pos1</code> 和
 <code>chrom2/pos2</code>。使用
 <a href="https://cooler.readthedocs.io/en/latest/cli.html#cooler-cload-pairs"><code>cooler cload pairs</code></a>
 生成固定 1 kb、symmetric-upper 的 COOL：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>cooler<span class="w"> </span>cload<span class="w"> </span>pairs<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span>-c1<span class="w"> </span><span class="m">2</span><span class="w"> </span>-p1<span class="w"> </span><span class="m">3</span><span class="w"> </span>-c2<span class="w"> </span><span class="m">4</span><span class="w"> </span>-p2<span class="w"> </span><span class="m">5</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span>source-contigs.chrom.sizes:1000<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span>contacts.pairs.gz<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span>contacts.1k.cool
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>cooler<span class="w"> </span>cload<span class="w"> </span>pairs<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>-c1<span class="w"> </span><span class="m">2</span><span class="w"> </span>-p1<span class="w"> </span><span class="m">3</span><span class="w"> </span>-c2<span class="w"> </span><span class="m">4</span><span class="w"> </span>-p2<span class="w"> </span><span class="m">5</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>source-contigs.chrom.sizes:1000<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span>contacts.pairs.gz<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">  </span>contacts.1k.cool
 </span></code></pre></div>
 <p>标准 pairs 位点是 1-based。只有当实际输入位点为 0-based 时才添加
 <code>--zero-based</code>。应在构建 COOL 前决定 MAPQ 过滤标准；已聚合计数无法恢复
 之前丢弃的接触。</p>
+</div>
+</div>
+</div>
 <h2 id="cool2mcool-mcool">使用 cool2mcool 转换为 MCOOL<a class="headerlink" href="#cool2mcool-mcool" title="Permanent link">&para;</a></h2>
 <p>从 <a href="https://github.com/wangyibin/C-Studio/releases">C-Studio Releases</a> 下载
 <code>linux-x86_64</code>、<code>linux-aarch64</code> 或 <code>macos-arm64</code> 软件包。这个独立 Rust
 命令要求输入为固定 bin、symmetric-upper 的 1 kb COOL；输出为多分辨率
 MCOOL，每个输出分辨率都会写入 ICE、KR、VC 和 VC_SQRT 向量。</p>
 <p>例如，下载 Linux 软件包后运行：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>tar<span class="w"> </span>-xzf<span class="w"> </span>cool2mcool-*-linux-x86_64.tar.gz
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>./cool2mcool-*-linux-x86_64/cool2mcool<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>/absolute/path/contacts.1k.cool<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span>/absolute/path/contacts.mcool
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>tar<span class="w"> </span>-xzf<span class="w"> </span>cool2mcool-*-linux-x86_64.tar.gz
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>./cool2mcool-*-linux-x86_64/cool2mcool<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span>/absolute/path/contacts.1k.cool<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span>/absolute/path/contacts.mcool
 </span></code></pre></div>
 <p>Linux ARM64 用户改用 <code>linux-aarch64</code>，Apple Silicon macOS 用户改用
 <code>macos-arm64</code> 软件包。</p>
 <p>如需从源码构建，则在仓库根目录中运行：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nb">cd</span><span class="w"> </span>tools/cool2mcool
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>pixi<span class="w"> </span>install
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>pixi<span class="w"> </span>run<span class="w"> </span>run<span class="w"> </span>/absolute/path/contacts.1k.cool<span class="w"> </span>/absolute/path/contacts.mcool
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nb">cd</span><span class="w"> </span>tools/cool2mcool
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>pixi<span class="w"> </span>install
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>pixi<span class="w"> </span>run<span class="w"> </span>run<span class="w"> </span>/absolute/path/contacts.1k.cool<span class="w"> </span>/absolute/path/contacts.mcool
 </span></code></pre></div>
 <p>默认输出分辨率为 1 kb、5 kb、10 kb、25 kb、50 kb、100 kb、250 kb、500 kb、
 1 Mb 和 2.5 Mb。可使用 <code>--threads</code>、<code>--level-parallelism</code> 和
 <code>--resolutions</code>；只在需要用成功生成的新文件替换旧输出时使用 <code>--force</code>：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span>--threads<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span>--level-parallelism<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">  </span>--resolutions<span class="w"> </span><span class="m">2500000</span>,1000000,500000,250000,100000,50000,25000,10000,5000,1000<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">  </span>/absolute/path/contacts.1k.cool<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">  </span>/absolute/path/contacts.mcool
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span>--threads<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span>--level-parallelism<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span>--resolutions<span class="w"> </span><span class="m">2500000</span>,1000000,500000,250000,100000,50000,25000,10000,5000,1000<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span>/absolute/path/contacts.1k.cool<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span>/absolute/path/contacts.mcool
 </span></code></pre></div>
 <p>作为标准 Cooler 替代方案，可使用
 <a href="https://cooler.readthedocs.io/en/latest/cli.html#cooler-zoomify"><code>cooler zoomify</code></a>：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>cooler<span class="w"> </span>zoomify<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span>--resolutions<span class="w"> </span><span class="m">1000</span>,5000,10000,25000,50000,100000,250000,500000,1000000,2500000<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span>--balance<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span>--out<span class="w"> </span>contacts.mcool<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span>contacts.1k.cool
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>cooler<span class="w"> </span>zoomify<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>--resolutions<span class="w"> </span><span class="m">1000</span>,5000,10000,25000,50000,100000,250000,500000,1000000,2500000<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span>--balance<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">  </span>--out<span class="w"> </span>contacts.mcool<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">  </span>contacts.1k.cool
 </span></code></pre></div>
 <p>标准 Cooler 生成的归一化列与 <code>cool2mcool</code> 写入的四列不完全相同；在
 C-Studio 中选择归一化前应先检查输出文件。</p>
 <h2 id="paf">生成 PAF 共线性比对<a class="headerlink" href="#paf" title="Permanent link">&para;</a></h2>
 <p>C-Studio 把 PAF query 作为可编辑源 contig 轴，把 PAF target 作为参考轴。
 因此，传给 minimap2 的第二个 FASTA 必须使用与 AGP 第 6 列一致的序列名：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>minimap2<span class="w"> </span>-cx<span class="w"> </span>asm5<span class="w"> </span>-t<span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>reference.fa<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span>source-contigs.fa<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">  </span>&gt;<span class="w"> </span>alignments.paf
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>minimap2<span class="w"> </span>-cx<span class="w"> </span>asm5<span class="w"> </span>-t<span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span>reference.fa<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span>source-contigs.fa<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">  </span>&gt;<span class="w"> </span>alignments.paf
 </span></code></pre></div>
 <p>根据预期组装差异选择 <code>asm5</code>、<code>asm10</code> 或 <code>asm20</code> preset。C-Studio 读取
 PAF 前 12 列；可以保留可选 <code>cg</code> 或 <code>cs</code> tag，但不是必需。参见
@@ -1350,17 +1378,17 @@ PAF 前 12 列；可以保留可选 <code>cg</code> 或 <code>cs</code> tag，�
 <h2 id="_2">生成覆盖度轨道<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
 <p>先把用于覆盖度的 reads 比对到 <code>source-contigs.fa</code>，然后输出四列、0-based
 half-open bedGraph。对坐标排序 BAM 可运行：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>samtools<span class="w"> </span>sort<span class="w"> </span>-@<span class="w"> </span><span class="m">16</span><span class="w"> </span>-o<span class="w"> </span>reads.sorted.bam<span class="w"> </span>reads.bam
-</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>samtools<span class="w"> </span>index<span class="w"> </span>reads.sorted.bam
-</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>bedtools<span class="w"> </span>genomecov<span class="w"> </span>-ibam<span class="w"> </span>reads.sorted.bam<span class="w"> </span>-bga<span class="w"> </span>&gt;<span class="w"> </span>coverage.bedgraph
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>samtools<span class="w"> </span>sort<span class="w"> </span>-@<span class="w"> </span><span class="m">16</span><span class="w"> </span>-o<span class="w"> </span>reads.sorted.bam<span class="w"> </span>reads.bam
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>samtools<span class="w"> </span>index<span class="w"> </span>reads.sorted.bam
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>bedtools<span class="w"> </span>genomecov<span class="w"> </span>-ibam<span class="w"> </span>reads.sorted.bam<span class="w"> </span>-bga<span class="w"> </span>&gt;<span class="w"> </span>coverage.bedgraph
 </span></code></pre></div>
 <p><code>-bga</code> 包含零覆盖区间；如需更小的仅非零轨道，可使用 <code>-bg</code>。参见
 <a href="https://bedtools.readthedocs.io/en/latest/content/tools/genomecov.html"><code>bedtools genomecov</code> 文档</a>。</p>
 <p>原始 <code>samtools depth</code> 输出为三列，不能直接作为 C-Studio coverage 轨道。
 如有需要，请转为 bedGraph 坐标：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>samtools<span class="w"> </span>depth<span class="w"> </span>-aa<span class="w"> </span>reads.sorted.bam<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;BEGIN { OFS=&quot;\t&quot; } { print $1, $2 - 1, $2, $3 }&#39;</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">  </span>&gt;<span class="w"> </span>coverage.bedgraph
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>samtools<span class="w"> </span>depth<span class="w"> </span>-aa<span class="w"> </span>reads.sorted.bam<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;BEGIN { OFS=&quot;\t&quot; } { print $1, $2 - 1, $2, $3 }&#39;</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">  </span>&gt;<span class="w"> </span>coverage.bedgraph
 </span></code></pre></div>
 <h2 id="gfa">准备 GFA 证据<a class="headerlink" href="#gfa" title="Permanent link">&para;</a></h2>
 <p>使用组装器输出的 GFA，例如 primary-unitig GFA。不要根据 AGP 邻接关系虚构图连接。
@@ -1368,16 +1396,16 @@ half-open bedGraph。对坐标排序 BAM 可运行：</p>
 序列或 <code>LN</code> tag 获取长度。显式 <code>L</code> 记录提供图拓扑。</p>
 <h2 id="_3">加载前验证标识符<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
 <p>对比 AGP component ID 与 COOL chromosome 名：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>awk<span class="w"> </span><span class="s1">&#39;$5 != &quot;N&quot; &amp;&amp; $5 != &quot;U&quot; { print $6 }&#39;</span><span class="w"> </span>assembly.agp<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-u<span class="w"> </span>&gt;<span class="w"> </span>agp.components.txt
-</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>cooler<span class="w"> </span>dump<span class="w"> </span>-t<span class="w"> </span>chroms<span class="w"> </span>contacts.1k.cool<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-f1<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-u<span class="w"> </span>&gt;<span class="w"> </span>cool.chroms.txt
-</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>comm<span class="w"> </span>-3<span class="w"> </span>agp.components.txt<span class="w"> </span>cool.chroms.txt
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>awk<span class="w"> </span><span class="s1">&#39;$5 != &quot;N&quot; &amp;&amp; $5 != &quot;U&quot; { print $6 }&#39;</span><span class="w"> </span>assembly.agp<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-u<span class="w"> </span>&gt;<span class="w"> </span>agp.components.txt
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>cooler<span class="w"> </span>dump<span class="w"> </span>-t<span class="w"> </span>chroms<span class="w"> </span>contacts.1k.cool<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-f1<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-u<span class="w"> </span>&gt;<span class="w"> </span>cool.chroms.txt
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>comm<span class="w"> </span>-3<span class="w"> </span>agp.components.txt<span class="w"> </span>cool.chroms.txt
 </span></code></pre></div>
 <p>如果没有输出，表示两组标识符一致。打开 C-Studio 前还应检查矩阵和 MCOOL 层级：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>cooler<span class="w"> </span>info<span class="w"> </span>contacts.1k.cool
-</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>cooler<span class="w"> </span>ls<span class="w"> </span>contacts.mcool
-</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>cooler<span class="w"> </span>info<span class="w"> </span>contacts.mcool::/resolutions/1000
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>cooler<span class="w"> </span>info<span class="w"> </span>contacts.1k.cool
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>cooler<span class="w"> </span>ls<span class="w"> </span>contacts.mcool
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>cooler<span class="w"> </span>info<span class="w"> </span>contacts.mcool::/resolutions/1000
 </span></code></pre></div>
 <p>最后，把准备好的文件放入同一目录，并按<a href="../project-data/">项目目录发现规则</a>加载。</p>
 
