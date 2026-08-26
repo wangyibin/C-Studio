@@ -60,6 +60,7 @@ export interface PlacementRecommendation extends PlacementRecommendationCandidat
   rank: number;
   confidence: PlacementRecommendationConfidence;
   junctions: PlacementJunctionEvidence[];
+  availableJunctionCount: number;
   supportedJunctionCount: number;
   bestEndpointMatchCount: number;
   gfaMatchCount: number;
@@ -82,6 +83,9 @@ export interface PlacementGroupOccupancyConflict {
   locusId: string;
   selectedBlockIds: string[];
   occupiedBlockIds: string[];
+  overlapBp?: number;
+  selectedLocusCoverage?: number;
+  occupiedLocusCoverage?: number;
 }
 
 export type PlacementSyntenyAdjacencyDirection = "upstream" | "downstream";
@@ -92,6 +96,7 @@ export interface PlacementSyntenyAdjacency {
   targetName: string;
   direction: PlacementSyntenyAdjacencyDirection;
   targetGap: number;
+  kind: "nearest" | "boundary-anchor";
 }
 
 export type PlacementRecommendationRankingMode =
@@ -112,6 +117,7 @@ export interface PlacementRecommendationPlan {
   syntenyAnchors: ReferenceSyntenyAnchor[];
   syntenyAdjacencies: PlacementSyntenyAdjacency[];
   occupancyConflicts: PlacementGroupOccupancyConflict[];
+  excludedUnanchoredTargetObjectCount: number;
 }
 
 export interface PlacementRecommendationUnavailable {
@@ -247,16 +253,26 @@ export function buildPlacementRecommendationPlan({
     return selected;
   }
   const selectedIdSet = new Set(selected.blocks.map((block) => block.id));
-  const boundaries = enumeratePlacementBoundaries(blocks, selection);
+  const eligibleTargetObjectIds = placementEligibleTargetObjectIds(blocks);
+  const excludedUnanchoredTargetObjectCount = new Set(
+    blocks
+      .map((block) => block.objectId)
+      .filter((objectId) => !eligibleTargetObjectIds.has(objectId)),
+  ).size;
+  const boundaries = enumeratePlacementBoundaries(blocks, selection).filter(
+    (boundary) => eligibleTargetObjectIds.has(boundary.targetObjectId),
+  );
+  const blocksById = new Map(blocks.map((block) => [block.id, block]));
   const occupancyConflicts = placementGroupOccupancyConflicts(
     blocks,
     selected.blocks,
     syntenyAlleleGroups,
+    syntenyAlleleEdges,
+    syntenyAnchors,
   );
   const occupiedObjectIds = new Set(
     occupancyConflicts.map((conflict) => conflict.targetObjectId),
   );
-  const blocksById = new Map(blocks.map((block) => [block.id, block]));
   const syntenyAdjacencies = buildPlacementSyntenyAdjacencies({
     blocks,
     selectedBlocks: selected.blocks,
@@ -266,6 +282,9 @@ export function buildPlacementRecommendationPlan({
       syntenyPartnerLimitPerSide,
       defaultSyntenyPartnerLimitPerSide,
     ),
+  }).filter((adjacency) => {
+    const objectId = blocksById.get(adjacency.partnerBlockId)?.objectId;
+    return objectId !== undefined && eligibleTargetObjectIds.has(objectId);
   });
   const incidentCoarseLinks = coarseLinks
     .filter((link) => (
@@ -279,6 +298,7 @@ export function buildPlacementRecommendationPlan({
     selectedIdSet,
     blocksById,
     occupiedObjectIds,
+    eligibleTargetObjectIds,
     sanitizeLimit(overviewPartnerLimit, defaultOverviewPartnerLimit),
   );
   const allIncidentGfaEdges = gfaEdges
@@ -289,6 +309,7 @@ export function buildPlacementRecommendationPlan({
     selectedIdSet,
     blocksById,
     occupiedObjectIds,
+    eligibleTargetObjectIds,
     sanitizeLimit(gfaPartnerLimit, defaultGfaPartnerLimit),
   );
   const gfaPartnerIdSet = new Set(gfaPartnerIds);
@@ -345,14 +366,15 @@ export function buildPlacementRecommendationPlan({
     syntenyAnchors: [...syntenyAnchors],
     syntenyAdjacencies,
     occupancyConflicts,
+    excludedUnanchoredTargetObjectCount,
   };
 }
 
 /**
- * Convert high-confidence PAF anchors into positive placement evidence. Only
- * the nearest non-overlapping reference neighbors are returned; directly
- * overlapping allele anchors are explicitly excluded and remain negative
- * evidence. The current AGP is not changed by this operation.
+ * Convert high-confidence PAF anchors into positive placement evidence. True
+ * reciprocal allele overlaps remain excluded, while a short anchor crossing
+ * the edge of a much larger selected locus is retained as boundary support.
+ * The current AGP is not changed by this operation.
  */
 export function buildPlacementSyntenyAdjacencies({
   blocks,
@@ -398,14 +420,27 @@ export function buildPlacementSyntenyAdjacencies({
   );
   const selectedNodeIds = new Set(selectedTargetAnchors.map((anchor) => anchor.nodeId));
   const excludedAlleleNodeIds = new Set<string>();
+  const boundaryAnchorNodeIds = new Set<string>();
   for (const edge of alleleEdges) {
     if (selectedNodeIds.has(edge.left.nodeId)) {
-      excludedAlleleNodeIds.add(edge.right.nodeId);
+      if (edge.relationship === "boundary-overlap") {
+        boundaryAnchorNodeIds.add(edge.right.nodeId);
+      } else {
+        excludedAlleleNodeIds.add(edge.right.nodeId);
+      }
     }
     if (selectedNodeIds.has(edge.right.nodeId)) {
-      excludedAlleleNodeIds.add(edge.left.nodeId);
+      if (edge.relationship === "boundary-overlap") {
+        boundaryAnchorNodeIds.add(edge.left.nodeId);
+      } else {
+        excludedAlleleNodeIds.add(edge.left.nodeId);
+      }
     }
   }
+  const selectedTargetIntervals = mergeTargetIntervals(
+    selectedTargetAnchors.flatMap((anchor) => anchor.targetIntervals),
+  );
+  const selectedTargetSpan = targetIntervalSpan(selectedTargetIntervals);
   const selectedTargetStart = Math.min(
     ...selectedTargetAnchors.map((anchor) => anchor.targetStart),
   );
@@ -449,14 +484,52 @@ export function buildPlacementSyntenyAdjacencies({
         targetName,
         direction,
         targetGap,
+        kind: "nearest" as const,
       })));
-  const adjacencies = [...nearest("upstream"), ...nearest("downstream")];
+  const boundary = available.flatMap((anchor): PlacementSyntenyAdjacency[] => {
+    if (!boundaryAnchorNodeIds.has(anchor.nodeId) || selectedTargetSpan <= 0) {
+      return [];
+    }
+    const anchorIntervals = mergeTargetIntervals(anchor.targetIntervals);
+    const anchorSpan = targetIntervalSpan(anchorIntervals);
+    const overlapBp = targetIntervalIntersectionSpan(selectedTargetIntervals, anchorIntervals);
+    const selectedCoverage = overlapBp / selectedTargetSpan;
+    const anchorCoverage = anchorSpan > 0 ? overlapBp / anchorSpan : 0;
+    if (selectedCoverage > 0.1 || anchorCoverage < 0.5) {
+      return [];
+    }
+    const direction: PlacementSyntenyAdjacencyDirection | null =
+      anchor.targetStart < selectedTargetEnd && anchor.targetEnd > selectedTargetEnd
+        ? "downstream"
+        : anchor.targetStart < selectedTargetStart && anchor.targetEnd > selectedTargetStart
+          ? "upstream"
+          : null;
+    if (!direction) {
+      return [];
+    }
+    return anchor.occurrenceBlockIds
+      .filter((id) => blockIdSet.has(id) && !selectedBlockIdSet.has(id))
+      .map((partnerBlockId) => ({
+        partnerBlockId,
+        partnerNodeId: anchor.nodeId,
+        targetName,
+        direction,
+        targetGap: 0,
+        kind: "boundary-anchor",
+      }));
+  });
+  const adjacencies = [
+    ...boundary,
+    ...nearest("upstream"),
+    ...nearest("downstream"),
+  ];
   const byKey = new Map(adjacencies.map((adjacency) => [
     `${adjacency.partnerBlockId}\u0000${adjacency.direction}`,
     adjacency,
   ]));
   return [...byKey.values()].sort((left, right) => (
     left.direction.localeCompare(right.direction)
+    || Number(left.kind !== "boundary-anchor") - Number(right.kind !== "boundary-anchor")
     || left.targetGap - right.targetGap
     || left.partnerBlockId.localeCompare(right.partnerBlockId)
   ));
@@ -466,6 +539,8 @@ function placementGroupOccupancyConflicts(
   blocks: ReadonlyArray<ContactMapLayoutBlock>,
   selectedBlocks: ReadonlyArray<ContactMapLayoutBlock>,
   syntenyAlleleGroups: ReadonlyArray<ReferenceSyntenyAlleleGroup>,
+  syntenyAlleleEdges: ReadonlyArray<ReferenceSyntenyAlleleEdge>,
+  syntenyAnchors: ReadonlyArray<ReferenceSyntenyAnchor>,
 ): PlacementGroupOccupancyConflict[] {
   const selectedIdSet = new Set(selectedBlocks.map((block) => block.id));
   const blocksById = new Map(blocks.map((block) => [block.id, block]));
@@ -477,9 +552,21 @@ function placementGroupOccupancyConflicts(
     locusId,
     selectedBlockIds,
     occupiedBlockIds,
+    overlapBp,
+    selectedLocusCoverage,
+    occupiedLocusCoverage,
   }: PlacementGroupOccupancyConflict) => {
     const key = `${targetObjectId}\u0000${kind}\u0000${locusId}`;
     const existing = conflictsByKey.get(key);
+    const mergedOverlapBp = Math.max(existing?.overlapBp ?? 0, overlapBp ?? 0);
+    const mergedSelectedCoverage = Math.max(
+      existing?.selectedLocusCoverage ?? 0,
+      selectedLocusCoverage ?? 0,
+    );
+    const mergedOccupiedCoverage = Math.max(
+      existing?.occupiedLocusCoverage ?? 0,
+      occupiedLocusCoverage ?? 0,
+    );
     conflictsByKey.set(key, {
       targetObjectId,
       kind,
@@ -492,6 +579,13 @@ function placementGroupOccupancyConflicts(
         ...(existing?.occupiedBlockIds ?? []),
         ...occupiedBlockIds,
       ]),
+      ...(mergedOverlapBp > 0 ? { overlapBp: mergedOverlapBp } : {}),
+      ...(mergedSelectedCoverage > 0
+        ? { selectedLocusCoverage: mergedSelectedCoverage }
+        : {}),
+      ...(mergedOccupiedCoverage > 0
+        ? { occupiedLocusCoverage: mergedOccupiedCoverage }
+        : {}),
     });
   };
 
@@ -520,37 +614,84 @@ function placementGroupOccupancyConflicts(
     });
   }
 
-  for (const group of syntenyAlleleGroups) {
-    const selectedMembers = group.members.filter((member) => (
-      member.occurrenceBlockIds.some((id) => selectedIdSet.has(id))
-    ));
-    if (selectedMembers.length === 0) {
+  const exactConflictObjectIds = new Set(
+    [...conflictsByKey.values()]
+      .filter((conflict) => conflict.kind === "exact-source")
+      .map((conflict) => conflict.targetObjectId),
+  );
+  const anchors = uniqueAnchors([
+    ...syntenyAnchors,
+    ...syntenyAlleleGroups.flatMap((group) => group.members),
+    ...syntenyAlleleEdges.flatMap((edge) => [edge.left, edge.right]),
+  ]);
+  const selectedAnchors = anchors.filter((anchor) => (
+    anchor.occurrenceBlockIds.some((id) => selectedIdSet.has(id))
+  ));
+  const selectedNodeIds = new Set(selectedAnchors.map((anchor) => anchor.nodeId));
+  const objectIds = sortedUnique(blocks.map((block) => block.objectId));
+  for (const targetObjectId of objectIds) {
+    if (exactConflictObjectIds.has(targetObjectId)) {
       continue;
     }
-    const selectedMemberIds = new Set(selectedMembers.map((member) => member.nodeId));
-    const selectedGroupBlockIds = selectedMembers.flatMap((member) => (
-      member.occurrenceBlockIds.filter((id) => selectedIdSet.has(id))
+    const occupiedAnchors = anchors.filter((anchor) => (
+      !selectedNodeIds.has(anchor.nodeId)
+      && anchor.occurrenceBlockIds.some((id) => {
+        const block = blocksById.get(id);
+        return block?.objectId === targetObjectId && !selectedIdSet.has(id);
+      })
     ));
-    for (const occupiedMember of group.members) {
-      if (selectedMemberIds.has(occupiedMember.nodeId)) {
+    const targetNames = sortedUnique(selectedAnchors.map((anchor) => anchor.targetName));
+    for (const targetName of targetNames) {
+      const selectedTargetAnchors = selectedAnchors.filter(
+        (anchor) => anchor.targetName === targetName,
+      );
+      const occupiedTargetAnchors = occupiedAnchors.filter(
+        (anchor) => anchor.targetName === targetName,
+      );
+      if (selectedTargetAnchors.length === 0 || occupiedTargetAnchors.length === 0) {
         continue;
       }
-      for (const occupiedBlockId of occupiedMember.occurrenceBlockIds) {
-        if (selectedIdSet.has(occupiedBlockId)) {
-          continue;
-        }
-        const occupiedBlock = blocksById.get(occupiedBlockId);
-        if (!occupiedBlock) {
-          continue;
-        }
-        addConflict({
-          targetObjectId: occupiedBlock.objectId,
-          kind: "paf-allele-locus",
-          locusId: group.id,
-          selectedBlockIds: selectedGroupBlockIds,
-          occupiedBlockIds: [occupiedBlockId],
-        });
+      const selectedIntervals = mergeTargetIntervals(
+        selectedTargetAnchors.flatMap((anchor) => anchor.targetIntervals),
+      );
+      const occupiedIntervals = mergeTargetIntervals(
+        occupiedTargetAnchors.flatMap((anchor) => anchor.targetIntervals),
+      );
+      const selectedSpan = targetIntervalSpan(selectedIntervals);
+      const occupiedSpan = targetIntervalSpan(occupiedIntervals);
+      const overlapBp = targetIntervalIntersectionSpan(selectedIntervals, occupiedIntervals);
+      const selectedLocusCoverage = selectedSpan > 0 ? overlapBp / selectedSpan : 0;
+      if (selectedLocusCoverage < 0.5) {
+        continue;
       }
+      const selectedBlockIds = selectedTargetAnchors
+        .filter((anchor) => targetIntervalIntersectionSpan(
+          mergeTargetIntervals(anchor.targetIntervals),
+          occupiedIntervals,
+        ) > 0)
+        .flatMap((anchor) => anchor.occurrenceBlockIds.filter((id) => selectedIdSet.has(id)));
+      const occupiedBlockIds = occupiedTargetAnchors
+        .filter((anchor) => targetIntervalIntersectionSpan(
+          selectedIntervals,
+          mergeTargetIntervals(anchor.targetIntervals),
+        ) > 0)
+        .flatMap((anchor) => anchor.occurrenceBlockIds.filter((id) => (
+          blocksById.get(id)?.objectId === targetObjectId && !selectedIdSet.has(id)
+        )));
+      if (selectedBlockIds.length === 0 || occupiedBlockIds.length === 0) {
+        continue;
+      }
+      addConflict({
+        targetObjectId,
+        kind: "paf-allele-locus",
+        locusId: `synteny-occupancy:${targetName}:${selectedIntervals[0]?.[0] ?? 0}-`
+          + `${selectedIntervals[selectedIntervals.length - 1]?.[1] ?? 0}`,
+        selectedBlockIds,
+        occupiedBlockIds,
+        overlapBp,
+        selectedLocusCoverage,
+        occupiedLocusCoverage: occupiedSpan > 0 ? overlapBp / occupiedSpan : 0,
+      });
     }
   }
 
@@ -699,9 +840,11 @@ export function rankPlacementRecommendations(
     const confidence = recommendationConfidence({
       copyAmbiguous: plan.copyAmbiguous,
       occupancyConflictCount: occupancyConflicts.length,
+      availableJunctionCount: junctions.length,
       supportedJunctionCount: supported.length,
       bestEndpointMatchCount,
       gfaMatchCount,
+      pafAdjacencyMatchCount,
       complete: evidence.every((junction) => junction.complete),
     });
     return [{
@@ -710,6 +853,7 @@ export function rankPlacementRecommendations(
       rank: 0,
       confidence,
       junctions: evidence,
+      availableJunctionCount: junctions.length,
       supportedJunctionCount: supported.length,
       bestEndpointMatchCount,
       gfaMatchCount,
@@ -861,9 +1005,38 @@ function candidatePafAdjacencyMatchCount(
   const adjacencyKeys = new Set(adjacencies.map((adjacency) => (
     `${adjacency.partnerBlockId}\u0000${adjacency.direction}`
   )));
-  return candidateEndpointJunctions(selected, candidate, blocks).filter((junction) => (
-    adjacencyKeys.has(`${junction.partnerBlockId}\u0000${directions[junction.side]}`)
-  )).length;
+  const blocksById = new Map(blocks.map((block) => [block.id, block]));
+  const anchorsByBlockId = new Map<string, ReferenceSyntenyAnchor>();
+  for (const anchor of anchors) {
+    for (const blockId of anchor.occurrenceBlockIds) {
+      anchorsByBlockId.set(blockId, anchor);
+    }
+  }
+  const candidateAscending = directions.right === "downstream";
+  return candidateEndpointJunctions(selected, candidate, blocks).filter((junction) => {
+    if (!adjacencyKeys.has(`${junction.partnerBlockId}\u0000${directions[junction.side]}`)) {
+      return false;
+    }
+    const partnerBlock = blocksById.get(junction.partnerBlockId);
+    const partnerAnchor = anchorsByBlockId.get(junction.partnerBlockId);
+    return partnerBlock !== undefined
+      && partnerAnchor !== undefined
+      && blockReferenceAscending(partnerBlock, partnerAnchor) === candidateAscending;
+  }).length;
+}
+
+function blockReferenceAscending(
+  block: ContactMapLayoutBlock,
+  anchor: ReferenceSyntenyAnchor,
+) {
+  const leftSide = leftPhysicalSide(block.orientation);
+  const rightSide = rightPhysicalSide(block.orientation);
+  if (!leftSide || !rightSide) {
+    return null;
+  }
+  const leftCoordinate = anchorCoordinateForPhysicalSide(anchor, leftSide);
+  const rightCoordinate = anchorCoordinateForPhysicalSide(anchor, rightSide);
+  return leftCoordinate === rightCoordinate ? null : leftCoordinate < rightCoordinate;
 }
 
 function candidateSelectedReferenceDirections(
@@ -871,9 +1044,7 @@ function candidateSelectedReferenceDirections(
   candidate: PlacementRecommendationCandidate,
   anchors: ReadonlyArray<ReferenceSyntenyAnchor>,
 ): Record<"left" | "right", PlacementSyntenyAdjacencyDirection> | null {
-  const firstSelected = selected.blocks[0];
-  const lastSelected = selected.blocks[selected.blocks.length - 1];
-  if (!firstSelected || !lastSelected) {
+  if (selected.blocks.length === 0) {
     return null;
   }
   const anchorByBlockId = new Map<string, ReferenceSyntenyAnchor>();
@@ -882,34 +1053,34 @@ function candidateSelectedReferenceDirections(
       anchorByBlockId.set(blockId, anchor);
     }
   }
-  const reversed = candidate.orientation !== selected.currentOrientation;
-  const leftSelected = reversed ? lastSelected : firstSelected;
-  const rightSelected = reversed ? firstSelected : lastSelected;
-  const leftSelectedSide = reversed
-    ? rightPhysicalSide(lastSelected.orientation)
-    : leftPhysicalSide(firstSelected.orientation);
-  const rightSelectedSide = reversed
-    ? leftPhysicalSide(firstSelected.orientation)
-    : rightPhysicalSide(lastSelected.orientation);
-  const leftAnchor = anchorByBlockId.get(leftSelected.id);
-  const rightAnchor = anchorByBlockId.get(rightSelected.id);
-  if (
-    !leftSelectedSide
-    || !rightSelectedSide
-    || !leftAnchor
-    || !rightAnchor
-    || leftAnchor.targetName !== rightAnchor.targetName
-    || leftAnchor.strandDominance < 0.75
-    || rightAnchor.strandDominance < 0.75
-  ) {
+  const anchored = selected.blocks.flatMap((block) => {
+    const anchor = anchorByBlockId.get(block.id);
+    return anchor && anchor.strandDominance >= 0.75 ? [{ block, anchor }] : [];
+  });
+  const targetName = anchored[0]?.anchor.targetName;
+  const targetAnchored = targetName
+    ? anchored.filter((item) => item.anchor.targetName === targetName)
+    : [];
+  if (targetAnchored.length === 0) {
     return null;
   }
-  const leftCoordinate = anchorCoordinateForPhysicalSide(leftAnchor, leftSelectedSide);
-  const rightCoordinate = anchorCoordinateForPhysicalSide(rightAnchor, rightSelectedSide);
+  const first = targetAnchored[0];
+  const last = targetAnchored[targetAnchored.length - 1];
+  const leftSide = leftPhysicalSide(first.block.orientation);
+  const rightSide = rightPhysicalSide(last.block.orientation);
+  if (!leftSide || !rightSide) {
+    return null;
+  }
+  const leftCoordinate = anchorCoordinateForPhysicalSide(first.anchor, leftSide);
+  const rightCoordinate = anchorCoordinateForPhysicalSide(last.anchor, rightSide);
   if (leftCoordinate === rightCoordinate) {
     return null;
   }
-  return leftCoordinate < rightCoordinate
+  const currentAscending = leftCoordinate < rightCoordinate;
+  const candidateAscending = candidate.orientation === selected.currentOrientation
+    ? currentAscending
+    : !currentAscending;
+  return candidateAscending
     ? { left: "upstream", right: "downstream" }
     : { left: "downstream", right: "upstream" };
 }
@@ -1097,16 +1268,20 @@ function hasGfaPortMatch(
 function recommendationConfidence({
   copyAmbiguous,
   occupancyConflictCount,
+  availableJunctionCount,
   supportedJunctionCount,
   bestEndpointMatchCount,
   gfaMatchCount,
+  pafAdjacencyMatchCount,
   complete,
 }: {
   copyAmbiguous: boolean;
   occupancyConflictCount: number;
+  availableJunctionCount: number;
   supportedJunctionCount: number;
   bestEndpointMatchCount: number;
   gfaMatchCount: number;
+  pafAdjacencyMatchCount: number;
   complete: boolean;
 }): PlacementRecommendationConfidence {
   if (copyAmbiguous || occupancyConflictCount > 0) {
@@ -1114,16 +1289,21 @@ function recommendationConfidence({
   }
   if (
     complete
-    && supportedJunctionCount === 2
-    && bestEndpointMatchCount === 2
-    && gfaMatchCount >= 1
+    && availableJunctionCount > 0
+    && supportedJunctionCount === availableJunctionCount
+    && bestEndpointMatchCount === availableJunctionCount
+    && (gfaMatchCount >= 1 || pafAdjacencyMatchCount >= 1)
   ) {
     return "high";
   }
   if (
     complete
     && (
-      (supportedJunctionCount === 2 && bestEndpointMatchCount >= 1)
+      (
+        availableJunctionCount > 0
+        && supportedJunctionCount === availableJunctionCount
+        && bestEndpointMatchCount >= 1
+      )
       || (supportedJunctionCount >= 1 && gfaMatchCount >= 1)
     )
   ) {
@@ -1185,6 +1365,7 @@ function occupancyTierPartnerIds<T extends { source: string; target: string }>(
   selectedIdSet: ReadonlySet<string>,
   blocksById: ReadonlyMap<string, ContactMapLayoutBlock>,
   occupiedObjectIds: ReadonlySet<string>,
+  eligibleTargetObjectIds: ReadonlySet<string>,
   limitPerTier: number,
 ) {
   const compatible: string[] = [];
@@ -1194,6 +1375,9 @@ function occupancyTierPartnerIds<T extends { source: string; target: string }>(
   for (const item of evidence) {
     const partnerId = selectedIdSet.has(item.source) ? item.target : item.source;
     const partnerObjectId = blocksById.get(partnerId)?.objectId;
+    if (partnerObjectId === undefined || !eligibleTargetObjectIds.has(partnerObjectId)) {
+      continue;
+    }
     const isConflict = partnerObjectId !== undefined && occupiedObjectIds.has(partnerObjectId);
     const values = isConflict ? conflicting : compatible;
     const seen = isConflict ? conflictingSeen : compatibleSeen;
@@ -1230,12 +1414,74 @@ function exactSourceIntervalKey(block: ContactMapLayoutBlock) {
   return `${block.sourceId}\u0001${block.sourceStart}\u0001${block.sourceEnd}`;
 }
 
+function placementEligibleTargetObjectIds(
+  blocks: ReadonlyArray<ContactMapLayoutBlock>,
+) {
+  const blocksByObject = new Map<string, ContactMapLayoutBlock[]>();
+  for (const block of blocks) {
+    const values = blocksByObject.get(block.objectId) ?? [];
+    values.push(block);
+    blocksByObject.set(block.objectId, values);
+  }
+  return new Set([...blocksByObject]
+    .filter(([objectId, objectBlocks]) => !(
+      objectBlocks.length === 1 && objectBlocks[0]?.sourceId === objectId
+    ))
+    .map(([objectId]) => objectId));
+}
+
 function sortedUnique(values: ReadonlyArray<string>) {
   return [...new Set(values)].sort((left, right) => left.localeCompare(right));
 }
 
 function uniqueAnchors(anchors: ReadonlyArray<ReferenceSyntenyAnchor>) {
   return [...new Map(anchors.map((anchor) => [anchor.nodeId, anchor])).values()];
+}
+
+type TargetInterval = readonly [number, number];
+
+function mergeTargetIntervals(intervals: ReadonlyArray<TargetInterval>) {
+  const sorted = [...intervals]
+    .filter(([start, end]) => Number.isFinite(start) && Number.isFinite(end) && start < end)
+    .sort(([leftStart, leftEnd], [rightStart, rightEnd]) => (
+      leftStart - rightStart || leftEnd - rightEnd
+    ));
+  const merged: Array<[number, number]> = [];
+  for (const [start, end] of sorted) {
+    const previous = merged[merged.length - 1];
+    if (!previous || start > previous[1]) {
+      merged.push([start, end]);
+    } else {
+      previous[1] = Math.max(previous[1], end);
+    }
+  }
+  return merged;
+}
+
+function targetIntervalSpan(intervals: ReadonlyArray<TargetInterval>) {
+  return intervals.reduce((sum, [start, end]) => sum + Math.max(0, end - start), 0);
+}
+
+function targetIntervalIntersectionSpan(
+  left: ReadonlyArray<TargetInterval>,
+  right: ReadonlyArray<TargetInterval>,
+) {
+  let leftIndex = 0;
+  let rightIndex = 0;
+  let total = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    total += Math.max(
+      0,
+      Math.min(left[leftIndex][1], right[rightIndex][1])
+        - Math.max(left[leftIndex][0], right[rightIndex][0]),
+    );
+    if (left[leftIndex][1] < right[rightIndex][1]) {
+      leftIndex += 1;
+    } else {
+      rightIndex += 1;
+    }
+  }
+  return total;
 }
 
 function sameIds(left: ReadonlyArray<string>, right: ReadonlyArray<string>) {

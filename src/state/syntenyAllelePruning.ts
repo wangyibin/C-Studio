@@ -34,6 +34,43 @@ export interface ReferenceSyntenyAlleleGroup {
   members: ReferenceSyntenyAnchor[];
 }
 
+export type ReferenceSyntenyAlleleConfidence = "high" | "review";
+
+export type ReferenceSyntenyAlleleRelationship =
+  | "allele"
+  | "boundary-overlap"
+  | "partial-overlap";
+
+export type ReferenceSyntenyAnchorExclusionReason =
+  | "no-paf-alignment"
+  | "partial-source-overlap"
+  | "low-query-coverage"
+  | "low-identity"
+  | "low-mapq"
+  | "multi-locus-split"
+  | "multi-locus-repetitive"
+  | "multi-locus-mixed";
+
+export interface ReferenceSyntenyAmbiguousLocus {
+  targetName: string;
+  targetStart: number;
+  targetEnd: number;
+  queryStart: number;
+  queryEnd: number;
+  queryCoverage: number;
+  identity: number;
+  meanMapq: number;
+  score: number;
+}
+
+export interface ReferenceSyntenyAnchorExclusion {
+  nodeId: string;
+  sourceId: string;
+  occurrenceBlockIds: string[];
+  reason: ReferenceSyntenyAnchorExclusionReason;
+  candidateLoci: ReferenceSyntenyAmbiguousLocus[];
+}
+
 /**
  * One directly observed, non-transitive co-synteny relationship. Unlike the
  * legacy display groups, an anchor may participate in more than one edge.
@@ -43,11 +80,18 @@ export interface ReferenceSyntenyAlleleEdge {
   targetName: string;
   left: ReferenceSyntenyAnchor;
   right: ReferenceSyntenyAnchor;
+  overlapBp: number;
   targetOverlap: number;
+  reciprocalTargetOverlap: number;
+  leftTargetCoverage: number;
+  rightTargetCoverage: number;
+  relationship: ReferenceSyntenyAlleleRelationship;
   minQueryCoverage: number;
   minIdentity: number;
   minMeanMapq: number;
   minTargetDominance: number;
+  confidence: ReferenceSyntenyAlleleConfidence;
+  confidenceScore: number;
 }
 
 export interface SyntenyAlleleSignalMask {
@@ -63,9 +107,11 @@ export interface ReferenceSyntenyAllelePruning {
   anchors: ReferenceSyntenyAnchor[];
   alleleEdges: ReferenceSyntenyAlleleEdge[];
   groups: ReferenceSyntenyAlleleGroup[];
+  exclusions: ReferenceSyntenyAnchorExclusion[];
   maskByPair: Map<string, SyntenyAlleleSignalMask>;
   directAllelePairCount: number;
   pairwiseAlleleOccurrencePairCount: number;
+  compactGroupAlleleOccurrencePairCount: number;
   shadowOnlyAlleleOccurrencePairCount: number;
   legacyOnlyAlleleOccurrencePairCount: number;
   crossAllelePairCount: number;
@@ -73,6 +119,9 @@ export interface ReferenceSyntenyAllelePruning {
   matchedPairCount: number;
   excludedBlockCount: number;
   multiMappingBlockCount: number;
+  splitMappingBlockCount: number;
+  repetitiveMappingBlockCount: number;
+  mixedMappingBlockCount: number;
   fingerprint: string;
 }
 
@@ -82,11 +131,14 @@ interface ReferenceSyntenyAlleleOptions {
   minMeanMapq?: number;
   minTargetDominance?: number;
   minTargetOverlap?: number;
+  minReciprocalTargetOverlap?: number;
+  maxBoundaryReciprocalTargetOverlap?: number;
   maxTargetLocusGap?: number;
 }
 
 interface TargetAnchorCandidate {
   targetName: string;
+  queryIntervals: Interval[];
   targetIntervals: Interval[];
   targetStrand: "+" | "-";
   strandDominance: number;
@@ -94,6 +146,7 @@ interface TargetAnchorCandidate {
   identity: number;
   meanMapq: number;
   score: number;
+  primaryScore: number;
 }
 
 interface SourceOccurrenceNode {
@@ -111,11 +164,13 @@ interface AlignmentObservation {
   identity: number;
   mapq: number;
   observedBp: number;
+  alignmentType: PafPreviewRecord["alignmentType"];
 }
 
 interface AnchorBuildResult {
   anchor: ReferenceSyntenyAnchor | null;
   multiMapping: boolean;
+  exclusion: Omit<ReferenceSyntenyAnchorExclusion, "nodeId" | "sourceId" | "occurrenceBlockIds"> | null;
 }
 
 const defaultOptions = {
@@ -124,14 +179,18 @@ const defaultOptions = {
   minMeanMapq: 1,
   minTargetDominance: 0.75,
   minTargetOverlap: 0.5,
+  minReciprocalTargetOverlap: 0.5,
+  maxBoundaryReciprocalTargetOverlap: 0.1,
   maxTargetLocusGap: 100_000,
 };
 
 /**
- * Identify direct pairwise co-synteny relationships, then preserve the legacy
- * disjoint-group Kprune masks for a shadow-mode rollout. The returned factors
- * affect recommendation evidence only; source PAF/Hi-C data and the current
- * AGP remain untouched.
+ * Identify direct pairwise co-synteny relationships and use those observed
+ * edges as the authoritative direct-allele masks. Disjoint groups remain a
+ * compact locus summary for display and cross-locus matching, but they must
+ * not discard valid non-transitive edges. The returned factors affect
+ * recommendation evidence only; source PAF/Hi-C data and the current AGP
+ * remain untouched.
  */
 export function buildReferenceSyntenyAllelePruning(
   records: ReadonlyArray<PafPreviewRecord>,
@@ -144,8 +203,12 @@ export function buildReferenceSyntenyAllelePruning(
   const sourceNodes = buildSourceOccurrenceNodes(blocks);
   const partiallyOverlappingNodeIds = partialSourceOverlapNodeIds(sourceNodes);
   const anchors: ReferenceSyntenyAnchor[] = [];
+  const exclusions: ReferenceSyntenyAnchorExclusion[] = [];
   let excludedBlockCount = 0;
   let multiMappingBlockCount = 0;
+  let splitMappingBlockCount = 0;
+  let repetitiveMappingBlockCount = 0;
+  let mixedMappingBlockCount = 0;
 
   for (const node of sourceNodes) {
     const representative = node.blocks[0];
@@ -153,10 +216,14 @@ export function buildReferenceSyntenyAllelePruning(
       ?? (!representative || representative.id === node.sourceId
         ? undefined
         : recordsByQuery.get(representative.id));
-    if (!sourceRecords || sourceRecords.length === 0 || partiallyOverlappingNodeIds.has(node.id)) {
-      if (sourceRecords?.length) {
-        excludedBlockCount += node.blocks.length;
-      }
+    if (!sourceRecords || sourceRecords.length === 0) {
+      excludedBlockCount += node.blocks.length;
+      exclusions.push(anchorExclusion(node, "no-paf-alignment", []));
+      continue;
+    }
+    if (partiallyOverlappingNodeIds.has(node.id)) {
+      excludedBlockCount += node.blocks.length;
+      exclusions.push(anchorExclusion(node, "partial-source-overlap", []));
       continue;
     }
     const built = buildPrimaryAnchor(node, sourceRecords, resolvedOptions);
@@ -164,6 +231,22 @@ export function buildReferenceSyntenyAllelePruning(
       anchors.push(built.anchor);
     } else {
       excludedBlockCount += node.blocks.length;
+      if (built.exclusion) {
+        const exclusion = {
+          ...built.exclusion,
+          nodeId: node.id,
+          sourceId: node.sourceId,
+          occurrenceBlockIds: node.blocks.map((block) => block.id),
+        };
+        exclusions.push(exclusion);
+        if (exclusion.reason === "multi-locus-split") {
+          splitMappingBlockCount += node.blocks.length;
+        } else if (exclusion.reason === "multi-locus-repetitive") {
+          repetitiveMappingBlockCount += node.blocks.length;
+        } else if (exclusion.reason === "multi-locus-mixed") {
+          mixedMappingBlockCount += node.blocks.length;
+        }
+      }
       if (built.multiMapping) {
         multiMappingBlockCount += node.blocks.length;
       }
@@ -173,9 +256,15 @@ export function buildReferenceSyntenyAllelePruning(
   const alleleEdges = buildReferenceSyntenyAlleleEdges(
     anchors,
     resolvedOptions.minTargetOverlap,
+    resolvedOptions.minReciprocalTargetOverlap,
+    resolvedOptions.maxBoundaryReciprocalTargetOverlap,
   );
-  const groups = clusterReferenceAnchors(anchors, resolvedOptions.minTargetOverlap);
+  const groups = clusterReferenceAnchors(
+    anchors,
+    resolvedOptions.minReciprocalTargetOverlap,
+  );
   const maskByPair = new Map<string, SyntenyAlleleSignalMask>();
+  const legacyDirectAllelePairs = expandedAlleleGroupPairKeys(groups);
 
   for (const node of sourceNodes.filter((candidate) => candidate.blocks.length > 1)) {
     const occurrenceIds = node.blocks.map((block) => block.id);
@@ -187,24 +276,6 @@ export function buildReferenceSyntenyAllelePruning(
           sourceGroupId: `duplicate:${node.id}`,
           targetGroupId: `duplicate:${node.id}`,
         });
-      }
-    }
-  }
-
-  for (const group of groups) {
-    for (let left = 0; left < group.members.length; left += 1) {
-      for (let right = left + 1; right < group.members.length; right += 1) {
-        setExpandedMask(
-          maskByPair,
-          group.members[left].occurrenceBlockIds,
-          group.members[right].occurrenceBlockIds,
-          {
-          factor: 0,
-          reason: "direct-allele",
-          sourceGroupId: group.id,
-          targetGroupId: group.id,
-          },
-        );
       }
     }
   }
@@ -284,14 +355,34 @@ export function buildReferenceSyntenyAllelePruning(
     }
   }
 
+  // Direct PAF overlap is stronger evidence than a cross-locus Hi-C matching
+  // decision. Apply it last so a valid non-transitive edge cannot be
+  // overwritten merely because its two anchors landed in different compact
+  // display groups.
+  for (const edge of alleleEdges) {
+    if (edge.confidence !== "high" || edge.relationship !== "allele") {
+      continue;
+    }
+    setExpandedMask(
+      maskByPair,
+      edge.left.occurrenceBlockIds,
+      edge.right.occurrenceBlockIds,
+      {
+        factor: 0,
+        reason: "direct-allele",
+        sourceGroupId: edge.id,
+        targetGroupId: edge.id,
+      },
+    );
+  }
+
   const masks = [...maskByPair.entries()].sort(([left], [right]) => left.localeCompare(right));
   const directAllelePairCount = masks.filter(([, mask]) => mask.reason === "direct-allele").length;
-  const pairwiseAlleleOccurrencePairs = expandedAlleleEdgePairKeys(alleleEdges);
-  const legacyDirectAllelePairs = new Set(masks
-    .filter(([, mask]) => mask.reason === "direct-allele")
-    .map(([key]) => key));
+  const pairwiseAlleleOccurrencePairs = expandedAlleleEdgePairKeys(
+    alleleEdges.filter((edge) => edge.relationship === "allele"),
+  );
   const shadowOnlyAlleleOccurrencePairCount = [...pairwiseAlleleOccurrencePairs]
-    .filter((key) => !legacyDirectAllelePairs.has(key)).length;
+    .filter((key) => !maskByPair.has(key)).length;
   const legacyOnlyAlleleOccurrencePairCount = [...legacyDirectAllelePairs]
     .filter((key) => !pairwiseAlleleOccurrencePairs.has(key)).length;
   const crossAllelePairCount = masks.filter(([, mask]) => mask.reason === "cross-allele-nonmatch").length;
@@ -301,7 +392,16 @@ export function buildReferenceSyntenyAllelePruning(
       `${anchor.nodeId}:${anchor.targetName}:${anchor.targetStart}-${anchor.targetEnd}:`
       + `${anchor.targetStrand}:${anchor.strandDominance}`
     )),
-    ...alleleEdges.map((edge) => `${edge.id}:${edge.targetOverlap}`),
+    ...alleleEdges.map((edge) => (
+      `${edge.id}:${edge.relationship}:${edge.targetOverlap}:`
+      + `${edge.reciprocalTargetOverlap}:${edge.confidence}:${edge.confidenceScore}`
+    )),
+    ...exclusions.map((exclusion) => (
+      `${exclusion.nodeId}:${exclusion.reason}:${exclusion.candidateLoci.map((locus) => (
+        `${locus.targetName}:${locus.targetStart}-${locus.targetEnd}:`
+        + `${locus.queryStart}-${locus.queryEnd}`
+      )).join(",")}`
+    )),
     ...groups.map((group) => `${group.id}:${group.members.map(
       (member) => `${member.nodeId}[${member.occurrenceBlockIds.join(",")}]`,
     ).join(",")}`),
@@ -312,9 +412,11 @@ export function buildReferenceSyntenyAllelePruning(
     anchors,
     alleleEdges,
     groups,
+    exclusions,
     maskByPair,
     directAllelePairCount,
     pairwiseAlleleOccurrencePairCount: pairwiseAlleleOccurrencePairs.size,
+    compactGroupAlleleOccurrencePairCount: legacyDirectAllelePairs.size,
     shadowOnlyAlleleOccurrencePairCount,
     legacyOnlyAlleleOccurrencePairCount,
     crossAllelePairCount,
@@ -322,6 +424,9 @@ export function buildReferenceSyntenyAllelePruning(
     matchedPairCount,
     excludedBlockCount,
     multiMappingBlockCount,
+    splitMappingBlockCount,
+    repetitiveMappingBlockCount,
+    mixedMappingBlockCount,
     fingerprint,
   };
 }
@@ -334,6 +439,8 @@ export function buildReferenceSyntenyAllelePruning(
 export function buildReferenceSyntenyAlleleEdges(
   anchors: ReadonlyArray<ReferenceSyntenyAnchor>,
   minTargetOverlap: number,
+  minReciprocalTargetOverlap = minTargetOverlap,
+  maxBoundaryReciprocalTargetOverlap = 0.1,
 ): ReferenceSyntenyAlleleEdge[] {
   const anchorsByTarget = new Map<string, ReferenceSyntenyAnchor[]>();
   for (const anchor of anchors) {
@@ -350,23 +457,49 @@ export function buildReferenceSyntenyAlleleEdges(
     for (const anchor of sorted) {
       active = active.filter((candidate) => candidate.targetEnd > anchor.targetStart);
       for (const candidate of active) {
-        const overlap = targetOverlap(candidate, anchor);
-        if (overlap < minTargetOverlap) {
+        const overlap = targetOverlapMetrics(candidate, anchor);
+        if (overlap.shorterCoverage < minTargetOverlap) {
           continue;
         }
         const [left, right] = candidate.nodeId.localeCompare(anchor.nodeId) <= 0
           ? [candidate, anchor]
           : [anchor, candidate];
+        const relationship: ReferenceSyntenyAlleleRelationship =
+          overlap.reciprocalCoverage >= minReciprocalTargetOverlap
+            ? "allele"
+            : overlap.reciprocalCoverage <= maxBoundaryReciprocalTargetOverlap
+              && crossesTargetBoundary(candidate, anchor)
+              ? "boundary-overlap"
+              : "partial-overlap";
+        const confidence: ReferenceSyntenyAlleleConfidence = relationship === "partial-overlap"
+          ? "review"
+          : "high";
+        const leftTargetCoverage = left.nodeId === candidate.nodeId
+          ? overlap.leftCoverage
+          : overlap.rightCoverage;
+        const rightTargetCoverage = right.nodeId === anchor.nodeId
+          ? overlap.rightCoverage
+          : overlap.leftCoverage;
+        const confidenceOverlap = relationship === "boundary-overlap"
+          ? overlap.shorterCoverage
+          : overlap.reciprocalCoverage;
         edges.push({
           id: `synteny-edge:${targetName}:${left.nodeId}:${right.nodeId}`,
           targetName,
           left,
           right,
-          targetOverlap: overlap,
+          overlapBp: overlap.overlapBp,
+          targetOverlap: overlap.shorterCoverage,
+          reciprocalTargetOverlap: overlap.reciprocalCoverage,
+          leftTargetCoverage,
+          rightTargetCoverage,
+          relationship,
           minQueryCoverage: Math.min(left.queryCoverage, right.queryCoverage),
           minIdentity: Math.min(left.identity, right.identity),
           minMeanMapq: Math.min(left.meanMapq, right.meanMapq),
           minTargetDominance: Math.min(left.targetDominance, right.targetDominance),
+          confidence,
+          confidenceScore: alleleEdgeConfidenceScore(left, right, confidenceOverlap),
         });
       }
       active.push(anchor);
@@ -461,13 +594,18 @@ function buildPrimaryAnchor(
       identity,
       mapq: Math.max(0, record.mapq),
       observedBp,
+      alignmentType: record.alignmentType,
     });
     byTarget.set(record.targetName, values);
   }
 
   const blockLength = node.sourceEnd - node.sourceStart;
   if (blockLength <= 0) {
-    return { anchor: null, multiMapping: false };
+    return {
+      anchor: null,
+      multiMapping: false,
+      exclusion: { reason: "no-paf-alignment", candidateLoci: [] },
+    };
   }
   const candidates: TargetAnchorCandidate[] = [];
   for (const [targetName, observations] of byTarget) {
@@ -498,6 +636,7 @@ function buildPrimaryAnchor(
         : 0;
       candidates.push({
         targetName,
+        queryIntervals,
         targetIntervals,
         targetStrand,
         strandDominance,
@@ -505,26 +644,54 @@ function buildPrimaryAnchor(
         identity,
         meanMapq,
         score: queryAlignedBp * identity,
+        primaryScore: locus.some((observation) => observation.alignmentType === "primary")
+          ? queryAlignedBp * identity
+          : 0,
       });
     }
   }
-  candidates.sort((left, right) => right.score - left.score
+  const hasTaggedPrimary = candidates.some((candidate) => candidate.primaryScore > 0);
+  candidates.sort((left, right) => (hasTaggedPrimary
+    ? right.primaryScore - left.primaryScore
+    : 0)
+    || right.score - left.score
     || right.queryCoverage - left.queryCoverage
     || left.targetName.localeCompare(right.targetName));
   const primary = candidates[0];
   if (!primary) {
-    return { anchor: null, multiMapping: false };
+    return {
+      anchor: null,
+      multiMapping: false,
+      exclusion: { reason: "no-paf-alignment", candidateLoci: [] },
+    };
   }
   const totalScore = candidates.reduce((sum, candidate) => sum + candidate.score, 0);
   const targetDominance = totalScore > 0 ? primary.score / totalScore : 0;
   const multiMapping = targetDominance < options.minTargetDominance;
+  const candidateLoci = candidates.map(candidateLocusSummary);
+  const exclusionReason: ReferenceSyntenyAnchorExclusionReason | null = multiMapping
+    ? `multi-locus-${multiLocusKind(primary, candidates.slice(1))}`
+    : primary.queryCoverage < options.minQueryCoverage
+      ? "low-query-coverage"
+      : primary.identity < options.minIdentity
+        ? "low-identity"
+        : primary.meanMapq < options.minMeanMapq
+          ? "low-mapq"
+          : null;
   if (
     primary.queryCoverage < options.minQueryCoverage
     || primary.identity < options.minIdentity
     || primary.meanMapq < options.minMeanMapq
     || multiMapping
   ) {
-    return { anchor: null, multiMapping };
+    return {
+      anchor: null,
+      multiMapping,
+      exclusion: {
+        reason: exclusionReason ?? "no-paf-alignment",
+        candidateLoci,
+      },
+    };
   }
   const occurrenceBlockIds = node.blocks.map((block) => block.id);
   return {
@@ -545,7 +712,79 @@ function buildPrimaryAnchor(
       targetDominance,
     },
     multiMapping: false,
+    exclusion: null,
   };
+}
+
+function anchorExclusion(
+  node: SourceOccurrenceNode,
+  reason: ReferenceSyntenyAnchorExclusionReason,
+  candidateLoci: ReferenceSyntenyAmbiguousLocus[],
+): ReferenceSyntenyAnchorExclusion {
+  return {
+    nodeId: node.id,
+    sourceId: node.sourceId,
+    occurrenceBlockIds: node.blocks.map((block) => block.id),
+    reason,
+    candidateLoci,
+  };
+}
+
+function candidateLocusSummary(
+  candidate: TargetAnchorCandidate,
+): ReferenceSyntenyAmbiguousLocus {
+  return {
+    targetName: candidate.targetName,
+    targetStart: candidate.targetIntervals[0]?.[0] ?? 0,
+    targetEnd: candidate.targetIntervals[candidate.targetIntervals.length - 1]?.[1] ?? 0,
+    queryStart: candidate.queryIntervals[0]?.[0] ?? 0,
+    queryEnd: candidate.queryIntervals[candidate.queryIntervals.length - 1]?.[1] ?? 0,
+    queryCoverage: candidate.queryCoverage,
+    identity: candidate.identity,
+    meanMapq: candidate.meanMapq,
+    score: candidate.score,
+  };
+}
+
+function multiLocusKind(
+  primary: TargetAnchorCandidate,
+  alternatives: ReadonlyArray<TargetAnchorCandidate>,
+): "split" | "repetitive" | "mixed" {
+  if (alternatives.length === 0) {
+    return "mixed";
+  }
+  const overlaps = alternatives.map((candidate) => intervalOverlapFraction(
+    primary.queryIntervals,
+    candidate.queryIntervals,
+  ));
+  if (overlaps.every((overlap) => overlap <= 0.1)) {
+    return "split";
+  }
+  if (overlaps.some((overlap) => overlap >= 0.5)) {
+    return "repetitive";
+  }
+  return "mixed";
+}
+
+function intervalOverlapFraction(left: ReadonlyArray<Interval>, right: ReadonlyArray<Interval>) {
+  const denominator = Math.min(intervalSpan(left), intervalSpan(right));
+  return denominator > 0 ? intervalIntersectionSpan(left, right) / denominator : 0;
+}
+
+function alleleEdgeConfidenceScore(
+  left: ReferenceSyntenyAnchor,
+  right: ReferenceSyntenyAnchor,
+  targetOverlapValue: number,
+) {
+  const coverage = Math.min(left.queryCoverage, right.queryCoverage);
+  const identity = Math.min(left.identity, right.identity);
+  const dominance = Math.min(left.targetDominance, right.targetDominance);
+  const mapqWeight = Math.min(1, Math.min(left.meanMapq, right.meanMapq) / 20);
+  return clamp01(targetOverlapValue * coverage * identity * dominance * mapqWeight);
+}
+
+function clamp01(value: number) {
+  return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0));
 }
 
 function clusterTargetObservations(
@@ -610,7 +849,7 @@ function clusterReferenceAnchors(
       let bestCluster: ReferenceSyntenyAnchor[] | null = null;
       let bestScore = -1;
       for (const cluster of clusters) {
-        const overlaps = cluster.map((member) => targetOverlap(anchor, member));
+        const overlaps = cluster.map((member) => reciprocalTargetOverlap(anchor, member));
         const minimum = Math.min(...overlaps);
         if (minimum >= minTargetOverlap && minimum > bestScore) {
           bestCluster = cluster;
@@ -647,15 +886,44 @@ function compareAnchorsByTarget(
     || left.nodeId.localeCompare(right.nodeId);
 }
 
-function targetOverlap(left: ReferenceSyntenyAnchor, right: ReferenceSyntenyAnchor) {
-  const denominator = Math.min(
-    intervalSpan(left.targetIntervals),
-    intervalSpan(right.targetIntervals),
+function reciprocalTargetOverlap(
+  left: ReferenceSyntenyAnchor,
+  right: ReferenceSyntenyAnchor,
+) {
+  return targetOverlapMetrics(left, right).reciprocalCoverage;
+}
+
+function targetOverlapMetrics(
+  left: ReferenceSyntenyAnchor,
+  right: ReferenceSyntenyAnchor,
+) {
+  const leftSpan = intervalSpan(left.targetIntervals);
+  const rightSpan = intervalSpan(right.targetIntervals);
+  const overlapBp = intervalIntersectionSpan(left.targetIntervals, right.targetIntervals);
+  const leftCoverage = leftSpan > 0 ? overlapBp / leftSpan : 0;
+  const rightCoverage = rightSpan > 0 ? overlapBp / rightSpan : 0;
+  return {
+    overlapBp,
+    leftCoverage,
+    rightCoverage,
+    shorterCoverage: Math.max(leftCoverage, rightCoverage),
+    reciprocalCoverage: Math.min(leftCoverage, rightCoverage),
+  };
+}
+
+function crossesTargetBoundary(
+  left: ReferenceSyntenyAnchor,
+  right: ReferenceSyntenyAnchor,
+) {
+  return (
+    left.targetStart < right.targetStart
+    && right.targetStart < left.targetEnd
+    && left.targetEnd < right.targetEnd
+  ) || (
+    right.targetStart < left.targetStart
+    && left.targetStart < right.targetEnd
+    && right.targetEnd < left.targetEnd
   );
-  if (denominator <= 0) {
-    return 0;
-  }
-  return intervalIntersectionSpan(left.targetIntervals, right.targetIntervals) / denominator;
 }
 
 function maximumWeightPairs(
@@ -805,6 +1073,26 @@ function expandedAlleleEdgePairKeys(
       for (const rightBlockId of edge.right.occurrenceBlockIds) {
         if (leftBlockId !== rightBlockId) {
           pairs.add(syntenyAllelePairKey(leftBlockId, rightBlockId));
+        }
+      }
+    }
+  }
+  return pairs;
+}
+
+function expandedAlleleGroupPairKeys(
+  groups: ReadonlyArray<ReferenceSyntenyAlleleGroup>,
+) {
+  const pairs = new Set<string>();
+  for (const group of groups) {
+    for (let left = 0; left < group.members.length; left += 1) {
+      for (let right = left + 1; right < group.members.length; right += 1) {
+        for (const leftBlockId of group.members[left].occurrenceBlockIds) {
+          for (const rightBlockId of group.members[right].occurrenceBlockIds) {
+            if (leftBlockId !== rightBlockId) {
+              pairs.add(syntenyAllelePairKey(leftBlockId, rightBlockId));
+            }
+          }
         }
       }
     }

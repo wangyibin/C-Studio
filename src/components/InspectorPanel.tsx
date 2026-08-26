@@ -932,7 +932,9 @@ function ChromosomeGroupList({
                     type="button"
                     className={`selection-chip ${isBlockSelected(selection, group.id, block) ? "selected" : ""}`}
                     aria-label={`Select block ${label}`}
-                    title={label}
+                    title={block.isComposite
+                      ? label
+                      : `${label} (${childContigs[0]?.orientation ?? "?"})`}
                     onClick={() => onUiAction(block.isComposite
                       ? {
                           type: "selectAssemblyContig",
@@ -950,6 +952,21 @@ function ChromosomeGroupList({
                   >
                     <span className={block.isComposite ? "selection-block-label" : "selection-contig-label"}>
                       {label}
+                      {!block.isComposite && childContigs[0] ? (
+                        <>
+                          {" "}
+                          <strong
+                            className={`selection-contig-orientation orientation-${
+                              childContigs[0].orientation === "+"
+                                ? "forward"
+                                : childContigs[0].orientation === "-" ? "reverse" : "unknown"
+                            }`}
+                            aria-hidden="true"
+                          >
+                            {childContigs[0].orientation}
+                          </strong>
+                        </>
+                      ) : null}
                     </span>
                     <small>{block.isComposite ? `${block.contigIds.length} contigs` : "contig"}</small>
                   </button>

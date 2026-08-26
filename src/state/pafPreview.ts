@@ -11,6 +11,10 @@ export interface PafPreviewRecord {
   residueMatches: number;
   alignmentBlockLen: number;
   mapq: number;
+  alignmentType?: "primary" | "secondary" | "inversion" | "other";
+  editDistance?: number;
+  cigar?: string;
+  differenceString?: string;
 }
 
 export interface PafSyntenyPreview {
@@ -82,6 +86,7 @@ function parsePafRecord(columns: string[]): PafPreviewRecord | null {
   const residueMatches = Number(columns[9]);
   const alignmentBlockLen = Number(columns[10]);
   const mapq = Number(columns[11]);
+  const optionalTags = parseOptionalTags(columns.slice(12));
 
   if (
     !Number.isFinite(queryLength) ||
@@ -99,7 +104,7 @@ function parsePafRecord(columns: string[]): PafPreviewRecord | null {
     return null;
   }
 
-  return {
+  const record: PafPreviewRecord = {
     queryName: columns[0],
     queryStart,
     queryEnd,
@@ -113,4 +118,38 @@ function parsePafRecord(columns: string[]): PafPreviewRecord | null {
     alignmentBlockLen,
     mapq,
   };
+  const alignmentType = pafAlignmentType(optionalTags.get("tp")?.value);
+  const editDistance = optionalTags.get("NM");
+  const cigar = optionalTags.get("cg");
+  const differenceString = optionalTags.get("cs");
+  if (alignmentType) record.alignmentType = alignmentType;
+  if (editDistance?.type === "i" && Number.isFinite(Number(editDistance.value))) {
+    record.editDistance = Number(editDistance.value);
+  }
+  if (cigar?.type === "Z") record.cigar = cigar.value;
+  if (differenceString?.type === "Z") record.differenceString = differenceString.value;
+  return record;
+}
+
+function parseOptionalTags(columns: ReadonlyArray<string>) {
+  const tags = new Map<string, { type: string; value: string }>();
+  for (const column of columns) {
+    const firstSeparator = column.indexOf(":");
+    const secondSeparator = column.indexOf(":", firstSeparator + 1);
+    if (firstSeparator <= 0 || secondSeparator <= firstSeparator + 1) {
+      continue;
+    }
+    tags.set(column.slice(0, firstSeparator), {
+      type: column.slice(firstSeparator + 1, secondSeparator),
+      value: column.slice(secondSeparator + 1),
+    });
+  }
+  return tags;
+}
+
+function pafAlignmentType(value: string | undefined): PafPreviewRecord["alignmentType"] {
+  if (value === "P") return "primary";
+  if (value === "S") return "secondary";
+  if (value === "I") return "inversion";
+  return value === undefined ? undefined : "other";
 }

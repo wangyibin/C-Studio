@@ -1788,6 +1788,21 @@ pub fn load_paf_file(path: String) -> Result<ImportedContactFile, String> {
 }
 
 #[tauri::command]
+pub async fn load_paf_text(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        load_paf_text_from_path(&path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn load_paf_text_from_path(path: &Path) -> Result<String, String> {
+    paf_file_from_path(path)?;
+    read_text_file(path)
+}
+
+#[tauri::command]
 pub fn load_project_directory(path: String) -> Result<ImportedProjectDirectory, String> {
     scan_project_directory(Path::new(&path))
 }
@@ -6021,19 +6036,19 @@ mod tests {
     use super::{
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
         build_synteny_view, contact_overview_aggregate_cell_bound, get_app_status,
-        history_sidecar_path, layout_gfa_bandage_response, load_agp_bundle, load_project_directory,
-        open_text_reader, persistent_contact_lod_cache_enabled_for_path,
-        persistent_display_tile_plans, persistent_lod_cache_key, sort_project_contact_candidates,
-        write_agp_bundle, write_agp_file, write_existing_agp_path, BedGraphRecordRequest,
-        ContactMapBinRequest, ContactMapCellResponse, ContactMapLayoutBlockRequest,
-        ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest, ContactMapTileResponse,
-        ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
-        ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
-        CoverageViewFromBedGraphRequest, CoverageViewRequest, GfaBandageLayoutEdgeRequest,
-        GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest, PafRecordRequest,
-        PersistentDisplayCacheContext, PersistentDisplayTileAccumulator, PersistentDisplayTilePlan,
-        SyntenyViewRequest, DISPLAY_CACHE_COPY_SEMANTICS_VERSION,
-        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
+        history_sidecar_path, layout_gfa_bandage_response, load_agp_bundle,
+        load_paf_text_from_path, load_project_directory, open_text_reader,
+        persistent_contact_lod_cache_enabled_for_path, persistent_display_tile_plans,
+        persistent_lod_cache_key, sort_project_contact_candidates, write_agp_bundle,
+        write_agp_file, write_existing_agp_path, BedGraphRecordRequest, ContactMapBinRequest,
+        ContactMapCellResponse, ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest,
+        ContactMapTileKeyRequest, ContactMapTileResponse, ContactMapTilesFromCoolRequest,
+        ContactMapViewFromCoolRequest, ContactMapViewRequest, ContactMapViewportRequest,
+        ContactNormalizationRequest, ContactTileRequestPurpose, CoverageViewFromBedGraphRequest,
+        CoverageViewRequest, GfaBandageLayoutEdgeRequest, GfaBandageLayoutNodeRequest,
+        GfaBandageLayoutRequest, PafRecordRequest, PersistentDisplayCacheContext,
+        PersistentDisplayTileAccumulator, PersistentDisplayTilePlan, SyntenyViewRequest,
+        DISPLAY_CACHE_COPY_SEMANTICS_VERSION, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
 
     #[test]
@@ -6180,6 +6195,30 @@ mod tests {
                 .count(),
             1
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_plain_and_gzip_paf_text_for_frontend_allele_ranking() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("c-studio-paf-text-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let paf = "ctg1\t100\t0\t100\t+\tchr1\t1000\t20\t120\t95\t100\t60\ttp:A:P\n";
+        let plain_path = root.join("alignments.paf");
+        fs::write(&plain_path, paf).unwrap();
+
+        let gzip_path = root.join("alignments.paf.gz");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(paf.as_bytes()).unwrap();
+        fs::write(&gzip_path, encoder.finish().unwrap()).unwrap();
+
+        assert_eq!(load_paf_text_from_path(&plain_path).unwrap(), paf);
+        assert_eq!(load_paf_text_from_path(&gzip_path).unwrap(), paf);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -3070,6 +3070,7 @@ button {
 .placement-recommendation-title {
   gap: 7px;
   min-width: 0;
+  align-items: flex-start;
 }
 
 .placement-recommendation-title > span:nth-child(2) {
@@ -3080,11 +3081,11 @@ button {
 }
 
 .placement-recommendation-title strong {
-  overflow: hidden;
   color: var(--text);
   font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .placement-recommendation-title small {
@@ -3585,7 +3586,7 @@ button {
 }
 
 .selection-block-label {
-  font-size: 14px;
+  font-size: 10px;
 }
 
 .selection-group.selected .selection-contig-label {

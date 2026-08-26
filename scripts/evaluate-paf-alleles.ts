@@ -33,8 +33,17 @@ const paf = buildPafSyntenyPreview(pafText);
 const pruning = buildReferenceSyntenyAllelePruning(paf.records, layout.blocks, []);
 const truthContigs = parseTruthContigs(truthAgpText);
 const truthById = new Map(truthContigs.map((contig) => [contig.id, contig]));
+const sourceIdByBlockId = new Map(layout.blocks.map((block) => [block.id, block.sourceId]));
 const predictedPairs = predictedAllelePairs(pruning.groups);
 const pairwisePredictedPairs = pairwiseAllelePairs(pruning.alleleEdges);
+const activeDirectMaskPairs = new Set([...pruning.maskByPair]
+  .filter(([, mask]) => mask.reason === "direct-allele")
+  .flatMap(([key]) => {
+    const [leftBlockId, rightBlockId] = splitPairKey(key);
+    const left = sourceIdByBlockId.get(leftBlockId);
+    const right = sourceIdByBlockId.get(rightBlockId);
+    return left && right && left !== right ? [pairKey(left, right)] : [];
+  }));
 const pafSupportedPairs = buildPafSupportedPairs(pruning.anchors, 0.5);
 const pafConsistencyMetrics = comparePairSets(pafSupportedPairs, predictedPairs, 0.5);
 const pairwisePafConsistencyMetrics = comparePairSets(
@@ -46,6 +55,15 @@ const pafContigConsistencyMetrics = contigMetrics(pafSupportedPairs, predictedPa
 const pairwisePafContigConsistencyMetrics = contigMetrics(
   pafSupportedPairs,
   pairwisePredictedPairs,
+);
+const activeMaskConsistencyMetrics = comparePairSets(
+  pafSupportedPairs,
+  activeDirectMaskPairs,
+  0.5,
+);
+const activeMaskContigConsistencyMetrics = contigMetrics(
+  pafSupportedPairs,
+  activeDirectMaskPairs,
 );
 const acceptedSourceIds = new Set(pruning.anchors.map((anchor) => anchor.sourceId));
 const groupedSourceIds = new Set(pruning.groups.flatMap((group) => (
@@ -102,6 +120,12 @@ const pairwiseCoarseLabelErrors = [...pairwisePredictedPairs].filter((key) => {
   const right = truthById.get(rightId);
   return !left || !right || left.chromosome !== right.chromosome || left.haplotype === right.haplotype;
 });
+const activeMaskCoarseLabelErrors = [...activeDirectMaskPairs].filter((key) => {
+  const [leftId, rightId] = splitPairKey(key);
+  const left = truthById.get(leftId);
+  const right = truthById.get(rightId);
+  return !left || !right || left.chromosome !== right.chromosome || left.haplotype === right.haplotype;
+});
 const wrongTargetAnchors = pruning.anchors.filter((anchor) => {
   const truth = truthById.get(anchor.sourceId);
   return !truth || normalizeChromosome(anchor.targetName) !== truth.chromosome;
@@ -134,6 +158,16 @@ const output = {
     excludedBlocks: pruning.excludedBlockCount,
     excludedSourceIds,
     multiMappingBlocks: pruning.multiMappingBlockCount,
+    splitMappingBlocks: pruning.splitMappingBlockCount,
+    repetitiveMappingBlocks: pruning.repetitiveMappingBlockCount,
+    mixedMappingBlocks: pruning.mixedMappingBlockCount,
+    exclusionReasons: countByLabels(pruning.exclusions.map((exclusion) => exclusion.reason)),
+    exclusionDetails: pruning.exclusions.map((exclusion) => ({
+      sourceId: exclusion.sourceId,
+      blockIds: exclusion.occurrenceBlockIds,
+      reason: exclusion.reason,
+      candidateLoci: exclusion.candidateLoci,
+    })),
     targetChromosomeAccuracy: divide(
       pruning.anchors.length - wrongTargetAnchors.length,
       pruning.anchors.length,
@@ -142,6 +176,7 @@ const output = {
   },
   groupResults: {
     groups: pruning.groups.length,
+    compactGroupOccurrencePairs: pruning.compactGroupAlleleOccurrencePairCount,
     sizeCounts: countBy(groupSummaries.map((group) => group.size)),
     groupedContigs: groupedSourceIds.size,
     groupedContigCoverage: divide(groupedSourceIds.size, truthContigs.length),
@@ -151,13 +186,40 @@ const output = {
     pureGroups: groupSummaries.filter((group) => group.pairPurity === 1).length,
     impureGroups: groupSummaries.filter((group) => group.pairPurity < 1).length,
     meanPairPurity: mean(groupSummaries.map((group) => group.pairPurity)),
-    role: "Legacy disjoint groups retained for current hard masking and occupancy UI.",
+    role: "Compact display and cross-locus matching summary; not authoritative for direct-allele masking.",
+  },
+  activeDirectMaskResults: {
+    occurrencePairs: activeDirectMaskPairs.size,
+    pafInternalLocusConsistency: {
+      ...activeMaskConsistencyMetrics,
+      perContig: activeMaskContigConsistencyMetrics,
+      independentTruth: false,
+      interpretation: "Checks the direct PAF relationships currently active in Hi-C pruning and occupancy ranking.",
+    },
+    independentCoarseLabelValidation: {
+      predictedPairs: activeDirectMaskPairs.size,
+      correctSameChromosomeCrossHaplotypePairs:
+        activeDirectMaskPairs.size - activeMaskCoarseLabelErrors.length,
+      precision: divide(
+        activeDirectMaskPairs.size - activeMaskCoarseLabelErrors.length,
+        activeDirectMaskPairs.size,
+      ),
+      errorExamples: activeMaskCoarseLabelErrors.slice(0, 30)
+        .map((key) => describePair(key, truthById)),
+      locusLevelRecallAvailable: false,
+    },
   },
   pairwiseEdgeResults: {
     sourceLocusEdges: pruning.alleleEdges.length,
     occurrencePairs: pruning.pairwiseAlleleOccurrencePairCount,
     shadowOnlyOccurrencePairs: pruning.shadowOnlyAlleleOccurrencePairCount,
     legacyOnlyOccurrencePairs: pruning.legacyOnlyAlleleOccurrencePairCount,
+    confidenceCounts: countByLabels(pruning.alleleEdges.map((edge) => edge.confidence)),
+    confidenceScore: {
+      minimum: Math.min(...pruning.alleleEdges.map((edge) => edge.confidenceScore)),
+      mean: mean(pruning.alleleEdges.map((edge) => edge.confidenceScore)),
+      maximum: Math.max(...pruning.alleleEdges.map((edge) => edge.confidenceScore)),
+    },
     pafInternalLocusConsistency: {
       ...pairwisePafConsistencyMetrics,
       perContig: pairwisePafContigConsistencyMetrics,

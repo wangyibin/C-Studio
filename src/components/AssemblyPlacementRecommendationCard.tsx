@@ -9,7 +9,6 @@ import {
   buildPlacementRecommendationPreviewLayout,
   placementEndpointRequestKey,
   rankPlacementRecommendations,
-  type PlacementGroupOccupancyConflict,
   type PlacementRecommendation,
 } from "../state/assemblyPlacementRecommendation";
 import {
@@ -230,6 +229,28 @@ export function AssemblyPlacementRecommendationCard({
     );
   }
 
+  const selectedBlockIds = new Set(plan.selectedBlocks.map((block) => block.id));
+  const selectedPafExclusions = pafText.trim()
+    ? syntenyPruning.exclusions.filter((exclusion) => (
+      exclusion.occurrenceBlockIds.some((id) => selectedBlockIds.has(id))
+    ))
+    : [];
+  const occupiedGroupCount = new Set(
+    plan.occupancyConflicts.map((conflict) => conflict.targetObjectId),
+  ).size;
+  const selectedPafReviewSourceCount = new Set(
+    selectedPafExclusions.map((exclusion) => exclusion.sourceId),
+  ).size;
+  const reviewMessages = [
+    plan.copyAmbiguous ? "copy assignment is ambiguous" : null,
+    occupiedGroupCount > 0
+      ? `${occupiedGroupCount} occupied ${occupiedGroupCount === 1 ? "group was" : "groups were"} demoted`
+      : null,
+    selectedPafReviewSourceCount > 0
+      ? `${selectedPafReviewSourceCount} selected ${selectedPafReviewSourceCount === 1 ? "source needs" : "sources need"} PAF review`
+      : null,
+  ].filter((message): message is string => message !== null);
+
   const recommendations = loadState.key === planKey && loadState.status === "ready"
     ? rankPlacementRecommendations(
       plan,
@@ -255,60 +276,9 @@ export function AssemblyPlacementRecommendationCard({
         </span>
         <em>Top 3</em>
       </div>
-      {plan.copyAmbiguous ? (
+      {reviewMessages.length > 0 ? (
         <p className="placement-recommendation-warning">
-          At least one source interval has multiple current copies; contact evidence cannot uniquely assign every occurrence.
-        </p>
-      ) : null}
-      {plan.occupancyConflicts.length > 0 ? (
-        <p className="placement-recommendation-warning">
-          Group occupancy ranking demoted {placementOccupancyConflictSummary(
-            plan.occupancyConflicts,
-          )}; compatible groups rank first.
-        </p>
-      ) : null}
-      {syntenyPruning.groups.length > 0 || syntenyPruning.duplicateOccurrencePairCount > 0 ? (
-        <p className="placement-recommendation-warning">
-          {pafText.trim() ? "Synteny PAF allele-aware" : "Duplicate-aware"} ranking: {
-            syntenyPruning.groups.length
-          } allele {
-            syntenyPruning.groups.length === 1 ? "group" : "groups"
-          } · {syntenyPruning.directAllelePairCount} direct, {
-            syntenyPruning.crossAllelePairCount
-          } cross-allele and {syntenyPruning.duplicateOccurrencePairCount} duplicated-occurrence Hi-C {
-            syntenyPruning.directAllelePairCount
-              + syntenyPruning.crossAllelePairCount
-              + syntenyPruning.duplicateOccurrencePairCount === 1 ? "pair" : "pairs"
-          } masked.
-        </p>
-      ) : pafText.trim() ? (
-        <p className="placement-recommendation-warning">
-          No high-confidence co-syntenic allele group was found; contact scores are unchanged.
-        </p>
-      ) : null}
-      {plan.syntenyAdjacencies.length > 0 ? (
-        <p className="placement-recommendation-warning">
-          PAF adjacency ranking added {plan.syntenyAdjacencies.length} nearest upstream/downstream {
-            plan.syntenyAdjacencies.length === 1 ? "anchor" : "anchors"
-          } to the candidate comparison; overlapping allele loci remain excluded.
-        </p>
-      ) : null}
-      {pafText.trim() && syntenyPruning.alleleEdges.length > 0 ? (
-        <p className="placement-recommendation-warning">
-          Pairwise PAF shadow: {syntenyPruning.alleleEdges.length} direct source-locus {
-            syntenyPruning.alleleEdges.length === 1 ? "edge" : "edges"
-          } covering {syntenyPruning.pairwiseAlleleOccurrencePairCount} current-occurrence {
-            syntenyPruning.pairwiseAlleleOccurrencePairCount === 1 ? "pair" : "pairs"
-          }; {syntenyPruning.shadowOnlyAlleleOccurrencePairCount} additional {
-            syntenyPruning.shadowOnlyAlleleOccurrencePairCount === 1 ? "pair is" : "pairs are"
-          } detected but not yet hard-masked.
-        </p>
-      ) : null}
-      {syntenyPruning.multiMappingBlockCount > 0 ? (
-        <p className="placement-recommendation-warning">
-          {syntenyPruning.multiMappingBlockCount} PAF-multimapping {
-            syntenyPruning.multiMappingBlockCount === 1 ? "block was" : "blocks were"
-          } treated as duplicated/repetitive and excluded from hard pruning.
+          Review: {reviewMessages.join("; ")}.
         </p>
       ) : null}
       {loading ? (
@@ -404,6 +374,7 @@ function PlacementRecommendationItem({
   const keyboardPreviewActiveRef = useRef(false);
   const blocksById = new Map(blocks.map((block) => [block.id, block]));
   const boundary = placementBoundaryLabel(recommendation, blocksById);
+  const placementTitle = `${recommendation.targetObjectId} · ${boundary}`;
   const stopPointerPreview = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (previewPointerIdRef.current !== event.pointerId) {
       return;
@@ -419,7 +390,7 @@ function PlacementRecommendationItem({
       <div className="placement-recommendation-title">
         <span className="placement-recommendation-rank">{recommendation.rank}</span>
         <span>
-          <strong>{recommendation.targetObjectId} · {boundary}</strong>
+          <strong title={placementTitle}>{placementTitle}</strong>
           <small>{placementOrientationLabel(recommendation)}</small>
         </span>
         <em className={`confidence-${recommendation.confidence}`}>
@@ -428,10 +399,10 @@ function PlacementRecommendationItem({
       </div>
       <div className="placement-recommendation-evidence">
         <span>{placementRecommendationOccupancyLabel(recommendation)}</span>
-        <span>{recommendation.supportedJunctionCount}/2 contact sides</span>
+        <span>{recommendation.supportedJunctionCount}/{recommendation.availableJunctionCount} available contact sides</span>
         <span>{recommendation.bestEndpointMatchCount} endpoint maxima</span>
         {recommendation.pafAdjacencyMatchCount > 0 ? (
-          <span>{recommendation.pafAdjacencyMatchCount}/2 PAF-adjacent sides</span>
+          <span>{recommendation.pafAdjacencyMatchCount}/{recommendation.availableJunctionCount} PAF-supported sides</span>
         ) : null}
         {recommendation.gfaMatchCount > 0 ? (
           <span>{recommendation.gfaMatchCount} GFA port {recommendation.gfaMatchCount === 1 ? "match" : "matches"}</span>
@@ -572,31 +543,6 @@ function formatScore(value: number) {
   });
 }
 
-function placementOccupancyConflictSummary(
-  conflicts: ReadonlyArray<PlacementGroupOccupancyConflict>,
-) {
-  const kindsByObject = new Map<string, Set<PlacementGroupOccupancyConflict["kind"]>>();
-  for (const conflict of conflicts) {
-    const kinds = kindsByObject.get(conflict.targetObjectId) ?? new Set();
-    kinds.add(conflict.kind);
-    kindsByObject.set(conflict.targetObjectId, kinds);
-  }
-  const labels = [...kindsByObject]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([objectId, kinds]) => {
-      const reasons = [
-        kinds.has("exact-source") ? "exact source" : null,
-        kinds.has("paf-allele-locus") ? "PAF allele locus" : null,
-      ].filter((reason): reason is string => reason !== null);
-      return `${objectId} (${reasons.join(" + ")})`;
-    });
-  const visible = labels.slice(0, 6);
-  const remainder = labels.length - visible.length;
-  return `${labels.length} chromosome ${labels.length === 1 ? "group" : "groups"}: ${
-    visible.join(", ")
-  }${remainder > 0 ? ` and ${remainder} more` : ""}`;
-}
-
 function placementRecommendationOccupancyLabel(
   recommendation: PlacementRecommendation,
 ) {
@@ -604,8 +550,16 @@ function placementRecommendationOccupancyLabel(
     return "No detected source/locus conflict";
   }
   const kinds = new Set(recommendation.occupancyConflicts.map((conflict) => conflict.kind));
+  const pafCoverage = Math.max(
+    0,
+    ...recommendation.occupancyConflicts
+      .filter((conflict) => conflict.kind === "paf-allele-locus")
+      .map((conflict) => conflict.selectedLocusCoverage ?? 0),
+  );
   return [
     kinds.has("exact-source") ? "Exact-source conflict" : null,
-    kinds.has("paf-allele-locus") ? "PAF allele-locus conflict" : null,
+    kinds.has("paf-allele-locus")
+      ? `PAF locus occupied${pafCoverage > 0 ? ` (${Math.round(pafCoverage * 100)}% selected locus)` : ""}`
+      : null,
   ].filter((label): label is string => label !== null).join(" + ");
 }

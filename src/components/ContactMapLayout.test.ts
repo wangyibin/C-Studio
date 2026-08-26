@@ -202,7 +202,7 @@ describe("confirmed contact map layout styles", () => {
       /\.selection-group-header strong\s*\{[^}]*font-size:\s*14px;/,
     );
     expect(styles).toMatch(
-      /\.selection-block-label\s*\{[^}]*font-size:\s*14px;/,
+      /\.selection-block-label\s*\{[^}]*font-size:\s*10px;/,
     );
     expect(inspectorSource).toContain(
       'block.isComposite ? "selection-block-label" : "selection-contig-label"',

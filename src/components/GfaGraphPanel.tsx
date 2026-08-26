@@ -210,6 +210,8 @@ interface GfaSelectionBox {
 const defaultView: ViewTransform = { x: 24, y: 24, scale: 0.72 };
 const graphNodeLimit = 1_200;
 export const defaultGfaReviewOpen = false;
+// Keep the review implementation available while its unfinished UI is hidden.
+export const gfaReviewOptionVisible: boolean = false;
 
 export function gfaAgpPlacementObjectIds(blocks: ContactMapLayoutBlock[]) {
   return buildAssemblyEditModel(blocks).chromosomes.map((chromosome) => chromosome.id);
@@ -771,6 +773,7 @@ export function GfaGraphPanel({
   const [selectedUnplacedNodeId, setSelectedUnplacedNodeId] = useState<string | null>(null);
   const [placementNodeId, setPlacementNodeId] = useState<string | null>(null);
   const [curationAssistantOpen, setCurationAssistantOpen] = useState(defaultGfaReviewOpen);
+  const reviewAssistantVisible = gfaReviewOptionVisible && curationAssistantOpen;
   const [curationAssistantView, setCurationAssistantView] = useState<CurationAssistantView>("queue");
   const [selectedCurationIssueId, setSelectedCurationIssueId] = useState<string | null>(null);
   const endpointHiCCacheRef = useRef(new Map<string, GfaEndpointHiCLoadResult>());
@@ -1238,7 +1241,7 @@ export function GfaGraphPanel({
 
   useEffect(() => {
     if (
-      !curationAssistantOpen
+      !reviewAssistantVisible
       || curationAssistantView !== "evidence"
       || !selectedEndpointHiCPair
       || !onLoadEndpointHiC
@@ -1279,7 +1282,7 @@ export function GfaGraphPanel({
       cancelled = true;
     };
   }, [
-    curationAssistantOpen,
+    reviewAssistantVisible,
     curationAssistantView,
     loadEndpointHiCCached,
     onLoadEndpointHiC,
@@ -1984,14 +1987,16 @@ export function GfaGraphPanel({
               </label>
             </div>
             <span className="gfa-toolbar-divider" aria-hidden="true" />
-            <button
-              type="button"
-              className="gfa-link-toggle gfa-review-toggle"
-              aria-label="Toggle GFA review queue and evidence card"
-              aria-pressed={curationAssistantOpen}
-              title="Show or hide read-only GFA and 3D contact review candidates"
-              onClick={() => setCurationAssistantOpen((open) => !open)}
-            >Review {curationIssues.length.toLocaleString()}</button>
+            {gfaReviewOptionVisible ? (
+              <button
+                type="button"
+                className="gfa-link-toggle gfa-review-toggle"
+                aria-label="Toggle GFA review queue and evidence card"
+                aria-pressed={curationAssistantOpen}
+                title="Show or hide read-only GFA and 3D contact review candidates"
+                onClick={() => setCurationAssistantOpen((open) => !open)}
+              >Review {curationIssues.length.toLocaleString()}</button>
+            ) : null}
             <button
               type="button"
               className="gfa-toolbar-details-toggle"
@@ -2089,7 +2094,7 @@ export function GfaGraphPanel({
           </div>
         </div> : null}
       </header>
-      <div className={`gfa-canvas-frame${curationAssistantOpen ? " with-curation-assistant" : ""}`}>
+      <div className={`gfa-canvas-frame${reviewAssistantVisible ? " with-curation-assistant" : ""}`}>
         <canvas
           ref={canvasRef}
           className="gfa-graph-canvas"
@@ -2129,7 +2134,7 @@ export function GfaGraphPanel({
             }}
           />
         ) : null}
-        {curationAssistantOpen ? (
+        {reviewAssistantVisible ? (
           <GfaCurationAssistant
             issues={curationIssues}
             selectedIssue={selectedCurationIssue}

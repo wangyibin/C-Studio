@@ -28,6 +28,20 @@ describe("buildPafSyntenyPreview", () => {
     expect(preview.ignoredLines).toBe(1);
   });
 
+  it("parses standard optional tags used for alignment confidence", () => {
+    const preview = buildPafSyntenyPreview(
+      "ctgA\t1000\t0\t900\t+\tchr1\t2000\t100\t1000\t850\t900\t60"
+      + "\ttp:A:P\tNM:i:50\tcg:Z:850M50I\tcs:Z::850+ac",
+    );
+
+    expect(preview.records[0]).toMatchObject({
+      alignmentType: "primary",
+      editDistance: 50,
+      cigar: "850M50I",
+      differenceString: ":850+ac",
+    });
+  });
+
   it("summarizes imported PAF text", () => {
     expect(
       summarizePafText(

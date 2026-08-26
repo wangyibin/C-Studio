@@ -4650,6 +4650,9 @@ export function App() {
         invoke<ExampleDatasetSummary>("load_example_dataset"),
         invoke<string>("load_example_gfa_text"),
       ]);
+      const nativePafText = summary.paf_path
+        ? await invoke<string>("load_paf_text", { path: summary.paf_path })
+        : "";
       const importedDataset = ensureImportedDataset(summary);
       sourceAgpRef.current = sourceAgpSnapshot(
         importedDataset.agp_layout,
@@ -4665,7 +4668,7 @@ export function App() {
       setContactSources(importedDataset.contact_sources ?? []);
       setCoverageRecords([]);
       setPafPath(importedDataset.paf_path);
-      setPafText("");
+      setPafText(nativePafText);
       setPafImported(Boolean(importedDataset.paf_path));
       setGfaDocument(parseGfaText(gfaText, "hifi.asm.bp.p_utg.noseq.gfa"));
       dispatchUi({ type: "setAssemblyBlocks", blocks: importedDataset.agp_layout.blocks });
@@ -4925,6 +4928,9 @@ export function App() {
         return;
       }
       const project = await invoke<ImportedProjectDirectory>("load_project_directory", { path });
+      const nativePafText = project.paf
+        ? await invoke<string>("load_paf_text", { path: project.paf.path })
+        : "";
 
       const agpText = project.agp?.text;
       const agpLayout = agpText ? parseAgpLayout(agpText) : emptyAgpLayout();
@@ -4959,7 +4965,7 @@ export function App() {
       dispatchUi({ type: "setOverviewMode", mode: "overview" });
       if (project.paf) {
         setPafPath(project.paf.path);
-        setPafText("");
+        setPafText(nativePafText);
         setPafImported(true);
       } else {
         setPafPath(null);
@@ -5018,8 +5024,9 @@ export function App() {
         return;
       }
       const selected = await invoke<ImportedContactFile>("load_paf_file", { path });
+      const nativePafText = await invoke<string>("load_paf_text", { path: selected.path });
       setPafPath(selected.path);
-      setPafText("");
+      setPafText(nativePafText);
       setPafImported(true);
       setStatusMessage(`PAF imported: ${selected.name}`);
       dispatchUi({ type: "setOverviewMode", mode: "overview" });

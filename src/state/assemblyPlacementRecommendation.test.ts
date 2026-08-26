@@ -143,11 +143,18 @@ function alleleEdge(
     targetName: left.targetName,
     left,
     right,
+    overlapBp: 1_000_000,
     targetOverlap: 1,
+    reciprocalTargetOverlap: 1,
+    leftTargetCoverage: 1,
+    rightTargetCoverage: 1,
+    relationship: "allele",
     minQueryCoverage: 0.95,
     minIdentity: 0.99,
     minMeanMapq: 60,
     minTargetDominance: 1,
+    confidence: "high",
+    confidenceScore: 0.94,
   };
 }
 
@@ -181,6 +188,57 @@ describe("assembly placement recommendation", () => {
       ["Chr02", "d", null, "d", false],
       ["Chr02", null, "d", null, false],
     ]);
+  });
+
+  it("does not use singleton self objects as recommendation targets", () => {
+    const scopedBlocks = [
+      block("left", "Chr01", 0),
+      block("selected", "Chr01", 1_000_000),
+      block("right", "Chr01", 2_000_000),
+      block("unanchored", "unanchored", 3_000_000),
+      block("renamed-source", "ScaffoldA", 4_000_000),
+    ];
+    const selectedAnchor = syntenyAnchor(
+      "selected-node",
+      "selected",
+      "selected",
+      10_000_000,
+    );
+    const unanchoredAnchor = syntenyAnchor(
+      "unanchored-node",
+      "unanchored",
+      "unanchored",
+      11_000_000,
+    );
+    const plan = buildPlacementRecommendationPlan({
+      blocks: scopedBlocks,
+      selection: { kind: "contigs", ids: ["selected"], exact: true },
+      coarseLinks: [
+        coarse("selected", "unanchored", 1_000),
+        coarse("selected", "renamed-source", 10),
+      ],
+      syntenyAnchors: [selectedAnchor, unanchoredAnchor],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    expect(plan.excludedUnanchoredTargetObjectCount).toBe(1);
+    expect(enumeratePlacementBoundaries(
+      scopedBlocks,
+      { kind: "contigs", ids: ["selected"], exact: true },
+    ).some((boundary) => boundary.targetObjectId === "unanchored")).toBe(true);
+    expect(plan.candidates.some(
+      (candidate) => candidate.targetObjectId === "unanchored",
+    )).toBe(false);
+    expect(plan.requests.some(
+      (request) => request.targetBlockId === "unanchored",
+    )).toBe(false);
+    expect(plan.syntenyAdjacencies.some(
+      (adjacency) => adjacency.partnerBlockId === "unanchored",
+    )).toBe(false);
+    expect(plan.candidates.some(
+      (candidate) => candidate.targetObjectId === "ScaffoldA",
+    )).toBe(true);
   });
 
   it("ranks a two-sided endpoint- and GFA-supported placement first", () => {
@@ -335,9 +393,12 @@ describe("assembly placement recommendation", () => {
     expect(plan.occupancyConflicts).toEqual([{
       targetObjectId: "Chr02",
       kind: "paf-allele-locus",
-      locusId: "synteny:Ref01:10000000-11000000:1",
+      locusId: "synteny-occupancy:Ref01:10000000-11000000",
       selectedBlockIds: ["b"],
       occupiedBlockIds: ["d"],
+      overlapBp: 1_000_000,
+      selectedLocusCoverage: 1,
+      occupiedLocusCoverage: 1,
     }]);
     expect(plan.coarseLinks.map((link) => [link.source, link.target])).toEqual([
       ["b", "d"],
@@ -356,6 +417,104 @@ describe("assembly placement recommendation", () => {
     expect(ranked[0]?.targetObjectId).not.toBe("Chr02");
     expect(firstConflictIndex).toBeGreaterThan(0);
     expect(ranked[firstConflictIndex]?.targetObjectId).toBe("Chr02");
+  });
+
+  it("demotes a direct pairwise PAF edge that is absent from compact allele groups", () => {
+    const selectedAnchor = syntenyAnchor("selected-node", "b", "b");
+    const occupiedAnchor = syntenyAnchor("occupied-node", "d", "d");
+    const edge = alleleEdge(selectedAnchor, occupiedAnchor);
+    const plan = buildPlacementRecommendationPlan({
+      blocks,
+      selection,
+      coarseLinks: [coarse("b", "d", 1_000), coarse("b", "a", 100)],
+      syntenyAlleleEdges: [edge],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    expect(plan.occupancyConflicts).toEqual([{
+      targetObjectId: "Chr02",
+      kind: "paf-allele-locus",
+      locusId: "synteny-occupancy:Ref01:10000000-11000000",
+      selectedBlockIds: ["b"],
+      occupiedBlockIds: ["d"],
+      overlapBp: 1_000_000,
+      selectedLocusCoverage: 1,
+      occupiedLocusCoverage: 1,
+    }]);
+  });
+
+  it("ranks an asymmetric terminal overlap as a one-sided boundary anchor", () => {
+    const boundaryBlocks = [
+      block("selected", "Chr03g2", 0),
+      block("g4-anchor", "Chr03g4", 1_000_000),
+      block("noise", "Chr05g3", 2_000_000),
+    ];
+    const selectedAnchor = {
+      ...syntenyAnchor("selected-node", "selected", "selected", 9_393_740),
+      targetEnd: 13_586_800,
+      targetIntervals: [[9_393_740, 13_586_800]] as Array<[number, number]>,
+    };
+    const boundaryAnchor = {
+      ...syntenyAnchor("boundary-node", "g4-anchor", "g4-anchor", 13_529_769),
+      targetEnd: 13_613_672,
+      targetIntervals: [[13_529_769, 13_613_672]] as Array<[number, number]>,
+    };
+    const boundaryEdge: ReferenceSyntenyAlleleEdge = {
+      ...alleleEdge(selectedAnchor, boundaryAnchor),
+      overlapBp: 57_031,
+      targetOverlap: 0.6797253971848444,
+      reciprocalTargetOverlap: 0.013602480762270392,
+      leftTargetCoverage: 0.013602480762270392,
+      rightTargetCoverage: 0.6797253971848444,
+      relationship: "boundary-overlap",
+      confidenceScore: 0.62,
+    };
+    const plan = buildPlacementRecommendationPlan({
+      blocks: boundaryBlocks,
+      selection: { kind: "contigs", ids: ["selected"], exact: true },
+      coarseLinks: [
+        coarse("selected", "g4-anchor", 10),
+        coarse("selected", "noise", 1_000),
+      ],
+      syntenyAnchors: [selectedAnchor, boundaryAnchor],
+      syntenyAlleleEdges: [boundaryEdge],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    expect(plan.occupancyConflicts.some(
+      (conflict) => conflict.targetObjectId === "Chr03g4",
+    )).toBe(false);
+    expect(plan.syntenyAdjacencies).toContainEqual({
+      partnerBlockId: "g4-anchor",
+      partnerNodeId: "boundary-node",
+      targetName: "Ref01",
+      direction: "downstream",
+      targetGap: 0,
+      kind: "boundary-anchor",
+    });
+
+    const ranked = rankPlacementRecommendations(plan, new Map([
+      [placementEndpointRequestKey({
+        sourceBlockId: "selected",
+        targetBlockId: "g4-anchor",
+      }), endpointResult("g4-anchor", [1, 2, 100, 3], "selected")],
+      [placementEndpointRequestKey({
+        sourceBlockId: "selected",
+        targetBlockId: "noise",
+      }), endpointResult("noise", [1, 2, 1_000, 3], "selected")],
+    ]), boundaryBlocks, 10, "paf-adjacency");
+
+    expect(ranked[0]).toMatchObject({
+      targetObjectId: "Chr03g4",
+      targetBlockId: "g4-anchor",
+      orientation: "+",
+      availableJunctionCount: 1,
+      supportedJunctionCount: 1,
+      pafAdjacencyMatchCount: 1,
+      occupancyConflicts: [],
+    });
   });
 
   it("shortlists nearest PAF neighbors while excluding the selected allele locus", () => {

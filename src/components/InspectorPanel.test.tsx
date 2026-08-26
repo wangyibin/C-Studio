@@ -431,8 +431,14 @@ describe("InspectorPanel", () => {
     expect(markup).toContain("ctg1");
     expect(markup).toContain("ctg2");
     expect(markup.match(/class="selection-contig-label"/g)).toHaveLength(2);
-    expect(markup).toContain('title="ctg1"');
-    expect(markup).toContain('title="ctg2"');
+    expect(markup).toContain('title="ctg1 (+)"');
+    expect(markup).toContain('title="ctg2 (-)"');
+    expect(markup).toContain(
+      'ctg1 <strong class="selection-contig-orientation orientation-forward" aria-hidden="true">+</strong>',
+    );
+    expect(markup).toContain(
+      'ctg2 <strong class="selection-contig-orientation orientation-reverse" aria-hidden="true">-</strong>',
+    );
     expect(markup).toContain('title="Double-click to rename Chr01"');
     expect(markup).toContain('class="selection-group-heading"');
     expect(markup).toContain('class="selection-group-locate-button"');

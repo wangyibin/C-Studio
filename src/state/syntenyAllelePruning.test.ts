@@ -105,9 +105,55 @@ describe("reference synteny allele pruning", () => {
     expect(result.groups.map((group) => group.members.map((member) => member.blockId)))
       .toEqual([["short-left", "long"]]);
     expect(result.pairwiseAlleleOccurrencePairCount).toBe(2);
-    expect(result.directAllelePairCount).toBe(1);
-    expect(result.shadowOnlyAlleleOccurrencePairCount).toBe(1);
+    expect(result.directAllelePairCount).toBe(2);
+    expect(result.shadowOnlyAlleleOccurrencePairCount).toBe(0);
     expect(result.legacyOnlyAlleleOccurrencePairCount).toBe(0);
+    expect(result.maskByPair.get(syntenyAllelePairKey("long", "short-right"))?.reason)
+      .toBe("direct-allele");
+  });
+
+  it("keeps an asymmetric terminal overlap as boundary support instead of an allele mask", () => {
+    const longBlock = {
+      ...block("long"),
+      sourceEnd: 4_193_175,
+      visualEnd: 4_193_175,
+    };
+    const boundaryBlock = {
+      ...block("boundary"),
+      sourceEnd: 83_959,
+      visualEnd: 83_959,
+    };
+    const result = buildReferenceSyntenyAllelePruning([
+      paf("long", "3", 9_393_740, 13_586_800, {
+        queryStart: 83,
+        queryEnd: 4_193_168,
+        queryLength: 4_193_175,
+        alignmentBlockLen: 4_193_120,
+        residueMatches: 4_156_469,
+        strand: "-",
+      }),
+      paf("boundary", "3", 13_529_769, 13_613_672, {
+        queryStart: 96,
+        queryEnd: 83_958,
+        queryLength: 83_959,
+        alignmentBlockLen: 83_904,
+        residueMatches: 76_743,
+        strand: "-",
+      }),
+    ], [longBlock, boundaryBlock], []);
+
+    expect(result.alleleEdges).toHaveLength(1);
+    expect(result.alleleEdges[0]).toMatchObject({
+      relationship: "boundary-overlap",
+      overlapBp: 57_031,
+      confidence: "high",
+    });
+    expect(result.alleleEdges[0].targetOverlap).toBeCloseTo(0.679725, 5);
+    expect(result.alleleEdges[0].reciprocalTargetOverlap).toBeCloseTo(0.013602, 5);
+    expect(result.maskByPair.has(syntenyAllelePairKey("long", "boundary"))).toBe(false);
+    expect(result.groups).toEqual([]);
+    expect(result.directAllelePairCount).toBe(0);
+    expect(result.pairwiseAlleleOccurrencePairCount).toBe(0);
   });
 
   it("does not add transitive edges across a chain of pairwise overlaps", () => {
@@ -296,6 +342,38 @@ describe("reference synteny allele pruning", () => {
       .toBe("duplicate-occurrence");
     expect(result.duplicateOccurrencePairCount).toBe(1);
     expect(result.multiMappingBlockCount).toBe(2);
+    expect(result.repetitiveMappingBlockCount).toBe(2);
+    expect(result.splitMappingBlockCount).toBe(0);
     expect(result.excludedBlockCount).toBe(2);
+  });
+
+  it("distinguishes disjoint split mappings from overlapping repetitive mappings", () => {
+    const result = buildReferenceSyntenyAllelePruning([
+      paf("split", "Ref01", 1_000_000, 1_600_000, {
+        queryStart: 0,
+        queryEnd: 600_000,
+        alignmentBlockLen: 600_000,
+        residueMatches: 570_000,
+      }),
+      paf("split", "Ref01", 5_000_000, 5_400_000, {
+        queryStart: 600_000,
+        queryEnd: 1_000_000,
+        alignmentBlockLen: 400_000,
+        residueMatches: 380_000,
+      }),
+    ], [block("split")], []);
+
+    expect(result.anchors).toEqual([]);
+    expect(result.multiMappingBlockCount).toBe(1);
+    expect(result.splitMappingBlockCount).toBe(1);
+    expect(result.repetitiveMappingBlockCount).toBe(0);
+    expect(result.exclusions).toEqual([expect.objectContaining({
+      sourceId: "split",
+      reason: "multi-locus-split",
+      candidateLoci: [
+        expect.objectContaining({ queryStart: 0, queryEnd: 600_000 }),
+        expect.objectContaining({ queryStart: 600_000, queryEnd: 1_000_000 }),
+      ],
+    })]);
   });
 });

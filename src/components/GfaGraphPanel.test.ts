@@ -5,6 +5,7 @@ import {
 } from "../state/assemblyPalette";
 import {
   defaultGfaReviewOpen,
+  gfaReviewOptionVisible,
   gfaAgpJunctionPoints,
   gfaAgpBandageJunctionPoints,
   gfaAgpPlacementObjectIds,
@@ -179,7 +180,8 @@ describe("GFA Add to AGP targets", () => {
 });
 
 describe("GFA review panel", () => {
-  it("starts closed while retaining the Review toggle", () => {
+  it("temporarily hides the Review option and keeps its panel closed", () => {
+    expect(gfaReviewOptionVisible).toBe(false);
     expect(defaultGfaReviewOpen).toBe(false);
   });
 });
