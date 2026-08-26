@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { GfaEndpointHiCLoadResult, GfaEndpointHiCQuadrant } from "./gfaEndpointHiC";
 import type { GfaGraphEdge } from "./gfa";
 import type { GfaHiCLink } from "./gfaHiCLinks";
+import type { HiCAlleleConcordancePair } from "./hicAlleleConcordance";
 import {
   applyPlacementRecommendation,
   buildPlacementRecommendationPreviewLayout,
@@ -107,6 +108,44 @@ function directAlleleMask(first: string, second: string) {
     targetGroupId: "synteny:Ref01:1-2:1",
   };
   return new Map([[syntenyAllelePairKey(first, second), mask]]);
+}
+
+function hicAllelePair(
+  leftBlockId: string,
+  rightBlockId: string,
+): HiCAlleleConcordancePair {
+  return {
+    id: `hic-concordance:${leftBlockId}:${rightBlockId}`,
+    leftBlockId,
+    rightBlockId,
+    leftObjectId: blocks.find((value) => value.id === leftBlockId)?.objectId ?? "left",
+    rightObjectId: blocks.find((value) => value.id === rightBlockId)?.objectId ?? "right",
+    concordanceRatio: 0.65,
+    parallelRatio: 0.65,
+    antiparallelRatio: 0.1,
+    orientation: "parallel",
+    support: 80,
+    supportUnit: "raw-contact-weight",
+    observedCellCount: 20,
+    resolvedWindowCount: 50,
+    coveredShorterWindowCount: 18,
+    lineRatio: 0.7,
+    lineExpectedRatio: 0.1,
+    lineEnrichment: 7,
+    lineZScore: 8,
+    lineWeight: 56,
+    lineOrientation: "parallel",
+    lineCoveredLeftWindowCount: 30,
+    lineCoveredRightWindowCount: 30,
+    lineCoveredLeftWindowFraction: 0.6,
+    lineCoveredRightWindowFraction: 0.6,
+    lineReciprocalCoverage: 0.6,
+    lineEffectiveWindowCount: 24,
+    lineEffectiveWindowFraction: 0.48,
+    lineReciprocalSpanFraction: 0.6,
+    evidenceModel: "concordance",
+    confidence: "high",
+  };
 }
 
 function syntenyAnchor(
@@ -417,6 +456,54 @@ describe("assembly placement recommendation", () => {
     expect(ranked[0]?.targetObjectId).not.toBe("Chr02");
     expect(firstConflictIndex).toBeGreaterThan(0);
     expect(ranked[firstConflictIndex]?.targetObjectId).toBe("Chr02");
+  });
+
+  it("keeps a Hi-C-concordant conflict reviewable after pruning its allelic link", () => {
+    const pair = hicAllelePair("b", "d");
+    const mask: SyntenyAlleleSignalMask = {
+      sourceBlockId: "b",
+      targetBlockId: "d",
+      factor: 0,
+      reason: "hic-concordance",
+      sourceGroupId: pair.id,
+      targetGroupId: pair.id,
+    };
+    const plan = buildPlacementRecommendationPlan({
+      blocks,
+      selection,
+      coarseLinks: [coarse("b", "d", 1_000), coarse("b", "a", 100)],
+      syntenyMaskByPair: new Map([[syntenyAllelePairKey("b", "d"), mask]]),
+      hicAllelePairs: [pair],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    expect(plan.occupancyConflicts).toEqual([{
+      targetObjectId: "Chr02",
+      kind: "hic-concordance",
+      locusId: pair.id,
+      selectedBlockIds: ["b"],
+      occupiedBlockIds: ["d"],
+      concordanceRatio: 0.65,
+      concordanceOrientation: "parallel",
+      concordanceSupport: 80,
+      concordanceSupportUnit: "raw-contact-weight",
+    }]);
+    expect(plan.coarseLinks.map((link) => [link.source, link.target])).toEqual([
+      ["b", "a"],
+    ]);
+    expect(plan.candidates.some((candidate) => candidate.targetObjectId === "Chr02")).toBe(true);
+    expect(plan.requests.some((request) => request.targetBlockId === "d")).toBe(true);
+
+    const ranked = rankPlacementRecommendations(plan, new Map([
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "a" }), endpointResult("a", [1, 5, 2, 3])],
+      [placementEndpointRequestKey({ sourceBlockId: "b", targetBlockId: "d" }), endpointResult("d", [800, 1_000, 700, 600])],
+    ]), blocks, 20);
+    const conflictCandidate = ranked.find((candidate) => candidate.targetObjectId === "Chr02");
+    expect(ranked[0]?.targetObjectId).not.toBe("Chr02");
+    expect(conflictCandidate).toBeDefined();
+    expect(conflictCandidate?.supportedJunctionCount).toBe(0);
+    expect(conflictCandidate?.syntenyPrunedJunctionCount).toBe(1);
   });
 
   it("demotes a direct pairwise PAF edge that is absent from compact allele groups", () => {

@@ -3037,6 +3037,14 @@ button {
   color: #92400e !important;
 }
 
+.placement-recommendation-allele-evidence {
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, #0284c7 22%, var(--border-soft));
+  border-radius: 5px;
+  background: color-mix(in srgb, #e0f2fe 48%, white);
+  color: #075985 !important;
+}
+
 .placement-recommendation-status.error {
   color: var(--danger) !important;
 }
@@ -4119,6 +4127,28 @@ summary:focus-visible,
 
 .toolbar-popover button svg {
   color: var(--good);
+}
+
+.add-data-source-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px;
+}
+
+.toolbar-popover .add-data-source-row .add-data-unload-button {
+  justify-content: center;
+  width: 30px;
+  padding: 0;
+  color: var(--muted);
+}
+
+.toolbar-popover .add-data-source-row .add-data-unload-button:hover {
+  background: color-mix(in srgb, var(--danger) 10%, white);
+  color: var(--danger);
+}
+
+.toolbar-popover .add-data-source-row .add-data-unload-button svg {
+  color: currentColor;
 }
 
 .toolbar-popover .add-data-clear-button {

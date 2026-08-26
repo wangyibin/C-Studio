@@ -9,6 +9,7 @@ import {
   buildPlacementRecommendationPreviewLayout,
   placementEndpointRequestKey,
   rankPlacementRecommendations,
+  selectedPlacementBlock,
   type PlacementRecommendation,
 } from "../state/assemblyPlacementRecommendation";
 import {
@@ -24,9 +25,18 @@ import {
   gfaHiCContactMapUsesLayout,
   maximumGfaHiCLinks,
 } from "../state/gfaHiCLinks";
+import type {
+  HiCAlleleConcordanceBatchLoader,
+  HiCAlleleConcordanceLoadResult,
+  HiCAlleleConcordancePair,
+} from "../state/hicAlleleConcordance";
+import { buildHiCTransLineCandidates } from "../state/hicAlleleConcordance";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import { buildPafSyntenyPreview } from "../state/pafPreview";
-import { buildReferenceSyntenyAllelePruning } from "../state/syntenyAllelePruning";
+import {
+  buildReferenceSyntenyAllelePruning,
+  type SyntenyAlleleSignalMask,
+} from "../state/syntenyAllelePruning";
 import type { UiAction } from "../state/uiState";
 import type { ContactNormalization } from "../state/uiState";
 
@@ -38,6 +48,7 @@ interface AssemblyPlacementRecommendationCardProps {
   pafText?: string;
   gfaDocument?: GfaEvidenceDocument | null;
   onLoadEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
+  onLoadHiCAlleleConcordanceBatch?: HiCAlleleConcordanceBatchLoader;
   activePreviewId?: string | null;
   onPreviewChange?: (candidate: PlacementRecommendation | null) => void;
   onUiAction: (action: UiAction) => void;
@@ -50,9 +61,17 @@ interface RecommendationLoadState {
   reason?: string;
 }
 
+interface AlleleConcordanceLoadState {
+  key: string;
+  status: "idle" | "loading" | "ready" | "error";
+  results: HiCAlleleConcordanceLoadResult[];
+  reason?: string;
+}
+
 const recommendationOverviewPartnerLimit = 12;
 const recommendationSyntenyMatchingPartnerLimit = 24;
 const recommendationResultLimit = 3;
+const recommendationAlleleCandidateLimit = 24;
 
 export function AssemblyPlacementRecommendationCard({
   blocks,
@@ -62,6 +81,7 @@ export function AssemblyPlacementRecommendationCard({
   pafText = "",
   gfaDocument = null,
   onLoadEndpointHiCBatch,
+  onLoadHiCAlleleConcordanceBatch,
   activePreviewId = null,
   onPreviewChange = () => undefined,
   onUiAction,
@@ -83,30 +103,179 @@ export function AssemblyPlacementRecommendationCard({
   const gfaEdges = useMemo(() => gfaDocument
     ? buildGfaAssemblyGraph(gfaDocument, blocks, Number.POSITIVE_INFINITY).edges
     : [], [blocks, gfaDocument]);
+  const hasPafEvidence = pafText.trim().length > 0;
   const syntenyPruning = useMemo(() => buildReferenceSyntenyAllelePruning(
     buildPafSyntenyPreview(pafText).records,
     blocks,
     coarseLinks,
   ), [blocks, coarseLinks, pafText]);
+  const hicTransLineCandidates = useMemo(() => {
+    if (hasPafEvidence || !overviewContactMap || !overviewReady) {
+      return null;
+    }
+    const selected = selectedPlacementBlock(blocks, selection);
+    if ("status" in selected) {
+      return null;
+    }
+    return buildHiCTransLineCandidates(
+      overviewContactMap,
+      blocks,
+      new Set(selected.blocks.map((block) => block.id)),
+    );
+  }, [blocks, hasPafEvidence, overviewContactMap, overviewReady, selection]);
+  const hicAlleleRequests = useMemo(() => {
+    if (hasPafEvidence) {
+      return [];
+    }
+    if (hicTransLineCandidates && hicTransLineCandidates.requests.length > 0) {
+      return hicTransLineCandidates.requests;
+    }
+    const selected = selectedPlacementBlock(blocks, selection);
+    if ("status" in selected) {
+      return [];
+    }
+    const selectedIds = new Set(selected.blocks.map((block) => block.id));
+    const blocksById = new Map(blocks.map((block) => [block.id, block]));
+    const requestsByKey = new Map<string, { sourceBlockId: string; targetBlockId: string }>();
+    for (const link of coarseLinks) {
+      const sourceSelected = selectedIds.has(link.source);
+      const targetSelected = selectedIds.has(link.target);
+      if (sourceSelected === targetSelected) {
+        continue;
+      }
+      const sourceBlock = blocksById.get(link.source);
+      const targetBlock = blocksById.get(link.target);
+      if (!sourceBlock || !targetBlock || sourceBlock.objectId === targetBlock.objectId) {
+        continue;
+      }
+      const request = {
+        sourceBlockId: sourceSelected ? link.source : link.target,
+        targetBlockId: sourceSelected ? link.target : link.source,
+      };
+      requestsByKey.set(alleleConcordanceRequestKey(request), request);
+      if (requestsByKey.size >= recommendationAlleleCandidateLimit) {
+        break;
+      }
+    }
+    return [...requestsByKey.values()];
+  }, [blocks, coarseLinks, hasPafEvidence, hicTransLineCandidates, selection]);
+  const hicAlleleRequestKey = useMemo(() => [
+    hasPafEvidence ? "paf-primary" : "hic-fallback",
+    overviewContactMap?.layoutScope ?? "no-layout",
+    hicTransLineCandidates?.fingerprint ?? "coarse-fallback",
+    ...hicAlleleRequests.map(alleleConcordanceRequestKey),
+  ].join("\u0000"), [
+    hasPafEvidence,
+    hicAlleleRequests,
+    hicTransLineCandidates?.fingerprint,
+    overviewContactMap?.layoutScope,
+  ]);
+  const [alleleLoadState, setAlleleLoadState] = useState<AlleleConcordanceLoadState>({
+    key: "",
+    status: "idle",
+    results: [],
+  });
+  useEffect(() => {
+    if (hasPafEvidence || hicAlleleRequests.length === 0) {
+      setAlleleLoadState({ key: hicAlleleRequestKey, status: "ready", results: [] });
+      return undefined;
+    }
+    if (!onLoadHiCAlleleConcordanceBatch) {
+      setAlleleLoadState({
+        key: hicAlleleRequestKey,
+        status: "error",
+        results: [],
+        reason: "Fine-resolution allelic contact querying is available in the desktop app.",
+      });
+      return undefined;
+    }
+    let active = true;
+    const timeout = window.setTimeout(() => {
+      setAlleleLoadState({ key: hicAlleleRequestKey, status: "loading", results: [] });
+      void onLoadHiCAlleleConcordanceBatch(hicAlleleRequests).then((results) => {
+        if (active) {
+          setAlleleLoadState({ key: hicAlleleRequestKey, status: "ready", results });
+        }
+      }).catch((error) => {
+        if (active) {
+          setAlleleLoadState({
+            key: hicAlleleRequestKey,
+            status: "error",
+            results: [],
+            reason: `Allelic concordance query failed: ${String(error)}`,
+          });
+        }
+      });
+    }, 120);
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [
+    hasPafEvidence,
+    hicAlleleRequestKey,
+    hicAlleleRequests,
+    onLoadHiCAlleleConcordanceBatch,
+  ]);
+  const currentAlleleResults = useMemo(() => (
+    alleleLoadState.key === hicAlleleRequestKey && alleleLoadState.status === "ready"
+      ? alleleLoadState.results.filter((result) => result.status === "ready" && result.complete)
+      : []
+  ), [alleleLoadState, hicAlleleRequestKey]);
+  const hicAllelePairs = useMemo(() => currentAlleleResults.flatMap((result) => (
+    result.status === "ready" ? result.result.pairs : []
+  )), [currentAlleleResults]);
+  const highConfidenceHiCAllelePairs = useMemo(
+    () => hicAllelePairs.filter((pair) => pair.confidence === "high"),
+    [hicAllelePairs],
+  );
+  const hicConcordanceSummary = useMemo(() => currentAlleleResults.find(
+    (result) => result.status === "ready",
+  ), [currentAlleleResults]);
+  const hicAlleleFingerprint = useMemo(() => [
+    hicAlleleRequestKey,
+    ...currentAlleleResults.flatMap((result) => (
+      result.status === "ready" ? [result.result.fingerprint] : []
+    )),
+  ].join("|"), [currentAlleleResults, hicAlleleRequestKey]);
+  const hicAlleleMaskByPair = useMemo(() => {
+    const masks = new Map<string, SyntenyAlleleSignalMask>();
+    for (const result of currentAlleleResults) {
+      if (result.status !== "ready") {
+        continue;
+      }
+      for (const [key, mask] of result.result.maskByPair) {
+        masks.set(key, mask);
+      }
+    }
+    return masks;
+  }, [currentAlleleResults]);
+  const alleleMaskByPair = useMemo(() => (
+    hasPafEvidence
+      ? syntenyPruning.maskByPair
+      : hicAlleleMaskByPair
+  ), [hasPafEvidence, hicAlleleMaskByPair, syntenyPruning.maskByPair]);
   const plan = useMemo(() => buildPlacementRecommendationPlan({
     blocks,
     selection,
     coarseLinks,
     gfaEdges,
-    syntenyMaskByPair: syntenyPruning.maskByPair,
+    syntenyMaskByPair: alleleMaskByPair,
     syntenyAlleleGroups: syntenyPruning.groups,
     syntenyAnchors: syntenyPruning.anchors,
     syntenyAlleleEdges: syntenyPruning.alleleEdges,
+    hicAllelePairs: highConfidenceHiCAllelePairs,
     overviewPartnerLimit: recommendationOverviewPartnerLimit,
   }), [
     blocks,
     coarseLinks,
     gfaEdges,
+    alleleMaskByPair,
+    highConfidenceHiCAllelePairs,
     selection,
     syntenyPruning.groups,
     syntenyPruning.alleleEdges,
     syntenyPruning.anchors,
-    syntenyPruning.maskByPair,
   ]);
   const planKey = useMemo(() => plan.status === "ready"
     ? [
@@ -115,6 +284,7 @@ export function AssemblyPlacementRecommendationCard({
       overviewContactMap?.normalization ?? "raw",
       expectedNormalization,
       syntenyPruning.fingerprint,
+      hicAlleleFingerprint,
       ...blocks.map((block) => [
         block.id,
         block.objectId,
@@ -128,7 +298,15 @@ export function AssemblyPlacementRecommendationCard({
       ...plan.requests.map(placementEndpointRequestKey),
     ].join("\u0000")
     : `unavailable:${plan.reason}`,
-  [blocks, expectedNormalization, overviewContactMap?.layoutScope, overviewContactMap?.normalization, plan, syntenyPruning.fingerprint]);
+  [
+    blocks,
+    expectedNormalization,
+    hicAlleleFingerprint,
+    overviewContactMap?.layoutScope,
+    overviewContactMap?.normalization,
+    plan,
+    syntenyPruning.fingerprint,
+  ]);
   const [loadState, setLoadState] = useState<RecommendationLoadState>({
     key: "",
     status: "idle",
@@ -150,6 +328,16 @@ export function AssemblyPlacementRecommendationCard({
     }
     if (plan.requests.length === 0) {
       setLoadState({ key: planKey, status: "ready", resultsByRequest: new Map() });
+      return undefined;
+    }
+    if (
+      !hasPafEvidence
+      && (
+        alleleLoadState.key !== hicAlleleRequestKey
+        || alleleLoadState.status !== "ready"
+      )
+    ) {
+      setLoadState({ key: planKey, status: "idle", resultsByRequest: new Map() });
       return undefined;
     }
     if (!overviewReady) {
@@ -198,7 +386,16 @@ export function AssemblyPlacementRecommendationCard({
       active = false;
       window.clearTimeout(timeout);
     };
-  }, [onLoadEndpointHiCBatch, overviewReady, plan, planKey]);
+  }, [
+    alleleLoadState.key,
+    alleleLoadState.status,
+    hasPafEvidence,
+    hicAlleleRequestKey,
+    onLoadEndpointHiCBatch,
+    overviewReady,
+    plan,
+    planKey,
+  ]);
 
   if (!selection) {
     return null;
@@ -241,6 +438,24 @@ export function AssemblyPlacementRecommendationCard({
   const selectedPafReviewSourceCount = new Set(
     selectedPafExclusions.map((exclusion) => exclusion.sourceId),
   ).size;
+  const selectedHiCAllelePairs = hicAllelePairs.filter((pair) => (
+    selectedBlockIds.has(pair.leftBlockId) || selectedBlockIds.has(pair.rightBlockId)
+  ));
+  const currentAlleleLoadStatus = alleleLoadState.key === hicAlleleRequestKey
+    ? alleleLoadState.status
+    : "idle";
+  const hicConcordanceRatioCutoff = hicConcordanceSummary?.status === "ready"
+    ? hicConcordanceSummary.result.concordanceRatioCutoff
+    : 0.2;
+  const hicMinimumSupport = hicConcordanceSummary?.status === "ready"
+    ? hicConcordanceSummary.result.minimumSupport
+    : 20;
+  const hicMinimumLineZScore = hicConcordanceSummary?.status === "ready"
+    ? hicConcordanceSummary.result.minimumLineZScore
+    : 4;
+  const firstAlleleUnavailableReason = alleleLoadState.key === hicAlleleRequestKey
+    ? alleleLoadState.results.find((result) => result.status !== "ready")?.reason
+    : undefined;
   const reviewMessages = [
     plan.copyAmbiguous ? "copy assignment is ambiguous" : null,
     occupiedGroupCount > 0
@@ -248,6 +463,11 @@ export function AssemblyPlacementRecommendationCard({
       : null,
     selectedPafReviewSourceCount > 0
       ? `${selectedPafReviewSourceCount} selected ${selectedPafReviewSourceCount === 1 ? "source needs" : "sources need"} PAF review`
+      : null,
+    selectedHiCAllelePairs.length > 0
+      ? `${selectedHiCAllelePairs.length} binned-concordance ${
+        selectedHiCAllelePairs.length === 1 ? "allelic partner was" : "allelic partners were"
+      } inferred from binned contacts`
       : null,
   ].filter((message): message is string => message !== null);
 
@@ -279,6 +499,27 @@ export function AssemblyPlacementRecommendationCard({
       {reviewMessages.length > 0 ? (
         <p className="placement-recommendation-warning">
           Review: {reviewMessages.join("; ")}.
+        </p>
+      ) : null}
+      {!hasPafEvidence ? (
+        <p className="placement-recommendation-allele-evidence">
+          {currentAlleleLoadStatus === "idle" || currentAlleleLoadStatus === "loading"
+            ? "Hi-C allelic evidence: tracing cross-object h-trans lines and evaluating fine-resolution concordance…"
+            : currentAlleleLoadStatus === "error"
+              ? `Hi-C allelic evidence unavailable: ${alleleLoadState.reason ?? "query failed"}`
+              : selectedHiCAllelePairs.length > 0
+            ? `Hi-C allelic evidence: ${selectedHiCAllelePairs.slice(0, 3).map((pair) => (
+              hicAllelePairLabel(pair, blocks)
+            )).join("; ")}${selectedHiCAllelePairs.length > 3 ? "; …" : ""}.`
+            : hicAlleleRequests.length === 0
+              ? "Hi-C allelic evidence: no distributed cross-object line or fallback partner was available for fine concordance testing."
+              : `Hi-C allelic evidence: no selected pair passed concordance ratio > ${
+                hicConcordanceRatioCutoff.toFixed(2)
+              } or background-adjusted line Z ≥ ${hicMinimumLineZScore.toFixed(1)} with at least ${
+                formatScore(hicMinimumSupport)
+              } raw contact weight.${
+                firstAlleleUnavailableReason ? ` ${firstAlleleUnavailableReason}` : ""
+              }`}
         </p>
       ) : null}
       {loading ? (
@@ -398,7 +639,7 @@ function PlacementRecommendationItem({
         </em>
       </div>
       <div className="placement-recommendation-evidence">
-        <span>{placementRecommendationOccupancyLabel(recommendation)}</span>
+        <span>{placementRecommendationOccupancyLabel(recommendation, blocksById)}</span>
         <span>{recommendation.supportedJunctionCount}/{recommendation.availableJunctionCount} available contact sides</span>
         <span>{recommendation.bestEndpointMatchCount} endpoint maxima</span>
         {recommendation.pafAdjacencyMatchCount > 0 ? (
@@ -408,7 +649,7 @@ function PlacementRecommendationItem({
           <span>{recommendation.gfaMatchCount} GFA port {recommendation.gfaMatchCount === 1 ? "match" : "matches"}</span>
         ) : null}
         {recommendation.syntenyPrunedJunctionCount > 0 ? (
-          <span>{recommendation.syntenyPrunedJunctionCount} synteny-pruned {
+          <span>{recommendation.syntenyPrunedJunctionCount} allele-pruned {
             recommendation.syntenyPrunedJunctionCount === 1 ? "side" : "sides"
           }</span>
         ) : null}
@@ -519,6 +760,15 @@ function placementBlockLabel(blocks: ReadonlyArray<ContactMapLayoutBlock>) {
   return `${blocks.length}-contig block`;
 }
 
+function alleleConcordanceRequestKey(request: {
+  sourceBlockId: string;
+  targetBlockId: string;
+}) {
+  return request.sourceBlockId.localeCompare(request.targetBlockId) <= 0
+    ? `${request.sourceBlockId}\u0000${request.targetBlockId}`
+    : `${request.targetBlockId}\u0000${request.sourceBlockId}`;
+}
+
 function placementOrientationLabel(recommendation: PlacementRecommendation) {
   if (recommendation.selectedBlockIds.length === 1) {
     return `Orientation ${recommendation.orientation}`;
@@ -543,8 +793,30 @@ function formatScore(value: number) {
   });
 }
 
+function hicAllelePairLabel(
+  pair: HiCAlleleConcordancePair,
+  blocks: ReadonlyArray<ContactMapLayoutBlock>,
+) {
+  const blocksById = new Map(blocks.map((block) => [block.id, block]));
+  const left = blocksById.get(pair.leftBlockId);
+  const right = blocksById.get(pair.rightBlockId);
+  const leftLabel = left ? assemblyContigDisplayName(left) : pair.leftBlockId;
+  const rightLabel = right ? assemblyContigDisplayName(right) : pair.rightBlockId;
+  const supportLabel = pair.supportUnit === "raw-contact-weight"
+    ? "raw contact weight"
+    : "normalized contact weight";
+  const lineLabel = pair.evidenceModel === "trans-line"
+    ? `, line Z ${pair.lineZScore.toFixed(1)}`
+    : "";
+  const confidenceLabel = pair.confidence === "high" ? "high" : "supported";
+  return `${leftLabel} ↔ ${rightLabel} (${confidenceLabel}, CR `
+    + `${pair.concordanceRatio.toFixed(2)}${lineLabel}, `
+    + `${formatScore(pair.support)} ${supportLabel}, ${pair.orientation})`;
+}
+
 function placementRecommendationOccupancyLabel(
   recommendation: PlacementRecommendation,
+  blocksById: ReadonlyMap<string, ContactMapLayoutBlock>,
 ) {
   if (recommendation.occupancyConflicts.length === 0) {
     return "No detected source/locus conflict";
@@ -556,10 +828,28 @@ function placementRecommendationOccupancyLabel(
       .filter((conflict) => conflict.kind === "paf-allele-locus")
       .map((conflict) => conflict.selectedLocusCoverage ?? 0),
   );
+  const hicConflicts = recommendation.occupancyConflicts.filter(
+    (conflict) => conflict.kind === "hic-concordance",
+  );
+  const hicPartners = [...new Set(hicConflicts.flatMap((conflict) => (
+    conflict.occupiedBlockIds.map((id) => {
+      const block = blocksById.get(id);
+      return block ? assemblyContigDisplayName(block) : id;
+    })
+  )))];
+  const hicConcordanceRatio = Math.max(
+    0,
+    ...hicConflicts.map((conflict) => conflict.concordanceRatio ?? 0),
+  );
   return [
     kinds.has("exact-source") ? "Exact-source conflict" : null,
     kinds.has("paf-allele-locus")
       ? `PAF locus occupied${pafCoverage > 0 ? ` (${Math.round(pafCoverage * 100)}% selected locus)` : ""}`
+      : null,
+    kinds.has("hic-concordance")
+      ? `Hi-C allele occupied${hicPartners.length > 0 ? `: ${hicPartners.join(", ")}` : ""}${
+        hicConcordanceRatio > 0 ? ` (CR ${hicConcordanceRatio.toFixed(2)})` : ""
+      }`
       : null,
   ].filter((label): label is string => label !== null).join(" + ");
 }

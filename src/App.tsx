@@ -172,6 +172,13 @@ import {
   type GfaEndpointHiCLoader,
   type GfaEndpointHiCQueryPlan,
 } from "./state/gfaEndpointHiC";
+import {
+  planHiCAlleleConcordanceQuery,
+  scoreHiCAlleleConcordanceQuery,
+  type HiCAlleleConcordanceBatchLoader,
+  type HiCAlleleConcordanceLoadResult,
+  type HiCAlleleConcordanceQueryPlan,
+} from "./state/hicAlleleConcordance";
 import { classifyGfaScaffolds, defaultGfaHomologPattern } from "./state/gfaHomologLayout";
 import {
   buildChromosomeViewLayout,
@@ -5142,6 +5149,68 @@ export function App() {
     }
   }
 
+  function unloadGfaData() {
+    setGfaDocument(null);
+    setPlacementPreview(null);
+    dispatchUi({ type: "setOverviewMode", mode: "overview" });
+    setStatusMessage("GFA assembly graph unloaded");
+    dispatchUi({ type: "appendLog", message: "GFA assembly graph unloaded" });
+    if (gfaInputRef.current) {
+      gfaInputRef.current.value = "";
+    }
+  }
+
+  function unloadPafData() {
+    setPafPath(null);
+    setPafText("");
+    setPafImported(false);
+    setSyntenyView(null);
+    setPlacementPreview(null);
+    setDataset((current) => current ? { ...current, paf_path: null } : current);
+    dispatchUi({ type: "setOverviewMode", mode: "overview" });
+    dispatchUi({ type: "setSyntenySplitOpen", open: false });
+    setStatusMessage("PAF alignments unloaded");
+    dispatchUi({ type: "appendLog", message: "PAF alignments unloaded" });
+    if (pafInputRef.current) {
+      pafInputRef.current.value = "";
+    }
+  }
+
+  function unloadCoverageData() {
+    setCoverageRecords([]);
+    setCoverageView(null);
+    setDataset((current) => current ? { ...current, coverage_path: null } : current);
+    setStatusMessage("Coverage track unloaded");
+    dispatchUi({ type: "appendLog", message: "Coverage track unloaded" });
+    if (coverageInputRef.current) {
+      coverageInputRef.current.value = "";
+    }
+  }
+
+  function unloadContactData() {
+    setDataset((current) => current ? {
+      ...current,
+      mcool_path: "",
+      cool_path: "",
+      mcool_size_bytes: 0,
+      available_resolutions: [],
+      contact_sources: [],
+    } : current);
+    setContactAvailableResolutions([]);
+    setContactSources([]);
+    setContactMap(null);
+    setOverviewContactMap(null);
+    overviewContactMapRef.current = null;
+    setContactGpuSourceLayout(null);
+    setContactTileDeltaStream(null);
+    setContactTilePreviewViewport(null);
+    setPlacementPreview(null);
+    setBackendStartedContactTileGeneration(null);
+    setPaintedContactTileGeneration(null);
+    setStatusMessage("Contact map unloaded");
+    dispatchUi({ type: "appendLog", message: "Contact map unloaded" });
+  }
+
   function clearAllLoadedData() {
     const generation = contactTileGenerationRef.current + 1;
     contactTileGenerationRef.current = generation;
@@ -5501,7 +5570,8 @@ export function App() {
     const planned: Array<{
       plan?: GfaEndpointHiCQueryPlan;
       result?: GfaEndpointHiCLoadResult;
-    }> = requests.map(({ sourceBlockId, targetBlockId }) => {
+    }> = requests.map((request) => {
+      const { sourceBlockId, targetBlockId } = request;
       const sourceBlock = blocksById.get(sourceBlockId);
       const targetBlock = blocksById.get(targetBlockId);
       if (!sourceBlock || !targetBlock) {
@@ -5675,6 +5745,208 @@ export function App() {
     uiState.normalization,
   ]);
 
+  const loadHiCAlleleConcordanceBatch = useCallback<HiCAlleleConcordanceBatchLoader>(async (
+    requests,
+  ) => {
+    if (requests.length === 0) {
+      return [];
+    }
+    if (!contactCoolPath) {
+      return requests.map(() => ({
+        status: "unavailable",
+        reason: "Load a compatible Hi-C, Pore-C, or CiFi contact map to infer allelic contigs.",
+      }));
+    }
+    const blocksById = new Map(assemblyLayout.blocks.map((block) => [block.id, block]));
+    const planned: Array<{
+      plan?: HiCAlleleConcordanceQueryPlan;
+      result?: HiCAlleleConcordanceLoadResult;
+    }> = requests.map((request) => {
+      const { sourceBlockId, targetBlockId } = request;
+      const sourceBlock = blocksById.get(sourceBlockId);
+      const targetBlock = blocksById.get(targetBlockId);
+      if (!sourceBlock || !targetBlock) {
+        return {
+          result: {
+            status: "unavailable" as const,
+            reason: "One of the allelic-evidence contig occurrences is no longer present in the current AGP.",
+          },
+        };
+      }
+      const plan = planHiCAlleleConcordanceQuery(
+        sourceBlock,
+        targetBlock,
+        contactAvailableResolutions,
+        contactTileSizeBins,
+        undefined,
+        {
+          expectedOrientation: request.expectedOrientation,
+          objectLineId: request.objectLineId,
+          objectLineEnrichment: request.objectLineEnrichment,
+        },
+      );
+      return plan.status === "ready" ? { plan } : { result: plan };
+    });
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+      return planned.map((entry) => entry.result ?? ({
+        status: "unavailable",
+        reason: "Fine-resolution allelic contacts are available in the desktop app; browser preview has no local Cooler backend.",
+        resolution: entry.plan?.targetResolution,
+      }));
+    }
+
+    const generation = contactTileGenerationRef.current;
+    // Concordance and marginal-background line scores are calibrated on link
+    // counts. Always query raw contacts even when the heatmap is balanced.
+    const normalization: ContactNormalization = "raw";
+    const grouped = new Map<string, Array<{
+      index: number;
+      plan: HiCAlleleConcordanceQueryPlan;
+    }>>();
+    planned.forEach((entry, index) => {
+      if (!entry.plan) {
+        return;
+      }
+      const key = `${entry.plan.sourceResolution}:${entry.plan.targetResolution}:${entry.plan.tileSizeBins}`;
+      const group = grouped.get(key) ?? [];
+      group.push({ index, plan: entry.plan });
+      grouped.set(key, group);
+    });
+    const results: Array<HiCAlleleConcordanceLoadResult | null> = planned.map(
+      (entry) => entry.result ?? null,
+    );
+    const startedAt = performance.now();
+    let backendBatchCount = 0;
+
+    await Promise.all([...grouped.values()].map(async (group) => {
+      const representative = group[0]!.plan;
+      const cacheKeyForTile = createContactTileCacheKeyResolver(
+        contactCoolPath,
+        representative.targetResolution,
+        representative.tileSizeBins,
+        normalization,
+        assemblyLayout.blocks,
+      );
+      const tilesByKey = new Map<string, ContactMapTileKey>();
+      for (const { plan } of group) {
+        for (const tile of plan.tiles) {
+          tilesByKey.set(cacheKeyForTile(tile), tile);
+        }
+      }
+      const requestedTiles = [...tilesByKey.values()];
+      const cachedTiles = requestedTiles.flatMap((tile) => {
+        const cached = endpointContactTileCacheRef.current.get(cacheKeyForTile(tile));
+        return cached ? [cached] : [];
+      });
+      const missingTiles = requestedTiles.filter(
+        (tile) => !endpointContactTileCacheRef.current.has(cacheKeyForTile(tile)),
+      );
+      try {
+        const loadedTiles = missingTiles.length === 0
+          ? []
+          : await endpointContactTileFlightsRef.current.loadBatch({
+            scope: contactTileScope(
+              contactCoolPath,
+              representative.targetResolution,
+              representative.tileSizeBins,
+              normalization,
+              assemblyLayout.blocks,
+            ),
+            tiles: missingTiles,
+            cacheKeyForTile,
+            nextRequestId: () => {
+              backendBatchCount += 1;
+              const nextRequestId = contactTileBackendRequestIdRef.current + 1;
+              contactTileBackendRequestIdRef.current = nextRequestId;
+              return nextRequestId;
+            },
+            load: (requestId, tiles) => loadContactTilesWithLayoutHandle(
+              contactLayoutHandleRegistry,
+              contactLayoutBlocks,
+              {
+                requestId,
+                generation,
+                purpose: "endpoint_evidence",
+                coolPath: contactCoolPath,
+                baseResolution: representative.sourceResolution,
+                targetResolution: representative.targetResolution,
+                tileSizeBins: representative.tileSizeBins,
+                normalization,
+                tiles,
+              },
+            ),
+          });
+        for (const tile of loadedTiles) {
+          endpointContactTileCacheRef.current.set(cacheKeyForTile(tile), tile);
+        }
+        while (endpointContactTileCacheRef.current.size > 384) {
+          const oldestKey = endpointContactTileCacheRef.current.keys().next().value;
+          if (typeof oldestKey !== "string") {
+            break;
+          }
+          endpointContactTileCacheRef.current.delete(oldestKey);
+        }
+        if (generation !== contactTileGenerationRef.current) {
+          for (const { index, plan } of group) {
+            results[index] = {
+              status: "unavailable",
+              reason: "The assembly or contact-map view changed while allelic evidence was loading.",
+              resolution: plan.targetResolution,
+            };
+          }
+          return;
+        }
+        const availableByTileKey = new Map(
+          [...cachedTiles, ...loadedTiles].map((tile) => [contactTileKey(tile), tile]),
+        );
+        for (const { index, plan } of group) {
+          const planTiles = plan.tiles.flatMap((tile) => {
+            const loaded = availableByTileKey.get(contactTileKey(tile));
+            return loaded ? [loaded] : [];
+          });
+          results[index] = scoreHiCAlleleConcordanceQuery(
+            plan,
+            planTiles,
+            normalization,
+          );
+        }
+      } catch (error) {
+        const cancelled = isContactTileRequestCancelled(error);
+        for (const { index, plan } of group) {
+          results[index] = {
+            status: cancelled ? "unavailable" : "error",
+            reason: cancelled
+              ? "Allelic evidence was superseded by a newer assembly or contact-map view."
+              : `Allelic contact query failed: ${String(error)}`,
+            resolution: plan.targetResolution,
+          };
+        }
+      }
+    }));
+
+    if (contactTileIpcPerformanceEnabled) {
+      const line = [
+        "CSTUDIO_PERF event=hic_allele_concordance_batch",
+        `pairs=${requests.length}`,
+        `groups=${grouped.size}`,
+        `backend_batches=${backendBatchCount}`,
+        `elapsed_ms=${Math.round((performance.now() - startedAt) * 10) / 10}`,
+      ].join(" ");
+      console.info(line);
+      void invoke("log_gfa_frontend_performance", { line }).catch(() => undefined);
+    }
+    return results.map((result) => result ?? ({
+      status: "error",
+      reason: "Allelic contact query produced no result.",
+    }));
+  }, [
+    assemblyLayout.blocks,
+    contactAvailableResolutions,
+    contactCoolPath,
+    contactLayoutBlocks,
+    contactLayoutHandleRegistry,
+  ]);
+
   const loadGfaEndpointHiC = useCallback<GfaEndpointHiCLoader>(async (
     sourceBlockId,
     targetBlockId,
@@ -5793,6 +6065,7 @@ export function App() {
       onLayoutGfaBandage={loadGfaBandageLayout}
       onLoadGfaEndpointHiC={loadGfaEndpointHiC}
       onLoadGfaEndpointHiCBatch={loadGfaEndpointHiCBatch}
+      onLoadHiCAlleleConcordanceBatch={loadHiCAlleleConcordanceBatch}
       gfaHomologPattern={gfaHomologPattern}
       onGfaHomologPatternChange={setGfaHomologPattern}
       chromosomeVisibility={chromosomeVisibility}
@@ -5830,6 +6103,10 @@ export function App() {
       onLoadExample={loadExamples}
       onLoadProject={loadProjectDirectory}
       onReloadAssembly={reloadSourceAssembly}
+      onUnloadGfa={unloadGfaData}
+      onUnloadContact={unloadContactData}
+      onUnloadPaf={unloadPafData}
+      onUnloadCoverage={unloadCoverageData}
       onClearAllData={clearAllLoadedData}
       status={status}
       statusMessage={statusMessage}

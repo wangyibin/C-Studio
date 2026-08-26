@@ -395,6 +395,14 @@ export function contactVisibleInteractionViewport(
   return activePreviewViewport ?? pendingCommittedViewport ?? displayViewport;
 }
 
+/** A resolution gesture takes ownership of any still-retained pan camera. */
+export function contactResolutionPanReleaseViewport(
+  pendingCommittedViewport: ContactViewport | null,
+  displayedViewport: ContactViewport,
+): ContactViewport | null {
+  return pendingCommittedViewport ? displayedViewport : null;
+}
+
 /** Keep wheel semantics separate from the presentation frame being translated. */
 export function contactWheelPanSessionCameras(
   displayViewport: ContactViewport,
@@ -893,6 +901,30 @@ export function committedPanTargetIsPainted(
     && Math.abs(target.viewport.yEnd - pendingViewport.yEnd) <= 1;
 }
 
+/** Do not publish annotations for a generation painted in a different camera. */
+export function contactPresentationTargetIsPainted(
+  target: (Pick<ContactMapView, "renderGeneration" | "viewport">) | null,
+  paintedGeneration: number | undefined,
+  presentedViewport: ContactViewport | undefined,
+): boolean {
+  if (!target) {
+    return false;
+  }
+  if (target.renderGeneration === undefined) {
+    return true;
+  }
+  if (
+    target.renderGeneration !== paintedGeneration
+    || !presentedViewport
+  ) {
+    return false;
+  }
+  return Math.abs(target.viewport.xStart - presentedViewport.xStart) <= 1
+    && Math.abs(target.viewport.xEnd - presentedViewport.xEnd) <= 1
+    && Math.abs(target.viewport.yStart - presentedViewport.yStart) <= 1
+    && Math.abs(target.viewport.yEnd - presentedViewport.yEnd) <= 1;
+}
+
 export interface ContactCoveragePresentationFrame {
   datasetKey: string;
   contactMap: ContactMapView;
@@ -1032,16 +1064,29 @@ export function advancePaintedContactPresentationFrame(
   current: PaintedContactPresentationFrame | null,
   target: PaintedContactPresentationFrame | null,
   paintedGeneration: number | undefined,
+  presentedViewport?: ContactViewport,
 ): PaintedContactPresentationFrame | null {
   if (!target) {
     return null;
   }
   const currentForDataset = current?.datasetKey === target.datasetKey ? current : null;
   const targetGeneration = target.contactMap.renderGeneration;
+  const targetMatchesCurrent = Boolean(
+    currentForDataset
+    && currentForDataset.contactMap.renderGeneration === targetGeneration
+    && Math.abs(currentForDataset.contactMap.viewport.xStart - target.contactMap.viewport.xStart) <= 1
+    && Math.abs(currentForDataset.contactMap.viewport.xEnd - target.contactMap.viewport.xEnd) <= 1
+    && Math.abs(currentForDataset.contactMap.viewport.yStart - target.contactMap.viewport.yStart) <= 1
+    && Math.abs(currentForDataset.contactMap.viewport.yEnd - target.contactMap.viewport.yEnd) <= 1
+  );
   if (
     targetGeneration === undefined
-    || targetGeneration === paintedGeneration
-    || currentForDataset?.contactMap.renderGeneration === targetGeneration
+    || contactPresentationTargetIsPainted(
+      target.contactMap,
+      paintedGeneration,
+      presentedViewport,
+    )
+    || targetMatchesCurrent
   ) {
     return target;
   }
@@ -1401,14 +1446,16 @@ export function ContactMapViewport({
   }, [onContactTileLayerCommit]);
   const reportTileLayerPaintComplete = useCallback((event: ContactTileLayerPaintEvent) => {
     const target = targetContactPresentationFrameRef.current?.contactMap;
-    const targetPaintComplete = (
-      event.paintRevision !== undefined
-      && target?.renderGeneration === event.paintRevision
+    const targetPaintComplete = contactPresentationTargetIsPainted(
+      target ?? null,
+      event.paintRevision,
+      event.presentedViewport,
     );
     traceContactPanCamera("viewport_paint_complete", {
       paintRevision: event.paintRevision,
       targetGeneration: target?.renderGeneration,
       targetViewport: target?.viewport,
+      presentedViewport: event.presentedViewport,
       pendingCommittedViewport: pendingCommittedPanViewportRef.current,
       targetPaintComplete,
     });
@@ -1425,6 +1472,7 @@ export function ContactMapViewport({
       current,
       targetContactPresentationFrameRef.current,
       event.paintRevision,
+      event.presentedViewport,
     ));
     if (event.paintRevision !== undefined) {
       onContactTileLayerPaintComplete?.({
@@ -1546,6 +1594,7 @@ export function ContactMapViewport({
       current,
       targetContactPresentationFrame,
       usesTiledRenderer ? undefined : renderGeneration,
+      usesTiledRenderer ? undefined : targetContactPresentationFrame?.contactMap.viewport,
     ));
   }, [renderGeneration, targetContactPresentationFrame, usesTiledRenderer]);
   const paintedPresentationFrame = paintedContactPresentationFrame?.datasetKey === presentationDatasetKey
@@ -2117,7 +2166,10 @@ export function ContactMapViewport({
             displayedViewport,
             resolutionWheelSession,
           );
-          if (zoomAction) onUiAction(zoomAction);
+          if (zoomAction) {
+            supersedePendingPanForResolution(displayedViewport);
+            onUiAction(zoomAction);
+          }
           return;
         }
         const viewportResolutionOptions = availableContactResolutions(
@@ -2148,6 +2200,7 @@ export function ContactMapViewport({
           return;
         }
         resolutionWheelReadyAtRef.current = now + resolutionWheelCooldownMs;
+        supersedePendingPanForResolution(displayedViewport);
         onUiAction(zoomAction);
         return;
       }
@@ -2418,6 +2471,25 @@ export function ContactMapViewport({
       resetPanTransform();
     }
     onContactViewportPreview?.(null);
+  }
+
+  function supersedePendingPanForResolution(displayedViewport: ContactViewport) {
+    const releaseViewport = contactResolutionPanReleaseViewport(
+      pendingCommittedPanViewportRef.current,
+      displayedViewport,
+    );
+    if (!releaseViewport) {
+      return;
+    }
+    traceContactPanCamera("resolution_supersedes_pan", {
+      pendingCommittedViewport: pendingCommittedPanViewportRef.current,
+      releaseViewport,
+    }, true);
+    cancelScheduledPanFrame();
+    pendingCommittedPanViewportRef.current = null;
+    // Keep the existing DOM annotation transform until the replacement frame
+    // paints, but stop forcing that pan camera onto the replacement GPU scene.
+    contactTilePanRendererRef.current?.releasePanViewport(releaseViewport);
   }
 
   function startPan(event: React.PointerEvent<HTMLElement>) {

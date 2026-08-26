@@ -1,12 +1,14 @@
 # C-Studio
-![](https://img.shields.io/github/v/tag/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/top/wangyibin/C-Studio) ![](https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio) ![](https://img.shields.io/github/last-commit/wangyibin/C-Studio) ![](https://img.shields.io/github/contributors/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/code-size/wangyibin/C-Studio) ![platforms](https://img.shields.io/badge/platforms-aarch64%20|%20x86-blue) [![](https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat)](https://github.com/wangyibin/C-Studio/releases)
+![](https://img.shields.io/github/languages/top/wangyibin/C-Studio) ![](https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio) ![](https://img.shields.io/github/last-commit/wangyibin/C-Studio) ![](https://img.shields.io/github/contributors/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/code-size/wangyibin/C-Studio) ![platforms](https://img.shields.io/badge/platforms-macos%20|%20windows-blue) [![](https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat)](https://github.com/wangyibin/C-Studio/releases)
+
+> ⚠️ **开发状态：**C-Studio 仍在积极开发中，功能和界面可能发生变化。
 
 C-Studio 是一个处于早期阶段的桌面应用，用于检查染色体尺度组装、对照多类证据，
 并由用户主动编辑 AGP。当前应用由 Tauri 2、React、TypeScript 和 Rust 构建。
 
 !!! important "当前范围"
 
-    本文档描述当前 `0.3.5` 实现。C-Studio 提供证据辅助的校订工作流，
+    本文档描述当前实现。C-Studio 提供证据辅助的校订工作流，
     但**不会**替用户判断生物学上正确的断点、方向、分组或拷贝数。
 
 ## C-Studio 汇集的内容

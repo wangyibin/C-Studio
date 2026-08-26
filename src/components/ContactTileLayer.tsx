@@ -49,6 +49,8 @@ export interface ContactTileLayerPaintEvent {
   renderEpoch: number;
   canvasCount: number;
   paintRevision?: number;
+  /** Camera that owns the pixels copied to the visible presentation surface. */
+  presentedViewport?: ContactViewport;
   /** Captured during React's commit phase, before canvas layout effects. */
   commitTimestamp?: number;
 }
@@ -1382,15 +1384,21 @@ function ContactTileSharedGpuCanvas({
         return;
       }
       completed = true;
+      const presentedViewport = activeRenderer.presentedViewport()
+        ?? activeCandidate.scene.viewport;
       presentedRef.current = candidate;
       traceContactPanCamera("layer_scene_presented", {
         mode: staging ? "staging" : "front",
-        viewport: candidate.scene.viewport,
+        viewport: presentedViewport,
+        requestedViewport: candidate.scene.viewport,
         generation: candidate.scene.generation,
         slot: candidate.slot,
         retries: retryAttempt,
       });
-      onSlotPaintCompleteRef.current(candidate.slot, event);
+      onSlotPaintCompleteRef.current(candidate.slot, {
+        ...event,
+        presentedViewport,
+      });
     };
     function attemptPresentation() {
       if (!active || completed) {
@@ -1561,6 +1569,7 @@ function ContactTileSurface({
       renderEpoch: paintEpochCounterRef.current,
       canvasCount: paintCanvasKeys.length,
       paintRevision,
+      presentedViewport: viewport,
     };
     let coordinator!: ContactTilePaintCoordinator;
     coordinator = createContactTilePaintCoordinator({
@@ -1585,6 +1594,10 @@ function ContactTileSurface({
     renderStyle.colorScale.min,
     renderStyle.colorScale.max,
     visibleTileIdentitySignature,
+    viewport.xEnd,
+    viewport.xStart,
+    viewport.yEnd,
+    viewport.yStart,
   ]);
 
   useCommitPreparationEffect(() => {

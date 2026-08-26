@@ -112,7 +112,7 @@ export function buildLengthNormalizedGfaHiCLinks(
   );
   const countsByPair = new Map<string, AggregatedPair>();
 
-  forEachOverviewCell(contactMap, (xBin, yBin, count) => {
+  forEachContactOverviewCell(contactMap, (xBin, yBin, count) => {
     if (!Number.isFinite(count) || count <= 0) {
       return;
     }
@@ -240,7 +240,7 @@ function blockMembershipsByBin(
   return membershipsByBin;
 }
 
-function forEachOverviewCell(
+export function forEachContactOverviewCell(
   contactMap: ContactMapView,
   visit: (xBin: number, yBin: number, count: number) => void,
 ) {

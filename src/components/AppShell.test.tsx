@@ -19,6 +19,7 @@ function renderShell(
     autoSaveAvailable?: boolean;
     gfaHomologPattern?: string;
     includeUnanchoredInChromosomeFilter?: boolean;
+    pafImported?: boolean;
   } = {},
 ) {
   const uiState = createInitialUiState("Ready");
@@ -43,7 +44,7 @@ function renderShell(
       syntenyView={null}
       coverageView={null}
       pafText=""
-      pafImported={false}
+      pafImported={project.pafImported ?? false}
       gfaDocument={null}
       gfaHomologPattern={gfaHomologPattern}
       onGfaHomologPatternChange={() => undefined}
@@ -79,6 +80,10 @@ function renderShell(
       onAutoSaveEnabledChange={() => undefined}
       onLoadExample={() => undefined}
       onReloadAssembly={() => undefined}
+      onUnloadGfa={() => undefined}
+      onUnloadContact={() => undefined}
+      onUnloadPaf={() => undefined}
+      onUnloadCoverage={() => undefined}
       onClearAllData={() => undefined}
       status={{
         version: "0.1.3",
@@ -152,6 +157,15 @@ describe("AppShell confirmed workspace", () => {
 
     expect(markup).toContain('class="global-homolog-pattern invalid"');
     expect(markup).toContain("Invalid regular expression:");
+  });
+
+  it("offers a separate unload action for imported PAF data", () => {
+    const emptyMarkup = renderShell();
+    const loadedMarkup = renderShell(false, null, "None (Raw)", { pafImported: true });
+
+    expect(emptyMarkup).not.toContain('aria-label="Unload PAF alignments"');
+    expect(loadedMarkup).toContain('aria-label="Unload PAF alignments"');
+    expect(loadedMarkup).toContain('title="Unload only the PAF alignments"');
   });
 
   it("offers unanchored AGP objects as one aggregated filter option", () => {

@@ -7,7 +7,8 @@ type Interval = readonly [number, number];
 export type SyntenyAllelePruneReason =
   | "duplicate-occurrence"
   | "direct-allele"
-  | "cross-allele-nonmatch";
+  | "cross-allele-nonmatch"
+  | "hic-concordance";
 
 export interface ReferenceSyntenyAnchor {
   nodeId: string;

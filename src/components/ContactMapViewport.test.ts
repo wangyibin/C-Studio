@@ -22,6 +22,8 @@ import {
   contactPanPrefetchChannel,
   contactPanPreviewTileSignature,
   contactPanTransformOffsets,
+  contactPresentationTargetIsPainted,
+  contactResolutionPanReleaseViewport,
   contactVisibleInteractionViewport,
   contactWheelPanSessionCameras,
   presentContactPanPrefetchBatches,
@@ -712,6 +714,17 @@ describe("fast consecutive pan camera", () => {
       transformSourceViewport: retainedDisplayViewport,
     });
   });
+
+  it("lets a resolution gesture take ownership of the exact pending pan camera", () => {
+    const displayViewport = { xStart: 0, xEnd: 100, yStart: 0, yEnd: 100 };
+    const pendingViewport = { xStart: 20, xEnd: 120, yStart: 30, yEnd: 130 };
+
+    expect(contactResolutionPanReleaseViewport(
+      pendingViewport,
+      pendingViewport,
+    )).toBe(pendingViewport);
+    expect(contactResolutionPanReleaseViewport(null, displayViewport)).toBeNull();
+  });
 });
 
 describe("contact and coverage presentation frames", () => {
@@ -844,9 +857,43 @@ describe("contact and coverage presentation frames", () => {
       coverageView: coarseCoverage,
     };
 
-    expect(advancePaintedContactPresentationFrame(oldFrame, coarseTarget, 20)).toBe(oldFrame);
+    expect(advancePaintedContactPresentationFrame(
+      oldFrame,
+      coarseTarget,
+      20,
+      oldContactMap.viewport,
+    )).toBe(oldFrame);
     expect(advancePaintedContactPresentationFrame(oldFrame, coarseTarget, undefined)).toBe(oldFrame);
-    expect(advancePaintedContactPresentationFrame(oldFrame, coarseTarget, 21)).toBe(coarseTarget);
+    expect(advancePaintedContactPresentationFrame(
+      oldFrame,
+      coarseTarget,
+      21,
+      coarseContactMap.viewport,
+    )).toBe(coarseTarget);
+  });
+
+  it("rejects a matching generation painted in the retained pan camera", () => {
+    const target = {
+      renderGeneration: 21,
+      viewport: { xStart: 0, xEnd: 1_000, yStart: 0, yEnd: 1_000 },
+    };
+    const retainedPanViewport = {
+      xStart: 400,
+      xEnd: 600,
+      yStart: 450,
+      yEnd: 550,
+    };
+
+    expect(contactPresentationTargetIsPainted(
+      target,
+      21,
+      retainedPanViewport,
+    )).toBe(false);
+    expect(contactPresentationTargetIsPainted(
+      target,
+      21,
+      target.viewport,
+    )).toBe(true);
   });
 
   it("does not leak an old dataset border while the next dataset heatmap paints", () => {
@@ -871,8 +918,18 @@ describe("contact and coverage presentation frames", () => {
       coverageView: null,
     };
 
-    expect(advancePaintedContactPresentationFrame(oldFrame, nextTarget, 1)).toBeNull();
-    expect(advancePaintedContactPresentationFrame(oldFrame, nextTarget, 2)).toBe(nextTarget);
+    expect(advancePaintedContactPresentationFrame(
+      oldFrame,
+      nextTarget,
+      1,
+      oldFrame.contactMap.viewport,
+    )).toBeNull();
+    expect(advancePaintedContactPresentationFrame(
+      oldFrame,
+      nextTarget,
+      2,
+      nextTarget.contactMap.viewport,
+    )).toBe(nextTarget);
   });
 });
 

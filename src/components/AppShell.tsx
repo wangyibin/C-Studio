@@ -12,6 +12,7 @@ import {
   SaveAll,
   Trash2,
   Undo2,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
@@ -36,6 +37,7 @@ import type {
   GfaEndpointHiCBatchLoader,
   GfaEndpointHiCLoader,
 } from "../state/gfaEndpointHiC";
+import type { HiCAlleleConcordanceBatchLoader } from "../state/hicAlleleConcordance";
 import { classifyGfaScaffolds } from "../state/gfaHomologLayout";
 import {
   buildCenteredContactViewport,
@@ -93,6 +95,7 @@ interface AppShellProps {
   onLayoutGfaBandage?: GfaBandageLayoutLoader;
   onLoadGfaEndpointHiC?: GfaEndpointHiCLoader;
   onLoadGfaEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
+  onLoadHiCAlleleConcordanceBatch?: HiCAlleleConcordanceBatchLoader;
   gfaHomologPattern: string;
   onGfaHomologPatternChange: (pattern: string) => void;
   chromosomeVisibility: ChromosomeVisibility;
@@ -126,6 +129,10 @@ interface AppShellProps {
   onLoadExample: () => void;
   onLoadProject?: () => void;
   onReloadAssembly: () => void;
+  onUnloadGfa: () => void;
+  onUnloadContact: () => void;
+  onUnloadPaf: () => void;
+  onUnloadCoverage: () => void;
   onClearAllData: () => void;
   status: AppStatus;
   statusMessage: string;
@@ -197,6 +204,7 @@ export function AppShell({
   onLayoutGfaBandage,
   onLoadGfaEndpointHiC,
   onLoadGfaEndpointHiCBatch,
+  onLoadHiCAlleleConcordanceBatch,
   gfaHomologPattern,
   onGfaHomologPatternChange,
   chromosomeVisibility,
@@ -230,6 +238,10 @@ export function AppShell({
   onLoadExample,
   onLoadProject = () => undefined,
   onReloadAssembly,
+  onUnloadGfa,
+  onUnloadContact,
+  onUnloadPaf,
+  onUnloadCoverage,
   onClearAllData,
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
@@ -305,6 +317,30 @@ export function AppShell({
     gfaImported ? "assembly graph" : null,
   ].filter((label): label is string => label !== null);
   const hasLoadedData = loadedDataLabels.length > 0;
+
+  useEffect(() => {
+    if (!gfaDocument && gfaPanelOpen) {
+      setGfaPanelOpen(false);
+      if (!heatmapPanelOpen && !uiState.layout.syntenySplitOpen) {
+        setHeatmapPanelOpen(true);
+      }
+    }
+  }, [gfaDocument, gfaPanelOpen, heatmapPanelOpen, uiState.layout.syntenySplitOpen]);
+
+  useEffect(() => {
+    if (!syntenyImported && uiState.layout.syntenySplitOpen) {
+      onUiAction({ type: "setSyntenySplitOpen", open: false });
+      if (!heatmapPanelOpen && !gfaPanelOpen) {
+        setHeatmapPanelOpen(true);
+      }
+    }
+  }, [
+    gfaPanelOpen,
+    heatmapPanelOpen,
+    onUiAction,
+    syntenyImported,
+    uiState.layout.syntenySplitOpen,
+  ]);
 
   onChromosomeFilterPatternChangeRef.current = onChromosomeFilterPatternChange;
 
@@ -919,22 +955,74 @@ export function AppShell({
                     <RefreshCcw size={14} aria-hidden="true" />
                   </button>
                 )}
-                <button type="button" onClick={() => runAddDataAction(() => gfaInputRef.current?.click())}>
-                  <span>Assembly graph (.gfa)</span>
-                  {gfaImported ? <Check size={14} aria-label="Loaded" /> : null}
-                </button>
-                <button type="button" onClick={() => runAddDataAction(onContactFileSelected)}>
-                  <span>Contact map (.cool/.mcool)</span>
-                  {contactImported ? <Check size={14} aria-label="Loaded" /> : null}
-                </button>
-                <button type="button" onClick={() => runAddDataAction(onPafFileRequested)}>
-                  <span>Synteny alignments (.paf)</span>
-                  {pafImported ? <Check size={14} aria-label="Loaded" /> : null}
-                </button>
-                <button type="button" onClick={() => runAddDataAction(onCoverageFileRequested)}>
-                  <span>Coverage track</span>
-                  {coverageImported ? <Check size={14} aria-label="Loaded" /> : null}
-                </button>
+                <div className="add-data-source-row">
+                  <button type="button" onClick={() => runAddDataAction(() => gfaInputRef.current?.click())}>
+                    <span>Assembly graph (.gfa)</span>
+                    {gfaImported ? <Check size={14} aria-label="Loaded" /> : null}
+                  </button>
+                  {gfaImported ? (
+                    <button
+                      className="add-data-unload-button"
+                      type="button"
+                      aria-label="Unload GFA assembly graph"
+                      title="Unload only the GFA assembly graph"
+                      onClick={() => runAddDataAction(onUnloadGfa)}
+                    >
+                      <X size={13} aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </div>
+                <div className="add-data-source-row">
+                  <button type="button" onClick={() => runAddDataAction(onContactFileSelected)}>
+                    <span>Contact map (.cool/.mcool)</span>
+                    {contactImported ? <Check size={14} aria-label="Loaded" /> : null}
+                  </button>
+                  {contactImported ? (
+                    <button
+                      className="add-data-unload-button"
+                      type="button"
+                      aria-label="Unload contact map"
+                      title="Unload only the contact map"
+                      onClick={() => runAddDataAction(onUnloadContact)}
+                    >
+                      <X size={13} aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </div>
+                <div className="add-data-source-row">
+                  <button type="button" onClick={() => runAddDataAction(onPafFileRequested)}>
+                    <span>Synteny alignments (.paf)</span>
+                    {syntenyImported ? <Check size={14} aria-label="Loaded" /> : null}
+                  </button>
+                  {syntenyImported ? (
+                    <button
+                      className="add-data-unload-button"
+                      type="button"
+                      aria-label="Unload PAF alignments"
+                      title="Unload only the PAF alignments"
+                      onClick={() => runAddDataAction(onUnloadPaf)}
+                    >
+                      <X size={13} aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </div>
+                <div className="add-data-source-row">
+                  <button type="button" onClick={() => runAddDataAction(onCoverageFileRequested)}>
+                    <span>Coverage track</span>
+                    {coverageImported ? <Check size={14} aria-label="Loaded" /> : null}
+                  </button>
+                  {coverageImported ? (
+                    <button
+                      className="add-data-unload-button"
+                      type="button"
+                      aria-label="Unload coverage track"
+                      title="Unload only the coverage track"
+                      onClick={() => runAddDataAction(onUnloadCoverage)}
+                    >
+                      <X size={13} aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </div>
                 <span className="popover-divider" aria-hidden="true" />
                 <button type="button" onClick={() => runAddDataAction(onLoadExample)}>
                   <span>Load example project</span>
@@ -1490,6 +1578,7 @@ export function AppShell({
               gfaPreviewScaffoldIds={gfaPreviewScaffoldIds}
               gfaChromosomeFilterActive={chromosomeVisibility.active}
               onLoadGfaEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
+              onLoadHiCAlleleConcordanceBatch={onLoadHiCAlleleConcordanceBatch}
               placementPreview={placementPreview}
               onPlacementPreviewChange={changePlacementPreview}
               onExpandHeatmap={expandHeatmapPanel}

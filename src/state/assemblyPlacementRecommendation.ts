@@ -13,6 +13,11 @@ import {
 } from "./gfaEndpointHiC";
 import type { GfaGraphEdge, GfaSegmentSide } from "./gfa";
 import type { GfaHiCLink } from "./gfaHiCLinks";
+import type {
+  HiCAlleleConcordancePair,
+  HiCConcordanceOrientation,
+  HiCConcordanceSupportUnit,
+} from "./hicAlleleConcordance";
 import type { ContactMapLayoutBlock } from "./importers";
 import {
   syntenyAllelePairKey,
@@ -75,7 +80,8 @@ export interface PlacementRecommendation extends PlacementRecommendationCandidat
 
 export type PlacementGroupOccupancyConflictKind =
   | "exact-source"
-  | "paf-allele-locus";
+  | "paf-allele-locus"
+  | "hic-concordance";
 
 export interface PlacementGroupOccupancyConflict {
   targetObjectId: string;
@@ -86,6 +92,10 @@ export interface PlacementGroupOccupancyConflict {
   overlapBp?: number;
   selectedLocusCoverage?: number;
   occupiedLocusCoverage?: number;
+  concordanceRatio?: number;
+  concordanceOrientation?: HiCConcordanceOrientation;
+  concordanceSupport?: number;
+  concordanceSupportUnit?: HiCConcordanceSupportUnit;
 }
 
 export type PlacementSyntenyAdjacencyDirection = "upstream" | "downstream";
@@ -232,6 +242,7 @@ export function buildPlacementRecommendationPlan({
   syntenyAlleleGroups = [],
   syntenyAnchors = [],
   syntenyAlleleEdges = [],
+  hicAllelePairs = [],
   overviewPartnerLimit = defaultOverviewPartnerLimit,
   gfaPartnerLimit = defaultGfaPartnerLimit,
   syntenyPartnerLimitPerSide = defaultSyntenyPartnerLimitPerSide,
@@ -244,6 +255,7 @@ export function buildPlacementRecommendationPlan({
   syntenyAlleleGroups?: ReadonlyArray<ReferenceSyntenyAlleleGroup>;
   syntenyAnchors?: ReadonlyArray<ReferenceSyntenyAnchor>;
   syntenyAlleleEdges?: ReadonlyArray<ReferenceSyntenyAlleleEdge>;
+  hicAllelePairs?: ReadonlyArray<HiCAlleleConcordancePair>;
   overviewPartnerLimit?: number;
   gfaPartnerLimit?: number;
   syntenyPartnerLimitPerSide?: number;
@@ -269,6 +281,7 @@ export function buildPlacementRecommendationPlan({
     syntenyAlleleGroups,
     syntenyAlleleEdges,
     syntenyAnchors,
+    hicAllelePairs,
   );
   const occupiedObjectIds = new Set(
     occupancyConflicts.map((conflict) => conflict.targetObjectId),
@@ -321,6 +334,7 @@ export function buildPlacementRecommendationPlan({
     ...coarsePartnerIds,
     ...gfaPartnerIds,
     ...syntenyAdjacencies.map((adjacency) => adjacency.partnerBlockId),
+    ...occupancyConflicts.flatMap((conflict) => conflict.occupiedBlockIds),
   ]);
   const shortlistedBoundaries = boundaries.filter((boundary) => (
     boundary.isCurrentBoundary
@@ -541,6 +555,7 @@ function placementGroupOccupancyConflicts(
   syntenyAlleleGroups: ReadonlyArray<ReferenceSyntenyAlleleGroup>,
   syntenyAlleleEdges: ReadonlyArray<ReferenceSyntenyAlleleEdge>,
   syntenyAnchors: ReadonlyArray<ReferenceSyntenyAnchor>,
+  hicAllelePairs: ReadonlyArray<HiCAlleleConcordancePair>,
 ): PlacementGroupOccupancyConflict[] {
   const selectedIdSet = new Set(selectedBlocks.map((block) => block.id));
   const blocksById = new Map(blocks.map((block) => [block.id, block]));
@@ -555,6 +570,10 @@ function placementGroupOccupancyConflicts(
     overlapBp,
     selectedLocusCoverage,
     occupiedLocusCoverage,
+    concordanceRatio,
+    concordanceOrientation,
+    concordanceSupport,
+    concordanceSupportUnit,
   }: PlacementGroupOccupancyConflict) => {
     const key = `${targetObjectId}\u0000${kind}\u0000${locusId}`;
     const existing = conflictsByKey.get(key);
@@ -586,6 +605,10 @@ function placementGroupOccupancyConflicts(
       ...(mergedOccupiedCoverage > 0
         ? { occupiedLocusCoverage: mergedOccupiedCoverage }
         : {}),
+      ...(concordanceRatio !== undefined ? { concordanceRatio } : {}),
+      ...(concordanceOrientation !== undefined ? { concordanceOrientation } : {}),
+      ...(concordanceSupport !== undefined ? { concordanceSupport } : {}),
+      ...(concordanceSupportUnit !== undefined ? { concordanceSupportUnit } : {}),
     });
   };
 
@@ -619,6 +642,30 @@ function placementGroupOccupancyConflicts(
       .filter((conflict) => conflict.kind === "exact-source")
       .map((conflict) => conflict.targetObjectId),
   );
+  for (const pair of hicAllelePairs) {
+    const leftSelected = selectedIdSet.has(pair.leftBlockId);
+    const rightSelected = selectedIdSet.has(pair.rightBlockId);
+    if (leftSelected === rightSelected) {
+      continue;
+    }
+    const selectedBlockId = leftSelected ? pair.leftBlockId : pair.rightBlockId;
+    const occupiedBlockId = leftSelected ? pair.rightBlockId : pair.leftBlockId;
+    const occupiedBlock = blocksById.get(occupiedBlockId);
+    if (!occupiedBlock || exactConflictObjectIds.has(occupiedBlock.objectId)) {
+      continue;
+    }
+    addConflict({
+      targetObjectId: occupiedBlock.objectId,
+      kind: "hic-concordance",
+      locusId: pair.id,
+      selectedBlockIds: [selectedBlockId],
+      occupiedBlockIds: [occupiedBlockId],
+      concordanceRatio: pair.concordanceRatio,
+      concordanceOrientation: pair.orientation,
+      concordanceSupport: pair.support,
+      concordanceSupportUnit: pair.supportUnit,
+    });
+  }
   const anchors = uniqueAnchors([
     ...syntenyAnchors,
     ...syntenyAlleleGroups.flatMap((group) => group.members),
@@ -814,7 +861,15 @@ export function rankPlacementRecommendations(
     ));
     const supported = evidence.filter((junction) => junction.normalizedCountPerMb2 > 0);
     const gfaMatchCount = evidence.filter((junction) => junction.gfaMatch).length;
-    if (supported.length === 0 && gfaMatchCount === 0 && pafAdjacencyMatchCount === 0) {
+    const occupancyConflicts = plan.occupancyConflicts.filter(
+      (conflict) => conflict.targetObjectId === candidate.targetObjectId,
+    );
+    if (
+      supported.length === 0
+      && gfaMatchCount === 0
+      && pafAdjacencyMatchCount === 0
+      && occupancyConflicts.length === 0
+    ) {
       return [];
     }
     const contactScore = supported.length >= 2
@@ -834,9 +889,6 @@ export function rankPlacementRecommendations(
     const syntenyPrunedJunctionCount = evidence.filter(
       (junction) => junction.syntenyPruneReason !== null,
     ).length;
-    const occupancyConflicts = plan.occupancyConflicts.filter(
-      (conflict) => conflict.targetObjectId === candidate.targetObjectId,
-    );
     const confidence = recommendationConfidence({
       copyAmbiguous: plan.copyAmbiguous,
       occupancyConflictCount: occupancyConflicts.length,

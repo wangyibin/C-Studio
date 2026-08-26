@@ -206,6 +206,8 @@ export interface ContactTileGpuRenderer {
   retainPanViewport: (viewport: ContactViewport) => void;
   /** Return camera ownership to the declarative scene after target paint. */
   releasePanViewport: (viewport: ContactViewport) => void;
+  /** Camera that owns the pixels most recently copied to the visible surface. */
+  presentedViewport: () => ContactViewport | null;
   redraw: () => boolean;
   performanceSnapshot: () => ContactTileGpuPerformanceSnapshot;
   destroy: () => void;
@@ -1702,6 +1704,7 @@ export function createContactTileGpuRenderer(
 
   let pendingVirtualPresentation: PendingVirtualPresentation | null = null;
   let retainedPanViewport: ContactViewport | null = null;
+  let lastPresentedViewport: ContactViewport | null = null;
   let pendingPresentationFence: PendingPresentationFence | null = null;
   let pendingPrefetchScene: ContactTileGpuScene | null = null;
   let pendingPrefetchGeneration: number | undefined;
@@ -2582,6 +2585,7 @@ export function createContactTileGpuRenderer(
       presentFramePresentation(gl, presentation, canvas.width, canvas.height);
       if (presentation === framePresentation) {
         hasPresentedFrontFrame = true;
+        lastPresentedViewport = activeScene.viewport;
       }
     }
     uploadContext.performance.virtualTextureDraws += 1;
@@ -2864,6 +2868,7 @@ export function createContactTileGpuRenderer(
         presentFramePresentation(gl, presentation, canvas.width, canvas.height);
         if (presentation === framePresentation) {
           hasPresentedFrontFrame = true;
+          lastPresentedViewport = activeScene.viewport;
         }
       }
       return true;
@@ -2888,6 +2893,7 @@ export function createContactTileGpuRenderer(
       presentFramePresentation(gl, presentation, canvas.width, canvas.height);
       if (presentation === framePresentation) {
         hasPresentedFrontFrame = true;
+        lastPresentedViewport = activeScene.viewport;
       }
     }
     return true;
@@ -2969,6 +2975,7 @@ export function createContactTileGpuRenderer(
     stagingFramePresentation = previousFrontPresentation;
     presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
     hasPresentedFrontFrame = true;
+    lastPresentedViewport = scene?.viewport ?? lastPresentedViewport;
     uploadContext.performance.framebufferSwaps += 1;
     traceContactPanCamera("gpu_fbo_present", {
       sceneViewport: scene?.viewport,
@@ -3023,6 +3030,7 @@ export function createContactTileGpuRenderer(
     pendingAppendedDescriptors.clear();
     presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
     hasPresentedFrontFrame = true;
+    lastPresentedViewport = pending.scene.viewport;
     uploadContext.performance.uploadFenceSignals += 1;
     pending.onPresented?.(true);
     pendingPrefetchScene = contactTileGpuUploadPlan(pending.scene)
@@ -3411,7 +3419,11 @@ export function createContactTileGpuRenderer(
   };
 
   const sceneWithRetainedPanViewport = (nextScene: ContactTileGpuScene) => (
-    retainedPanViewport
+    contactTileGpuSceneCanUseRetainedPanViewport(
+      scene,
+      nextScene,
+      retainedPanViewport,
+    )
       ? { ...nextScene, viewport: retainedPanViewport }
       : nextScene
   );
@@ -4226,6 +4238,7 @@ export function createContactTileGpuRenderer(
       retainedPanViewport = null;
       setActivePanViewport(viewport);
     },
+    presentedViewport: () => lastPresentedViewport,
     redraw: () => {
       if (pendingVirtualPresentation || pendingPresentationFence) {
         if (hasPresentedFrontFrame && framePresentation) {
@@ -5276,6 +5289,34 @@ function sameContactTileGpuViewport(left: ContactViewport, right: ContactViewpor
     && left.xEnd === right.xEnd
     && left.yStart === right.yStart
     && left.yEnd === right.yEnd;
+}
+
+/**
+ * A retained camera owns only same-surface translation. Resolution, layout,
+ * normalization, and new-generation camera changes are replacement scenes
+ * and must keep their declarative camera; otherwise the renderer can report a
+ * new generation while still drawing the previous pan viewport. Same-
+ * generation publications are stale React/data refreshes and remain pinned.
+ */
+export function contactTileGpuSceneCanUseRetainedPanViewport(
+  currentScene: ContactTileGpuScene | null,
+  nextScene: ContactTileGpuScene,
+  retainedViewport: ContactViewport | null,
+): retainedViewport is ContactViewport {
+  if (!currentScene || !retainedViewport) {
+    return false;
+  }
+  const currentDataScope = currentScene.sourceLayout?.dataScope
+    ?? currentScene.dataScope;
+  const nextDataScope = nextScene.sourceLayout?.dataScope
+    ?? nextScene.dataScope;
+  return currentScene.resolution === nextScene.resolution
+    && currentScene.tileSizeBins === nextScene.tileSizeBins
+    && currentDataScope === nextDataScope
+    && (
+      currentScene.generation === nextScene.generation
+      || sameContactTileGpuViewport(nextScene.viewport, retainedViewport)
+    );
 }
 
 function sameContactTileGpuScene(left: ContactTileGpuScene, right: ContactTileGpuScene) {

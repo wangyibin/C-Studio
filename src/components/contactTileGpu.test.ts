@@ -12,6 +12,7 @@ import {
   contactTileGpuBoundaryInstanceData,
   contactTileGpuDrawCoverageIsComplete,
   contactTileGpuSceneTextureFormat,
+  contactTileGpuSceneCanUseRetainedPanViewport,
   contactTileGpuTexturePreference,
   contactTileGpuUploadBatch,
   contactTileGpuUploadPlan,
@@ -25,6 +26,56 @@ import {
   contactTileVirtualPageTransposeFlag,
   createContactTileGpuRenderer,
 } from "./contactTileGpu";
+
+describe("retained pan scene ownership", () => {
+  const renderStyle = {
+    colormap: "Reds" as const,
+    colorScale: { log: false, min: 0, max: 10 },
+  };
+  const sourceViewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
+  const retainedViewport = { xStart: 100, xEnd: 3_900, yStart: 100, yEnd: 3_900 };
+  const currentScene = {
+    dataScope: "layout|raw",
+    descriptors: [],
+    generation: 7,
+    resolution: 1_000,
+    tileSizeBins: 4,
+    viewport: retainedViewport,
+    renderStyle,
+  };
+
+  it("pins stale same-generation publications but not replacement cameras", () => {
+    expect(contactTileGpuSceneCanUseRetainedPanViewport(
+      currentScene,
+      { ...currentScene, viewport: sourceViewport },
+      retainedViewport,
+    )).toBe(true);
+    expect(contactTileGpuSceneCanUseRetainedPanViewport(
+      currentScene,
+      {
+        ...currentScene,
+        generation: 8,
+        viewport: { xStart: 500, xEnd: 2_500, yStart: 500, yEnd: 2_500 },
+      },
+      retainedViewport,
+    )).toBe(false);
+    expect(contactTileGpuSceneCanUseRetainedPanViewport(
+      currentScene,
+      {
+        ...currentScene,
+        generation: 8,
+        resolution: 5_000,
+        viewport: { xStart: 0, xEnd: 20_000, yStart: 0, yEnd: 20_000 },
+      },
+      retainedViewport,
+    )).toBe(false);
+    expect(contactTileGpuSceneCanUseRetainedPanViewport(
+      currentScene,
+      { ...currentScene, generation: 8, viewport: retainedViewport },
+      retainedViewport,
+    )).toBe(true);
+  });
+});
 
 function mockWebGlCanvas() {
   const texImage2D = vi.fn();
@@ -961,6 +1012,51 @@ describe("contactTileFloatTextureData", () => {
     // Once released, a genuine declarative camera change is accepted again.
     expect(renderer?.setScene({ ...scene, viewport: sourceViewport })).toBe(true);
     expect(drawArrays).toHaveBeenCalledTimes(drawsAtPointerUp + 1);
+    renderer?.destroy();
+  });
+
+  it("lets a new-generation zoom camera supersede retained pan ownership", () => {
+    const { canvas } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const sourceViewport = { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 };
+    const retainedViewport = { xStart: 100, xEnd: 3_900, yStart: 100, yEnd: 3_900 };
+    const zoomViewport = { xStart: 500, xEnd: 2_500, yStart: 500, yEnd: 2_500 };
+    const scene = {
+      dataScope: "layout|raw",
+      descriptors: [{
+        key: "0:0:source",
+        tile: {
+          tileX: 0,
+          tileY: 0,
+          cells: [{ xBin: 0, yBin: 0, count: 9 }],
+        },
+        transpose: false,
+      }],
+      generation: 7,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: sourceViewport,
+      renderStyle: {
+        colormap: "Reds" as const,
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    };
+
+    expect(renderer?.setScene(scene)).toBe(true);
+    renderer?.retainPanViewport(retainedViewport);
+    const presented = vi.fn();
+    expect(renderer?.stageScene({
+      ...scene,
+      generation: 8,
+      viewport: zoomViewport,
+    }, presented)).toBe(true);
+
+    expect(presented).toHaveBeenCalledWith(true);
+    expect(renderer?.presentedViewport()).toEqual(zoomViewport);
     renderer?.destroy();
   });
 

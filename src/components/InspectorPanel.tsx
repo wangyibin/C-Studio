@@ -23,6 +23,7 @@ import {
 import type { ContactMapLayoutBlock } from "../state/importers";
 import type { GfaEvidenceDocument } from "../state/gfa";
 import type { GfaEndpointHiCBatchLoader } from "../state/gfaEndpointHiC";
+import type { HiCAlleleConcordanceBatchLoader } from "../state/hicAlleleConcordance";
 import type { PlacementRecommendation } from "../state/assemblyPlacementRecommendation";
 import {
   buildCenteredContactViewport,
@@ -65,6 +66,7 @@ interface InspectorPanelProps {
   gfaPreviewScaffoldIds?: ReadonlySet<string>;
   gfaChromosomeFilterActive?: boolean;
   onLoadGfaEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
+  onLoadHiCAlleleConcordanceBatch?: HiCAlleleConcordanceBatchLoader;
   placementPreview?: PlacementRecommendation | null;
   onPlacementPreviewChange?: (candidate: PlacementRecommendation | null) => void;
 }
@@ -92,6 +94,7 @@ export function InspectorPanel({
   gfaPreviewScaffoldIds = new Set<string>(),
   gfaChromosomeFilterActive = false,
   onLoadGfaEndpointHiCBatch,
+  onLoadHiCAlleleConcordanceBatch,
   placementPreview = null,
   onPlacementPreviewChange = () => undefined,
 }: InspectorPanelProps) {
@@ -242,6 +245,7 @@ export function InspectorPanel({
           pafText={pafText}
           gfaDocument={gfaDocument}
           onLoadEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
+          onLoadHiCAlleleConcordanceBatch={onLoadHiCAlleleConcordanceBatch}
           activePreviewId={placementPreview?.id ?? null}
           onPreviewChange={onPlacementPreviewChange}
           onUiAction={onUiAction}
