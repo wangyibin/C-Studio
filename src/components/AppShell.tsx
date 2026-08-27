@@ -1300,7 +1300,7 @@ export function AppShell({
               type="button"
               aria-label="Undo"
               aria-keyshortcuts="Control+Z Meta+Z Control+U Meta+U"
-              title={`Undo (${shortcuts.undo}; Juicebox: ${shortcuts.legacyUndo})`}
+              title={`Undo (${shortcuts.undo}; Alternate shortcut: ${shortcuts.legacyUndo})`}
               disabled={uiState.operationHistory.length === 0}
               onClick={() => onUiAction({ type: "undo" })}
             >
@@ -1311,7 +1311,7 @@ export function AppShell({
               type="button"
               aria-label="Redo"
               aria-keyshortcuts="Meta+Shift+Z Control+Y Control+R Meta+R"
-              title={`Redo (${shortcuts.redo}; Juicebox: ${shortcuts.legacyRedo})`}
+              title={`Redo (${shortcuts.redo}; Alternate shortcut: ${shortcuts.legacyRedo})`}
               disabled={uiState.redoStack.length === 0}
               onClick={() => onUiAction({ type: "redo" })}
             >

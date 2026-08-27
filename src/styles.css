@@ -1378,10 +1378,6 @@ button {
   cursor: pointer;
 }
 
-.assembly-overlay.adaptive-boundary-contrast .assembly-box {
-  filter: drop-shadow(0 0 0.75px rgba(255, 255, 255, 0.96));
-}
-
 .chromosome-box {
   z-index: 1;
   border: 1px solid rgba(56, 165, 255, 0.92);

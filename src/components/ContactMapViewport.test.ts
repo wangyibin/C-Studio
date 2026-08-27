@@ -209,22 +209,6 @@ describe("GPU assembly boundary scene", () => {
       .toEqual([[0, 100], [100, 200], [200, 300]]);
   });
 
-  it("adds a white outer stroke without replacing semantic boundary colors", () => {
-    const boundaries = contactGpuAssemblyBoundaries({
-      model,
-      selection: { kind: "contigs", ids: ["Chr01:2:left"] },
-      showChromosomeBoxes: true,
-      showBlockBoxes: true,
-      showContigBoxes: true,
-      adaptiveBoundaryContrast: true,
-    });
-
-    expect(boundaries).toHaveLength(10);
-    expect(boundaries[0]).toMatchObject({ color: [1, 1, 1], lineWidthCssPx: 3 });
-    expect(boundaries[1]).toMatchObject({ color: [0.22, 0.65, 1], lineWidthCssPx: 1 });
-    expect(boundaries[4]).toMatchObject({ color: [1, 1, 1], lineWidthCssPx: 4 });
-    expect(boundaries[5]).toMatchObject({ color: [0, 0, 0], lineWidthCssPx: 2 });
-  });
 });
 const viewport = {
   xStart: 50_000_000,

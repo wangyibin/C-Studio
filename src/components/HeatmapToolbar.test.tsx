@@ -43,7 +43,7 @@ describe("HeatmapToolbar", () => {
     expect(markup).toContain('aria-label="Color range minimum"');
     expect(markup).toContain('aria-label="Color range maximum"');
     expect(markup).toContain('aria-label="Heatmap color map"');
-    expect(markup).toContain('<option value="redp1_r_half" selected="">redp1_r_half</option><option value="Reds">Classic Reds</option>');
+    expect(markup).toContain('<option value="redp1_r_half" selected="">redp1_r_half</option><option value="Reds">whitered</option>');
     expect(markup).toContain('<option value="Graphite">Graphite</option>');
     expect(markup).toContain('<option value="redp1_r">redp1_r</option>');
     expect(markup).toContain('<option value="Rose">Rose</option>');

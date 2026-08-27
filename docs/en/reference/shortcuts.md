@@ -10,8 +10,8 @@ select box, or editable element.
 | Save AGP | ++cmd+s++ | ++ctrl+s++ |
 | Undo | ++cmd+z++ | ++ctrl+z++ |
 | Redo | ++shift+cmd+z++ | ++ctrl+y++ |
-| Juicebox-style undo | ++cmd+u++ | ++ctrl+u++ |
-| Juicebox-style redo | ++cmd+r++ | ++ctrl+r++ |
+| Alternate shortcut for undo | ++cmd+u++ | ++ctrl+u++ |
+| Alternate shortcut for redo | ++cmd+r++ | ++ctrl+r++ |
 | Deselect/cancel | ++esc++ | ++esc++ |
 | Toggle annotations | ++f2++ | ++f2++ |
 | Toggle inspector | ++f9++ | ++f9++ |
@@ -43,4 +43,3 @@ confirmation dialog rather than deleting immediately.
 
 With resolution locked, the resolution gesture zooms around the pointer while
 retaining the current matrix level.
-

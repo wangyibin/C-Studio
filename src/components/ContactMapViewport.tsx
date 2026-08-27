@@ -498,14 +498,12 @@ export function contactGpuAssemblyBoundaries({
   showChromosomeBoxes,
   showBlockBoxes,
   showContigBoxes,
-  adaptiveBoundaryContrast = false,
 }: {
   model: AssemblyEditModel;
   selection: UiState["assembly"]["selection"];
   showChromosomeBoxes: boolean;
   showBlockBoxes: boolean;
   showContigBoxes: boolean;
-  adaptiveBoundaryContrast?: boolean;
 }): ContactTileGpuBoundary[] {
   const selectedContigIds = new Set(selectedBlockIds(model.blocks, selection));
   const selectedUnitIds = new Set(
@@ -527,15 +525,6 @@ export function contactGpuAssemblyBoundaries({
     minimumSpanCssPx: number,
   ) => {
     if (Number.isFinite(visualStart) && Number.isFinite(visualEnd) && visualEnd > visualStart) {
-      if (adaptiveBoundaryContrast) {
-        boundaries.push({
-          visualStart,
-          visualEnd,
-          color: [1, 1, 1],
-          lineWidthCssPx: lineWidthCssPx + 2,
-          minimumSpanCssPx,
-        });
-      }
       boundaries.push({
         visualStart,
         visualEnd,
@@ -1798,7 +1787,6 @@ export function ContactMapViewport({
       showChromosomeBoxes: uiState.assembly.showChromosomeBoxes,
       showBlockBoxes: uiState.assembly.showBlockBoxes,
       showContigBoxes: uiState.assembly.showContigBoxes,
-      adaptiveBoundaryContrast: true,
     }),
     [
       assemblyModel,
@@ -3792,7 +3780,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
 
   return (
     <div
-      className={`assembly-overlay adaptive-boundary-contrast${
+      className={`assembly-overlay${
         pointerState.kind === "cut" ? " cut-preview-active" : ""
       }`}
       data-rendered-block-count={renderVisualBoundaries ? visibleBlocks.length : 0}

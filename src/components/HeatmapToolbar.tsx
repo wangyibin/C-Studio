@@ -24,7 +24,7 @@ const colormapLabels: Record<UiState["contact"]["colormap"], string> = {
   Cividis: "Cividis",
   Mako: "Mako",
   Amber: "Amber",
-  Reds: "Classic Reds",
+  Reds: "whitered",
   Magma: "Magma",
   Viridis: "Viridis",
   Inferno: "Inferno",
