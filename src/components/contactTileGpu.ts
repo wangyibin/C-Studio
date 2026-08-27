@@ -5406,7 +5406,17 @@ function evictLeastRecentlyUsedTextures(
 }
 
 function paletteStopCount(colormap: ContactTileRenderStyle["colormap"]) {
-  if (colormap === "Reds") return 0;
+  if (
+    colormap === "Reds"
+    || colormap === "Graphite"
+    || colormap === "Plum"
+    || colormap === "redp1_r_half"
+    || colormap === "redp1_r"
+    || colormap === "Rose"
+    || colormap === "Cividis"
+    || colormap === "Mako"
+    || colormap === "Amber"
+  ) return 0;
   if (colormap === "Turbo") return 5;
   return 4;
 }

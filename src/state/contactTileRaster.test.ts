@@ -9,7 +9,7 @@ import {
   rasterizeContactTileDelta,
   rasterizeContactTileDenseBuffer,
 } from "./contactTileRaster";
-import type { ContactColormap } from "./uiState";
+import { contactColormaps, type ContactColormap } from "./uiState";
 
 const tileSizeBins = 4;
 const paletteOpacity = 0.88;
@@ -131,7 +131,7 @@ describe("rasterizeContactTile", () => {
     }));
     const tile = { tileX: 0, tileY: 1, cells };
 
-    for (const colormap of ["Reds", "Viridis", "Magma", "Inferno", "Turbo"] as const) {
+    for (const colormap of contactColormaps) {
       const pixels = rasterize(tile, colormap, scale);
       counts.forEach((count, index) => {
         expect(rgbaAt(pixels, index % tileSizeBins, Math.floor(index / tileSizeBins))).toEqual(

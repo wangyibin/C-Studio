@@ -1,10 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createInitialUiState } from "../state/uiState";
+import { contactColorCss } from "../state/contactColor";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   contactOverviewMapForDisplayedNormalization,
   contactOverviewWindowViewport,
+  drawOverviewHeatmap,
   InspectorPanel,
 } from "./InspectorPanel";
 
@@ -37,6 +39,26 @@ const contactMap: ContactMapView = {
 };
 
 describe("InspectorPanel", () => {
+  it("draws the overview with the active main-heatmap colormap", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.contact.colormap = "Rose";
+    const context = {
+      clearRect: vi.fn(),
+      fillRect: vi.fn(),
+      fillStyle: "",
+    };
+    const canvas = {
+      width: 100,
+      height: 100,
+      getContext: vi.fn(() => context),
+    } as unknown as HTMLCanvasElement;
+
+    drawOverviewHeatmap(canvas, contactMap, uiState, 1_000);
+
+    expect(context.fillStyle).toBe(contactColorCss("Rose", 1));
+    expect(context.fillRect).toHaveBeenCalledTimes(2);
+  });
+
   it("does not show an overview from a different normalization", () => {
     const rawMap = { ...contactMap, normalization: "raw" as const };
     const iceOverview = {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   availableContactResolutions,
   availableContactResolutionsForDataset,
+  contactColormaps,
   contactNormalizationForBackend,
   contactNormalizationLabel,
   contactResolutions,
@@ -275,8 +276,23 @@ describe("reduceUiState", () => {
   it("controls contact map resolution, jump target, colormap, and color scale", () => {
     let state = createInitialUiState("Browser preview mode");
 
-    expect(state.contact.colormap).toBe("Reds");
+    expect(state.contact.colormap).toBe("redp1_r_half");
     expect(state.contact.resolution).toBe("500 kb");
+    expect(contactColormaps).toEqual([
+      "redp1_r_half",
+      "Reds",
+      "Graphite",
+      "Plum",
+      "redp1_r",
+      "Rose",
+      "Cividis",
+      "Mako",
+      "Amber",
+      "Magma",
+      "Viridis",
+      "Inferno",
+      "Turbo",
+    ]);
     expect(contactResolutions).toEqual([
       "2.5 Mb",
       "2 Mb",

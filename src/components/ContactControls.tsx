@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Lock, Settings, Sparkles, Unlock } from "lucide-react";
+import { Check, Pin, Settings, Sparkles } from "lucide-react";
 import type { UiAction, UiState } from "../state/uiState";
 import {
   availableContactResolutions,
@@ -127,7 +127,7 @@ export function ContactControls({ onLoadExample, onUiAction, uiState }: ContactC
             }
             onClick={() => onUiAction({ type: "toggleContactResolutionLock" })}
           >
-            {uiState.contact.resolutionLocked ? <Lock size={18} /> : <Unlock size={18} />}
+            <Pin size={18} />
           </button>
         </div>
         <div className="resolution-ticks" aria-hidden="true">

@@ -1054,10 +1054,10 @@ describe("drawTileCanvas", () => {
     expect(context.putImageData).toHaveBeenCalledTimes(2);
     expect(context.putImageData).toHaveBeenLastCalledWith(imageData, 0, 0);
     expect(Array.from(imageData.data.slice((2 * 4 + 1) * 4, (2 * 4 + 2) * 4))).toEqual(
-      [255, 0, 0, 255],
+      [179, 35, 25, 255],
     );
     expect(Array.from(imageData.data.slice((1 * 4 + 2) * 4, (1 * 4 + 3) * 4))).toEqual(
-      [255, 0, 0, 255],
+      [179, 35, 25, 255],
     );
   });
 

@@ -1134,6 +1134,7 @@ function ContactOverview({
   }, [
     displayedOverview,
     displayedTotalSpanBp,
+    uiState.contact.colormap,
     uiState.contact.colorScale.log,
   ]);
 
@@ -1230,7 +1231,7 @@ function ContactOverview({
   );
 }
 
-function drawOverviewHeatmap(
+export function drawOverviewHeatmap(
   canvas: HTMLCanvasElement | null,
   contactMap: ContactMapView | null,
   uiState: UiState,
@@ -1261,9 +1262,33 @@ function drawOverviewHeatmap(
   const binSize = Math.max(1, (contactMap.resolution / Math.max(1, totalSpanBp)) * width);
 
   const drawCell = (xBin: number, yBin: number, count: number) => {
-    drawOverviewCell(context, xBin, yBin, count, contactMap.resolution, totalSpanBp, width, height, binSize, scale);
+    drawOverviewCell(
+      context,
+      xBin,
+      yBin,
+      count,
+      contactMap.resolution,
+      totalSpanBp,
+      width,
+      height,
+      binSize,
+      scale,
+      uiState.contact.colormap,
+    );
     if (xBin !== yBin) {
-      drawOverviewCell(context, yBin, xBin, count, contactMap.resolution, totalSpanBp, width, height, binSize, scale);
+      drawOverviewCell(
+        context,
+        yBin,
+        xBin,
+        count,
+        contactMap.resolution,
+        totalSpanBp,
+        width,
+        height,
+        binSize,
+        scale,
+        uiState.contact.colormap,
+      );
     }
   };
   if (contactMap.tiles && contactMap.tiles.length > 0) {
@@ -1289,11 +1314,12 @@ function drawOverviewCell(
   height: number,
   binSize: number,
   scale: Pick<ContactColorScale, "log" | "min" | "max">,
+  colormap: UiState["contact"]["colormap"],
 ) {
   const x = ((xBin * resolution) / totalSpanBp) * width;
   const y = ((yBin * resolution) / totalSpanBp) * height;
   const intensity = normalizeContactValue(count, scale);
-  context.fillStyle = contactColorCss("Reds", intensity);
+  context.fillStyle = contactColorCss(colormap, intensity);
   context.fillRect(x, y, binSize, binSize);
 }
 

@@ -2,19 +2,34 @@ import { useEffect, useState } from "react";
 import {
   ArrowRight,
   Grid2X2,
-  Lock,
-  Maximize2,
+  Pin,
   Sparkles,
   Square,
-  Unlock,
 } from "lucide-react";
 import type { ContactResolution, UiAction, UiState } from "../state/uiState";
 import {
   availableContactResolutions,
+  contactColormaps,
   normalizations,
   storedContactResolutionsForDataset,
 } from "../state/uiState";
 import { resolveContactJumpInputs } from "../state/contactJump";
+
+const colormapLabels: Record<UiState["contact"]["colormap"], string> = {
+  Graphite: "Graphite",
+  Plum: "Plum",
+  redp1_r_half: "redp1_r_half",
+  redp1_r: "redp1_r",
+  Rose: "Rose",
+  Cividis: "Cividis",
+  Mako: "Mako",
+  Amber: "Amber",
+  Reds: "Classic Reds",
+  Magma: "Magma",
+  Viridis: "Viridis",
+  Inferno: "Inferno",
+  Turbo: "Turbo",
+};
 
 export interface HeatmapToolbarProps {
   uiState: UiState;
@@ -59,10 +74,6 @@ export function HeatmapToolbar({
   const [draftJumpX, setDraftJumpX] = useState("");
   const [draftJumpY, setDraftJumpY] = useState("");
   const [jumpError, setJumpError] = useState<string | null>(null);
-  const draftResolutionRatio = resolutionOptions.length <= 1
-    ? 0
-    : draftResolutionIndex / (resolutionOptions.length - 1);
-  const resolutionIndicatorLeft = 9 + draftResolutionRatio * 162;
 
   useEffect(() => {
     setDraftResolutionIndex(safeResolutionIndex);
@@ -80,9 +91,11 @@ export function HeatmapToolbar({
     setDraftMax(String(colorScaleMax));
   }, [colorScaleMax]);
 
-  function commitResolution(rawIndex = draftResolutionIndex) {
+  function selectResolution(rawIndex: number) {
     const nextIndex = Math.min(resolutionOptions.length - 1, Math.max(0, rawIndex));
     const resolution = resolutionOptions[nextIndex];
+    setDraftResolutionIndex(nextIndex);
+    onContactResolutionPreview?.(null);
     if (resolution && resolution !== uiState.contact.resolution) {
       onUiAction({ type: "setContactResolution", resolution });
     }
@@ -152,52 +165,80 @@ export function HeatmapToolbar({
             </span>
           </span>
           <span className="heatmap-resolution-track">
-            <input
-              className="heatmap-resolution-range"
-              type="range"
-              min="0"
-              max={Math.max(0, resolutionOptions.length - 1)}
-              step="1"
-              value={draftResolutionIndex}
-              disabled={!resolutionOptionsReady}
-              aria-label="Contact map resolution"
-              aria-valuetext={resolutionOptionsReady
-                ? resolutionOptions[draftResolutionIndex] ?? uiState.contact.resolution
-                : "Stored resolutions unavailable"}
-              onChange={(event) => {
-                const nextIndex = Number(event.target.value);
-                setDraftResolutionIndex(nextIndex);
-                onContactResolutionPreview?.(resolutionOptions[nextIndex] ?? null);
-              }}
-              onBlur={(event) => commitResolution(Number(event.currentTarget.value))}
-              onKeyUp={(event) => commitResolution(Number(event.currentTarget.value))}
-              onPointerUp={(event) => commitResolution(Number(event.currentTarget.value))}
-            />
+            <span className="heatmap-resolution-line" aria-hidden="true" />
             <span
-              className="heatmap-resolution-indicator"
-              aria-hidden="true"
-              style={{ left: `${resolutionIndicatorLeft}px` }}
-            />
-            <span className="heatmap-resolution-ticks" aria-hidden="true">
+              className="heatmap-resolution-options"
+              role="radiogroup"
+              aria-label="Contact map resolution"
+              aria-busy={!resolutionOptionsReady}
+            >
               {resolutionOptions.map((resolution, index) => {
-                const isFirst = index === 0;
-                const isLast = index === resolutionOptions.length - 1;
-                const isMiddle = index === Math.round((resolutionOptions.length - 1) / 2);
-                const showLabel = isFirst || isMiddle || isLast;
                 const position = resolutionOptions.length <= 1
                   ? 0
                   : (index / (resolutionOptions.length - 1)) * 100;
                 return (
-                  <span
-                    className={`heatmap-resolution-tick${
+                  <button
+                    className="heatmap-resolution-option"
+                    key={resolution}
+                    type="button"
+                    role="radio"
+                    aria-label={resolution}
+                    aria-checked={index === draftResolutionIndex}
+                    tabIndex={index === draftResolutionIndex ? 0 : -1}
+                    title={`Set resolution to ${resolution}`}
+                    style={{ left: `${position}%` }}
+                    onBlur={() => onContactResolutionPreview?.(null)}
+                    onClick={() => selectResolution(index)}
+                    onFocus={() => onContactResolutionPreview?.(resolution)}
+                    onPointerEnter={() => onContactResolutionPreview?.(resolution)}
+                    onPointerLeave={() => onContactResolutionPreview?.(null)}
+                    onKeyDown={(event) => {
+                      let nextIndex: number | null = null;
+                      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+                        nextIndex = (index + 1) % resolutionOptions.length;
+                      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+                        nextIndex = (index - 1 + resolutionOptions.length) % resolutionOptions.length;
+                      } else if (event.key === "Home") {
+                        nextIndex = 0;
+                      } else if (event.key === "End") {
+                        nextIndex = resolutionOptions.length - 1;
+                      }
+                      if (nextIndex === null) {
+                        return;
+                      }
+                      event.preventDefault();
+                      const resolutionButtons = event.currentTarget.parentElement
+                        ?.querySelectorAll<HTMLButtonElement>('[role="radio"]');
+                      resolutionButtons?.[nextIndex]?.focus();
+                      selectResolution(nextIndex);
+                    }}
+                  >
+                    <span aria-hidden="true" />
+                  </button>
+                );
+              })}
+            </span>
+            <span className="heatmap-resolution-labels" aria-hidden="true">
+              {resolutionOptions.map((resolution, index) => {
+                const isFirst = index === 0;
+                const isLast = index === resolutionOptions.length - 1;
+                const isMiddle = index === Math.round((resolutionOptions.length - 1) / 2);
+                if (!isFirst && !isMiddle && !isLast) {
+                  return null;
+                }
+                const position = resolutionOptions.length <= 1
+                  ? 0
+                  : (index / (resolutionOptions.length - 1)) * 100;
+                return (
+                  <small
+                    className={`heatmap-resolution-label${
                       isFirst ? " first" : isLast ? " last" : ""
                     }`}
                     key={resolution}
                     style={{ left: `${position}%` }}
                   >
-                    <i />
-                    {showLabel ? <small>{resolution}</small> : null}
-                  </span>
+                    {resolution}
+                  </small>
                 );
               })}
             </span>
@@ -216,14 +257,34 @@ export function HeatmapToolbar({
           }
           onClick={() => onUiAction({ type: "toggleContactResolutionLock" })}
         >
-          {uiState.contact.resolutionLocked
-            ? <Lock size={15} aria-hidden="true" />
-            : <Unlock size={15} aria-hidden="true" />}
+          <Pin size={15} aria-hidden="true" />
         </button>
       </div>
 
+      <div className="heatmap-toolbar-group heatmap-colormap-control" role="group" aria-label="Heatmap appearance">
+        <label className="heatmap-colormap-field">
+          <span className="heatmap-toolbar-label">Heatmap color</span>
+          <select
+            value={uiState.contact.colormap}
+            aria-label="Heatmap color map"
+            onChange={(event) => onUiAction({
+              type: "setContactColormap",
+              colormap: event.target.value as UiState["contact"]["colormap"],
+            })}
+          >
+            {contactColormaps.map((colormap) => (
+              <option key={colormap} value={colormap}>{colormapLabels[colormap]}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
       <div className="heatmap-toolbar-group heatmap-color-control" role="group" aria-label="Color range">
-        <span className="heatmap-red-gradient" aria-hidden="true" />
+        <span
+          className="heatmap-color-gradient"
+          data-colormap={uiState.contact.colormap}
+          aria-hidden="true"
+        />
         <span className="heatmap-color-fields">
           <label className="heatmap-color-field">
             <span>Min</span>
@@ -330,15 +391,6 @@ export function HeatmapToolbar({
       </div>
 
       <div className="heatmap-toolbar-group heatmap-navigation-actions" role="group" aria-label="Viewport navigation">
-        <button
-          className="heatmap-toolbar-button"
-          type="button"
-          aria-label="Fit whole genome"
-          onClick={() => onUiAction({ type: "fitContactViewport", totalSpanMb: safeTotalSpanMb })}
-        >
-          <Maximize2 size={15} aria-hidden="true" />
-          <span>Fit</span>
-        </button>
         <span className="heatmap-toolbar-label">Jump</span>
         <div
           className={`heatmap-jump-fields${jumpError ? " invalid" : ""}`}

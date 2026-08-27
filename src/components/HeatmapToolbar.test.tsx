@@ -23,29 +23,44 @@ describe("HeatmapToolbar", () => {
     expect(markup).not.toContain('aria-label="Selection actions"');
     expect(markup).not.toContain('aria-label="Reverse selection"');
     expect(markup).not.toContain('aria-label="Copy selection"');
+    expect(markup).toContain('class="lucide lucide-pin"');
+    expect(markup).not.toContain('class="lucide lucide-unlock"');
     expect(markup).toContain('aria-label="Contact map resolution"');
     expect(markup).toContain('<span class="heatmap-resolution-heading">');
     expect(markup).toContain('<span class="heatmap-resolution-value" aria-live="polite">500 kb</span>');
     expect(markup).not.toContain('aria-label="Stored contact map resolution"');
     expect(markup).not.toContain('<select class="heatmap-resolution-value"');
-    expect(markup).toContain('class="heatmap-resolution-range" type="range" min="0" max="8"');
+    expect(markup).toContain('class="heatmap-resolution-options" role="radiogroup" aria-label="Contact map resolution" aria-busy="false"');
+    expect(markup.match(/class="heatmap-resolution-option"[^>]*role="radio"/g)).toHaveLength(9);
+    expect(markup).toContain('role="radio" aria-label="500 kb" aria-checked="true" tabindex="0"');
+    expect(markup).not.toContain('type="range"');
     expect(markup).not.toContain("<small>Max</small>");
     expect(markup).not.toContain("<small>Min</small>");
-    expect(markup).toContain('class="heatmap-resolution-indicator"');
-    expect(markup.match(/<span class="heatmap-resolution-tick(?: [^"]+)?"/g)).toHaveLength(9);
-    expect(markup.match(/<span class="heatmap-resolution-tick(?: [^"]+)?"[^>]*><i><\/i><small>/g)).toHaveLength(3);
-    expect(markup).toContain('class="heatmap-resolution-tick first"');
-    expect(markup).toContain('class="heatmap-resolution-tick last"');
-    expect(markup).not.toContain('aria-valuetext="2.5 Mb"');
+    expect(markup).not.toContain('class="heatmap-resolution-indicator"');
+    expect(markup.match(/<small class="heatmap-resolution-label(?: [^"]+)?"/g)).toHaveLength(3);
+    expect(markup).toContain('class="heatmap-resolution-label first"');
+    expect(markup).toContain('class="heatmap-resolution-label last"');
     expect(markup).toContain('aria-label="Color range minimum"');
     expect(markup).toContain('aria-label="Color range maximum"');
+    expect(markup).toContain('aria-label="Heatmap color map"');
+    expect(markup).toContain('<option value="redp1_r_half" selected="">redp1_r_half</option><option value="Reds">Classic Reds</option>');
+    expect(markup).toContain('<option value="Graphite">Graphite</option>');
+    expect(markup).toContain('<option value="redp1_r">redp1_r</option>');
+    expect(markup).toContain('<option value="Rose">Rose</option>');
+    expect(markup).toContain('<option value="Cividis">Cividis</option>');
+    expect(markup).toContain('<option value="Mako">Mako</option>');
+    expect(markup).toContain('<option value="Amber">Amber</option>');
+    expect(markup).toContain('data-colormap="redp1_r_half"');
+    expect(markup).not.toContain('aria-label="Adaptive boundary contrast"');
+    expect(markup).not.toContain('>Edges</span>');
     expect(markup).toContain('class="heatmap-color-fields"');
     expect(markup).not.toContain('class="heatmap-color-separator"');
+    expect(markup).toContain('<label class="heatmap-toolbar-group heatmap-normalization-control"><span class="heatmap-toolbar-label">Normalization</span><select');
     expect(markup).toContain('aria-label="Contact map normalization"');
     expect(markup).toContain('aria-label="Chromosome boxes"');
     expect(markup).toContain('aria-label="Block boxes"');
     expect(markup).toContain('aria-label="Contig boxes"');
-    expect(markup).toContain('aria-label="Fit whole genome"');
+    expect(markup).not.toContain('aria-label="Fit whole genome"');
     expect(markup).toContain('aria-label="X contig or interval"');
     expect(markup).toContain('aria-label="Y contig or interval"');
     expect(markup).toContain('placeholder="contig[:start-end]"');
@@ -94,10 +109,9 @@ describe("HeatmapToolbar", () => {
       />,
     );
 
-    expect(markup).toContain('aria-valuetext="2 Mb"');
-    expect(markup).toContain('type="range" min="0" max="10"');
+    expect(markup).toContain('role="radio" aria-label="2 Mb" aria-checked="true" tabindex="0"');
     expect(markup).toContain('<span class="heatmap-resolution-value" aria-live="polite">2 Mb</span>');
-    expect(markup.match(/<span class="heatmap-resolution-tick(?: [^"]+)?"/g)).toHaveLength(11);
+    expect(markup.match(/class="heatmap-resolution-option"[^>]*role="radio"/g)).toHaveLength(11);
     expect(markup).not.toContain('<select class="heatmap-resolution-value"');
     expect(markup).toContain("2.5 Mb");
     expect(markup).toContain("1 kb");
@@ -117,9 +131,8 @@ describe("HeatmapToolbar", () => {
     );
 
     expect(markup).toContain(">Loading…</span>");
-    expect(markup).toContain('type="range" min="0" max="0"');
-    expect(markup).toContain('disabled=""');
-    expect(markup).toContain('aria-valuetext="Stored resolutions unavailable"');
+    expect(markup).toContain('role="radiogroup" aria-label="Contact map resolution" aria-busy="true"');
+    expect(markup).not.toContain('role="radio"');
     expect(markup).not.toContain("2.5 Mb");
     expect(markup).not.toContain("2 Mb");
     expect(markup).not.toContain("1 Mb");
@@ -135,6 +148,7 @@ describe("HeatmapToolbar", () => {
       max: 7.5,
       auto: false,
     };
+    uiState.contact.colormap = "Plum";
     uiState.assembly.showBlockBoxes = false;
     uiState.assembly.showContigBoxes = false;
     uiState.normalization = "KR (Balanced)";
@@ -144,11 +158,15 @@ describe("HeatmapToolbar", () => {
     );
 
     expect(openingButton(markup, "Unlock resolution")).toContain('aria-pressed="true"');
+    expect(markup).toContain('class="lucide lucide-pin"');
+    expect(markup).not.toContain('class="lucide lucide-lock"');
     expect(openingButton(markup, "Automatic color range")).toContain('aria-pressed="false"');
     expect(openingButton(markup, "Block boxes")).toContain('aria-pressed="false"');
     expect(openingButton(markup, "Contig boxes")).toContain('aria-pressed="false"');
     expect(markup).toContain('value="1.25"');
     expect(markup).toContain('value="7.5"');
+    expect(markup).toContain('<option value="Plum" selected="">Plum</option>');
+    expect(markup).toContain('data-colormap="Plum"');
     expect(markup).toContain('<option value="KR (Balanced)" selected="">KR (Balanced)</option>');
     expect(markup.match(/placeholder="contig\[:start-end\]"/g)).toHaveLength(2);
   });

@@ -1378,6 +1378,10 @@ button {
   cursor: pointer;
 }
 
+.assembly-overlay.adaptive-boundary-contrast .assembly-box {
+  filter: drop-shadow(0 0 0.75px rgba(255, 255, 255, 0.96));
+}
+
 .chromosome-box {
   z-index: 1;
   border: 1px solid rgba(56, 165, 255, 0.92);
@@ -1494,14 +1498,14 @@ button {
 
 .assembly-cut-marker > svg {
   position: absolute;
-  left: 50%;
+  left: calc(50% + 3px);
   top: 50%;
   filter:
     drop-shadow(1px 0 0 rgba(255, 255, 255, 0.96))
     drop-shadow(-1px 0 0 rgba(255, 255, 255, 0.96))
     drop-shadow(0 1px 0 rgba(255, 255, 255, 0.96))
     drop-shadow(0 -1px 0 rgba(255, 255, 255, 0.96));
-  transform: translate(-20px, -20px) rotate(-135deg);
+  transform: translateY(-50%) rotate(-135deg);
   transform-origin: center;
 }
 
@@ -2669,13 +2673,13 @@ button {
   z-index: 1;
   right: 3%;
   left: 9%;
-  border-top: 1px solid color-mix(in srgb, var(--text) 26%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 26%, transparent);
   background: transparent;
   pointer-events: none;
 }
 
 .synteny-target-lane:last-of-type {
-  border-top: 0;
+  border-bottom: 0;
 }
 
 .synteny-target-lane span {
@@ -4368,130 +4372,125 @@ summary:focus-visible,
 .heatmap-resolution-track {
   position: absolute;
   top: 11px;
-  left: 0;
+  right: 9px;
+  left: 9px;
   display: block;
-  width: 180px;
+  width: auto;
   height: 25px;
 }
 
-.heatmap-resolution-range {
-  appearance: none;
+.heatmap-resolution-line {
   position: absolute;
-  top: 1px;
+  top: 8px;
+  right: 0;
   left: 0;
-  z-index: 2;
-  width: 180px;
-  height: 14px !important;
-  padding: 0;
-  border: 0 !important;
-  background: transparent !important;
-  box-shadow: none !important;
-  accent-color: var(--accent);
-}
-
-.heatmap-resolution-range::-webkit-slider-runnable-track {
-  height: 3px;
-  border-radius: 999px;
-  background: #d1d1d6;
-}
-
-.heatmap-resolution-range::-webkit-slider-thumb {
-  appearance: none;
-  width: 18px;
-  height: 18px;
-  margin-top: -7.5px;
-  border: 0;
-  background: transparent;
-}
-
-.heatmap-resolution-range::-moz-range-track {
-  height: 3px;
-  border: 0;
-  border-radius: 999px;
-  background: #d1d1d6;
-}
-
-.heatmap-resolution-range::-moz-range-thumb {
-  width: 18px;
-  height: 18px;
-  border: 0;
-  background: transparent;
-}
-
-.heatmap-resolution-indicator {
-  position: absolute;
-  top: -4px;
-  z-index: 3;
-  width: 16px;
-  height: 13px;
-  border: 1px solid #b8b8bd;
-  border-radius: 5px;
-  background: #ffffff;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
-  transform: translateX(-50%);
-  pointer-events: none;
-}
-
-.heatmap-resolution-indicator::after {
-  content: "";
-  position: absolute;
-  bottom: -4px;
-  left: 50%;
-  width: 7px;
-  height: 7px;
-  border-right: 1px solid #b8b8bd;
-  border-bottom: 1px solid #b8b8bd;
-  background: #ffffff;
-  transform: translateX(-50%) rotate(45deg);
-}
-
-.heatmap-resolution-ticks {
-  position: absolute;
-  top: 13px;
-  right: 9px;
-  left: 9px;
   z-index: 1;
-  height: 12px;
-  pointer-events: none;
+  height: 1px;
+  border-radius: 999px;
+  background: #b9bbc1;
 }
 
-.heatmap-resolution-tick {
+.heatmap-resolution-options {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+}
+
+.heatmap-resolution-option {
   position: absolute;
   top: 0;
   display: grid;
-  justify-items: center;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+  color: inherit;
   transform: translateX(-50%);
+  cursor: pointer;
 }
 
-.heatmap-resolution-tick.first {
-  justify-items: center;
-  transform: translateX(-50%);
-}
-
-.heatmap-resolution-tick.last {
-  justify-items: center;
-  transform: translateX(-50%);
-}
-
-.heatmap-resolution-tick i {
+.heatmap-resolution-option > span {
   display: block;
-  width: 1px;
-  height: 5px;
-  background: color-mix(in srgb, var(--text) 52%, transparent);
+  width: 7px;
+  height: 7px;
+  border: 1px solid #92949a;
+  border-radius: 50%;
+  background: #ffffff;
+  transition: border-color 100ms ease, background-color 100ms ease, box-shadow 100ms ease;
 }
 
-.heatmap-resolution-tick small {
-  margin-top: 1px;
+.heatmap-resolution-option:hover > span {
+  border-color: #5f83aa;
+}
+
+.heatmap-resolution-option[aria-checked="true"] > span {
+  width: 9px;
+  height: 9px;
+  border-color: #2878d0;
+  background: #2878d0;
+  box-shadow: 0 0 0 3px rgba(40, 120, 208, 0.17);
+}
+
+.heatmap-resolution-option:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 78%, white);
+  outline-offset: 1px;
+}
+
+.heatmap-resolution-labels {
+  position: absolute;
+  top: 18px;
+  right: 0;
+  left: 0;
+  height: 8px;
+  pointer-events: none;
+}
+
+.heatmap-resolution-label {
+  position: absolute;
   color: var(--muted);
   font-size: 8px;
   font-weight: 550;
   font-variant-numeric: tabular-nums;
   line-height: 1;
   white-space: nowrap;
+  transform: translateX(-50%);
+}
+
+.heatmap-resolution-label.first {
+  transform: none;
+}
+
+.heatmap-resolution-label.last {
+  transform: translateX(-100%);
 }
 
 .heatmap-color-control {
   gap: 4px;
+}
+
+.heatmap-colormap-control {
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.heatmap-colormap-field {
+  display: inline-flex;
+  align-items: flex-start;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+
+.heatmap-colormap-field select {
+  width: 112px;
+  height: 22px;
+  border-radius: 5px;
+  padding: 0 22px 0 7px;
+  font-size: 10px;
 }
 
 .heatmap-color-fields {
@@ -4500,12 +4499,85 @@ summary:focus-visible,
   gap: 1px;
 }
 
-.heatmap-red-gradient {
+.heatmap-color-gradient {
   width: 54px;
   height: 10px;
   border: 1px solid #d4d4d6;
   border-radius: 2px;
+}
+
+.heatmap-color-gradient[data-colormap="Graphite"] {
+  background: linear-gradient(90deg, #f8fafc, #e2e8f0, #cbd5e1, #64748b, #0f172a);
+}
+
+.heatmap-color-gradient[data-colormap="Plum"] {
+  background: linear-gradient(90deg, #fafafc, #e9e5f3, #b8a7d1, #745a9b, #2e203f);
+}
+
+.heatmap-color-gradient[data-colormap="redp1_r_half"] {
+  background: linear-gradient(
+    90deg,
+    #fbe1d6,
+    #f9c5b2,
+    #f6a78e,
+    #f38468,
+    #e9694b,
+    #dd5136,
+    #cf422a,
+    #c13321,
+    #b32319
+  );
+}
+
+.heatmap-color-gradient[data-colormap="redp1_r"] {
+  background: linear-gradient(
+    90deg,
+    #fbe1d6,
+    #f6a78e,
+    #e9694b,
+    #ce412a,
+    #b22218,
+    #991721,
+    #851541,
+    #620c5e,
+    #2b075c
+  );
+}
+
+.heatmap-color-gradient[data-colormap="Rose"] {
+  background: linear-gradient(90deg, #ffffff, #fde8e7, #f5a3a0, #d9485f, #7f1d3a);
+}
+
+.heatmap-color-gradient[data-colormap="Cividis"] {
+  background: linear-gradient(90deg, #00204c, #414d6b, #7c7b78, #bcaf6f, #fde737);
+}
+
+.heatmap-color-gradient[data-colormap="Mako"] {
+  background: linear-gradient(90deg, #f6fafa, #b8ddd6, #5aa6a4, #24657a, #10243e);
+}
+
+.heatmap-color-gradient[data-colormap="Amber"] {
+  background: linear-gradient(90deg, #fffcf5, #fde7b2, #f5b942, #c56a16, #57260b);
+}
+
+.heatmap-color-gradient[data-colormap="Reds"] {
   background: linear-gradient(90deg, #ffffff, #ff0000);
+}
+
+.heatmap-color-gradient[data-colormap="Magma"] {
+  background: linear-gradient(90deg, #000004, #721f81, #f1605d, #fcfdbf);
+}
+
+.heatmap-color-gradient[data-colormap="Viridis"] {
+  background: linear-gradient(90deg, #440154, #31688e, #35b779, #fde725);
+}
+
+.heatmap-color-gradient[data-colormap="Inferno"] {
+  background: linear-gradient(90deg, #000004, #781c6d, #ed6925, #fcffa4);
+}
+
+.heatmap-color-gradient[data-colormap="Turbo"] {
+  background: linear-gradient(90deg, #30123b, #28a5f6, #7ef658, #faba39, #7a0403);
 }
 
 .heatmap-color-field {
@@ -4533,13 +4605,20 @@ summary:focus-visible,
 }
 
 .heatmap-normalization-control {
-  gap: 5px;
+  align-items: flex-start;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+
+.heatmap-normalization-control .heatmap-toolbar-label {
+  padding-left: 1px;
 }
 
 .heatmap-normalization-control select {
-  width: 88px;
-  height: 30px;
-  border-radius: 6px;
+  width: 112px;
+  height: 22px;
+  border-radius: 5px;
   padding: 0 22px 0 7px;
   font-size: 10px;
 }

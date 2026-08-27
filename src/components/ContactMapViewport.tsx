@@ -216,6 +216,7 @@ interface AssemblyCutTargetInput {
 
 interface AssemblyPointerTargetInput extends AssemblyCutTargetInput {
   selectionKind?: AssemblySelection["kind"];
+  cutEnabled?: boolean;
 }
 
 interface AssemblyPointerPosition {
@@ -305,6 +306,11 @@ export function assemblySelectionControlsVisible(
   const visibleHeightPx = (visibleYSpan / viewportYSpan) * Math.max(1, heightPx);
   return visibleWidthPx >= minimumAssemblySelectionControlSpanPx
     && visibleHeightPx >= minimumAssemblySelectionControlSpanPx;
+}
+
+/** Cutting is an affordance for one explicitly selected block or contig only. */
+export function assemblySelectionAllowsCut(selection: AssemblySelection | null) {
+  return selection?.kind === "contigs" && selection.ids.length === 1;
 }
 
 /** Upload every completed pan-prefetch batch, then present the updated page table once. */
@@ -492,12 +498,14 @@ export function contactGpuAssemblyBoundaries({
   showChromosomeBoxes,
   showBlockBoxes,
   showContigBoxes,
+  adaptiveBoundaryContrast = false,
 }: {
   model: AssemblyEditModel;
   selection: UiState["assembly"]["selection"];
   showChromosomeBoxes: boolean;
   showBlockBoxes: boolean;
   showContigBoxes: boolean;
+  adaptiveBoundaryContrast?: boolean;
 }): ContactTileGpuBoundary[] {
   const selectedContigIds = new Set(selectedBlockIds(model.blocks, selection));
   const selectedUnitIds = new Set(
@@ -519,6 +527,15 @@ export function contactGpuAssemblyBoundaries({
     minimumSpanCssPx: number,
   ) => {
     if (Number.isFinite(visualStart) && Number.isFinite(visualEnd) && visualEnd > visualStart) {
+      if (adaptiveBoundaryContrast) {
+        boundaries.push({
+          visualStart,
+          visualEnd,
+          color: [1, 1, 1],
+          lineWidthCssPx: lineWidthCssPx + 2,
+          minimumSpanCssPx,
+        });
+      }
       boundaries.push({
         visualStart,
         visualEnd,
@@ -1261,7 +1278,9 @@ export function assemblyPointerStateAtScreenPoint(
     return { kind: "select", blockId: null, visualPosition: null };
   }
 
-  const cutTarget = assemblyCutTargetAtScreenPoint(input);
+  const cutTarget = input.cutEnabled === false
+    ? null
+    : assemblyCutTargetAtScreenPoint(input);
   if (cutTarget) {
     return {
       kind: "cut",
@@ -1779,6 +1798,7 @@ export function ContactMapViewport({
       showChromosomeBoxes: uiState.assembly.showChromosomeBoxes,
       showBlockBoxes: uiState.assembly.showBlockBoxes,
       showContigBoxes: uiState.assembly.showContigBoxes,
+      adaptiveBoundaryContrast: true,
     }),
     [
       assemblyModel,
@@ -2974,6 +2994,7 @@ export function ContactMapViewport({
           viewportYStart: interactionViewport.yStart,
           viewportYEnd: interactionViewport.yEnd,
           selectionKind: uiState.assembly.selection?.kind,
+          cutEnabled: assemblySelectionAllowsCut(uiState.assembly.selection),
         })
       : null;
     if (
@@ -3126,6 +3147,7 @@ export function ContactMapViewport({
       viewportYStart: interactionViewport.yStart,
       viewportYEnd: interactionViewport.yEnd,
       selectionKind: uiState.assembly.selection?.kind,
+      cutEnabled: assemblySelectionAllowsCut(uiState.assembly.selection),
     }));
   }
 
@@ -3770,7 +3792,9 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
 
   return (
     <div
-      className={`assembly-overlay ${pointerState.kind === "cut" ? "cut-preview-active" : ""}`.trim()}
+      className={`assembly-overlay adaptive-boundary-contrast${
+        pointerState.kind === "cut" ? " cut-preview-active" : ""
+      }`}
       data-rendered-block-count={renderVisualBoundaries ? visibleBlocks.length : 0}
       data-rendered-contig-count={renderVisualBoundaries ? visibleContigs.length : 0}
       onDoubleClick={onDoubleClick}
@@ -3941,6 +3965,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
             );
           })() : null}
         {(showBlockBoxes || showContigBoxes)
+          && assemblySelectionAllowsCut(selection)
           && pointerState.kind === "cut"
           && pointerState.visualPosition !== null ? (() => {
           const left = ((pointerState.visualPosition - viewportXStart) / viewportXSpan) * 100;
@@ -3956,7 +3981,7 @@ const AssemblyOverlay = memo(function AssemblyOverlay({
             >
               <span className="assembly-cut-guide" />
               <span className="assembly-cut-point" />
-              <Scissors size={17} strokeWidth={2.25} absoluteStrokeWidth />
+              <Scissors size={10} strokeWidth={2.25} absoluteStrokeWidth />
             </span>
           );
         })() : null}

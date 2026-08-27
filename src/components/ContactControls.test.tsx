@@ -97,6 +97,8 @@ describe("ContactControls", () => {
     expect(markup).toContain('aria-label="Lock resolution"');
     expect(markup).toContain('aria-pressed="false"');
     expect(markup).toContain('title="Lock resolution during zoom"');
+    expect(markup).toContain('class="lucide lucide-pin"');
+    expect(markup).not.toContain('class="lucide lucide-unlock"');
     expect(markup).toContain('<span>500 KB</span>');
     expect(markup).not.toContain('<span>2.5 MB</span>');
   });
@@ -113,6 +115,8 @@ describe("ContactControls", () => {
     expect(markup).toContain('aria-label="Unlock resolution"');
     expect(markup).toContain('aria-pressed="true"');
     expect(markup).toContain('title="Resolution locked at 500 kb"');
+    expect(markup).toContain('class="lucide lucide-pin"');
+    expect(markup).not.toContain('class="lucide lucide-lock"');
   });
 
   it("offers independent chromosome, block, and child-contig box controls", () => {

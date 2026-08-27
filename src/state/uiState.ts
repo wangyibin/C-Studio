@@ -61,7 +61,20 @@ export type ContactResolution =
 // into thousands of visible tile requests. Manual controls instead use the
 // target level's default pixels-per-bin geometry.
 const maxManualContactBinsPerAxis = 6_144;
-export type ContactColormap = "Reds" | "Viridis" | "Magma" | "Inferno" | "Turbo";
+export type ContactColormap =
+  | "Graphite"
+  | "Plum"
+  | "redp1_r_half"
+  | "redp1_r"
+  | "Rose"
+  | "Cividis"
+  | "Mako"
+  | "Amber"
+  | "Reds"
+  | "Viridis"
+  | "Magma"
+  | "Inferno"
+  | "Turbo";
 export type Normalization =
   | "None (Raw)"
   | "ICE (Balanced)"
@@ -322,7 +335,21 @@ export type UiAction =
 
 export const resolutions: Resolution[] = ["10 kb", "25 kb", "50 kb", "100 kb"];
 export const contactResolutions: ContactResolution[] = [...contactResolutionLevels];
-export const contactColormaps: ContactColormap[] = ["Reds", "Viridis", "Magma", "Inferno", "Turbo"];
+export const contactColormaps: ContactColormap[] = [
+  "redp1_r_half",
+  "Reds",
+  "Graphite",
+  "Plum",
+  "redp1_r",
+  "Rose",
+  "Cividis",
+  "Mako",
+  "Amber",
+  "Magma",
+  "Viridis",
+  "Inferno",
+  "Turbo",
+];
 export const normalizations: Normalization[] = [
   "None (Raw)",
   "ICE (Balanced)",
@@ -486,7 +513,7 @@ export function createInitialUiState(initialMessage: string): UiState {
       viewportCenterYMb: 98.42,
       viewportSpanMb: 200,
       jumpTargetMb: 98.42,
-      colormap: "Reds",
+      colormap: "redp1_r_half",
       colorScale: {
         log: false,
         min: 0,

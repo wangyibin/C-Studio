@@ -29,7 +29,21 @@ describe("contactColorAt", () => {
 });
 
 describe("contactColorLut", () => {
-  const colormaps: ContactColormap[] = ["Reds", "Viridis", "Magma", "Inferno", "Turbo"];
+  const colormaps: ContactColormap[] = [
+    "Graphite",
+    "Plum",
+    "redp1_r_half",
+    "redp1_r",
+    "Rose",
+    "Cividis",
+    "Mako",
+    "Amber",
+    "Reds",
+    "Viridis",
+    "Magma",
+    "Inferno",
+    "Turbo",
+  ];
 
   function expectRgba8Equivalent(
     actual: ReturnType<typeof contactColorFromLut>,
@@ -56,6 +70,38 @@ describe("contactColorLut", () => {
         contactColorFromLut(lut, colormap, 1),
       );
     }
+  });
+
+  it("interpolates the continuous palettes across their designed stops", () => {
+    expect(contactColorAt("Graphite", 0, 1)).toEqual({
+      red: 248,
+      green: 250,
+      blue: 252,
+      alpha: 1,
+    });
+    expect(contactColorAt("Graphite", 1, 1)).toEqual({
+      red: 15,
+      green: 23,
+      blue: 42,
+      alpha: 1,
+    });
+    expect(contactColorAt("Plum", 0.5, 1)).toEqual({
+      red: 184,
+      green: 167,
+      blue: 209,
+      alpha: 1,
+    });
+    expect(contactColorAt("redp1_r_half", 0, 1)).toMatchObject({ red: 251, green: 225, blue: 214 });
+    expect(contactColorAt("redp1_r_half", 1, 1)).toMatchObject({ red: 179, green: 35, blue: 25 });
+    expect(contactColorAt("redp1_r", 0, 1)).toMatchObject({ red: 251, green: 225, blue: 214 });
+    expect(contactColorAt("redp1_r", 1, 1)).toMatchObject({ red: 43, green: 7, blue: 92 });
+    expect(contactColorAt("Rose", 1, 1)).toMatchObject({ red: 127, green: 29, blue: 58 });
+    expect(contactColorAt("Cividis", 1, 1)).toMatchObject({ red: 253, green: 231, blue: 55 });
+    expect(contactColorAt("Mako", 1, 1)).toMatchObject({ red: 16, green: 36, blue: 62 });
+    expect(contactColorAt("Amber", 1, 1)).toMatchObject({ red: 87, green: 38, blue: 11 });
+    expect(contactColorLutIndex("Graphite", 0.5)).toBe(127);
+    expect(contactColorLutIndex("Plum", 0.5)).toBe(127);
+    expect(contactColorLutIndex("Rose", 0.5)).toBe(127);
   });
 
   it("uses explicit lower-bound 8-bit intensity quantization", () => {
@@ -109,7 +155,7 @@ describe("contactColorLut", () => {
   });
 
   it("preserves every discrete-palette stop boundary exactly", () => {
-    const stopCounts: Record<Exclude<ContactColormap, "Reds">, number> = {
+    const stopCounts: Record<"Viridis" | "Magma" | "Inferno" | "Turbo", number> = {
       Viridis: 4,
       Magma: 4,
       Inferno: 4,
@@ -117,7 +163,7 @@ describe("contactColorLut", () => {
     };
 
     for (const [colormap, stopCount] of Object.entries(stopCounts) as Array<[
-      Exclude<ContactColormap, "Reds">,
+      keyof typeof stopCounts,
       number,
     ]>) {
       const lut = contactColorLut(colormap, 0.88);
@@ -143,7 +189,7 @@ describe("contactColorLut", () => {
     expect(contactColorFromLut(reds, "Reds", 127 / 255).alpha).toBe(1);
     expect(contactColorFromLut(reds, "Reds", 1).alpha).toBe(1);
 
-    for (const colormap of colormaps.filter((name) => name !== "Reds")) {
+    for (const colormap of ["Viridis", "Magma", "Inferno", "Turbo"] as const) {
       const alphaBytes = (opacity: number) => Array.from(
         { length: contactColorLutSize },
         (_, index) => contactColorLut(colormap, opacity)[index * 4 + 3],
@@ -151,6 +197,22 @@ describe("contactColorLut", () => {
       expect(new Set(alphaBytes(0.42))).toEqual(new Set([Math.round(0.42 * 255)]));
       expect(new Set(alphaBytes(-3))).toEqual(new Set([0]));
       expect(new Set(alphaBytes(3))).toEqual(new Set([255]));
+    }
+    for (const colormap of [
+      "Graphite",
+      "Plum",
+      "redp1_r_half",
+      "redp1_r",
+      "Rose",
+      "Cividis",
+      "Mako",
+      "Amber",
+    ] as const) {
+      const alphaBytes = Array.from(
+        { length: contactColorLutSize },
+        (_, index) => contactColorLut(colormap, 0.1)[index * 4 + 3],
+      );
+      expect(new Set(alphaBytes)).toEqual(new Set([255]));
     }
   });
 
