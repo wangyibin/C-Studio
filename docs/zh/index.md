@@ -6,6 +6,11 @@
 C-Studio 是一个处于早期阶段的桌面应用，用于检查染色体尺度组装、对照多类证据，
 并由用户主动编辑 AGP。当前应用由 Tauri 2、React、TypeScript 和 Rust 构建。
 
+![图 1：C-Studio 将组装状态与证据视图汇集到同步工作区。](assets/C-Studio_Figure1_overview.png)
+
+*图 1｜C-Studio 将 AGP、三维接触、共线性、覆盖度和组装图证据汇集到可感知拷贝的
+同步校订工作区。*
+
 !!! important "当前范围"
 
     本文档描述当前实现。C-Studio 提供证据辅助的校订工作流，
@@ -14,9 +19,9 @@ C-Studio 是一个处于早期阶段的桌面应用，用于检查染色体尺�
 ## C-Studio 汇集的内容
 
 - AGP 组装结构与可编辑的 contig 放置
-- `.cool` 和 `.mcool` 接触矩阵
+- `.mcool` 接触矩阵
 - PAF 共线性比对
-- depth 或 bedGraph 覆盖度轨道
+- BedGraph 覆盖度轨道
 - GFA 组装图拓扑及可选的端点级三维接触证据
 - 感知拷贝的选择、编辑、历史、撤销、重做和 AGP 导出
 - 与编辑后 AGP 一同保存、可兼容恢复的操作历史 sidecar
@@ -24,9 +29,9 @@ C-Studio 是一个处于早期阶段的桌面应用，用于检查染色体尺�
 ```mermaid
 flowchart LR
     A["AGP 组装"] --> W["同步工作区"]
-    B["COOL 或 MCOOL 接触矩阵"] --> W
+    B["MCOOL 接触矩阵"] --> W
     C["PAF 共线性"] --> W
-    D["Depth 或 bedGraph"] --> W
+    D["BedGraph"] --> W
     E["GFA 组装图"] --> W
     W --> U["用户主动编辑"]
     U --> H["历史与检查"]

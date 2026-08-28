@@ -8,13 +8,17 @@ assemblies, comparing multiple evidence layers, and making user-directed AGP
 edits. The current application is built with Tauri 2, React, TypeScript, and
 Rust.
 
+![Figure 1. C-Studio combines assembly state and evidence views in a synchronized workspace.](assets/C-Studio_Figure1_overview.png)
+
+*Figure 1. C-Studio combines AGP, 3D contacts, synteny, coverage, and assembly
+graph evidence in a synchronized, copy-aware curation workspace.*
 
 ## What C-Studio brings together
 
 - AGP assembly structure and editable contig placements
-- `.cool` and `.mcool` contact maps
+- `.mcool` contact maps
 - PAF synteny alignments
-- depth or bedGraph coverage tracks
+- BedGraph coverage tracks
 - GFA assembly topology and optional endpoint-level 3D-contact evidence
 - copy-aware selection, editing, history, undo, redo, and AGP export
 - compatible operation-history sidecars saved alongside edited AGP files
@@ -22,9 +26,9 @@ Rust.
 ```mermaid
 flowchart LR
     A["AGP assembly"] --> W["Synchronized workspace"]
-    B["COOL or MCOOL contacts"] --> W
+    B["MCOOL contacts"] --> W
     C["PAF synteny"] --> W
-    D["Depth or bedGraph"] --> W
+    D["BedGraph"] --> W
     E["GFA graph"] --> W
     W --> U["User-directed edits"]
     U --> H["History and validation"]

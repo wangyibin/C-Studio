@@ -18,6 +18,7 @@ import {
   contactTileGpuUploadPlan,
   contactTileGpuVirtualTextureBudgetBytes,
   contactTileGpuVirtualTextureEnabled,
+  contactFramePresentationDestination,
   contactTileSourcePagePlan,
   contactTileVirtualCamera,
   contactTileVirtualPageExactFlag,
@@ -26,6 +27,26 @@ import {
   contactTileVirtualPageTransposeFlag,
   createContactTileGpuRenderer,
 } from "./contactTileGpu";
+
+describe("retained frame presentation geometry", () => {
+  it("centers a square front frame without stretching after a landscape resize", () => {
+    expect(contactFramePresentationDestination(256, 256, 512, 384)).toEqual({
+      left: 64,
+      bottom: 0,
+      right: 448,
+      top: 384,
+    });
+  });
+
+  it("centers a landscape front frame without stretching after a portrait resize", () => {
+    expect(contactFramePresentationDestination(512, 384, 256, 256)).toEqual({
+      left: 0,
+      bottom: 32,
+      right: 256,
+      top: 224,
+    });
+  });
+});
 
 describe("retained pan scene ownership", () => {
   const renderStyle = {
@@ -638,10 +659,12 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
-  it("re-blits the stable front while a staging fence blocks pointer camera draws", () => {
+  it("re-blits the stable front without stretching while a staging fence blocks pointer camera draws", () => {
     const {
       canvas,
       blitFramebuffer,
+      clientHeightRead,
+      clientWidthRead,
       clientWaitSync,
       fenceSync,
     } = mockWebGlCanvas();
@@ -695,19 +718,22 @@ describe("contactTileFloatTextureData", () => {
 
     // Resizing the canvas while the staging fence is pending must restore the
     // retained front instead of exposing WebKit's discarded black buffer. The
-    // source rectangle remains the old FBO size while the destination expands.
-    canvas.width = 512;
-    canvas.height = 384;
+    // backing canvas follows the new CSS size immediately, while the square
+    // source FBO remains centered at 1:1 until the wider target camera paints.
+    clientWidthRead.mockReturnValue(512);
+    clientHeightRead.mockReturnValue(384);
     expect(renderer?.redraw()).toBe(true);
+    expect(canvas.width).toBe(512);
+    expect(canvas.height).toBe(384);
     expect(blitFramebuffer).toHaveBeenCalledTimes(2);
     expect(blitFramebuffer).toHaveBeenLastCalledWith(
       0,
       0,
       256,
       256,
+      64,
       0,
-      0,
-      512,
+      448,
       384,
       26,
       19,
@@ -752,6 +778,60 @@ describe("contactTileFloatTextureData", () => {
 
     renderer?.setPanViewport(viewport);
     expect(blitFramebuffer).toHaveBeenCalledTimes(2);
+    renderer?.destroy();
+  });
+
+  it("holds an aspect-fitted front until a resized camera scene is published", () => {
+    const {
+      canvas,
+      blitFramebuffer,
+      clientHeightRead,
+      clientWidthRead,
+      drawArrays,
+    } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 4 }] },
+        transpose: false,
+      }],
+      generation: 1,
+      resolution: 1_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: {
+        colormap: "Reds",
+        colorScale: { log: false, min: 0, max: 10 },
+      },
+    })).toBe(true);
+    expect(blitFramebuffer).toHaveBeenCalledOnce();
+    const drawsBeforeResize = drawArrays.mock.calls.length;
+
+    clientWidthRead.mockReturnValue(512);
+    clientHeightRead.mockReturnValue(384);
+    expect(renderer?.redraw()).toBe(true);
+
+    expect(canvas.width).toBe(512);
+    expect(canvas.height).toBe(384);
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforeResize);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(2);
+    expect(blitFramebuffer).toHaveBeenLastCalledWith(
+      0,
+      0,
+      256,
+      256,
+      64,
+      0,
+      448,
+      384,
+      26,
+      19,
+    );
     renderer?.destroy();
   });
 

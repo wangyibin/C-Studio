@@ -14,15 +14,12 @@ AGP is required for assembly editing. Other evidence is optional.
 ```text
 my-project/
 ├── assembly.agp
-├── assembly.history.json
 ├── contacts.mcool
 ├── alignments.paf
-├── coverage.depth
+├── coverage.bedgraph
 └── assembly.gfa
 ```
-
-The history sidecar is optional. If present, its prefix must match the selected
-AGP. Only the top level is scanned. If a data type has several candidates,
+Only the top level is scanned. If a data type has several candidates,
 C-Studio loads one deterministic candidate and reports the others as skipped.
 See [project data](user-guide/project-data.md) for the exact rules.
 

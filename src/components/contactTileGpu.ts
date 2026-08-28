@@ -670,6 +670,51 @@ interface FramePresentationResources {
   height: number;
 }
 
+export interface ContactFramePresentationDestination {
+  left: number;
+  bottom: number;
+  right: number;
+  top: number;
+}
+
+/**
+ * Fit a retained front buffer into a resized canvas without changing its
+ * pixel aspect ratio. The uncovered strip is cleared by the presenter and is
+ * visible only until the replacement camera paints at the new aspect ratio.
+ */
+export function contactFramePresentationDestination(
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+): ContactFramePresentationDestination {
+  const safeSourceWidth = Math.max(1, Math.round(sourceWidth));
+  const safeSourceHeight = Math.max(1, Math.round(sourceHeight));
+  const safeTargetWidth = Math.max(1, Math.round(targetWidth));
+  const safeTargetHeight = Math.max(1, Math.round(targetHeight));
+  const scale = Math.min(
+    safeTargetWidth / safeSourceWidth,
+    safeTargetHeight / safeSourceHeight,
+  );
+  const fittedWidth = Math.max(
+    1,
+    Math.min(safeTargetWidth, Math.round(safeSourceWidth * scale)),
+  );
+  const fittedHeight = Math.max(
+    1,
+    Math.min(safeTargetHeight, Math.round(safeSourceHeight * scale)),
+  );
+  const left = Math.floor((safeTargetWidth - fittedWidth) / 2);
+  const bottom = Math.floor((safeTargetHeight - fittedHeight) / 2);
+
+  return {
+    left,
+    bottom,
+    right: left + fittedWidth,
+    top: bottom + fittedHeight,
+  };
+}
+
 interface VirtualTextureRendererResources {
   program: WebGLProgram;
   positionLocation: number;
@@ -4240,6 +4285,34 @@ export function createContactTileGpuRenderer(
     },
     presentedViewport: () => lastPresentedViewport,
     redraw: () => {
+      // CSS layout changes before React can publish the corresponding wider or
+      // taller genomic camera. Resize the backing store immediately so the
+      // browser cannot stretch its previous pixels, then preserve the retained
+      // FBO's aspect ratio until the replacement scene is ready.
+      resizeCanvasToDisplaySize(canvas, gl);
+      if (hasPresentedFrontFrame && framePresentation) {
+        const destination = contactFramePresentationDestination(
+          framePresentation.width,
+          framePresentation.height,
+          canvas.width,
+          canvas.height,
+        );
+        const aspectChanged = destination.left !== 0
+          || destination.bottom !== 0
+          || destination.right !== canvas.width
+          || destination.top !== canvas.height;
+        if (aspectChanged) {
+          presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+          traceContactPanCamera("gpu_redraw_aspect_hold", {
+            sourceWidth: framePresentation.width,
+            sourceHeight: framePresentation.height,
+            targetWidth: canvas.width,
+            targetHeight: canvas.height,
+            viewport: lastPresentedViewport,
+          });
+          return true;
+        }
+      }
       if (pendingVirtualPresentation || pendingPresentationFence) {
         if (hasPresentedFrontFrame && framePresentation) {
           // A ResizeObserver callback can arrive while a target scene is still
@@ -5254,17 +5327,32 @@ function presentFramePresentation(
   width: number,
   height: number,
 ) {
+  const destination = contactFramePresentationDestination(
+    frame.width,
+    frame.height,
+    width,
+    height,
+  );
   gl.bindFramebuffer(gl.READ_FRAMEBUFFER, frame.framebuffer);
   gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+  const fillsTarget = destination.left === 0
+    && destination.bottom === 0
+    && destination.right === width
+    && destination.top === height;
+  if (!fillsTarget) {
+    gl.viewport(0, 0, width, height);
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
   gl.blitFramebuffer(
     0,
     0,
     frame.width,
     frame.height,
-    0,
-    0,
-    width,
-    height,
+    destination.left,
+    destination.bottom,
+    destination.right,
+    destination.top,
     gl.COLOR_BUFFER_BIT,
     gl.NEAREST,
   );

@@ -774,6 +774,32 @@ export function contactViewportSizePxFromBounds(bounds: { width: number; height:
   return Number.isFinite(side) && side > 0 ? side : null;
 }
 
+export function contactSquarePlotSidePx({
+  layoutRight,
+  layoutBottom,
+  stageLeft,
+  stageTop,
+  navigatorWidth,
+  navigatorHeight,
+  paddingRight = 0,
+  paddingBottom = 0,
+}: {
+  layoutRight: number;
+  layoutBottom: number;
+  stageLeft: number;
+  stageTop: number;
+  navigatorWidth: number;
+  navigatorHeight: number;
+  paddingRight?: number;
+  paddingBottom?: number;
+}) {
+  const availableWidth = layoutRight - paddingRight - stageLeft - navigatorWidth;
+  const availableHeight = layoutBottom - paddingBottom - stageTop - navigatorHeight;
+  const side = Math.floor(Math.min(availableWidth, availableHeight));
+
+  return Number.isFinite(side) && side > 0 ? side : null;
+}
+
 interface AxisNavigatorViewportInput {
   axis: "x" | "y";
   centerRatio: number;
@@ -2336,9 +2362,11 @@ export function ContactMapViewport({
     totalSpanMb,
   ]);
 
-  useEffect(() => {
+  usePrePaintEffect(() => {
+    const layout = mapLayoutRef.current;
+    const stage = mapContentRef.current;
     const frame = canvasFrameRef.current;
-    if (!frame) {
+    if (!layout || !stage || !frame) {
       return;
     }
 
@@ -2346,6 +2374,26 @@ export function ContactMapViewport({
       refreshCanvasFrameBounds(frame);
     };
     const reportMetricsAndRedraw = () => {
+      const layoutBounds = layout.getBoundingClientRect();
+      const stageBounds = stage.getBoundingClientRect();
+      const navigatorCorner = layout.querySelector<HTMLElement>(".map-navigator-corner");
+      const navigatorBounds = navigatorCorner?.getBoundingClientRect();
+      const layoutStyle = window.getComputedStyle(layout);
+      const squareSidePx = contactSquarePlotSidePx({
+        layoutRight: layoutBounds.right,
+        layoutBottom: layoutBounds.bottom,
+        stageLeft: stageBounds.left,
+        stageTop: stageBounds.top,
+        navigatorWidth: navigatorBounds?.width ?? 0,
+        navigatorHeight: navigatorBounds?.height ?? 0,
+        paddingRight: Number.parseFloat(layoutStyle.paddingRight) || 0,
+        paddingBottom: Number.parseFloat(layoutStyle.paddingBottom) || 0,
+      });
+      if (squareSidePx === null) {
+        return;
+      }
+      layout.style.setProperty("--contact-map-square-size", `${squareSidePx}px`);
+
       const bounds = refreshCanvasFrameBounds(frame);
       if (!bounds) {
         return;
@@ -2374,14 +2422,21 @@ export function ContactMapViewport({
     const observer = typeof ResizeObserver === "undefined"
       ? null
       : new ResizeObserver(reportMetricsAndRedraw);
-    observer?.observe(frame);
+    observer?.observe(layout);
     window.addEventListener("scroll", updateCachedBounds, true);
     return () => {
       observer?.disconnect();
       window.removeEventListener("scroll", updateCachedBounds, true);
+      layout.style.removeProperty("--contact-map-square-size");
       canvasFrameBoundsRef.current = null;
     };
-  }, [onUiAction, totalSpanMb, usesTiledRenderer]);
+  }, [
+    hasCoverageTrack,
+    onUiAction,
+    totalSpanMb,
+    uiState.tracks.coverageVisible,
+    usesTiledRenderer,
+  ]);
 
   usePrePaintEffect(() => {
     if (usesTiledRenderer || !displayContactMap) {

@@ -12,15 +12,13 @@
 ```text
 my-project/
 ├── assembly.agp
-├── assembly.history.json
 ├── contacts.mcool
 ├── alignments.paf
 ├── coverage.depth
 └── assembly.gfa
 ```
 
-history sidecar 为可选文件；如果存在，其前缀必须与选中的 AGP 一致。程序只
-扫描目录顶层。同一类型存在多个候选文件时，C-Studio 会按确定性规则加载
+程序只扫描目录顶层。同一类型存在多个候选文件时，C-Studio 会按确定性规则加载
 一个，并把其他候选报告为已跳过。精确规则见[项目数据](user-guide/project-data.md)。
 
 ## 2. 加载数据

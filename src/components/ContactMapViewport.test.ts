@@ -37,6 +37,7 @@ import {
   contactViewportForAxisNavigator,
   contactViewportForPlacementPreview,
   contactViewportSizePxFromBounds,
+  contactSquarePlotSidePx,
   contactTileOverscanDirectionForViewports,
   contactWheelNavigationMode,
   contactWheelPanCommitDelta,
@@ -1271,6 +1272,43 @@ describe("contactViewportSizePxFromBounds", () => {
     expect(contactViewportSizePxFromBounds({ width: 700, height: 1200 })).toBe(700);
     expect(contactViewportSizePxFromBounds({ width: 0, height: 640 })).toBeNull();
     expect(contactViewportSizePxFromBounds({ width: Number.NaN, height: 640 })).toBeNull();
+  });
+});
+
+describe("contactSquarePlotSidePx", () => {
+  it("uses the limiting axis after fixed gutters, navigators, and padding", () => {
+    expect(contactSquarePlotSidePx({
+      layoutRight: 1_200,
+      layoutBottom: 800,
+      stageLeft: 100,
+      stageTop: 80,
+      navigatorWidth: 42,
+      navigatorHeight: 39,
+      paddingRight: 6,
+      paddingBottom: 6,
+    })).toBe(675);
+
+    expect(contactSquarePlotSidePx({
+      layoutRight: 800,
+      layoutBottom: 1_200,
+      stageLeft: 100,
+      stageTop: 80,
+      navigatorWidth: 42,
+      navigatorHeight: 39,
+      paddingRight: 6,
+      paddingBottom: 6,
+    })).toBe(652);
+  });
+
+  it("rejects layouts without a positive drawable square", () => {
+    expect(contactSquarePlotSidePx({
+      layoutRight: 100,
+      layoutBottom: 100,
+      stageLeft: 100,
+      stageTop: 50,
+      navigatorWidth: 0,
+      navigatorHeight: 0,
+    })).toBeNull();
   });
 });
 
