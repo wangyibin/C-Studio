@@ -337,33 +337,7 @@
         <a href="./reference/formats/" class="md-tabs__link">
           
   
-  Reference
-
-        </a>
-      </li>
-    
-  
-
-      
-        
-  
-  
-  
-  
-    
-      
-      
-        
-      
-    
-    
-    
-    
-      <li class="md-tabs__item">
-        <a href="./development/documentation/" class="md-tabs__link">
-          
-  
-  Development
+  Misc
 
         </a>
       </li>
@@ -847,7 +821,7 @@
   <span class="md-ellipsis">
     
   
-  Reference
+  Misc
 
     
   </span>
@@ -862,7 +836,7 @@
             <span class="md-nav__icon md-icon"></span>
             
   
-  Reference
+  Misc
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
@@ -982,94 +956,6 @@
   
 
     
-      
-      
-  
-  
-  
-  
-    
-    
-      
-        
-      
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
-        
-          
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-  Development
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-  Development
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="./development/documentation/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-  Build the documentation
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-    
   </ul>
 </nav>
                   </div>
@@ -1162,7 +1048,7 @@
 
 
 <h1 id="c-studio">C-Studio<a class="headerlink" href="#c-studio" title="Permanent link">&para;</a></h1>
-<p><img alt="" src="https://img.shields.io/github/languages/top/wangyibin/C-Studio" /> <img alt="" src="https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio" /> <img alt="" src="https://img.shields.io/github/last-commit/wangyibin/C-Studio" /> <img alt="" src="https://img.shields.io/github/contributors/wangyibin/C-Studio" /> <img alt="" src="https://img.shields.io/github/languages/code-size/wangyibin/C-Studio" /> <img alt="platforms" src="https://img.shields.io/badge/platforms-aarch64%20|%20x86-blue" /> <a href="https://github.com/wangyibin/C-Studio/releases"><img alt="" src="https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat" /></a></p>
+<p><img alt="" src="https://img.shields.io/github/languages/top/wangyibin/C-Studio" /> <img alt="" src="https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio" /> <img alt="" src="https://img.shields.io/github/last-commit/wangyibin/C-Studio" /> <img alt="" src="https://img.shields.io/github/contributors/wangyibin/C-Studio" /> <img alt="" src="https://img.shields.io/github/languages/code-size/wangyibin/C-Studio" /> <img alt="platforms" src="https://img.shields.io/badge/platforms-macos%20|%20windows-blue" /> <a href="https://github.com/wangyibin/C-Studio/releases"><img alt="" src="https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat" /></a></p>
 <blockquote>
 <p>⚠️ <strong>Development status:</strong> C-Studio is under active development. Features and interfaces may change.</p>
 </blockquote>
@@ -1170,21 +1056,24 @@
 assemblies, comparing multiple evidence layers, and making user-directed AGP
 edits. The current application is built with Tauri 2, React, TypeScript, and
 Rust.</p>
+<p><img alt="Figure 1. C-Studio combines assembly state and evidence views in a synchronized workspace." src="assets/C-Studio_Figure1_overview.png" /></p>
+<p><em>Figure 1. C-Studio combines AGP, 3D contacts, synteny, coverage, and assembly
+graph evidence in a synchronized, copy-aware curation workspace.</em></p>
 <h2 id="what-c-studio-brings-together">What C-Studio brings together<a class="headerlink" href="#what-c-studio-brings-together" title="Permanent link">&para;</a></h2>
 <ul>
 <li>AGP assembly structure and editable contig placements</li>
-<li><code>.cool</code> and <code>.mcool</code> contact maps</li>
+<li><code>.mcool</code> contact maps</li>
 <li>PAF synteny alignments</li>
-<li>depth or bedGraph coverage tracks</li>
+<li>BedGraph coverage tracks</li>
 <li>GFA assembly topology and optional endpoint-level 3D-contact evidence</li>
 <li>copy-aware selection, editing, history, undo, redo, and AGP export</li>
 <li>compatible operation-history sidecars saved alongside edited AGP files</li>
 </ul>
 <pre class="mermaid"><code>flowchart LR
     A["AGP assembly"] --&gt; W["Synchronized workspace"]
-    B["COOL or MCOOL contacts"] --&gt; W
+    B["MCOOL contacts"] --&gt; W
     C["PAF synteny"] --&gt; W
-    D["Depth or bedGraph"] --&gt; W
+    D["BedGraph"] --&gt; W
     E["GFA graph"] --&gt; W
     W --&gt; U["User-directed edits"]
     U --&gt; H["History and validation"]

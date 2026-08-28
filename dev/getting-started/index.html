@@ -339,33 +339,7 @@
         <a href="../reference/formats/" class="md-tabs__link">
           
   
-  Reference
-
-        </a>
-      </li>
-    
-  
-
-      
-        
-  
-  
-  
-  
-    
-      
-      
-        
-      
-    
-    
-    
-    
-      <li class="md-tabs__item">
-        <a href="../development/documentation/" class="md-tabs__link">
-          
-  
-  Development
+  Misc
 
         </a>
       </li>
@@ -882,7 +856,7 @@
   <span class="md-ellipsis">
     
   
-  Reference
+  Misc
 
     
   </span>
@@ -897,7 +871,7 @@
             <span class="md-nav__icon md-icon"></span>
             
   
-  Reference
+  Misc
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
@@ -998,94 +972,6 @@
     
   
   Troubleshooting
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-    
-      
-      
-  
-  
-  
-  
-    
-    
-      
-        
-      
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
-        
-          
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-  Development
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-  Development
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../development/documentation/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-  Build the documentation
 
     
   </span>
@@ -1237,16 +1123,14 @@ between evidence and edits explicit.</p>
 <h2 id="1-prepare-a-project-directory">1. Prepare a project directory<a class="headerlink" href="#1-prepare-a-project-directory" title="Permanent link">&para;</a></h2>
 <p>For a real project, place copies of the inputs in one dedicated directory. An
 AGP is required for assembly editing. Other evidence is optional.</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>my-project/
+<p><div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>my-project/
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── assembly.agp
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── assembly.history.json
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>├── contacts.mcool
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>├── alignments.paf
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>├── coverage.depth
-</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>└── assembly.gfa
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── contacts.mcool
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>├── alignments.paf
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>├── coverage.bedgraph
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>└── assembly.gfa
 </span></code></pre></div>
-<p>The history sidecar is optional. If present, its prefix must match the selected
-AGP. Only the top level is scanned. If a data type has several candidates,
+Only the top level is scanned. If a data type has several candidates,
 C-Studio loads one deterministic candidate and reports the others as skipped.
 See <a href="../user-guide/project-data/">project data</a> for the exact rules.</p>
 <h2 id="2-load-data">2. Load data<a class="headerlink" href="#2-load-data" title="Permanent link">&para;</a></h2>
