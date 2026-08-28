@@ -1736,34 +1736,6 @@ describe("reduceUiState", () => {
     expect(state.assembly.showContigBoxes).toBe(false);
   });
 
-  it("sets all heatmap annotation layers together for the F2 shortcut", () => {
-    let state = createInitialUiState("Browser preview mode");
-    state = reduceUiState(state, { type: "toggleAssemblyOverlay", overlay: "contig" });
-    expect(state.assembly.showChromosomeBoxes).toBe(true);
-    expect(state.assembly.showBlockBoxes).toBe(true);
-    expect(state.assembly.showContigBoxes).toBe(false);
-
-    state = reduceUiState(state, {
-      type: "setAssemblyOverlayVisibility",
-      chromosome: false,
-      block: false,
-      contig: false,
-    });
-    expect(state.assembly.showChromosomeBoxes).toBe(false);
-    expect(state.assembly.showBlockBoxes).toBe(false);
-    expect(state.assembly.showContigBoxes).toBe(false);
-
-    state = reduceUiState(state, {
-      type: "setAssemblyOverlayVisibility",
-      chromosome: true,
-      block: true,
-      contig: false,
-    });
-    expect(state.assembly.showChromosomeBoxes).toBe(true);
-    expect(state.assembly.showBlockBoxes).toBe(true);
-    expect(state.assembly.showContigBoxes).toBe(false);
-  });
-
   it("reverses selected contigs as one segment from the reducer", () => {
     let state = createInitialUiState("Browser preview mode");
 

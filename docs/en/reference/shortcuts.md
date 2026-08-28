@@ -13,9 +13,6 @@ select box, or editable element.
 | Alternate shortcut for undo | ++cmd+u++ | ++ctrl+u++ |
 | Alternate shortcut for redo | ++cmd+r++ | ++ctrl+r++ |
 | Deselect/cancel | ++esc++ | ++esc++ |
-| Toggle annotations | ++f2++ | ++f2++ |
-| Toggle inspector | ++f9++ | ++f9++ |
-| Open data menu | ++f10++ | ++f10++ |
 
 ## Assembly operations
 

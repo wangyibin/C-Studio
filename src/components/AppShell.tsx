@@ -296,11 +296,6 @@ export function AppShell({
   const addDataMenuRef = useRef<HTMLDetailsElement>(null);
   const appMenuRef = useRef<HTMLDetailsElement>(null);
   const chromosomeFilterMenuRef = useRef<HTMLDetailsElement>(null);
-  const hiddenAssemblyOverlaysRef = useRef<{
-    chromosome: boolean;
-    block: boolean;
-    contig: boolean;
-  } | null>(null);
   const syntenySelectionAnchorRef = useRef<string | null>(null);
   const agpImported = Boolean(dataset?.agp_path || uiState.assembly.blocks.length > 0);
   const sourceAssemblyAvailable = Boolean(dataset?.agp_layout.blocks.length);
@@ -715,48 +710,9 @@ export function AppShell({
         }
         return;
       }
-      if (intent === "toggle-inspector") {
-        onUiAction({ type: "toggleLayoutPanel", panel: "right" });
-        return;
-      }
-      if (intent === "open-file-menu") {
-        addDataMenuRef.current?.setAttribute("open", "");
-        addDataMenuRef.current?.querySelector<HTMLElement>("summary")?.focus();
-        return;
-      }
       if (intent === "toggle-resolution-lock") {
         onUiAction({ type: "toggleContactResolutionLock" });
-        return;
       }
-
-      const { showChromosomeBoxes, showBlockBoxes, showContigBoxes } = uiState.assembly;
-      if (showChromosomeBoxes || showBlockBoxes || showContigBoxes) {
-        hiddenAssemblyOverlaysRef.current = {
-          chromosome: showChromosomeBoxes,
-          block: showBlockBoxes,
-          contig: showContigBoxes,
-        };
-        onUiAction({
-          type: "setAssemblyOverlayVisibility",
-          chromosome: false,
-          block: false,
-          contig: false,
-        });
-        return;
-      }
-
-      const overlaysToRestore = hiddenAssemblyOverlaysRef.current ?? {
-        chromosome: true,
-        block: true,
-        contig: true,
-      };
-      hiddenAssemblyOverlaysRef.current = null;
-      onUiAction({
-        type: "setAssemblyOverlayVisibility",
-        chromosome: overlaysToRestore.chromosome,
-        block: overlaysToRestore.block,
-        contig: overlaysToRestore.contig,
-      });
     }
 
     window.addEventListener("keydown", handleJuiceboxShortcut, true);
@@ -764,7 +720,7 @@ export function AppShell({
   }, [
     onExportAgp,
     onUiAction,
-    uiState.assembly,
+    uiState.assembly.blocks.length,
     uiState.operationHistory.length,
     uiState.redoStack.length,
   ]);
@@ -894,8 +850,7 @@ export function AppShell({
             >
               <summary
                 className="global-action-button"
-                aria-keyshortcuts="F10"
-                title="Open data menu (F10)"
+                title="Open data menu"
               >
                 <Plus size={15} aria-hidden="true" />
                 <span>Add Data</span>
@@ -1343,8 +1298,7 @@ export function AppShell({
               className={`global-icon-button${uiState.layout.rightCollapsed ? "" : " active"}`}
               type="button"
               aria-label={uiState.layout.rightCollapsed ? "Show inspector" : "Hide inspector"}
-              aria-keyshortcuts="F9"
-              title="Show or hide inspector (F9)"
+              title="Show or hide inspector"
               aria-pressed={!uiState.layout.rightCollapsed}
               onClick={() => onUiAction({ type: "toggleLayoutPanel", panel: "right" })}
             >
@@ -1377,9 +1331,6 @@ export function AppShell({
                     <div><dt>Pan diagonally</dt><dd>{shortcuts.diagonalWheel}</dd></div>
                     <div><dt>Pan vertically</dt><dd>{shortcuts.verticalWheel}</dd></div>
                     <div><dt>Deselect / cancel</dt><dd>Esc</dd></div>
-                    <div><dt>Toggle annotations</dt><dd>F2</dd></div>
-                    <div><dt>Toggle inspector</dt><dd>F9</dd></div>
-                    <div><dt>Open data menu</dt><dd>F10</dd></div>
                   </dl>
                 </section>
               </div>

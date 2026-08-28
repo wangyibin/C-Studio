@@ -97,10 +97,8 @@ nav:
       - 导航与选择: user-guide/navigation-selection.md
       - 组装编辑: user-guide/assembly-editing.md
       - 证据视图: user-guide/evidence.md
-  - 参考:
+  - Misc:
       - 数据格式: reference/formats.md
       - 键盘快捷键: reference/shortcuts.md
       - 当前限制: reference/limitations.md
       - 故障排查: reference/troubleshooting.md
-  - 开发:
-      - 构建文档: development/documentation.md

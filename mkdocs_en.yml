@@ -95,10 +95,8 @@ nav:
       - Navigation and selection: user-guide/navigation-selection.md
       - Assembly editing: user-guide/assembly-editing.md
       - Evidence views: user-guide/evidence.md
-  - Reference:
+  - Misc:
       - Data formats: reference/formats.md
       - Keyboard shortcuts: reference/shortcuts.md
       - Current limitations: reference/limitations.md
       - Troubleshooting: reference/troubleshooting.md
-  - Development:
-      - Build the documentation: development/documentation.md

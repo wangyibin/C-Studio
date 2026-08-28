@@ -289,7 +289,6 @@ export type UiAction =
       nextOperationId: number;
     }
   | { type: "toggleAssemblyOverlay"; overlay: "chromosome" | "block" | "contig" }
-  | { type: "setAssemblyOverlayVisibility"; chromosome: boolean; block?: boolean; contig: boolean }
   | { type: "selectAssemblyContig"; id: string; additive: boolean }
   | { type: "focusAssemblyContig"; id: string }
   | { type: "selectAssemblyContigs"; ids: string[] }
@@ -1466,28 +1465,6 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           },
         },
         `${capitalize(action.overlay)} boxes ${visible ? "shown" : "hidden"}`,
-      );
-    }
-    case "setAssemblyOverlayVisibility": {
-      const blockVisible = action.block ?? action.contig;
-      if (
-        state.assembly.showChromosomeBoxes === action.chromosome
-        && state.assembly.showBlockBoxes === blockVisible
-        && state.assembly.showContigBoxes === action.contig
-      ) {
-        return state;
-      }
-      return withLog(
-        {
-          ...state,
-          assembly: {
-            ...state.assembly,
-            showChromosomeBoxes: action.chromosome,
-            showBlockBoxes: blockVisible,
-            showContigBoxes: action.contig,
-          },
-        },
-        `Heatmap annotations ${action.chromosome || blockVisible || action.contig ? "shown" : "hidden"}`,
       );
     }
     case "selectAssemblyContig": {

@@ -128,7 +128,7 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('title="No source AGP loaded"');
     expect(markup).toContain("Clear all loaded data…");
     expect(markup).toContain('title="No loaded data"');
-    expect(markup).toContain('aria-keyshortcuts="F10"');
+    expect(markup).not.toContain('aria-keyshortcuts="F10"');
     expect(markup).toContain('role="separator"');
     expect(markup).toContain('aria-label="Resize inspector"');
     expect(markup).toContain('aria-keyshortcuts="Control+Z Meta+Z Control+U Meta+U"');
@@ -148,6 +148,9 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain(`<dt>Delete contig</dt><dd>${shortcuts.deleteContig}</dd>`);
     expect(markup).toContain(`<dt>Pan diagonally</dt><dd>${shortcuts.diagonalWheel}</dd>`);
     expect(markup).toContain(`<dt>Pan vertically</dt><dd>${shortcuts.verticalWheel}</dd>`);
+    expect(markup).not.toContain("Toggle annotations");
+    expect(markup).not.toContain("Toggle inspector");
+    expect(markup).not.toContain("Open data menu</dt><dd>F10");
   });
 
   it("marks an invalid global homolog regex in the top toolbar", () => {
@@ -239,8 +242,8 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain('aria-label="Inspector"');
     expect(markup).toContain('aria-label="Block boxes"');
     expect(markup).toContain('aria-label="Contig boxes"');
-    expect(markup).toContain('aria-keyshortcuts="F2"');
-    expect(markup).toContain('aria-keyshortcuts="F9"');
+    expect(markup).not.toContain('aria-keyshortcuts="F2"');
+    expect(markup).not.toContain('aria-keyshortcuts="F9"');
     expect(markup).toContain('aria-label="Heatmap window controls"');
     expect(markup).toContain('aria-label="Expand heatmap window"');
     expect(markup).toContain('aria-label="Close heatmap window"');

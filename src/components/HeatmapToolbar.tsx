@@ -355,8 +355,7 @@ export function HeatmapToolbar({
         className="heatmap-toolbar-group heatmap-box-controls"
         role="group"
         aria-label="Heatmap boxes"
-        aria-keyshortcuts="F2"
-        title="Show or hide heatmap annotations (F2)"
+        title="Show or hide heatmap annotations"
       >
         <button
           className={`heatmap-toolbar-button${uiState.assembly.showChromosomeBoxes ? " active" : ""}`}

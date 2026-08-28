@@ -20,9 +20,6 @@ describe("juiceboxShortcutIntent", () => {
     expect(shortcut({ key: "s", metaKey: true })).toBe("save");
     expect(shortcut({ key: "S", ctrlKey: true })).toBe("save");
     expect(shortcut({ key: "s", metaKey: true, editable: true })).toBe("save");
-    expect(shortcut({ key: "F2" })).toBe("toggle-annotations");
-    expect(shortcut({ key: "F9" })).toBe("toggle-inspector");
-    expect(shortcut({ key: "F10" })).toBe("open-file-menu");
     expect(shortcut({ key: "l" })).toBe("toggle-resolution-lock");
     expect(shortcut({ key: "L" })).toBe("toggle-resolution-lock");
     expect(shortcut({ key: "u", metaKey: true })).toBe("undo");
@@ -36,15 +33,13 @@ describe("juiceboxShortcutIntent", () => {
   });
 
   it("does not consume unsupported Juicebox functions or browser text-entry keys", () => {
-    for (const key of ["F1", "F3", "F4", "F5", "F6", "F7", "F8"]) {
+    for (const key of ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10"]) {
       expect(shortcut({ key })).toBeNull();
     }
     expect(shortcut({ key: "u" })).toBeNull();
     expect(shortcut({ key: "r", altKey: true })).toBeNull();
     expect(shortcut({ key: "r", ctrlKey: true, shiftKey: true })).toBeNull();
     expect(shortcut({ key: "y", metaKey: true })).toBeNull();
-    expect(shortcut({ key: "F2", repeat: true })).toBeNull();
-    expect(shortcut({ key: "F9", editable: true })).toBeNull();
     expect(shortcut({ key: "l", editable: true })).toBeNull();
     expect(shortcut({ key: "l", repeat: true })).toBeNull();
     expect(shortcut({ key: "l", shiftKey: true })).toBeNull();

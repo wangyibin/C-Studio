@@ -1,68 +1,34 @@
 # 故障排查
 
-## 文件或目录选择器没有打开
+## 无法打开 C-Studio
 
-当前桌面版在 macOS 和 Windows 上使用 Tauri 原生对话框插件。如果旧版本报告
-“only implemented for macOS”，请更新到当前版本。否则，请确认应用具有
-所选目录的访问权限，并检查是否有原生对话框隐藏在主窗口后面。真实 Windows
-桌面行为仍应在发布 QA 中单独检查。
+请从官方 [GitHub Releases](https://github.com/wangyibin/C-Studio/releases)
+下载与平台匹配的安装包。macOS 上确认下载来源后，按住 Control 点按应用并选择**打开**；
+Windows 上出现 SmartScreen 警告时，也应先确认安装程序来源。
 
-## “No supported project files found”
+## C-Studio 没有找到项目文件
 
-确认支持的文件是所选目录顶层的普通文件，并使用专用扩展名：`.agp`、
-`.gfa`/`.gfa1`、`.paf`、`.depth`/`.bedgraph`/`.bg`、`.cool` 或 `.mcool`。
-文本格式可以增加 `.gz`。目录扫描不会发现子目录和通用 `.txt` 文件。
+选择的文件夹顶层应包含普通文件。支持 `.agp`、`.gfa`/`.gfa1`、`.paf`、
+`.depth`/`.bedgraph`/`.bg`、`.cool` 和 `.mcool`；文本文件可以使用 `.gz` 后缀。
+当 macOS 或 Windows 请求权限时，请允许 C-Studio 访问所选文件夹。
 
-## 热图或轨道为空
+## 热图或证据视图为空
 
-比较 AGP component ID 与接触矩阵 chromosome 名、PAF query 名、覆盖度
-chromosome 名和 GFA segment 名。只有源 ID 匹配且区间相交的证据才会被投影。
+AGP component ID 必须与接触矩阵、PAF、覆盖度和 GFA 中的 chromosome 或 segment
+名称一致。随后检查当前视图、分辨率、颜色范围、归一化和图层可见性。回到全组装视图并
+使用 **Auto** 颜色范围可作为安全复位。
 
-同时检查视口、所选分辨率、颜色最大值、轨道可见性和归一化。可用 **Fit** 和
-**Auto** 颜色范围安全复位。
+## 无法保存或恢复历史
 
-## 普通 COOL 文件很慢
+请先使用**另存为**选择一个可写、未压缩的 AGP 目标；自动保存不能覆盖 `.agp.gz`
+输入文件。若要恢复历史，将 `<AGP-prefix>.history.json` 放在匹配 AGP 旁边。格式错误或
+不兼容的 sidecar 会被忽略，但 AGP 仍可正常打开。
 
-单分辨率 `.cool` 在新尺度下可能反复执行昂贵的投影和聚合。日常浏览建议准备
-`.mcool` 金字塔。不要比较 debug 与 release 构建的计时。
+## GFA 视图或同源布局缺失
 
-仅用于开发诊断：
+GFA 需要名称匹配的有效 `S` 记录。若同源布局未出现，请设置 **Homolog regex**：捕获组
+1 表示同源组，捕获组 2 表示组内顺序；例如 `(Chr\d+)g(\d+)` 可匹配 `Chr01g1`。
 
-```bash
-CSTUDIO_PERF_LOG=1 npm run tauri dev
-```
+## “Load example project” 无法使用
 
-输出的计时字段属于诊断信息，不是稳定公开 API。
-
-## GFA 导入后没有图
-
-C-Studio 需要有效的 `S` 记录。只包含其他记录类型的输入会报告没有找到 GFA
-`S` 记录。请检查制表符分隔、segment 名称、序列为 `*` 时的 `LN` 标签和解析警告。
-
-## 同源布局缺失或无效
-
-修改 **Homolog regex**，使捕获组 1 标识同源组、捕获组 2 提供成员顺序。对于
-`Chr01g1` 这类名称，默认 `(Chr\d+)g(\d+)` 合适。表达式必须是有效的
-JavaScript 正则。
-
-## 自动保存不可用
-
-自动保存需要可写的普通 AGP 目标。先手动保存一次以选择路径；`.agp.gz` 源文件
-不能被覆盖；仅加载 AGP 不会建立保存目标。如果已选目标消失或不可写，
-C-Studio 会退回另存为或报告错误。
-
-## 已保存历史没有恢复
-
-请把 `<AGP-prefix>.history.json` 与对应 AGP 放在同一目录。C-Studio 会拒绝
-格式错误的 sidecar，也会拒绝内嵌规范 AGP 与当前布局不匹配的 sidecar。
-AGP 仍会正常加载，应用日志会记录该 sidecar 已被忽略。
-
-## 无法打开打包应用
-
-当前 macOS 包未公证；确认包来源后右键并选择**打开**。Windows 包没有签名，
-可能触发 SmartScreen。这些警告不能通过修改 C-Studio 设置消除。
-
-## 安装包中 “Load example project” 失败
-
-当前辅助功能依赖源码检出目录中的 `examples/`，尚未验证为安装包资源。在完成
-bundling 前，请从源码运行或逐个加载示例文件。
+该辅助功能依赖源码检出目录的 `examples/`。在安装包中，请改为逐个加载示例文件。

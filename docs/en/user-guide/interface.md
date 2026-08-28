@@ -48,7 +48,7 @@ not unload its source data.
 
 ## Inspector
 
-The right inspector is resizable and can be hidden with ++f9++. It contains:
+The right inspector is resizable and can be shown or hidden from the toolbar. It contains:
 
 - **Overview**: whole-assembly contact overview;
 - **Synteny**: compact PAF view; double-click opens the interactive split pane;

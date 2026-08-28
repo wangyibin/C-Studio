@@ -1,5 +1,5 @@
 # C-Studio
-![](https://img.shields.io/github/languages/top/wangyibin/C-Studio) ![](https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio) ![](https://img.shields.io/github/last-commit/wangyibin/C-Studio) ![](https://img.shields.io/github/contributors/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/code-size/wangyibin/C-Studio) ![platforms](https://img.shields.io/badge/platforms-aarch64%20|%20x86-blue) [![](https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat)](https://github.com/wangyibin/C-Studio/releases)
+![](https://img.shields.io/github/languages/top/wangyibin/C-Studio) ![](https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio) ![](https://img.shields.io/github/last-commit/wangyibin/C-Studio) ![](https://img.shields.io/github/contributors/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/code-size/wangyibin/C-Studio) ![platforms](https://img.shields.io/badge/platforms-macos%20|%20windows-blue) [![](https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat)](https://github.com/wangyibin/C-Studio/releases)
 
 > ⚠️ **Development status:** C-Studio is under active development. Features and interfaces may change.
 
