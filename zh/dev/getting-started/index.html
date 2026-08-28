@@ -339,33 +339,7 @@
         <a href="../reference/formats/" class="md-tabs__link">
           
   
-  参考
-
-        </a>
-      </li>
-    
-  
-
-      
-        
-  
-  
-  
-  
-    
-      
-      
-        
-      
-    
-    
-    
-    
-      <li class="md-tabs__item">
-        <a href="../development/documentation/" class="md-tabs__link">
-          
-  
-  开发
+  Misc
 
         </a>
       </li>
@@ -882,7 +856,7 @@
   <span class="md-ellipsis">
     
   
-  参考
+  Misc
 
     
   </span>
@@ -897,7 +871,7 @@
             <span class="md-nav__icon md-icon"></span>
             
   
-  参考
+  Misc
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
@@ -998,94 +972,6 @@
     
   
   故障排查
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-    
-      
-      
-  
-  
-  
-  
-    
-    
-      
-        
-      
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
-        
-          
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-  开发
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-  开发
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../development/documentation/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-  构建文档
 
     
   </span>
@@ -1237,14 +1123,12 @@
 其他证据均为可选。</p>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>my-project/
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── assembly.agp
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── assembly.history.json
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>├── contacts.mcool
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>├── alignments.paf
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>├── coverage.depth
-</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>└── assembly.gfa
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── contacts.mcool
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>├── alignments.paf
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>├── coverage.depth
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>└── assembly.gfa
 </span></code></pre></div>
-<p>history sidecar 为可选文件；如果存在，其前缀必须与选中的 AGP 一致。程序只
-扫描目录顶层。同一类型存在多个候选文件时，C-Studio 会按确定性规则加载
+<p>程序只扫描目录顶层。同一类型存在多个候选文件时，C-Studio 会按确定性规则加载
 一个，并把其他候选报告为已跳过。精确规则见<a href="../user-guide/project-data/">项目数据</a>。</p>
 <h2 id="2">2. 加载数据<a class="headerlink" href="#2" title="Permanent link">&para;</a></h2>
 <p>选择 <strong>Add Data → Load project folder…</strong>。也可以使用 <strong>Add Data</strong> 下的

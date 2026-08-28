@@ -337,33 +337,7 @@
         <a href="./reference/formats/" class="md-tabs__link">
           
   
-  参考
-
-        </a>
-      </li>
-    
-  
-
-      
-        
-  
-  
-  
-  
-    
-      
-      
-        
-      
-    
-    
-    
-    
-      <li class="md-tabs__item">
-        <a href="./development/documentation/" class="md-tabs__link">
-          
-  
-  开发
+  Misc
 
         </a>
       </li>
@@ -847,7 +821,7 @@
   <span class="md-ellipsis">
     
   
-  参考
+  Misc
 
     
   </span>
@@ -862,7 +836,7 @@
             <span class="md-nav__icon md-icon"></span>
             
   
-  参考
+  Misc
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
@@ -982,94 +956,6 @@
   
 
     
-      
-      
-  
-  
-  
-  
-    
-    
-      
-        
-      
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
-        
-          
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-  开发
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-  开发
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="./development/documentation/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-  构建文档
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-    
   </ul>
 </nav>
                   </div>
@@ -1168,6 +1054,9 @@
 </blockquote>
 <p>C-Studio 是一个处于早期阶段的桌面应用，用于检查染色体尺度组装、对照多类证据，
 并由用户主动编辑 AGP。当前应用由 Tauri 2、React、TypeScript 和 Rust 构建。</p>
+<p><img alt="图 1：C-Studio 将组装状态与证据视图汇集到同步工作区。" src="assets/C-Studio_Figure1_overview.png" /></p>
+<p><em>图 1｜C-Studio 将 AGP、三维接触、共线性、覆盖度和组装图证据汇集到可感知拷贝的
+同步校订工作区。</em></p>
 <div class="admonition important">
 <p class="admonition-title">当前范围</p>
 <p>本文档描述当前实现。C-Studio 提供证据辅助的校订工作流，
@@ -1176,18 +1065,18 @@
 <h2 id="c-studio_1">C-Studio 汇集的内容<a class="headerlink" href="#c-studio_1" title="Permanent link">&para;</a></h2>
 <ul>
 <li>AGP 组装结构与可编辑的 contig 放置</li>
-<li><code>.cool</code> 和 <code>.mcool</code> 接触矩阵</li>
+<li><code>.mcool</code> 接触矩阵</li>
 <li>PAF 共线性比对</li>
-<li>depth 或 bedGraph 覆盖度轨道</li>
+<li>BedGraph 覆盖度轨道</li>
 <li>GFA 组装图拓扑及可选的端点级三维接触证据</li>
 <li>感知拷贝的选择、编辑、历史、撤销、重做和 AGP 导出</li>
 <li>与编辑后 AGP 一同保存、可兼容恢复的操作历史 sidecar</li>
 </ul>
 <pre class="mermaid"><code>flowchart LR
     A["AGP 组装"] --&gt; W["同步工作区"]
-    B["COOL 或 MCOOL 接触矩阵"] --&gt; W
+    B["MCOOL 接触矩阵"] --&gt; W
     C["PAF 共线性"] --&gt; W
-    D["Depth 或 bedGraph"] --&gt; W
+    D["BedGraph"] --&gt; W
     E["GFA 组装图"] --&gt; W
     W --&gt; U["用户主动编辑"]
     U --&gt; H["历史与检查"]
