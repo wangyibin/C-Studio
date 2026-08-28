@@ -3355,6 +3355,15 @@ button {
   white-space: nowrap;
 }
 
+.block-member-copy-count {
+  color: var(--muted);
+}
+
+.block-member-copy-count.multiple {
+  color: var(--accent);
+  font-weight: 700;
+}
+
 .contig-current-copy-state {
   display: flex;
   align-items: center;

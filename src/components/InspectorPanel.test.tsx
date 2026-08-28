@@ -494,6 +494,17 @@ describe("InspectorPanel", () => {
         orientation: "-",
         assemblyBlockId: "Chr01_block_1",
       },
+      {
+        id: "Chr02:1:ctg1_copy2",
+        objectId: "Chr02",
+        sourceId: "ctg1",
+        sourceStart: 0,
+        sourceEnd: 100,
+        visualStart: 250,
+        visualEnd: 350,
+        orientation: "+",
+        assemblyBlockId: null,
+      },
     ];
     uiState.assembly.selection = { kind: "contigs", ids: ["Chr01_block_1"] };
 
@@ -527,13 +538,17 @@ describe("InspectorPanel", () => {
     expect(markup).toContain(
       'class="block-member-list" aria-label="Contigs in Chr01_block_1"',
     );
-    expect(markup).toContain('class="block-member-metadata"><span>100 bp</span>');
-    expect(markup).toContain('class="block-member-metadata"><span>150 bp</span>');
+    expect(markup).toContain(
+      'class="block-member-metadata"><span>100 bp</span><span class="block-member-copy-count multiple">2 copies</span>',
+    );
+    expect(markup).toContain(
+      'class="block-member-metadata"><span>150 bp</span><span class="block-member-copy-count">1 copy</span>',
+    );
     expect(markup).toContain('class="selection-block-entry composite"');
     expect(markup).toContain("ctg1");
     expect(markup).toContain("ctg2");
-    expect(markup).toContain('aria-label="Center and select ctg1, orientation +"');
-    expect(markup).toContain('aria-label="Center and select ctg2, orientation -"');
+    expect(markup).toContain('aria-label="Center and select ctg1, 2 copies, orientation +"');
+    expect(markup).toContain('aria-label="Center and select ctg2, 1 copy, orientation -"');
     expect(markup).toContain(
       'class="selection-contig-orientation orientation-forward" aria-hidden="true">+</strong>',
     );

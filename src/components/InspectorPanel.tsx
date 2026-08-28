@@ -553,6 +553,10 @@ function AssemblyBlockSummary({
   const childContigs = block.contigIds
     .map((id) => contigsById.get(id))
     .filter((contig): contig is ContactMapLayoutBlock => Boolean(contig));
+  const coveringCopyCountByContigId = new Map(childContigs.map((contig) => [
+    contig.id,
+    assemblyCopyIntervalGroups(contigs, contig).filter((group) => group.coversInterval).length,
+  ]));
 
   return (
     <section className="contig-occurrences block-details" aria-label="Block details">
@@ -585,32 +589,39 @@ function AssemblyBlockSummary({
       <div className="block-member-list" aria-label={`Contigs in ${block.id}`}>
         <span>Contigs</span>
         <ol>
-          {childContigs.map((contig, index) => (
-            <li key={contig.id}>
-              <button
-                type="button"
-                title={`Center ${assemblyContigDisplayName(contig)} (${contig.orientation})`}
-                aria-label={`Center and select ${assemblyContigDisplayName(contig)}, orientation ${contig.orientation}`}
-                onClick={() => onUiAction({ type: "focusAssemblyContig", id: contig.id })}
-              >
-                <span className="block-member-name">
-                  <small>{index + 1}</small>
-                  <strong>{assemblyContigDisplayName(contig)}</strong>
-                </span>
-                <span className="block-member-metadata">
-                  <span>{formatSpan(Math.max(0, contig.sourceEnd - contig.sourceStart))}</span>
-                  <strong
-                    className={`selection-contig-orientation orientation-${
-                      contig.orientation === "+" ? "forward" : contig.orientation === "-" ? "reverse" : "unknown"
-                    }`}
-                    aria-hidden="true"
-                  >
-                    {contig.orientation}
-                  </strong>
-                </span>
-              </button>
-            </li>
-          ))}
+          {childContigs.map((contig, index) => {
+            const coveringCopyCount = coveringCopyCountByContigId.get(contig.id) ?? 0;
+            const copyCountLabel = formatCount(coveringCopyCount, "copy", "copies");
+            return (
+              <li key={contig.id}>
+                <button
+                  type="button"
+                  title={`Center ${assemblyContigDisplayName(contig)} (${copyCountLabel}, ${contig.orientation})`}
+                  aria-label={`Center and select ${assemblyContigDisplayName(contig)}, ${copyCountLabel}, orientation ${contig.orientation}`}
+                  onClick={() => onUiAction({ type: "focusAssemblyContig", id: contig.id })}
+                >
+                  <span className="block-member-name">
+                    <small>{index + 1}</small>
+                    <strong>{assemblyContigDisplayName(contig)}</strong>
+                  </span>
+                  <span className="block-member-metadata">
+                    <span>{formatSpan(Math.max(0, contig.sourceEnd - contig.sourceStart))}</span>
+                    <span className={`block-member-copy-count${coveringCopyCount > 1 ? " multiple" : ""}`}>
+                      {copyCountLabel}
+                    </span>
+                    <strong
+                      className={`selection-contig-orientation orientation-${
+                        contig.orientation === "+" ? "forward" : contig.orientation === "-" ? "reverse" : "unknown"
+                      }`}
+                      aria-hidden="true"
+                    >
+                      {contig.orientation}
+                    </strong>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
         </ol>
       </div>
       <div className="contig-current-copy-state block-lock-state">
