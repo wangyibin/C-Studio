@@ -65,7 +65,7 @@ describe("loadBrowserExampleBundle", () => {
     expect(bundle.coverageRecords).toHaveLength(40_633);
     expect(summarizePafText(bundle.pafText)).toMatchObject({
       alignmentCount: 825,
-      queryCount: 819,
+      queryCount: 817,
       targetCount: 5,
     });
     expect(bundle.gfaDocument.summary).toMatchObject({

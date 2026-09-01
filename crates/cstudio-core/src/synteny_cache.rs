@@ -14,7 +14,14 @@ pub struct SyntenyCacheKey {
 
 #[derive(Debug, Default)]
 pub struct SyntenyCache {
-    entries: HashMap<SyntenyCacheKey, Vec<PafRecord>>,
+    entries: HashMap<SyntenyCacheKey, SyntenyCacheEntry>,
+}
+
+#[derive(Debug)]
+struct SyntenyCacheEntry {
+    records: Vec<PafRecord>,
+    input_alignment_count: usize,
+    ignored_line_count: usize,
 }
 
 impl SyntenyCache {
@@ -27,7 +34,36 @@ impl SyntenyCache {
     }
 
     pub fn insert_records(&mut self, key: SyntenyCacheKey, records: Vec<PafRecord>) {
-        self.entries.insert(key, records);
+        let input_alignment_count = records
+            .iter()
+            .map(|record| record.alignment_count)
+            .sum();
+        self.insert_prepared_records(key, records, input_alignment_count, 0);
+    }
+
+    pub fn insert_prepared_records(
+        &mut self,
+        key: SyntenyCacheKey,
+        records: Vec<PafRecord>,
+        input_alignment_count: usize,
+        ignored_line_count: usize,
+    ) {
+        self.entries.insert(key, SyntenyCacheEntry {
+            records,
+            input_alignment_count,
+            ignored_line_count,
+        });
+    }
+
+    pub fn prepared_records(
+        &self,
+        key: &SyntenyCacheKey,
+    ) -> Option<(&[PafRecord], usize, usize)> {
+        self.entries.get(key).map(|entry| (
+            entry.records.as_slice(),
+            entry.input_alignment_count,
+            entry.ignored_line_count,
+        ))
     }
 
     pub fn build_cached_view(
@@ -35,11 +71,11 @@ impl SyntenyCache {
         key: &SyntenyCacheKey,
         query: &SyntenyQuery,
     ) -> CStudioResult<Option<SyntenyView>> {
-        let Some(records) = self.entries.get(key) else {
+        let Some(entry) = self.entries.get(key) else {
             return Ok(None);
         };
         let mut builder = SyntenyViewBuilder::new(query)?;
-        for record in records {
+        for record in &entry.records {
             builder.add_record_ref(record)?;
         }
         Ok(Some(builder.finish()))
@@ -112,6 +148,9 @@ mod tests {
                 residue_matches: 900,
                 alignment_block_len: 1_000,
                 mapq: 60,
+                alignment_type: None,
+                alignment_count: 1,
+                fragments: Vec::new(),
             }],
         );
 

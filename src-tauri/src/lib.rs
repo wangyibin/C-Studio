@@ -34,6 +34,8 @@ pub fn run() {
             commands::load_coverage_file,
             commands::load_paf_file,
             commands::load_paf_text,
+            commands::prepare_paf_file,
+            commands::load_gfa_file,
             commands::load_agp_bundle,
             commands::load_project_directory,
             commands::write_agp_file,

@@ -1,6 +1,6 @@
 import type { GfaHiCLink } from "./gfaHiCLinks";
 import type { ContactMapLayoutBlock } from "./importers";
-import type { PafPreviewRecord } from "./pafPreview";
+import type { PafPreviewFragment, PafPreviewRecord } from "./pafPreview";
 
 type Interval = readonly [number, number];
 
@@ -573,31 +573,42 @@ function buildPrimaryAnchor(
   const byTarget = new Map<string, AlignmentObservation[]>();
 
   for (const record of records) {
-    if (record.alignmentBlockLen <= 0) {
-      continue;
+    const fragments = record.fragments ?? [pafFragmentFromRecord(record)];
+    for (const fragment of fragments) {
+      if (fragment.alignmentBlockLen <= 0) {
+        continue;
+      }
+      const queryStart = Math.max(node.sourceStart, fragment.queryStart);
+      const queryEnd = Math.min(node.sourceEnd, fragment.queryEnd);
+      if (queryStart >= queryEnd) {
+        continue;
+      }
+      const targetInterval = projectQueryIntervalToTarget(
+        fragment,
+        record.strand,
+        queryStart,
+        queryEnd,
+      );
+      if (!targetInterval) {
+        continue;
+      }
+      const observedBp = queryEnd - queryStart;
+      const identity = Math.min(
+        1,
+        Math.max(0, fragment.residueMatches / fragment.alignmentBlockLen),
+      );
+      const values = byTarget.get(record.targetName) ?? [];
+      values.push({
+        queryInterval: [queryStart, queryEnd],
+        targetInterval,
+        strand: record.strand,
+        identity,
+        mapq: Math.max(0, fragment.mapq),
+        observedBp,
+        alignmentType: fragment.alignmentType ?? record.alignmentType,
+      });
+      byTarget.set(record.targetName, values);
     }
-    const queryStart = Math.max(node.sourceStart, record.queryStart);
-    const queryEnd = Math.min(node.sourceEnd, record.queryEnd);
-    if (queryStart >= queryEnd) {
-      continue;
-    }
-    const targetInterval = projectQueryIntervalToTarget(record, queryStart, queryEnd);
-    if (!targetInterval) {
-      continue;
-    }
-    const observedBp = queryEnd - queryStart;
-    const identity = Math.min(1, Math.max(0, record.residueMatches / record.alignmentBlockLen));
-    const values = byTarget.get(record.targetName) ?? [];
-    values.push({
-      queryInterval: [queryStart, queryEnd],
-      targetInterval,
-      strand: record.strand,
-      identity,
-      mapq: Math.max(0, record.mapq),
-      observedBp,
-      alignmentType: record.alignmentType,
-    });
-    byTarget.set(record.targetName, values);
   }
 
   const blockLength = node.sourceEnd - node.sourceStart;
@@ -812,24 +823,39 @@ function clusterTargetObservations(
 }
 
 function projectQueryIntervalToTarget(
-  record: PafPreviewRecord,
+  fragment: PafPreviewFragment,
+  strand: PafPreviewRecord["strand"],
   queryStart: number,
   queryEnd: number,
 ): Interval | null {
-  const querySpan = record.queryEnd - record.queryStart;
-  const targetSpan = record.targetEnd - record.targetStart;
+  const querySpan = fragment.queryEnd - fragment.queryStart;
+  const targetSpan = fragment.targetEnd - fragment.targetStart;
   if (querySpan <= 0 || targetSpan <= 0) {
     return null;
   }
-  const startOffset = (queryStart - record.queryStart) / querySpan;
-  const endOffset = (queryEnd - record.queryStart) / querySpan;
-  const first = record.strand === "+"
-    ? record.targetStart + targetSpan * startOffset
-    : record.targetEnd - targetSpan * startOffset;
-  const second = record.strand === "+"
-    ? record.targetStart + targetSpan * endOffset
-    : record.targetEnd - targetSpan * endOffset;
+  const startOffset = (queryStart - fragment.queryStart) / querySpan;
+  const endOffset = (queryEnd - fragment.queryStart) / querySpan;
+  const first = strand === "+"
+    ? fragment.targetStart + targetSpan * startOffset
+    : fragment.targetEnd - targetSpan * startOffset;
+  const second = strand === "+"
+    ? fragment.targetStart + targetSpan * endOffset
+    : fragment.targetEnd - targetSpan * endOffset;
   return [Math.min(first, second), Math.max(first, second)];
+}
+
+function pafFragmentFromRecord(record: PafPreviewRecord): PafPreviewFragment {
+  return {
+    queryStart: record.queryStart,
+    queryEnd: record.queryEnd,
+    targetStart: record.targetStart,
+    targetEnd: record.targetEnd,
+    residueMatches: record.residueMatches,
+    alignmentBlockLen: record.alignmentBlockLen,
+    mapq: record.mapq,
+    alignmentType: record.alignmentType,
+    editDistance: record.editDistance,
+  };
 }
 
 function clusterReferenceAnchors(

@@ -858,6 +858,13 @@ pub struct ImportedProjectTextFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImportedProjectFile {
+    pub path: String,
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedAgpBundle {
     pub agp: ImportedProjectTextFile,
@@ -868,12 +875,12 @@ pub struct ImportedAgpBundle {
 #[serde(rename_all = "camelCase")]
 pub struct ImportedProjectDirectory {
     pub directory: String,
-    pub agp: Option<ImportedProjectTextFile>,
-    pub history: Option<ImportedProjectTextFile>,
-    pub gfa: Option<ImportedProjectTextFile>,
-    pub paf: Option<ImportedContactFile>,
-    pub coverage: Option<ImportedContactFile>,
-    pub contact: Option<ImportedContactFile>,
+    pub agp: Option<ImportedProjectFile>,
+    pub history: Option<ImportedProjectFile>,
+    pub gfa: Option<ImportedProjectFile>,
+    pub paf: Option<ImportedProjectFile>,
+    pub coverage: Option<ImportedProjectFile>,
+    pub contact: Option<ImportedProjectFile>,
     pub ignored_candidates: Vec<String>,
 }
 
@@ -1612,6 +1619,84 @@ pub struct PafRecordRequest {
     pub residue_matches: u64,
     pub alignment_block_len: u64,
     pub mapq: u8,
+    #[serde(default = "default_paf_alignment_count")]
+    pub alignment_count: usize,
+    #[serde(default)]
+    pub fragments: Vec<PafFragmentRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PafFragmentRequest {
+    pub query_start: u64,
+    pub query_end: u64,
+    pub target_start: u64,
+    pub target_end: u64,
+    pub residue_matches: u64,
+    pub alignment_block_len: u64,
+    pub mapq: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedPafResponse {
+    pub path: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub cache_hit: bool,
+    pub summary: PreparedPafSummaryResponse,
+    pub records: Vec<PreparedPafRecordResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedPafSummaryResponse {
+    pub alignment_count: usize,
+    pub ignored_lines: usize,
+    pub query_count: usize,
+    pub target_count: usize,
+    pub chain_count: usize,
+    pub retained_alignment_count: usize,
+    pub discarded_alignment_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedPafRecordResponse {
+    pub query_name: String,
+    pub query_start: u64,
+    pub query_end: u64,
+    pub query_length: u64,
+    pub strand: String,
+    pub target_name: String,
+    pub target_start: u64,
+    pub target_end: u64,
+    pub target_length: u64,
+    pub residue_matches: u64,
+    pub alignment_block_len: u64,
+    pub mapq: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alignment_type: Option<&'static str>,
+    pub alignment_count: usize,
+    pub fragments: Vec<PreparedPafFragmentResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedPafFragmentResponse {
+    pub query_start: u64,
+    pub query_end: u64,
+    pub target_start: u64,
+    pub target_end: u64,
+    pub residue_matches: u64,
+    pub alignment_block_len: u64,
+    pub mapq: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alignment_type: Option<&'static str>,
+}
+
+fn default_paf_alignment_count() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1788,6 +1873,19 @@ pub fn load_paf_file(path: String) -> Result<ImportedContactFile, String> {
 }
 
 #[tauri::command]
+pub async fn prepare_paf_file(
+    path: String,
+    cache_state: tauri::State<'_, SyntenyCacheState>,
+) -> Result<PreparedPafResponse, String> {
+    let cache = Arc::clone(&cache_state.inner().cache);
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_paf_file_with_cache(Path::new(&path), cache.as_ref())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub async fn load_paf_text(path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(path);
@@ -1800,6 +1898,23 @@ pub async fn load_paf_text(path: String) -> Result<String, String> {
 fn load_paf_text_from_path(path: &Path) -> Result<String, String> {
     paf_file_from_path(path)?;
     read_text_file(path)
+}
+
+#[tauri::command]
+pub async fn load_gfa_file(path: String) -> Result<ImportedProjectTextFile, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        load_gfa_file_from_path(&path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn load_gfa_file_from_path(path: &Path) -> Result<ImportedProjectTextFile, String> {
+    if !has_data_suffix(path, &["gfa", "gfa1"]) {
+        return Err("selected file must end with .gfa, .gfa1, or their .gz form".to_string());
+    }
+    imported_text_file(path)
 }
 
 #[tauri::command]
@@ -5592,6 +5707,19 @@ fn imported_text_file(path: &Path) -> Result<ImportedProjectTextFile, String> {
     })
 }
 
+fn imported_project_file(path: &Path) -> Result<ImportedProjectFile, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    Ok(ImportedProjectFile {
+        path: path.to_string_lossy().to_string(),
+        name: path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("data")
+            .to_string(),
+        size_bytes: metadata.len(),
+    })
+}
+
 fn history_sidecar_path(agp_path: &Path) -> PathBuf {
     let filename = agp_path
         .file_name()
@@ -5673,9 +5801,12 @@ fn scan_project_directory(directory: &Path) -> Result<ImportedProjectDirectory, 
                 .map(|path| path.to_string_lossy().to_string()),
         );
     }
+    // Directory loading is discovery only. The frontend opens each selected
+    // source in dependency order so a large GFA never shares one IPC response
+    // with the files needed to establish the assembly and contact map first.
     let selected_agp = agp
         .first()
-        .map(|path| imported_text_file(path))
+        .map(|path| imported_project_file(path))
         .transpose()?;
     let selected_history = agp.first().and_then(|path| {
         let history_path = history_sidecar_path(path);
@@ -5683,23 +5814,23 @@ fn scan_project_directory(directory: &Path) -> Result<ImportedProjectDirectory, 
     });
     let selected_history = selected_history
         .as_deref()
-        .map(imported_text_file)
+        .map(imported_project_file)
         .transpose()?;
     let selected_gfa = gfa
         .first()
-        .map(|path| imported_text_file(path))
+        .map(|path| imported_project_file(path))
         .transpose()?;
     let selected_paf = paf
         .first()
-        .map(|path| paf_file_from_path(path))
+        .map(|path| imported_project_file(path))
         .transpose()?;
     let selected_coverage = coverage
         .first()
-        .map(|path| coverage_file_from_path(path))
+        .map(|path| imported_project_file(path))
         .transpose()?;
     let selected_contact = contact
         .first()
-        .map(|path| contact_file_from_path(path))
+        .map(|path| imported_project_file(path))
         .transpose()?;
     if selected_agp.is_none()
         && selected_gfa.is_none()
@@ -5777,6 +5908,11 @@ pub fn build_synteny_view(request: SyntenyViewRequest) -> Result<SyntenyViewResp
         .into_iter()
         .map(paf_record_from_request)
         .collect::<Result<Vec<_>, String>>()?;
+    let records = if records.iter().any(|record| !record.fragments.is_empty()) {
+        records
+    } else {
+        cstudio_core::synteny::consolidate_paf_split_alignments(records)
+    };
 
     synteny_response_from_view(
         cstudio_core::synteny::build_synteny_view(&query, records)
@@ -5809,17 +5945,8 @@ fn build_synteny_view_from_paf_with_cache(
         request.max_query_gap,
         request.max_target_gap,
     )?;
-    let metadata = fs::metadata(&request.paf_path).map_err(|error| error.to_string())?;
-    let key = SyntenyCacheKey {
-        path: request.paf_path.clone(),
-        size_bytes: metadata.len(),
-        modified_nanos: metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0),
-    };
+    let paf_path = Path::new(&request.paf_path);
+    let key = synteny_cache_key(paf_path)?;
 
     if let Some(view) = cache
         .lock()
@@ -5830,28 +5957,191 @@ fn build_synteny_view_from_paf_with_cache(
         return synteny_response_from_view(view);
     }
 
-    let mut records = Vec::new();
-
-    for line in open_text_reader(Path::new(&request.paf_path))?.lines() {
-        let line = line.map_err(|error| error.to_string())?;
-        if let Some(record) = cstudio_core::synteny::PafRecord::parse_line(&line)
-            .map_err(|error| error.to_string())?
-        {
-            records.push(record);
-        }
-    }
+    let loaded = load_and_consolidate_paf_records(paf_path)?;
 
     let mut cache = cache
         .lock()
         .map_err(|_| "synteny cache lock poisoned".to_string())?;
     if !cache.contains_key(&key) {
-        cache.insert_records(key.clone(), records);
+        cache.insert_prepared_records(
+            key.clone(),
+            loaded.records,
+            loaded.input_alignment_count,
+            loaded.ignored_line_count,
+        );
     }
     let view = cache
         .build_cached_view(&key, &query)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "synteny cache entry missing after import".to_string())?;
     synteny_response_from_view(view)
+}
+
+struct LoadedPreparedPaf {
+    records: Vec<cstudio_core::synteny::PafRecord>,
+    input_alignment_count: usize,
+    ignored_line_count: usize,
+}
+
+fn synteny_cache_key(path: &Path) -> Result<SyntenyCacheKey, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    Ok(SyntenyCacheKey {
+        path: path.to_string_lossy().to_string(),
+        size_bytes: metadata.len(),
+        modified_nanos: metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0),
+    })
+}
+
+fn load_and_consolidate_paf_records(path: &Path) -> Result<LoadedPreparedPaf, String> {
+    let mut records = Vec::new();
+    let mut ignored_line_count = 0;
+    for line in open_text_reader(path)?.lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        match cstudio_core::synteny::PafRecord::parse_line(&line) {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(_) => ignored_line_count += 1,
+        }
+    }
+    let input_alignment_count = records.len();
+    Ok(LoadedPreparedPaf {
+        records: cstudio_core::synteny::consolidate_paf_split_alignments(records),
+        input_alignment_count,
+        ignored_line_count,
+    })
+}
+
+fn prepare_paf_file_with_cache(
+    path: &Path,
+    cache: &Mutex<SyntenyCache>,
+) -> Result<PreparedPafResponse, String> {
+    let imported = paf_file_from_path(path)?;
+    let key = synteny_cache_key(path)?;
+    {
+        let cache = cache
+            .lock()
+            .map_err(|_| "synteny cache lock poisoned".to_string())?;
+        if let Some((records, input_alignment_count, ignored_line_count)) =
+            cache.prepared_records(&key)
+        {
+            return Ok(prepared_paf_response(
+                &imported,
+                records,
+                input_alignment_count,
+                ignored_line_count,
+                true,
+            ));
+        }
+    }
+
+    let loaded = load_and_consolidate_paf_records(path)?;
+    let response = prepared_paf_response(
+        &imported,
+        &loaded.records,
+        loaded.input_alignment_count,
+        loaded.ignored_line_count,
+        false,
+    );
+    let mut cache = cache
+        .lock()
+        .map_err(|_| "synteny cache lock poisoned".to_string())?;
+    if let Some((records, input_alignment_count, ignored_line_count)) = cache.prepared_records(&key)
+    {
+        return Ok(prepared_paf_response(
+            &imported,
+            records,
+            input_alignment_count,
+            ignored_line_count,
+            true,
+        ));
+    }
+    cache.insert_prepared_records(
+        key,
+        loaded.records,
+        loaded.input_alignment_count,
+        loaded.ignored_line_count,
+    );
+    Ok(response)
+}
+
+fn prepared_paf_response(
+    imported: &ImportedContactFile,
+    records: &[cstudio_core::synteny::PafRecord],
+    input_alignment_count: usize,
+    ignored_line_count: usize,
+    cache_hit: bool,
+) -> PreparedPafResponse {
+    let query_count = records
+        .iter()
+        .map(|record| record.query_name.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let target_count = records
+        .iter()
+        .map(|record| record.target_name.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let retained_alignment_count = records
+        .iter()
+        .map(|record| record.alignment_count)
+        .sum::<usize>();
+    PreparedPafResponse {
+        path: imported.path.clone(),
+        name: imported.name.clone(),
+        size_bytes: imported.size_bytes,
+        cache_hit,
+        summary: PreparedPafSummaryResponse {
+            alignment_count: input_alignment_count,
+            ignored_lines: ignored_line_count,
+            query_count,
+            target_count,
+            chain_count: records.len(),
+            retained_alignment_count,
+            discarded_alignment_count: input_alignment_count
+                .saturating_sub(retained_alignment_count),
+        },
+        records: records.iter().map(prepared_paf_record_response).collect(),
+    }
+}
+
+fn prepared_paf_record_response(
+    record: &cstudio_core::synteny::PafRecord,
+) -> PreparedPafRecordResponse {
+    PreparedPafRecordResponse {
+        query_name: record.query_name.clone(),
+        query_start: record.query_start,
+        query_end: record.query_end,
+        query_length: record.query_len,
+        strand: record.strand.to_string(),
+        target_name: record.target_name.clone(),
+        target_start: record.target_start,
+        target_end: record.target_end,
+        target_length: record.target_len,
+        residue_matches: record.residue_matches,
+        alignment_block_len: record.alignment_block_len,
+        mapq: record.mapq,
+        alignment_type: record.alignment_type.map(|value| value.as_str()),
+        alignment_count: record.alignment_count,
+        fragments: record
+            .fragments
+            .iter()
+            .map(|fragment| PreparedPafFragmentResponse {
+                query_start: fragment.query_start,
+                query_end: fragment.query_end,
+                target_start: fragment.target_start,
+                target_end: fragment.target_end,
+                residue_matches: fragment.residue_matches,
+                alignment_block_len: fragment.alignment_block_len,
+                mapq: fragment.mapq,
+                alignment_type: fragment.alignment_type.map(|value| value.as_str()),
+            })
+            .collect(),
+    }
 }
 
 fn coverage_query_from_parts(
@@ -5952,6 +6242,20 @@ fn paf_record_from_request(
         return Err(format!("invalid strand: {}", request.strand));
     }
 
+    let fragments = request
+        .fragments
+        .into_iter()
+        .map(|fragment| cstudio_core::synteny::PafFragment {
+            query_start: fragment.query_start,
+            query_end: fragment.query_end,
+            target_start: fragment.target_start,
+            target_end: fragment.target_end,
+            residue_matches: fragment.residue_matches,
+            alignment_block_len: fragment.alignment_block_len,
+            mapq: fragment.mapq,
+            alignment_type: None,
+        })
+        .collect();
     Ok(cstudio_core::synteny::PafRecord {
         query_name: request.query_name,
         query_len: request.query_len,
@@ -5965,6 +6269,9 @@ fn paf_record_from_request(
         residue_matches: request.residue_matches,
         alignment_block_len: request.alignment_block_len,
         mapq: request.mapq,
+        alignment_type: None,
+        alignment_count: request.alignment_count.max(1),
+        fragments,
     })
 }
 
@@ -6031,24 +6338,26 @@ mod tests {
         cool::CoolPixelColumnReadPolicy,
         coverage_cache::CoverageCache,
         source_contact_cache::SourceContactCache,
+        synteny_cache::SyntenyCache,
     };
 
     use super::{
         build_contact_map_view, build_coverage_view, build_coverage_view_from_bedgraph_with_cache,
         build_synteny_view, contact_overview_aggregate_cell_bound, get_app_status,
         history_sidecar_path, layout_gfa_bandage_response, load_agp_bundle,
-        load_paf_text_from_path, load_project_directory, open_text_reader,
+        load_gfa_file_from_path, load_paf_text_from_path, load_project_directory, open_text_reader,
         persistent_contact_lod_cache_enabled_for_path, persistent_display_tile_plans,
-        persistent_lod_cache_key, sort_project_contact_candidates, write_agp_bundle,
-        write_agp_file, write_existing_agp_path, BedGraphRecordRequest, ContactMapBinRequest,
-        ContactMapCellResponse, ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest,
-        ContactMapTileKeyRequest, ContactMapTileResponse, ContactMapTilesFromCoolRequest,
-        ContactMapViewFromCoolRequest, ContactMapViewRequest, ContactMapViewportRequest,
-        ContactNormalizationRequest, ContactTileRequestPurpose, CoverageViewFromBedGraphRequest,
-        CoverageViewRequest, GfaBandageLayoutEdgeRequest, GfaBandageLayoutNodeRequest,
-        GfaBandageLayoutRequest, PafRecordRequest, PersistentDisplayCacheContext,
-        PersistentDisplayTileAccumulator, PersistentDisplayTilePlan, SyntenyViewRequest,
-        DISPLAY_CACHE_COPY_SEMANTICS_VERSION, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
+        persistent_lod_cache_key, prepare_paf_file_with_cache, sort_project_contact_candidates,
+        write_agp_bundle, write_agp_file, write_existing_agp_path, BedGraphRecordRequest,
+        ContactMapBinRequest, ContactMapCellResponse, ContactMapLayoutBlockRequest,
+        ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest, ContactMapTileResponse,
+        ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
+        ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
+        CoverageViewFromBedGraphRequest, CoverageViewRequest, GfaBandageLayoutEdgeRequest,
+        GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest, PafRecordRequest,
+        PersistentDisplayCacheContext, PersistentDisplayTileAccumulator, PersistentDisplayTilePlan,
+        SyntenyViewRequest, DISPLAY_CACHE_COPY_SEMANTICS_VERSION,
+        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
 
     #[test]
@@ -6161,7 +6470,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_project_directory_and_reads_gzip_text_inputs() {
+    fn scans_project_directory_without_reading_large_text_inputs() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -6183,11 +6492,17 @@ mod tests {
         let project = load_project_directory(root.to_string_lossy().into_owned()).unwrap();
         assert_eq!(project.agp.as_ref().unwrap().name, "a.agp");
         assert_eq!(project.history.as_ref().unwrap().name, "a.history.json");
-        assert_eq!(project.history.as_ref().unwrap().text, "{\"version\":1}");
-        assert_eq!(project.gfa.as_ref().unwrap().text, "S\tctg1\tACGT\n");
+        assert_eq!(project.history.as_ref().unwrap().size_bytes, 13);
+        assert_eq!(project.gfa.as_ref().unwrap().name, "graph.gfa.gz");
         assert_eq!(project.paf.as_ref().unwrap().name, "reads.paf.gz");
         assert_eq!(project.coverage.as_ref().unwrap().name, "track.depth.gz");
         assert_eq!(project.ignored_candidates.len(), 1);
+        assert_eq!(
+            load_gfa_file_from_path(&root.join("graph.gfa.gz"))
+                .unwrap()
+                .text,
+            "S\tctg1\tACGT\n"
+        );
         assert_eq!(
             open_text_reader(&root.join("graph.gfa.gz"))
                 .unwrap()
@@ -6200,7 +6515,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_plain_and_gzip_paf_text_for_frontend_allele_ranking() {
+    fn loads_plain_and_gzip_paf_text() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -6219,6 +6534,54 @@ mod tests {
 
         assert_eq!(load_paf_text_from_path(&plain_path).unwrap(), paf);
         assert_eq!(load_paf_text_from_path(&gzip_path).unwrap(), paf);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepares_paf_once_and_reuses_filtered_cache_records() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "c-studio-prepare-paf-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paf_path = root.join("alignments.paf");
+        fs::write(
+            &paf_path,
+            [
+                "ctg1\t100000\t0\t4000\t+\tchr1\t200000\t10000\t14000\t3800\t4000\t60\ttp:A:P",
+                "ctg1\t100000\t5000\t9000\t+\tchr1\t200000\t15000\t19000\t3700\t4000\t60",
+                "ctg1\t100000\t10000\t14000\t+\tchr1\t200000\t20000\t24000\t3600\t4000\t60",
+                "invalid\tline",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let cache = Mutex::new(SyntenyCache::new());
+
+        let first = prepare_paf_file_with_cache(&paf_path, &cache).unwrap();
+        let second = prepare_paf_file_with_cache(&paf_path, &cache).unwrap();
+
+        assert!(!first.cache_hit);
+        assert!(second.cache_hit);
+        assert_eq!(first.summary.alignment_count, 3);
+        assert_eq!(first.summary.ignored_lines, 1);
+        assert_eq!(first.summary.chain_count, 1);
+        assert_eq!(first.summary.retained_alignment_count, 3);
+        assert_eq!(first.summary.discarded_alignment_count, 0);
+        assert_eq!(first.records.len(), 1);
+        assert_eq!(first.records[0].fragments.len(), 3);
+        assert_eq!(first.records[0].alignment_type, Some("primary"));
+        assert_eq!(
+            first.records[0].fragments[0].alignment_type,
+            Some("primary")
+        );
+        assert_eq!(first.records, second.records);
+        assert_eq!(cache.lock().unwrap().entry_count(), 1);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -10194,7 +10557,7 @@ mod tests {
         let response = build_synteny_view(SyntenyViewRequest {
             viewport: ContactMapViewportRequest {
                 x_start: 0,
-                x_end: 5_000,
+                x_end: 50_000,
                 y_start: 0,
                 y_end: 1,
             },
@@ -10202,53 +10565,57 @@ mod tests {
                 id: "block-a".to_string(),
                 source_id: "contig-a".to_string(),
                 source_start: 0,
-                source_end: 5_000,
+                source_end: 50_000,
                 visual_start: 0,
                 orientation: "+".to_string(),
             }],
             paf_records: vec![
                 PafRecordRequest {
                     query_name: "contig-a".to_string(),
-                    query_len: 5_000,
+                    query_len: 50_000,
                     query_start: 0,
-                    query_end: 1_000,
+                    query_end: 10_000,
                     strand: "+".to_string(),
                     target_name: "mono1".to_string(),
-                    target_len: 50_000,
-                    target_start: 10_000,
-                    target_end: 11_000,
-                    residue_matches: 900,
-                    alignment_block_len: 1_000,
+                    target_len: 500_000,
+                    target_start: 100_000,
+                    target_end: 110_000,
+                    residue_matches: 9_000,
+                    alignment_block_len: 10_000,
                     mapq: 60,
+                    alignment_count: 1,
+                    fragments: Vec::new(),
                 },
                 PafRecordRequest {
                     query_name: "contig-a".to_string(),
-                    query_len: 5_000,
-                    query_start: 1_050,
-                    query_end: 2_000,
+                    query_len: 50_000,
+                    query_start: 10_000,
+                    query_end: 20_000,
                     strand: "+".to_string(),
                     target_name: "mono1".to_string(),
-                    target_len: 50_000,
-                    target_start: 11_050,
-                    target_end: 12_000,
-                    residue_matches: 850,
-                    alignment_block_len: 950,
+                    target_len: 500_000,
+                    target_start: 110_000,
+                    target_end: 120_000,
+                    residue_matches: 9_000,
+                    alignment_block_len: 10_000,
                     mapq: 55,
+                    alignment_count: 1,
+                    fragments: Vec::new(),
                 },
             ],
             min_mapq: 20,
-            min_alignment_len: 500,
-            max_query_gap: 100,
-            max_target_gap: 100,
+            min_alignment_len: 5_000,
+            max_query_gap: 1_000,
+            max_target_gap: 1_000,
         })
         .expect("valid synteny view request");
 
         assert_eq!(response.blocks.len(), 1);
         assert_eq!(response.blocks[0].assembly_block_id, "block-a");
         assert_eq!(response.blocks[0].visual_start, 0);
-        assert_eq!(response.blocks[0].visual_end, 2_000);
+        assert_eq!(response.blocks[0].visual_end, 20_000);
         assert_eq!(response.blocks[0].target_id, "mono1");
-        assert_eq!(response.blocks[0].target_length, 50_000);
+        assert_eq!(response.blocks[0].target_length, 500_000);
         assert_eq!(response.blocks[0].alignment_count, 2);
     }
 }

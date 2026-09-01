@@ -5,6 +5,7 @@ import type { ContactMapView, ExampleDatasetSummary } from "../App";
 import { keyboardShortcutLabels } from "../state/keyboardShortcutLabels";
 import { resolveChromosomeVisibility } from "../state/chromosomeVisibility";
 import { classifyGfaScaffolds } from "../state/gfaHomologLayout";
+import type { PafPreviewRecord } from "../state/pafPreview";
 import { createInitialUiState, type UiState } from "../state/uiState";
 import { AppShell, clampGfaPanelHeight, clampInspectorPanelWidth } from "./AppShell";
 
@@ -20,6 +21,7 @@ function renderShell(
     gfaHomologPattern?: string;
     includeUnanchoredInChromosomeFilter?: boolean;
     pafImported?: boolean;
+    pafRecords?: PafPreviewRecord[];
   } = {},
 ) {
   const uiState = createInitialUiState("Ready");
@@ -43,7 +45,7 @@ function renderShell(
       overviewContactMap={null}
       syntenyView={null}
       coverageView={null}
-      pafText=""
+      pafRecords={project.pafRecords ?? []}
       pafImported={project.pafImported ?? false}
       gfaDocument={null}
       gfaHomologPattern={gfaHomologPattern}
@@ -59,7 +61,6 @@ function renderShell(
       onHiddenChromosomeIdsChange={() => undefined}
       onChromosomeFilterPatternChange={() => undefined}
       onIncludeUnanchoredInChromosomeFilterChange={() => undefined}
-      onPafTextChange={() => undefined}
       agpInputRef={createRef<HTMLInputElement>()}
       gfaInputRef={createRef<HTMLInputElement>()}
       pafInputRef={createRef<HTMLInputElement>()}
@@ -162,13 +163,32 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain("Invalid regular expression:");
   });
 
-  it("offers a separate unload action for imported PAF data", () => {
+  it("does not mark PAF as imported until an import flag or prepared record exists", () => {
     const emptyMarkup = renderShell();
-    const loadedMarkup = renderShell(false, null, "None (Raw)", { pafImported: true });
+    const flaggedMarkup = renderShell(false, null, "None (Raw)", { pafImported: true });
+    const preparedMarkup = renderShell(false, null, "None (Raw)", {
+      pafRecords: [{
+        queryName: "ctg1",
+        queryLength: 20_000,
+        queryStart: 0,
+        queryEnd: 10_000,
+        strand: "+",
+        targetName: "chr1",
+        targetLength: 30_000,
+        targetStart: 0,
+        targetEnd: 10_000,
+        residueMatches: 9_500,
+        alignmentBlockLen: 10_000,
+        mapq: 60,
+        alignmentCount: 1,
+      }],
+    });
 
     expect(emptyMarkup).not.toContain('aria-label="Unload PAF alignments"');
-    expect(loadedMarkup).toContain('aria-label="Unload PAF alignments"');
-    expect(loadedMarkup).toContain('title="Unload only the PAF alignments"');
+    expect(emptyMarkup).toContain('title="No loaded data"');
+    expect(flaggedMarkup).toContain('aria-label="Unload PAF alignments"');
+    expect(flaggedMarkup).toContain('title="Unload only the PAF alignments"');
+    expect(preparedMarkup).toContain('aria-label="Unload PAF alignments"');
   });
 
   it("offers unanchored AGP objects as one aggregated filter option", () => {

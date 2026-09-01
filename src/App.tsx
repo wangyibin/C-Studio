@@ -185,7 +185,12 @@ import {
   placeHiddenChromosomeBlocksAfter,
   resolveChromosomeVisibility,
 } from "./state/chromosomeVisibility";
-import { summarizePafText } from "./state/pafPreview";
+import {
+  buildPafSyntenyPreview,
+  summarizePafPreview,
+  type PafPreviewRecord,
+  type PreparedPafFile,
+} from "./state/pafPreview";
 import {
   buildBrowserSyntenyView,
   buildSyntenyViewRequest,
@@ -309,14 +314,20 @@ interface ImportedProjectTextFile {
   text: string;
 }
 
+interface ImportedProjectFile {
+  path: string;
+  name: string;
+  size_bytes: number;
+}
+
 interface ImportedProjectDirectory {
   directory: string;
-  agp: ImportedProjectTextFile | null;
-  history: ImportedProjectTextFile | null;
-  gfa: ImportedProjectTextFile | null;
-  paf: ImportedContactFile | null;
-  coverage: ImportedContactFile | null;
-  contact: ImportedContactFile | null;
+  agp: ImportedProjectFile | null;
+  history: ImportedProjectFile | null;
+  gfa: ImportedProjectFile | null;
+  paf: ImportedProjectFile | null;
+  coverage: ImportedProjectFile | null;
+  contact: ImportedProjectFile | null;
   ignoredCandidates: string[];
 }
 
@@ -414,12 +425,6 @@ interface ContactPanPrefetchPlan {
   usesMainLod: boolean;
 }
 
-const samplePaf = [
-  "ctg00003\t1400000\t120000\t760000\t+\tchrA\t2200000\t240000\t900000\t600000\t640000\t60",
-  "ctg00008\t960000\t180000\t620000\t-\tchrA\t2200000\t1040000\t1500000\t390000\t440000\t48",
-  "ctg00012\t780000\t60000\t410000\t+\tchrB\t1600000\t260000\t620000\t300000\t350000\t35",
-].join("\n");
-
 const browserFallbackStatus: AppStatus = {
   version: "browser-preview",
   engine: "cstudio-core",
@@ -454,6 +459,15 @@ const contactTileStreamEnabled = import.meta.env.VITE_CSTUDIO_TILE_STREAM !== "0
 const contactTileSingleScanEnabled = import.meta.env.VITE_CSTUDIO_TILE_SINGLE_SCAN !== "0";
 const contactTileDirectDeltaEnabled = import.meta.env.VITE_CSTUDIO_TILE_DIRECT_DELTA !== "0";
 const contactMainLodEnabled = import.meta.env.VITE_CSTUDIO_MAIN_LOD !== "0";
+
+function yieldToProjectLoadPaint() {
+  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
 
 function emitContactFrontendPerformanceLine(line: string) {
   if (!contactTileIpcPerformanceEnabled) {
@@ -1124,7 +1138,7 @@ export function App() {
   const [syntenyView, setSyntenyView] = useState<SyntenyView | null>(null);
   const [coverageView, setCoverageView] = useState<CoverageView | null>(null);
   const [coverageRecords, setCoverageRecords] = useState<BedGraphRecord[]>([]);
-  const [pafText, setPafText] = useState(samplePaf);
+  const [pafRecords, setPafRecords] = useState<PafPreviewRecord[]>([]);
   const [pafPath, setPafPath] = useState<string | null>(null);
   const [pafImported, setPafImported] = useState(false);
   const [gfaDocument, setGfaDocument] = useState<GfaEvidenceDocument | null>(null);
@@ -4574,7 +4588,7 @@ export function App() {
   ]);
 
   useEffect(() => {
-    if (!backgroundAssemblyLayout.blocks.length || (!pafPath && !pafText.trim())) {
+    if (!backgroundAssemblyLayout.blocks.length || (!pafPath && pafRecords.length === 0)) {
       setSyntenyView(null);
       return;
     }
@@ -4593,7 +4607,7 @@ export function App() {
       viewport.xEnd,
     );
     const request = buildSyntenyViewRequest({
-      pafText: pafPath ? "" : pafText,
+      pafRecords: pafPath ? [] : pafRecords,
       viewport,
       layoutBlocks: syntenyLayoutBlocks,
     });
@@ -4642,7 +4656,7 @@ export function App() {
   }, [
     backgroundAssemblyLayout,
     pafPath,
-    pafText,
+    pafRecords,
     uiState.contact.viewportCenterXMb,
     uiState.contact.viewportSpanMb,
     uiState.contact.viewportWidthPx,
@@ -4657,9 +4671,9 @@ export function App() {
         invoke<ExampleDatasetSummary>("load_example_dataset"),
         invoke<string>("load_example_gfa_text"),
       ]);
-      const nativePafText = summary.paf_path
-        ? await invoke<string>("load_paf_text", { path: summary.paf_path })
-        : "";
+      const preparedPaf = summary.paf_path
+        ? await invoke<PreparedPafFile>("prepare_paf_file", { path: summary.paf_path })
+        : null;
       const importedDataset = ensureImportedDataset(summary);
       sourceAgpRef.current = sourceAgpSnapshot(
         importedDataset.agp_layout,
@@ -4675,7 +4689,7 @@ export function App() {
       setContactSources(importedDataset.contact_sources ?? []);
       setCoverageRecords([]);
       setPafPath(importedDataset.paf_path);
-      setPafText(nativePafText);
+      setPafRecords(preparedPaf?.records ?? []);
       setPafImported(Boolean(importedDataset.paf_path));
       setGfaDocument(parseGfaText(gfaText, "hifi.asm.bp.p_utg.noseq.gfa"));
       dispatchUi({ type: "setAssemblyBlocks", blocks: importedDataset.agp_layout.blocks });
@@ -4691,6 +4705,7 @@ export function App() {
       });
     } catch {
       const example = await loadBrowserExampleBundle();
+      const pafPreview = buildPafSyntenyPreview(example.pafText);
       sourceAgpRef.current = sourceAgpSnapshot(
         example.dataset.agp_layout,
         example.dataset.agp_path,
@@ -4705,7 +4720,7 @@ export function App() {
       setContactSources(example.dataset.contact_sources ?? []);
       setCoverageRecords(example.coverageRecords);
       setPafPath(null);
-      setPafText(example.pafText);
+      setPafRecords(pafPreview.records);
       setPafImported(true);
       setGfaDocument(example.gfaDocument);
       dispatchUi({ type: "setAssemblyBlocks", blocks: example.dataset.agp_layout.blocks });
@@ -4717,7 +4732,7 @@ export function App() {
       setStatusMessage("Example dataset loaded with coverage, PAF and GFA in browser preview");
       dispatchUi({
         type: "appendLog",
-        message: `Example dataset loaded in browser preview: ${example.coverageRecords.length.toLocaleString()} coverage records, ${summarizePafText(example.pafText).alignmentCount.toLocaleString()} PAF alignments and ${example.gfaDocument.summary.segmentCount.toLocaleString()} GFA segments`,
+        message: `Example dataset loaded in browser preview: ${example.coverageRecords.length.toLocaleString()} coverage records, ${pafPreview.inputAlignmentCount.toLocaleString()} PAF alignments and ${example.gfaDocument.summary.segmentCount.toLocaleString()} GFA segments`,
       });
     }
   }
@@ -4924,6 +4939,7 @@ export function App() {
   }
 
   async function loadProjectDirectory() {
+    let loadStage = "directory scan";
     try {
       const path = await open({
         title: "Select a C-Studio project folder",
@@ -4935,74 +4951,150 @@ export function App() {
         return;
       }
       const project = await invoke<ImportedProjectDirectory>("load_project_directory", { path });
-      const nativePafText = project.paf
-        ? await invoke<string>("load_paf_text", { path: project.paf.path })
-        : "";
+      clearAllLoadedData(false);
 
-      const agpText = project.agp?.text;
-      const agpLayout = agpText ? parseAgpLayout(agpText) : emptyAgpLayout();
-      const canonicalAgp = exportAgpText(agpLayout.blocks);
-      const restoredHistory = project.agp
-        ? restoreImportedHistory(
-            project.history?.text ?? null,
-            canonicalAgp,
-            project.history?.name ?? operationHistoryFilename(project.agp.name),
-          )
-        : null;
-      const agpSummary = agpText ? summarizeAgpText(agpText) : null;
-      const gfaDocument = project.gfa ? parseGfaText(project.gfa.text, project.gfa.name) : null;
-      if (project.gfa && gfaDocument?.summary.segmentCount === 0) {
-        throw new Error(`${project.gfa.name}: no GFA S records found`);
-      }
+      const loaded: string[] = [];
+      let agpLayout = emptyAgpLayout();
+      let agpSummary: ReturnType<typeof summarizeAgpText> | null = null;
 
-      // A loaded source file is not a user-confirmed save destination. The
-      // first explicit Save must ask where the edited AGP should be written.
-      savedAgpPathRef.current = null;
-      sourceAgpRef.current = project.agp
-        ? sourceAgpSnapshot(agpLayout, project.agp.path)
-        : null;
-      setSavedAgpPath(null);
-      setSavedAgpText(project.agp ? canonicalAgp : "");
-      setSavedHistoryIdentity(project.agp ? historyIdentityForArchive(restoredHistory) : "");
-      dispatchAssemblyImport(agpLayout.blocks, restoredHistory);
       if (project.agp) {
+        loadStage = "AGP (1/5)";
+        setStatusMessage(`Loading project 1/5: AGP — ${project.agp.name}`);
+        await yieldToProjectLoadPaint();
+        const bundle = await invoke<ImportedAgpBundle>("load_agp_bundle", {
+          path: project.agp.path,
+        });
+        agpLayout = parseAgpLayout(bundle.agp.text);
+        agpSummary = summarizeAgpText(bundle.agp.text);
+        const canonicalAgp = exportAgpText(agpLayout.blocks);
+        const restoredHistory = restoreImportedHistory(
+          bundle.history?.text ?? null,
+          canonicalAgp,
+          bundle.history?.name ?? operationHistoryFilename(bundle.agp.name),
+        );
+
+        // A loaded source file is not a user-confirmed save destination. The
+        // first explicit Save must ask where the edited AGP should be written.
+        savedAgpPathRef.current = null;
+        sourceAgpRef.current = sourceAgpSnapshot(agpLayout, bundle.agp.path);
+        setSavedAgpPath(null);
+        setSavedAgpText(canonicalAgp);
+        setSavedHistoryIdentity(historyIdentityForArchive(restoredHistory));
+        dispatchAssemblyImport(agpLayout.blocks, restoredHistory);
+        dispatchUi({ type: "setOverviewMode", mode: "overview" });
         dispatchUi({ type: "fitContactViewport", totalSpanMb: agpLayout.totalSpan / 1_000_000 });
+        setDataset(buildDatasetSummary({
+          agpPath: bundle.agp.path,
+          mcoolPath: "",
+          coolPath: "",
+          pafPath: null,
+          agpLines: agpSummary.lineCount,
+          agpObjects: agpSummary.objectCount,
+          agpComponents: agpSummary.componentCount,
+          agpGaps: agpSummary.gapCount,
+          maxObjectSpan: agpSummary.maxObjectSpan,
+          mcoolSizeBytes: 0,
+          coveragePath: null,
+          agpLayout,
+          availableResolutions: [],
+          contactSources: [],
+        }));
+        loaded.push(bundle.agp.name);
+        if (bundle.history) loaded.push(bundle.history.name);
+        dispatchUi({ type: "appendLog", message: `Project stage 1/5 complete: AGP ${bundle.agp.name}` });
       }
-      setGfaDocument(gfaDocument);
-      dispatchUi({ type: "setOverviewMode", mode: "overview" });
+
+      if (project.contact) {
+        loadStage = "MCOOL (2/5)";
+        setStatusMessage(`Loading project 2/5: contact map — ${project.contact.name}`);
+        await yieldToProjectLoadPaint();
+        const contact = await invoke<ImportedContactFile>("load_contact_file", {
+          path: project.contact.path,
+        });
+        setDataset((current) => buildDatasetSummary({
+          agpPath: current?.agp_path ?? project.agp?.path ?? "",
+          mcoolPath: contact.name,
+          coolPath: contact.path,
+          pafPath: current?.paf_path ?? null,
+          agpLines: current?.agp_lines ?? agpSummary?.lineCount ?? 0,
+          agpObjects: current?.agp_objects ?? agpSummary?.objectCount ?? 0,
+          agpComponents: current?.agp_components ?? agpSummary?.componentCount ?? 0,
+          agpGaps: current?.agp_gaps ?? agpSummary?.gapCount ?? 0,
+          maxObjectSpan: current?.max_object_span ?? agpSummary?.maxObjectSpan ?? 0,
+          mcoolSizeBytes: contact.size_bytes,
+          coveragePath: current?.coverage_path ?? null,
+          agpLayout: current?.agp_layout ?? agpLayout,
+          availableResolutions: contact.available_resolutions,
+          contactSources: contact.sources,
+        }));
+        setContactAvailableResolutions(contact.available_resolutions ?? []);
+        setContactSources(contact.sources ?? []);
+        loaded.push(contact.name);
+        dispatchUi({ type: "appendLog", message: `Project stage 2/5 complete: contact map ${contact.name}` });
+      }
+
+      if (project.coverage) {
+        loadStage = "Coverage (3/5)";
+        setStatusMessage(`Loading project 3/5: coverage — ${project.coverage.name}`);
+        await yieldToProjectLoadPaint();
+        const coverage = await invoke<ImportedContactFile>("load_coverage_file", {
+          path: project.coverage.path,
+        });
+        setCoverageRecords([]);
+        setDataset((current) => current
+          ? { ...current, coverage_path: coverage.path }
+          : buildDatasetSummary({
+              agpPath: project.agp?.path ?? "",
+              mcoolPath: "",
+              coolPath: "",
+              pafPath: null,
+              agpLines: agpSummary?.lineCount ?? 0,
+              agpObjects: agpSummary?.objectCount ?? 0,
+              agpComponents: agpSummary?.componentCount ?? 0,
+              agpGaps: agpSummary?.gapCount ?? 0,
+              maxObjectSpan: agpSummary?.maxObjectSpan ?? 0,
+              mcoolSizeBytes: 0,
+              coveragePath: coverage.path,
+              agpLayout,
+              availableResolutions: [],
+              contactSources: [],
+            }));
+        loaded.push(coverage.name);
+        dispatchUi({ type: "appendLog", message: `Project stage 3/5 complete: coverage ${coverage.name}` });
+      }
+
       if (project.paf) {
-        setPafPath(project.paf.path);
-        setPafText(nativePafText);
+        loadStage = "Synteny (4/5)";
+        setStatusMessage(`Loading project 4/5: synteny — ${project.paf.name}`);
+        await yieldToProjectLoadPaint();
+        const paf = await invoke<PreparedPafFile>("prepare_paf_file", {
+          path: project.paf.path,
+        });
+        setPafPath(paf.path);
+        setPafRecords(paf.records);
         setPafImported(true);
-      } else {
-        setPafPath(null);
-        setPafText("");
-        setPafImported(false);
+        setDataset((current) => current ? { ...current, paf_path: paf.path } : current);
+        loaded.push(paf.name);
+        dispatchUi({ type: "appendLog", message: `Project stage 4/5 complete: synteny ${paf.name}` });
       }
-      setCoverageRecords([]);
 
-      const contact = project.contact;
-      setDataset(buildDatasetSummary({
-        agpPath: project.agp?.path ?? "",
-        mcoolPath: contact?.name ?? "",
-        coolPath: contact?.path ?? "",
-        agpLines: agpSummary?.lineCount ?? 0,
-        agpObjects: agpSummary?.objectCount ?? 0,
-        agpComponents: agpSummary?.componentCount ?? 0,
-        agpGaps: agpSummary?.gapCount ?? 0,
-        maxObjectSpan: agpSummary?.maxObjectSpan ?? 0,
-        mcoolSizeBytes: contact?.size_bytes ?? 0,
-        coveragePath: project.coverage?.path ?? null,
-        agpLayout,
-        availableResolutions: contact?.available_resolutions ?? [],
-        contactSources: contact?.sources ?? [],
-      }));
-      setContactAvailableResolutions(contact?.available_resolutions ?? []);
-      setContactSources(contact?.sources ?? []);
+      if (project.gfa) {
+        loadStage = "GFA (5/5)";
+        setStatusMessage(`Loading project 5/5: GFA — ${project.gfa.name}`);
+        await yieldToProjectLoadPaint();
+        const gfa = await invoke<ImportedProjectTextFile>("load_gfa_file", {
+          path: project.gfa.path,
+        });
+        const gfaDocument = parseGfaText(gfa.text, gfa.name);
+        gfa.text = "";
+        if (gfaDocument.summary.segmentCount === 0) {
+          throw new Error(`${gfa.name}: no GFA S records found`);
+        }
+        setGfaDocument(gfaDocument);
+        loaded.push(gfa.name);
+        dispatchUi({ type: "appendLog", message: `Project stage 5/5 complete: GFA ${gfa.name}` });
+      }
 
-      const loaded = [project.agp, project.history, project.gfa, project.paf, project.coverage, project.contact]
-        .filter((file): file is ImportedProjectTextFile | ImportedContactFile => file !== null)
-        .map((file) => file.name);
       const skipped = project.ignoredCandidates.length;
       setStatusMessage(`Project loaded: ${loaded.join(", ")}${skipped ? `; ${skipped} duplicate candidate${skipped === 1 ? "" : "s"} skipped` : ""}`);
       dispatchUi({
@@ -5010,8 +5102,8 @@ export function App() {
         message: `Project folder loaded: ${project.directory}; ${loaded.join(", ")}${skipped ? `; skipped duplicate candidates: ${project.ignoredCandidates.join(", ")}` : ""}`,
       });
     } catch (error) {
-      setStatusMessage(`Project load failed: ${String(error)}`);
-      dispatchUi({ type: "appendLog", message: `Project load failed: ${String(error)}` });
+      setStatusMessage(`Project load failed during ${loadStage}: ${String(error)}`);
+      dispatchUi({ type: "appendLog", message: `Project load failed during ${loadStage}: ${String(error)}` });
     }
   }
 
@@ -5030,16 +5122,18 @@ export function App() {
         setStatusMessage("PAF import canceled");
         return;
       }
-      const selected = await invoke<ImportedContactFile>("load_paf_file", { path });
-      const nativePafText = await invoke<string>("load_paf_text", { path: selected.path });
+      const selected = await invoke<PreparedPafFile>("prepare_paf_file", { path });
+      const summary = selected.summary;
       setPafPath(selected.path);
-      setPafText(nativePafText);
+      setPafRecords(selected.records);
       setPafImported(true);
-      setStatusMessage(`PAF imported: ${selected.name}`);
+      setStatusMessage(
+        `PAF imported: ${selected.name} (${summary.alignmentCount.toLocaleString()} alignments → ${summary.chainCount.toLocaleString()} chains)`,
+      );
       dispatchUi({ type: "setOverviewMode", mode: "overview" });
       dispatchUi({
         type: "appendLog",
-        message: `PAF imported natively: ${selected.name} (${selected.size_bytes.toLocaleString()} bytes)`,
+        message: `PAF imported natively: ${selected.name} (${selected.sizeBytes.toLocaleString()} bytes); ${summary.alignmentCount.toLocaleString()} alignments → ${summary.chainCount.toLocaleString()} chains, ${summary.discardedAlignmentCount.toLocaleString()} fragments filtered`,
       });
     } catch {
       pafInputRef.current?.click();
@@ -5048,18 +5142,19 @@ export function App() {
 
   async function importPafFile(file: File) {
     const text = await readImportedTextFile(file);
-    const summary = summarizePafText(text);
+    const preview = buildPafSyntenyPreview(text);
+    const summary = summarizePafPreview(preview);
 
     setPafPath(null);
-    setPafText(text);
+    setPafRecords(preview.records);
     setPafImported(true);
     setStatusMessage(
-      `PAF imported: ${file.name} (${summary.alignmentCount.toLocaleString()} alignments)`,
+      `PAF imported: ${file.name} (${summary.alignmentCount.toLocaleString()} alignments → ${summary.chainCount.toLocaleString()} chains)`,
     );
     dispatchUi({ type: "setOverviewMode", mode: "overview" });
     dispatchUi({
       type: "appendLog",
-      message: `PAF imported: ${file.name}; ${summary.alignmentCount.toLocaleString()} alignments, ${summary.ignoredLines.toLocaleString()} ignored`,
+      message: `PAF imported: ${file.name}; ${summary.alignmentCount.toLocaleString()} alignments → ${summary.chainCount.toLocaleString()} chains, ${summary.discardedAlignmentCount.toLocaleString()} fragments filtered, ${summary.ignoredLines.toLocaleString()} invalid lines ignored`,
     });
   }
 
@@ -5162,7 +5257,7 @@ export function App() {
 
   function unloadPafData() {
     setPafPath(null);
-    setPafText("");
+    setPafRecords([]);
     setPafImported(false);
     setSyntenyView(null);
     setPlacementPreview(null);
@@ -5211,7 +5306,7 @@ export function App() {
     dispatchUi({ type: "appendLog", message: "Contact map unloaded" });
   }
 
-  function clearAllLoadedData() {
+  function clearAllLoadedData(announce = true) {
     const generation = contactTileGenerationRef.current + 1;
     contactTileGenerationRef.current = generation;
     contactTilePerformance.supersedeBefore(generation);
@@ -5259,11 +5354,13 @@ export function App() {
     setCoverageRecords([]);
     setSyntenyView(null);
     setPafPath(null);
-    setPafText("");
+    setPafRecords([]);
     setPafImported(false);
     setGfaDocument(null);
     dispatchUi({ type: "clearLoadedData" });
-    setStatusMessage("All loaded data cleared");
+    if (announce) {
+      setStatusMessage("All loaded data cleared");
+    }
 
     if (agpInputRef.current) {
       agpInputRef.current.value = "";
@@ -6059,7 +6156,7 @@ export function App() {
       overviewContactMap={overviewContactMap}
       syntenyView={syntenyView}
       coverageView={coverageView}
-      pafText={pafText}
+      pafRecords={pafRecords}
       pafImported={pafImported}
       gfaDocument={gfaDocument}
       onLayoutGfaBandage={loadGfaBandageLayout}
@@ -6078,10 +6175,6 @@ export function App() {
       onHiddenChromosomeIdsChange={setHiddenChromosomeIds}
       onChromosomeFilterPatternChange={setChromosomeFilterPattern}
       onIncludeUnanchoredInChromosomeFilterChange={setIncludeUnanchoredInChromosomeFilter}
-      onPafTextChange={(value) => {
-        setPafPath(null);
-        setPafText(value);
-      }}
       agpInputRef={agpInputRef}
       gfaInputRef={gfaInputRef}
       pafInputRef={pafInputRef}

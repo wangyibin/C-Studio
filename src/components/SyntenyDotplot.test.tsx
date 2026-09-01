@@ -5,6 +5,8 @@ import {
   buildAssemblyTrack,
   buildDotplotLayout,
   dominantSyntenyTargetByChromosome,
+  maximumSyntenyDotplotSegments,
+  selectSyntenyBlocksForRendering,
   syntenyBlockIdsInSelection,
   syntenySelectedContigRanges,
   syntenySelectedReferenceRanges,
@@ -47,6 +49,27 @@ const syntenyView: SyntenyView = {
 };
 
 describe("SyntenyDotplot", () => {
+  it("caps dense dotplot DOM while retaining every represented target lane", () => {
+    const blocks = Array.from(
+      { length: maximumSyntenyDotplotSegments + 5 },
+      (_, index) => ({
+        ...syntenyView.blocks[0],
+        assemblyBlockId: `block-${index}`,
+        visualStart: index * 10,
+        visualEnd: index * 10 + 5,
+        targetId: index === maximumSyntenyDotplotSegments + 4 ? "rare-target" : "target-1",
+        alignmentCount: index % 3 + 1,
+      }),
+    );
+
+    const selected = selectSyntenyBlocksForRendering(blocks);
+
+    expect(selected).toHaveLength(maximumSyntenyDotplotSegments);
+    expect(new Set(selected.map((block) => block.targetId))).toEqual(
+      new Set(["target-1", "rare-target"]),
+    );
+  });
+
   it("renders assembly instances as keyboard-accessible selectable blocks", () => {
     const markup = renderToStaticMarkup(
       <SyntenyDotplot

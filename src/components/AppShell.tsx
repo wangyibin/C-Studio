@@ -27,6 +27,7 @@ import {
   selectedBlockIds,
 } from "../state/assemblyEditing";
 import type { CoverageView } from "../state/coverageView";
+import type { PafPreviewRecord } from "../state/pafPreview";
 import type { GfaEvidenceDocument } from "../state/gfa";
 import type { GfaBandageLayoutLoader } from "../state/gfaBandageLayout";
 import {
@@ -89,7 +90,7 @@ interface AppShellProps {
   overviewContactMap: ContactMapView | null;
   syntenyView: SyntenyView | null;
   coverageView: CoverageView | null;
-  pafText: string;
+  pafRecords: ReadonlyArray<PafPreviewRecord>;
   pafImported: boolean;
   gfaDocument: GfaEvidenceDocument | null;
   onLayoutGfaBandage?: GfaBandageLayoutLoader;
@@ -107,7 +108,6 @@ interface AppShellProps {
   onHiddenChromosomeIdsChange: (ids: Set<string>) => void;
   onChromosomeFilterPatternChange: (pattern: string) => void;
   onIncludeUnanchoredInChromosomeFilterChange: (include: boolean) => void;
-  onPafTextChange: (value: string) => void;
   agpInputRef: RefObject<HTMLInputElement>;
   gfaInputRef: RefObject<HTMLInputElement>;
   pafInputRef: RefObject<HTMLInputElement>;
@@ -198,7 +198,7 @@ export function AppShell({
   overviewContactMap,
   syntenyView,
   coverageView,
-  pafText,
+  pafRecords,
   pafImported,
   gfaDocument,
   onLayoutGfaBandage,
@@ -216,7 +216,6 @@ export function AppShell({
   onHiddenChromosomeIdsChange,
   onChromosomeFilterPatternChange,
   onIncludeUnanchoredInChromosomeFilterChange,
-  onPafTextChange,
   agpInputRef,
   gfaInputRef,
   pafInputRef,
@@ -301,7 +300,7 @@ export function AppShell({
   const sourceAssemblyAvailable = Boolean(dataset?.agp_layout.blocks.length);
   const contactImported = Boolean(dataset?.mcool_path || dataset?.cool_path || contactMap);
   const coverageImported = Boolean(dataset?.coverage_path || coverageView);
-  const syntenyImported = Boolean(pafImported || pafText.trim() || syntenyView);
+  const syntenyImported = Boolean(pafImported || pafRecords.length || syntenyView);
   const gfaImported = gfaDocument !== null;
   const gfaHomologPatternError = classifyGfaScaffolds([], gfaHomologPattern).error;
   const loadedDataLabels = [
@@ -1522,8 +1521,7 @@ export function AppShell({
               assemblyBlocks={activeAssemblyBlocks}
               viewAssemblyBlocks={viewAssemblyBlocks}
               selectedAssemblyBlockIds={selectedAssemblyBlockIds}
-              pafText={pafText}
-              onPafTextChange={onPafTextChange}
+              pafRecords={pafRecords}
               gfaDocument={gfaDocument}
               gfaHomologPattern={gfaHomologPattern}
               gfaPreviewScaffoldIds={gfaPreviewScaffoldIds}

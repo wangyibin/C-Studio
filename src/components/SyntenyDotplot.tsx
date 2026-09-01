@@ -119,6 +119,7 @@ const syntenyPlotLeftPercent = 9;
 const syntenyPlotRightPercent = 97;
 const syntenyPlotTopPercent = 7;
 const syntenyPlotBottomPercent = 93;
+export const maximumSyntenyDotplotSegments = 2_000;
 
 export function SyntenyDotplot({
   syntenyView,
@@ -852,7 +853,15 @@ export function buildDotplotLayout(
     ? canvasAspectRatio
     : 1;
 
-  const blocks = syntenyView.blocks.flatMap((block) => {
+  const visibleBlocks = syntenyView.blocks.filter((block) => (
+    block.visualEnd > syntenyView.viewport.xStart
+    && block.visualStart < syntenyView.viewport.xEnd
+  ));
+  const renderBlocks = selectSyntenyBlocksForRendering(
+    visibleBlocks,
+    maximumSyntenyDotplotSegments,
+  );
+  const blocks = renderBlocks.flatMap((block) => {
     const lane = lanesById.get(block.targetId);
     const visualSpan = block.visualEnd - block.visualStart;
     if (!lane || visualSpan <= 0) {
@@ -902,11 +911,56 @@ export function buildDotplotLayout(
         block.targetId
       }:${Math.round(Math.min(targetAtVisibleStart, targetAtVisibleEnd))}-${Math.round(
         Math.max(targetAtVisibleStart, targetAtVisibleEnd),
-      )}`,
+      )}${block.alignmentCount > 1 ? ` · ${block.alignmentCount} chained fragments` : ""}`,
     }];
   });
 
   return { blocks, targetLanes };
+}
+
+export function selectSyntenyBlocksForRendering(
+  blocks: ReadonlyArray<SyntenyBlockView>,
+  maximum = maximumSyntenyDotplotSegments,
+): SyntenyBlockView[] {
+  const limit = Math.max(0, Math.floor(maximum));
+  if (blocks.length <= limit) {
+    return [...blocks];
+  }
+  if (limit === 0) {
+    return [];
+  }
+
+  const ranked = blocks.map((block, index) => ({ block, index }));
+  const compare = (
+    left: (typeof ranked)[number],
+    right: (typeof ranked)[number],
+  ) => (
+    right.block.alignmentCount - left.block.alignmentCount
+    || (right.block.visualEnd - right.block.visualStart)
+      - (left.block.visualEnd - left.block.visualStart)
+    || right.block.mapq - left.block.mapq
+    || left.index - right.index
+  );
+  const bestByTarget = new Map<string, (typeof ranked)[number]>();
+  for (const candidate of ranked) {
+    const current = bestByTarget.get(candidate.block.targetId);
+    if (!current || compare(candidate, current) < 0) {
+      bestByTarget.set(candidate.block.targetId, candidate);
+    }
+  }
+  const selected = new Set(
+    [...bestByTarget.values()]
+      .sort(compare)
+      .slice(0, limit)
+      .map((candidate) => candidate.index),
+  );
+  for (const candidate of ranked.sort(compare)) {
+    if (selected.size >= limit) {
+      break;
+    }
+    selected.add(candidate.index);
+  }
+  return blocks.filter((_, index) => selected.has(index));
 }
 
 export function syntenyViewForAssemblyExtent(

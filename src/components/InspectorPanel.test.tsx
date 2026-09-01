@@ -146,8 +146,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={uiState.assembly.blocks}
         selectedAssemblyBlockIds={[]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
         onExpandHeatmap={() => undefined}
       />,
     );
@@ -192,8 +191,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={editedBlocks}
         selectedAssemblyBlockIds={[]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
       />,
     );
 
@@ -230,8 +228,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={[]}
         selectedAssemblyBlockIds={[]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
       />,
     );
 
@@ -256,8 +253,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={uiState.assembly.blocks}
         selectedAssemblyBlockIds={[]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
       />,
     );
 
@@ -289,8 +285,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={[]}
         selectedAssemblyBlockIds={[]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
         gfaDocument={{
           fileName: "a-very-long-hifiasm-primary-assembly-graph-file-name.gfa",
           segments: {
@@ -381,8 +376,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={uiState.assembly.blocks}
         selectedAssemblyBlockIds={uiState.assembly.selection.ids}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
       />,
     );
 
@@ -444,8 +438,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={uiState.assembly.blocks}
         selectedAssemblyBlockIds={["Chr01:1:ctg1", "Chr01:2:ctg2"]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
       />,
     );
 
@@ -520,8 +513,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={uiState.assembly.blocks}
         selectedAssemblyBlockIds={["Chr01:1:ctg1", "Chr01:2:ctg2"]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
       />,
     );
 
@@ -647,8 +639,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={uiState.assembly.blocks}
         selectedAssemblyBlockIds={["Chr01:1:utg1:left"]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
       />,
     );
 
@@ -706,8 +697,7 @@ describe("InspectorPanel", () => {
         syntenyView={null}
         assemblyBlocks={uiState.assembly.blocks}
         selectedAssemblyBlockIds={[]}
-        pafText=""
-        onPafTextChange={() => undefined}
+        pafRecords={[]}
       />,
     );
 

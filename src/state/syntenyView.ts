@@ -1,5 +1,5 @@
 import type { ContactMapLayoutBlock } from "./importers";
-import { buildPafSyntenyPreview } from "./pafPreview";
+import type { PafPreviewRecord } from "./pafPreview";
 import { buildCenteredContactViewport, type ContactViewport } from "./contactViewport";
 
 export interface SyntenyBlockView {
@@ -37,6 +37,16 @@ export interface SyntenyViewRequest {
     residueMatches: number;
     alignmentBlockLen: number;
     mapq: number;
+    alignmentCount: number;
+    fragments?: Array<{
+      queryStart: number;
+      queryEnd: number;
+      targetStart: number;
+      targetEnd: number;
+      residueMatches: number;
+      alignmentBlockLen: number;
+      mapq: number;
+    }>;
   }>;
   minMapq: number;
   minAlignmentLen: number;
@@ -45,7 +55,7 @@ export interface SyntenyViewRequest {
 }
 
 interface BuildSyntenyViewRequestInput {
-  pafText: string;
+  pafRecords: ReadonlyArray<PafPreviewRecord>;
   viewport: ContactViewport;
   layoutBlocks: ContactMapLayoutBlock[];
 }
@@ -79,16 +89,14 @@ export function buildSyntenyViewport({
 }
 
 export function buildSyntenyViewRequest({
-  pafText,
+  pafRecords,
   viewport,
   layoutBlocks,
 }: BuildSyntenyViewRequestInput): SyntenyViewRequest {
-  const preview = buildPafSyntenyPreview(pafText);
-
   return {
     viewport,
     layoutBlocks,
-    pafRecords: preview.records.map((record) => ({
+    pafRecords: pafRecords.map((record) => ({
       queryName: record.queryName,
       queryLen: record.queryLength,
       queryStart: record.queryStart,
@@ -101,68 +109,106 @@ export function buildSyntenyViewRequest({
       residueMatches: record.residueMatches,
       alignmentBlockLen: record.alignmentBlockLen,
       mapq: record.mapq,
+      alignmentCount: record.alignmentCount ?? 1,
+      fragments: record.fragments?.map((fragment) => ({
+        queryStart: fragment.queryStart,
+        queryEnd: fragment.queryEnd,
+        targetStart: fragment.targetStart,
+        targetEnd: fragment.targetEnd,
+        residueMatches: fragment.residueMatches,
+        alignmentBlockLen: fragment.alignmentBlockLen,
+        mapq: fragment.mapq,
+      })),
     })),
     minMapq: 0,
-    minAlignmentLen: 1,
+    minAlignmentLen: 10_000,
     maxQueryGap: 100_000,
     maxTargetGap: 100_000,
   };
 }
 
 export function buildBrowserSyntenyView(request: SyntenyViewRequest): SyntenyView {
+  const layoutBlocksBySource = new Map<string, ContactMapLayoutBlock[]>();
+  for (const layoutBlock of request.layoutBlocks) {
+    const sourceBlocks = layoutBlocksBySource.get(layoutBlock.sourceId);
+    if (sourceBlocks) {
+      sourceBlocks.push(layoutBlock);
+    } else {
+      layoutBlocksBySource.set(layoutBlock.sourceId, [layoutBlock]);
+    }
+  }
+
   const blocks = request.pafRecords.flatMap((record) => {
-    if (record.mapq < request.minMapq || record.alignmentBlockLen < request.minAlignmentLen) {
-      return [];
-    }
-
-    const querySpan = record.queryEnd - record.queryStart;
-    if (querySpan <= 0 || record.targetEnd <= record.targetStart) {
-      return [];
-    }
-
-    return request.layoutBlocks.flatMap((layoutBlock) => {
-      if (layoutBlock.sourceId !== record.queryName) {
+    const retainedChainFragments = record.fragments?.length ? record.fragments : null;
+    const fragments = retainedChainFragments ?? [{
+      queryStart: record.queryStart,
+      queryEnd: record.queryEnd,
+      targetStart: record.targetStart,
+      targetEnd: record.targetEnd,
+      residueMatches: record.residueMatches,
+      alignmentBlockLen: record.alignmentBlockLen,
+      mapq: record.mapq,
+    }];
+    return fragments.flatMap((fragment) => {
+      if (
+        fragment.mapq < request.minMapq
+        || (
+          retainedChainFragments === null
+          && fragment.alignmentBlockLen < request.minAlignmentLen
+        )
+      ) {
         return [];
       }
-
-      const overlapStart = Math.max(record.queryStart, layoutBlock.sourceStart);
-      const overlapEnd = Math.min(record.queryEnd, layoutBlock.sourceEnd);
-      if (overlapEnd - overlapStart < request.minAlignmentLen) {
+      const querySpan = fragment.queryEnd - fragment.queryStart;
+      if (querySpan <= 0 || fragment.targetEnd <= fragment.targetStart) {
         return [];
       }
+      return (layoutBlocksBySource.get(record.queryName) ?? []).flatMap((layoutBlock) => {
+        const overlapStart = Math.max(fragment.queryStart, layoutBlock.sourceStart);
+        const overlapEnd = Math.min(fragment.queryEnd, layoutBlock.sourceEnd);
+        if (
+          overlapEnd <= overlapStart
+          || (
+            retainedChainFragments === null
+            && overlapEnd - overlapStart < request.minAlignmentLen
+          )
+        ) {
+          return [];
+        }
 
-      const visualStart = layoutBlock.orientation === "-"
-        ? layoutBlock.visualStart + layoutBlock.sourceEnd - overlapEnd
-        : layoutBlock.visualStart + overlapStart - layoutBlock.sourceStart;
-      const visualEnd = layoutBlock.orientation === "-"
-        ? layoutBlock.visualStart + layoutBlock.sourceEnd - overlapStart
-        : layoutBlock.visualStart + overlapEnd - layoutBlock.sourceStart;
-      if (visualEnd <= request.viewport.xStart || visualStart >= request.viewport.xEnd) {
-        return [];
-      }
+        const visualStart = layoutBlock.orientation === "-"
+          ? layoutBlock.visualStart + layoutBlock.sourceEnd - overlapEnd
+          : layoutBlock.visualStart + overlapStart - layoutBlock.sourceStart;
+        const visualEnd = layoutBlock.orientation === "-"
+          ? layoutBlock.visualStart + layoutBlock.sourceEnd - overlapStart
+          : layoutBlock.visualStart + overlapEnd - layoutBlock.sourceStart;
+        if (visualEnd <= request.viewport.xStart || visualStart >= request.viewport.xEnd) {
+          return [];
+        }
 
-      const targetSpan = record.targetEnd - record.targetStart;
-      const targetStart = record.targetStart
-        + Math.floor((targetSpan * (overlapStart - record.queryStart)) / querySpan);
-      const targetEnd = record.targetStart
-        + Math.floor((targetSpan * (overlapEnd - record.queryStart)) / querySpan);
-      const strand = layoutBlock.orientation === "-"
-        ? record.strand === "+" ? "-" : record.strand === "-" ? "+" : record.strand
-        : record.strand;
+        const targetSpan = fragment.targetEnd - fragment.targetStart;
+        const targetStart = fragment.targetStart
+          + Math.floor((targetSpan * (overlapStart - fragment.queryStart)) / querySpan);
+        const targetEnd = fragment.targetStart
+          + Math.floor((targetSpan * (overlapEnd - fragment.queryStart)) / querySpan);
+        const strand = layoutBlock.orientation === "-"
+          ? record.strand === "+" ? "-" : record.strand === "-" ? "+" : record.strand
+          : record.strand;
 
-      return [{
-        assemblyBlockId: layoutBlock.id,
-        querySourceId: record.queryName,
-        visualStart,
-        visualEnd,
-        targetId: record.targetName,
-        targetLength: record.targetLen,
-        targetStart,
-        targetEnd,
-        strand,
-        mapq: record.mapq,
-        alignmentCount: 1,
-      }];
+        return [{
+          assemblyBlockId: layoutBlock.id,
+          querySourceId: record.queryName,
+          visualStart,
+          visualEnd,
+          targetId: record.targetName,
+          targetLength: record.targetLen,
+          targetStart,
+          targetEnd,
+          strand,
+          mapq: fragment.mapq,
+          alignmentCount: record.alignmentCount,
+        }];
+      });
     });
   });
 

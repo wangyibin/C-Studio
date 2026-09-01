@@ -42,6 +42,7 @@ import {
 import { fitContextMenuToViewport } from "./AssemblyContextMenu";
 import { GfaPreviewCard } from "./GfaGraphPanel";
 import { AssemblyPlacementRecommendationCard } from "./AssemblyPlacementRecommendationCard";
+import type { PafPreviewRecord } from "../state/pafPreview";
 
 interface InspectorPanelProps {
   dataset: ExampleDatasetSummary | null;
@@ -57,8 +58,7 @@ interface InspectorPanelProps {
   assemblyBlocks: ContactMapLayoutBlock[];
   viewAssemblyBlocks?: ContactMapLayoutBlock[];
   selectedAssemblyBlockIds: string[];
-  pafText: string;
-  onPafTextChange: (value: string) => void;
+  pafRecords: ReadonlyArray<PafPreviewRecord>;
   gfaDocument?: GfaEvidenceDocument | null;
   gfaHomologPattern?: string;
   onExpandHeatmap?: () => void;
@@ -85,8 +85,7 @@ export function InspectorPanel({
   assemblyBlocks,
   viewAssemblyBlocks = assemblyBlocks,
   selectedAssemblyBlockIds,
-  pafText,
-  onPafTextChange,
+  pafRecords,
   gfaDocument = null,
   gfaHomologPattern = "(Chr\\d+)g(\\d+)",
   onExpandHeatmap = () => undefined,
@@ -242,7 +241,7 @@ export function InspectorPanel({
           selection={uiState.assembly.selection}
           overviewContactMap={overviewContactMap}
           expectedNormalization={contactNormalizationForBackend(uiState.normalization)}
-          pafText={pafText}
+          pafRecords={pafRecords}
           gfaDocument={gfaDocument}
           onLoadEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
           onLoadHiCAlleleConcordanceBatch={onLoadHiCAlleleConcordanceBatch}

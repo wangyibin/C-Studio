@@ -32,7 +32,7 @@ import type {
 } from "../state/hicAlleleConcordance";
 import { buildHiCTransLineCandidates } from "../state/hicAlleleConcordance";
 import type { ContactMapLayoutBlock } from "../state/importers";
-import { buildPafSyntenyPreview } from "../state/pafPreview";
+import type { PafPreviewRecord } from "../state/pafPreview";
 import {
   buildReferenceSyntenyAllelePruning,
   type SyntenyAlleleSignalMask,
@@ -45,7 +45,7 @@ interface AssemblyPlacementRecommendationCardProps {
   selection: AssemblySelection | null;
   overviewContactMap: ContactMapView | null;
   expectedNormalization: ContactNormalization;
-  pafText?: string;
+  pafRecords?: ReadonlyArray<PafPreviewRecord>;
   gfaDocument?: GfaEvidenceDocument | null;
   onLoadEndpointHiCBatch?: GfaEndpointHiCBatchLoader;
   onLoadHiCAlleleConcordanceBatch?: HiCAlleleConcordanceBatchLoader;
@@ -72,13 +72,14 @@ const recommendationOverviewPartnerLimit = 12;
 const recommendationSyntenyMatchingPartnerLimit = 24;
 const recommendationResultLimit = 3;
 const recommendationAlleleCandidateLimit = 24;
+const emptyPafRecords: ReadonlyArray<PafPreviewRecord> = [];
 
 export function AssemblyPlacementRecommendationCard({
   blocks,
   selection,
   overviewContactMap,
   expectedNormalization,
-  pafText = "",
+  pafRecords = emptyPafRecords,
   gfaDocument = null,
   onLoadEndpointHiCBatch,
   onLoadHiCAlleleConcordanceBatch,
@@ -103,12 +104,12 @@ export function AssemblyPlacementRecommendationCard({
   const gfaEdges = useMemo(() => gfaDocument
     ? buildGfaAssemblyGraph(gfaDocument, blocks, Number.POSITIVE_INFINITY).edges
     : [], [blocks, gfaDocument]);
-  const hasPafEvidence = pafText.trim().length > 0;
+  const hasPafEvidence = pafRecords.length > 0;
   const syntenyPruning = useMemo(() => buildReferenceSyntenyAllelePruning(
-    buildPafSyntenyPreview(pafText).records,
+    pafRecords,
     blocks,
     coarseLinks,
-  ), [blocks, coarseLinks, pafText]);
+  ), [blocks, coarseLinks, pafRecords]);
   const hicTransLineCandidates = useMemo(() => {
     if (hasPafEvidence || !overviewContactMap || !overviewReady) {
       return null;
@@ -427,7 +428,7 @@ export function AssemblyPlacementRecommendationCard({
   }
 
   const selectedBlockIds = new Set(plan.selectedBlocks.map((block) => block.id));
-  const selectedPafExclusions = pafText.trim()
+  const selectedPafExclusions = hasPafEvidence
     ? syntenyPruning.exclusions.filter((exclusion) => (
       exclusion.occurrenceBlockIds.some((id) => selectedBlockIds.has(id))
     ))
