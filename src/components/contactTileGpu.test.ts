@@ -1336,10 +1336,12 @@ describe("contactTileFloatTextureData", () => {
 
     const { canvas, texImage3D, texSubImage3D } = mockWebGlCanvas();
     const presented = vi.fn();
+    const onTextureUpload = vi.fn();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
       performanceEnabled: false,
       texturePreference: "r16f",
       virtualTextureEnabled: true,
+      onTextureUpload,
     });
     expect(renderer?.setScene(scene, presented)).toBe(true);
     expect(presented).toHaveBeenCalledWith(true);
@@ -1350,6 +1352,11 @@ describe("contactTileFloatTextureData", () => {
       virtualTextureRebuilds: 1,
       virtualTextureUploads: 2,
     });
+    expect(onTextureUpload).toHaveBeenCalledWith(expect.objectContaining({
+      generation: 1,
+      resolution: 1_000,
+      uploadCount: 2,
+    }));
     renderer?.destroy();
   });
 

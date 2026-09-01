@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cstudio_core::contact_cache::{ContactCache, ContactCacheKey};
@@ -35,6 +35,7 @@ use crate::{
     },
     contact_display_memory_cache::DecodedDisplayTileCache,
     contact_lod_cache::{self, LodCacheCell, LodCachePayload},
+    webcontent_memory::{sample_webcontent_memory, WebContentMemoryMonitorState},
 };
 
 #[derive(Debug, Default)]
@@ -296,8 +297,28 @@ impl ContactTileRequestState {
 
     fn finish(&self, request_id: u64) {
         if let Ok(mut active_requests) = self.active_requests.lock() {
-            active_requests.remove(&request_id);
+            let released_generation = active_requests.remove(&request_id);
+            if contact_tile_perf_logging_enabled() {
+                if let Some(generation) = released_generation {
+                    emit_contact_tile_perf_line(&format!(
+                        "CSTUDIO_PERF event=contact_generation_request status=released request_id={} generation={} active_requests={}",
+                        request_id,
+                        generation,
+                        active_requests.len(),
+                    ));
+                }
+            }
         }
+    }
+
+    fn diagnostic_snapshot(&self) -> (u64, usize) {
+        let latest_generation = self.latest_generation.load(Ordering::SeqCst);
+        let active_requests = self
+            .active_requests
+            .lock()
+            .map(|requests| requests.len())
+            .unwrap_or(0);
+        (latest_generation, active_requests)
     }
 }
 
@@ -398,6 +419,13 @@ fn emit_contact_tile_perf_line(line: &str) {
             file.write_all(line.as_bytes())?;
             file.write_all(b"\n")
         });
+}
+
+fn unix_time_microseconds() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1117,6 +1145,50 @@ fn resolve_contact_tile_request(
 pub struct BeginContactTileGenerationRequest {
     pub generation: u64,
     pub retained_request_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartContactWebContentMemoryMonitorRequest {
+    pub generation: u64,
+    pub target_resolution: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactWebContentMemoryCheckpointStage {
+    IpcReceived,
+    DecodeComplete,
+    ReactCommit,
+    WebglUpload,
+    FirstPaint,
+    OverviewStart,
+}
+
+impl ContactWebContentMemoryCheckpointStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::IpcReceived => "ipc_received",
+            Self::DecodeComplete => "decode_complete",
+            Self::ReactCommit => "react_commit",
+            Self::WebglUpload => "webgl_upload",
+            Self::FirstPaint => "first_paint",
+            Self::OverviewStart => "overview_start",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogContactWebContentMemoryCheckpointRequest {
+    pub stage: ContactWebContentMemoryCheckpointStage,
+    pub generation: u64,
+    pub request_id: Option<u64>,
+    pub target_resolution: u64,
+    pub frontend_timestamp_us: u64,
+    pub payload_bytes: u64,
+    pub item_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -2396,6 +2468,32 @@ fn persistent_display_tile_plans(
         .collect()
 }
 
+/// Build the same canonical terminal-tile plan when the persistent display
+/// cache is disabled. The keys are deliberately local-only: they let the
+/// shared dense accumulator preserve request ordering without writing files.
+fn transient_display_tile_plans(
+    request: &ResolvedContactMapTilesFromCoolRequest,
+) -> Vec<PersistentDisplayTilePlan> {
+    request
+        .tiles
+        .iter()
+        .map(canonical_contact_tile_coordinate)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|(tile_x, tile_y)| {
+            let mut key = Vec::with_capacity(16);
+            key.extend_from_slice(&tile_x.to_le_bytes());
+            key.extend_from_slice(&tile_y.to_le_bytes());
+            PersistentDisplayTilePlan {
+                tile_x,
+                tile_y,
+                legacy_key: key.clone(),
+                key,
+            }
+        })
+        .collect()
+}
+
 fn persistent_display_cache_storage_format() -> DisplayCacheStorageFormat {
     if std::env::var("CSTUDIO_DISPLAY_CACHE_R16F").as_deref() == Ok("0") {
         DisplayCacheStorageFormat::Float32
@@ -2671,7 +2769,126 @@ pub fn begin_contact_tile_generation(
     request: BeginContactTileGenerationRequest,
     request_state: tauri::State<'_, ContactTileRequestState>,
 ) -> Result<Vec<u64>, String> {
-    request_state.retain_and_begin_generation(request.generation, &request.retained_request_ids)
+    let (previous_generation, active_before) = request_state.diagnostic_snapshot();
+    let retained = request_state
+        .retain_and_begin_generation(request.generation, &request.retained_request_ids)?;
+    if contact_tile_perf_logging_enabled() {
+        emit_contact_tile_perf_line(&format!(
+            "CSTUDIO_PERF event=contact_generation status=begun generation={} previous_generation={} active_before={} retained={} cancellation_candidates={}",
+            request.generation,
+            previous_generation,
+            active_before,
+            retained.len(),
+            active_before.saturating_sub(retained.len()),
+        ));
+    }
+    Ok(retained)
+}
+
+#[tauri::command]
+pub fn start_contact_webcontent_memory_monitor(
+    request: StartContactWebContentMemoryMonitorRequest,
+    monitor_state: tauri::State<'_, WebContentMemoryMonitorState>,
+) -> Result<(), String> {
+    if request.reason.len() > 64
+        || !request
+            .reason
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("contact memory monitor reason must be a short identifier".to_string());
+    }
+    if !contact_tile_perf_logging_enabled() {
+        return Ok(());
+    }
+    let state = monitor_state.inner().clone();
+    let token = state.start();
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let started_unix_time_us = unix_time_microseconds();
+        // The WebKit allocator peak can lag the backend response by more than
+        // 15 seconds while JS decoding, texture upload, and scavenging settle.
+        let sample_window = Duration::from_secs(45);
+        let sample_interval = Duration::from_millis(100);
+        let mut samples = 0_usize;
+        let mut last = sample_webcontent_memory();
+        let mut peak_selected_pid = last.selected_pid;
+        let mut peak_resident_bytes = last.resident_bytes;
+        let mut peak_physical_footprint_bytes = last.physical_footprint_bytes;
+        let mut peak_unix_time_us = unix_time_microseconds();
+        let mut peak_elapsed_ms = 0_u128;
+        let mut final_unix_time_us = peak_unix_time_us;
+        while state.is_active(token) && started.elapsed() < sample_window {
+            std::thread::sleep(sample_interval);
+            last = sample_webcontent_memory();
+            final_unix_time_us = unix_time_microseconds();
+            samples = samples.saturating_add(1);
+            peak_resident_bytes = peak_resident_bytes.max(last.resident_bytes);
+            if last.physical_footprint_bytes > peak_physical_footprint_bytes {
+                peak_selected_pid = last.selected_pid;
+                peak_physical_footprint_bytes = last.physical_footprint_bytes;
+                peak_unix_time_us = final_unix_time_us;
+                peak_elapsed_ms = started.elapsed().as_millis();
+            }
+        }
+        let status = if state.is_active(token) {
+            "window_complete"
+        } else {
+            "superseded"
+        };
+        emit_contact_tile_perf_line(&format!(
+            "CSTUDIO_PERF event=contact_webcontent_memory status={} generation={} target_resolution={} reason={} association=largest_webcontent peak_pid={} final_pid={} processes={} samples={} peak_resident_bytes={} peak_physical_footprint_bytes={} final_resident_bytes={} final_physical_footprint_bytes={} started_unix_time_us={} peak_unix_time_us={} final_unix_time_us={} peak_elapsed_ms={} elapsed_ms={}",
+            status,
+            request.generation,
+            request.target_resolution,
+            request.reason,
+            peak_selected_pid,
+            last.selected_pid,
+            last.processes,
+            samples,
+            peak_resident_bytes,
+            peak_physical_footprint_bytes,
+            last.resident_bytes,
+            last.physical_footprint_bytes,
+            started_unix_time_us,
+            peak_unix_time_us,
+            final_unix_time_us,
+            peak_elapsed_ms,
+            started.elapsed().as_millis(),
+        ));
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn log_contact_webcontent_memory_checkpoint(
+    request: LogContactWebContentMemoryCheckpointRequest,
+) -> Result<(), String> {
+    if !contact_tile_perf_logging_enabled() {
+        return Ok(());
+    }
+    let sample_started = Instant::now();
+    let sample = tauri::async_runtime::spawn_blocking(sample_webcontent_memory)
+        .await
+        .map_err(|error| error.to_string())?;
+    let sample_unix_time_us = unix_time_microseconds();
+    emit_contact_tile_perf_line(&format!(
+        "CSTUDIO_PERF event=contact_webcontent_memory_checkpoint stage={} generation={} request_id={} target_resolution={} frontend_timestamp_us={} sample_unix_time_us={} payload_bytes={} item_count={} association=largest_webcontent selected_pid={} processes={} resident_bytes={} physical_footprint_bytes={} sample_delay_us={}",
+        request.stage.as_str(),
+        request.generation,
+        request.request_id.unwrap_or(0),
+        request.target_resolution,
+        request.frontend_timestamp_us,
+        sample_unix_time_us,
+        request.payload_bytes,
+        request.item_count,
+        sample.selected_pid,
+        sample.processes,
+        sample.resident_bytes,
+        sample.physical_footprint_bytes,
+        sample_started.elapsed().as_micros(),
+    ));
+    Ok(())
 }
 
 #[tauri::command]
@@ -2954,8 +3171,6 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
     request: ContactMapTilesFromCoolRequest,
     app_handle: tauri::AppHandle,
     layout_registry_state: tauri::State<'_, ContactLayoutRegistryState>,
-    source_cache_state: tauri::State<'_, SourceContactCacheState>,
-    tile_cache_state: tauri::State<'_, ContactTileCacheState>,
     display_memory_cache_state: tauri::State<'_, ContactDisplayMemoryCacheState>,
     request_state: tauri::State<'_, ContactTileRequestState>,
 ) -> Result<tauri::ipc::Response, String> {
@@ -2974,8 +3189,6 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
         state: request_state.inner().clone(),
         request_id,
     };
-    let source_cache = Arc::clone(&source_cache_state.inner().cache);
-    let tile_cache = Arc::clone(&tile_cache_state.inner().cache);
     let display_memory_cache = Arc::clone(&display_memory_cache_state.inner().cache);
     let display_store_memory_cache = Arc::clone(&display_memory_cache);
     let task_request_state = request_state.inner().clone();
@@ -2983,85 +3196,100 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
     let display_cache_plans = display_cache_context
         .as_ref()
         .map(|context| persistent_display_tile_plans(context, &request))
-        .transpose()?
-        .unwrap_or_default();
+        .transpose()?;
+    let response_plans = display_cache_plans
+        .clone()
+        .unwrap_or_else(|| transient_display_tile_plans(&request));
     let display_store_context = display_cache_context.clone();
-    let (bytes, returned_tiles, response_cells, display_cache_stats, pending_display_store) =
-        tauri::async_runtime::spawn_blocking(move || {
-            let should_cancel = || task_request_state.is_cancelled(request_id);
-            if let Some(context) = display_cache_context.as_ref() {
-                let (cached_tiles, missing_plans, display_cache_stats) =
-                    load_persistent_display_tiles(
-                        context,
-                        &request,
-                        display_cache_plans.clone(),
-                        &display_memory_cache,
-                        &should_cancel,
-                    )?;
-                let mut compute_request = request;
-                compute_request.tiles = missing_plans
-                    .iter()
-                    .map(|plan| ContactMapTileKeyRequest {
-                        tile_x: plan.tile_x,
-                        tile_y: plan.tile_y,
-                    })
-                    .collect();
-                let computed_tiles = if compute_request.tiles.is_empty() {
-                    Vec::new()
-                } else {
-                    get_contact_map_tiles_from_cool_with_cache_cancellable(
-                        compute_request,
-                        source_cache.as_ref(),
-                        tile_cache.as_ref(),
-                        &should_cancel,
-                    )?
-                };
-                ensure_contact_tile_request_active(&should_cancel)?;
-                let pending_display_store = pending_display_tiles_from_complete_tiles(
-                    tile_size_bins,
-                    &missing_plans,
-                    &computed_tiles,
-                )?;
-                let dense_tiles = ordered_persistent_display_tiles(
-                    &display_cache_plans,
-                    cached_tiles,
-                    &pending_display_store,
-                )?;
-                let returned_tiles = dense_tiles.len();
-                let response_cells = dense_tiles.iter().map(display_tile_occupied_cells).sum();
-                let bytes = encode_contact_map_dense_tiles_binary_v1(
-                    &dense_tiles,
-                    tile_size_bins,
+    let (
+        bytes,
+        returned_tiles,
+        response_cells,
+        display_cache_stats,
+        pending_display_store,
+        scan_stats,
+        response_r16f_tiles,
+    ) = tauri::async_runtime::spawn_blocking(move || {
+        let should_cancel = || task_request_state.is_cancelled(request_id);
+        let (cached_tiles, missing_plans, display_cache_stats) =
+            if let (Some(context), Some(display_cache_plans)) =
+                (display_cache_context.as_ref(), display_cache_plans.as_ref())
+            {
+                load_persistent_display_tiles(
+                    context,
+                    &request,
+                    display_cache_plans.clone(),
+                    &display_memory_cache,
                     &should_cancel,
-                )?;
-                return Ok::<_, String>((
-                    bytes,
-                    returned_tiles,
-                    response_cells,
-                    display_cache_stats,
-                    Some(pending_display_store),
-                ));
-            }
+                )?
+            } else {
+                (
+                    Vec::new(),
+                    response_plans.clone(),
+                    PersistentDisplayCacheLookupStats::default(),
+                )
+            };
 
-            let tiles = get_contact_map_tiles_from_cool_with_cache_cancellable(
-                request,
-                source_cache.as_ref(),
-                tile_cache.as_ref(),
-                &should_cancel,
-            )?;
-            let returned_tiles = tiles.len();
-            let response_cells = tiles.iter().map(|tile| tile.cells.len()).sum();
-            let bytes = encode_contact_map_tiles_binary_v1(&tiles, tile_size_bins, &should_cancel)?;
-            Ok::<_, String>((
-                bytes,
-                returned_tiles,
-                response_cells,
-                PersistentDisplayCacheLookupStats::default(),
-                None,
-            ))
-        })
-        .await
-        .map_err(|error| error.to_string())??;
+        let mut compute_request = request;
+        compute_request.tiles = missing_plans
+            .iter()
+            .map(|plan| ContactMapTileKeyRequest {
+                tile_x: plan.tile_x,
+                tile_y: plan.tile_y,
+            })
+            .collect();
+        let mut accumulator =
+            PersistentDisplayTileAccumulator::new(tile_size_bins, &missing_plans)?;
+        let scan_stats = if compute_request.tiles.is_empty() {
+            ContactTileDeltaStreamStats::default()
+        } else {
+            compute_contact_tile_deltas_single_scan(compute_request, &should_cancel, |deltas| {
+                accumulator.merge(deltas)?;
+                Ok(0)
+            })?
+        };
+        ensure_contact_tile_request_active(&should_cancel)?;
+        let pending_display_store = accumulator.finish(&missing_plans)?;
+        let dense_tiles = ordered_persistent_display_tiles(
+            &response_plans,
+            cached_tiles,
+            &pending_display_store,
+        )?;
+        // The one-shot WebView response is presentation-only. Convert each
+        // completed tile to GPU-ready R16F where its values fit binary16;
+        // the authoritative MCOOL counts and normalization remain exact.
+        let response_tiles = dense_tiles
+            .iter()
+            .map(|tile| {
+                contact_display_cache::tile_for_storage_format(
+                    tile,
+                    DisplayCacheStorageFormat::R16f,
+                )
+            })
+            .collect::<Vec<_>>();
+        let response_r16f_tiles = response_tiles
+            .iter()
+            .filter(|tile| tile.r16f_values().is_some())
+            .count();
+        let returned_tiles = response_tiles.len();
+        let response_cells = response_tiles.iter().map(display_tile_occupied_cells).sum();
+        let bytes = encode_contact_map_dense_tiles_binary_v1(
+            &response_tiles,
+            tile_size_bins,
+            &should_cancel,
+        )?;
+        Ok::<_, String>((
+            bytes,
+            returned_tiles,
+            response_cells,
+            display_cache_stats,
+            Some(pending_display_store),
+            scan_stats,
+            response_r16f_tiles,
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     if let (Some(context), Some(pending)) = (display_store_context, pending_display_store) {
         if !pending.is_empty() {
             tauri::async_runtime::spawn_blocking(move || {
@@ -3101,6 +3329,25 @@ pub async fn get_contact_map_tiles_from_cool_binary_v1(
             display_cache_stats.memory_lookup.as_micros(),
             display_cache_stats.disk_read.as_micros(),
             display_cache_stats.read.as_micros(),
+            command_us,
+        ));
+        emit_contact_tile_perf_line(&format!(
+            "CSTUDIO_PERF event=contact_tile_dense_one_shot status=ok scenario={} request_id={} generation={} target_resolution={} requested_tiles={} returned_tiles={} r16f_tiles={} response_cells={} response_bytes={} indexed_visitor={} hdf5_chunks={} scanned_pixels={} visited_contacts={} hdf5_read_us={} scan_project_us={} command_us={}",
+            purpose.scenario_key(),
+            request_id,
+            generation,
+            target_resolution,
+            requested_tiles,
+            returned_tiles,
+            response_r16f_tiles,
+            response_cells,
+            response_bytes,
+            scan_stats.indexed_visitor,
+            scan_stats.visit_timings.hdf5_chunks,
+            scan_stats.visit_timings.scanned_pixels,
+            scan_stats.visited_contacts,
+            scan_stats.visit_timings.hdf5_read.as_micros(),
+            scan_stats.visit_timings.scan_project.as_micros(),
             command_us,
         ));
     }
@@ -3331,16 +3578,6 @@ impl PersistentDisplayTileAccumulator {
             })
             .collect()
     }
-}
-
-fn pending_display_tiles_from_complete_tiles(
-    tile_size_bins: u64,
-    plans: &[PersistentDisplayTilePlan],
-    tiles: &[ContactMapTileResponse],
-) -> Result<Vec<PendingDisplayCacheStore>, String> {
-    let mut accumulator = PersistentDisplayTileAccumulator::new(tile_size_bins, plans)?;
-    accumulator.merge(tiles)?;
-    accumulator.finish(plans)
 }
 
 fn ordered_persistent_display_tiles(

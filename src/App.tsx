@@ -100,6 +100,7 @@ import {
   nextContactResolutionForPerformance,
   type ContactTileRenderMilestone,
 } from "./state/contactTilePerformance";
+import { logContactMemoryCheckpoint } from "./state/contactMemoryCheckpoints";
 import { createContactResolutionResponsivenessTracker } from "./state/contactResolutionResponsiveness";
 import {
   adjacentContactResolutions,
@@ -459,6 +460,9 @@ const contactTileStreamEnabled = import.meta.env.VITE_CSTUDIO_TILE_STREAM !== "0
 const contactTileSingleScanEnabled = import.meta.env.VITE_CSTUDIO_TILE_SINGLE_SCAN !== "0";
 const contactTileDirectDeltaEnabled = import.meta.env.VITE_CSTUDIO_TILE_DIRECT_DELTA !== "0";
 const contactMainLodEnabled = import.meta.env.VITE_CSTUDIO_MAIN_LOD !== "0";
+// Default to the bounded one-shot dense response for the main visible LOD.
+// Set to 0 only for an explicit Channel-versus-direct A/B replay.
+const contactMainLodOneShotEnabled = import.meta.env.VITE_CSTUDIO_MAIN_LOD_ONE_SHOT !== "0";
 
 function yieldToProjectLoadPaint() {
   if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
@@ -744,16 +748,42 @@ function loadContactTilesWithLayoutHandle(
         }
       }
       if (!contactTileIpcPerformanceEnabled) {
-        const rawResponse = await invoke<unknown>("get_contact_map_tiles_from_cool_binary_v1", {
-          request: invokeRequest,
-        });
-        const decoded = decodeContactTileBinaryV1(rawResponse);
-        if (decoded.tileSizeBins !== request.tileSizeBins) {
-          throw new Error(
-            `contact tile binary size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
-          );
+        let rawResponse: unknown = null;
+        try {
+          rawResponse = await invoke<unknown>("get_contact_map_tiles_from_cool_binary_v1", {
+            request: invokeRequest,
+          });
+          if (request.purpose === "visible") {
+            logContactMemoryCheckpoint({
+              stage: "ipc_received",
+              generation: request.generation,
+              requestId: request.requestId,
+              targetResolution: request.targetResolution,
+              payloadBytes: rawResponse instanceof ArrayBuffer ? rawResponse.byteLength : 0,
+            });
+          }
+          const decoded = decodeContactTileBinaryV1(rawResponse);
+          if (decoded.tileSizeBins !== request.tileSizeBins) {
+            throw new Error(
+              `contact tile binary size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
+            );
+          }
+          if (request.purpose === "visible") {
+            logContactMemoryCheckpoint({
+              stage: "decode_complete",
+              generation: request.generation,
+              requestId: request.requestId,
+              targetResolution: request.targetResolution,
+              payloadBytes: decoded.byteLength,
+              itemCount: decoded.tiles.length + (decoded.denseTiles?.length ?? 0),
+            });
+          }
+          return contactMapTilesFromDecodedBinary(decoded);
+        } finally {
+          // Dense tile views own their small copied payloads. Drop the larger
+          // transport buffer as soon as decoding completes.
+          rawResponse = null;
         }
-        return contactMapTilesFromDecodedBinary(decoded);
       }
 
       const startedAt = performance.now();
@@ -761,8 +791,9 @@ function loadContactTilesWithLayoutHandle(
       let decodeUs = 0;
       let responseBytes = 0;
       let transport: ContactTileFrontendIpcPerformanceRequest["transport"] = "unknown";
+      let rawResponse: unknown = null;
       try {
-        const rawResponse = await invoke<unknown>("get_contact_map_tiles_from_cool_binary_v1", {
+        rawResponse = await invoke<unknown>("get_contact_map_tiles_from_cool_binary_v1", {
           request: invokeRequest,
         });
         const responseAt = performance.now();
@@ -771,12 +802,32 @@ function loadContactTilesWithLayoutHandle(
           responseBytes = rawResponse.byteLength;
           transport = "array_buffer";
         }
+        if (request.purpose === "visible") {
+          logContactMemoryCheckpoint({
+            stage: "ipc_received",
+            generation: request.generation,
+            requestId: request.requestId,
+            targetResolution: request.targetResolution,
+            payloadBytes: responseBytes,
+            frontendTimestamp: responseAt,
+          });
+        }
         const decoded = decodeContactTileBinaryV1(rawResponse);
         decodeUs = Math.round(Math.max(0, performance.now() - responseAt) * 1_000);
         if (decoded.tileSizeBins !== request.tileSizeBins) {
           throw new Error(
             `contact tile binary size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
           );
+        }
+        if (request.purpose === "visible") {
+          logContactMemoryCheckpoint({
+            stage: "decode_complete",
+            generation: request.generation,
+            requestId: request.requestId,
+            targetResolution: request.targetResolution,
+            payloadBytes: decoded.byteLength,
+            itemCount: decoded.tiles.length + (decoded.denseTiles?.length ?? 0),
+          });
         }
         const tiles = contactMapTilesFromDecodedBinary(decoded);
         logContactTileFrontendIpcPerformance({
@@ -815,6 +866,8 @@ function loadContactTilesWithLayoutHandle(
           status: "error",
         });
         throw error;
+      } finally {
+        rawResponse = null;
       }
     },
   );
@@ -853,6 +906,16 @@ function streamContactTilesWithLayoutHandle(
       channel.onmessage = (rawResponse) => {
         try {
           const responseAt = performance.now();
+          if (request.purpose === "visible") {
+            logContactMemoryCheckpoint({
+              stage: "ipc_received",
+              generation: request.generation,
+              requestId: request.requestId,
+              targetResolution: request.targetResolution,
+              payloadBytes: rawResponse instanceof ArrayBuffer ? rawResponse.byteLength : 0,
+              frontendTimestamp: responseAt,
+            });
+          }
           const decoded = decodeContactTileBinaryV1(rawResponse);
           decodeUs += Math.round(Math.max(0, performance.now() - responseAt) * 1_000);
           if (decoded.tileSizeBins !== request.tileSizeBins) {
@@ -884,6 +947,16 @@ function streamContactTilesWithLayoutHandle(
           allChunks,
         ]);
         invokeUs = Math.round(Math.max(0, performance.now() - startedAt) * 1_000);
+        if (request.purpose === "visible") {
+          logContactMemoryCheckpoint({
+            stage: "decode_complete",
+            generation: request.generation,
+            requestId: request.requestId,
+            targetResolution: request.targetResolution,
+            payloadBytes: responseBytes,
+            itemCount: streamedTiles.length,
+          });
+        }
         if (contactTileIpcPerformanceEnabled) {
           logContactTileFrontendIpcPerformance({
             requestId: request.requestId,
@@ -928,6 +1001,10 @@ function streamContactTilesWithLayoutHandle(
           });
         }
         throw error;
+      } finally {
+        // Break the application-level closure immediately. Tauri also removes
+        // its internal callback after the terminal Channel marker.
+        channel.onmessage = () => undefined;
       }
     },
   );
@@ -969,6 +1046,16 @@ function streamContactTileDeltasWithLayoutHandle(
       channel.onmessage = (rawResponse) => {
         try {
           const responseAt = performance.now();
+          if (request.purpose === "visible") {
+            logContactMemoryCheckpoint({
+              stage: "ipc_received",
+              generation: request.generation,
+              requestId: request.requestId,
+              targetResolution: request.targetResolution,
+              payloadBytes: rawResponse instanceof ArrayBuffer ? rawResponse.byteLength : 0,
+              frontendTimestamp: responseAt,
+            });
+          }
           const decoded = decodeContactTileBinaryV1(rawResponse);
           decodeUs += Math.round(Math.max(0, performance.now() - responseAt) * 1_000);
           responseBytes += decoded.byteLength;
@@ -1006,6 +1093,16 @@ function streamContactTileDeltasWithLayoutHandle(
           finished,
         ]);
         const tiles = accumulator.finish();
+        if (request.purpose === "visible") {
+          logContactMemoryCheckpoint({
+            stage: "decode_complete",
+            generation: request.generation,
+            requestId: request.requestId,
+            targetResolution: request.targetResolution,
+            payloadBytes: responseBytes,
+            itemCount: tiles.length,
+          });
+        }
         if (contactTileIpcPerformanceEnabled) {
           logContactTileFrontendIpcPerformance({
             requestId: request.requestId,
@@ -1030,6 +1127,8 @@ function streamContactTileDeltasWithLayoutHandle(
       } catch (error) {
         rejectFinished(error);
         throw error;
+      } finally {
+        channel.onmessage = () => undefined;
       }
     },
   );
@@ -1287,6 +1386,10 @@ export function App() {
   const latestUiStateRef = useRef(uiState);
   latestUiStateRef.current = uiState;
   const pendingResolutionPerformanceRef = useRef<PendingResolutionPerformance | null>(null);
+  const lastWebContentMemoryLoadRef = useRef<{
+    coolPath: string;
+    targetResolution: number;
+  } | null>(null);
   const contactTilePresentationScheduleRef = useRef<ContactTilePresentationSchedule | null>(null);
   const dispatchMeasuredUiAction = useCallback((action: UiAction) => {
     const currentUiState = latestUiStateRef.current;
@@ -1309,6 +1412,24 @@ export function App() {
   }, [contactResolutionResponsiveness, contactTilePerformance]);
   const handleContactTileLayerCommit = useCallback((event: ContactTileRenderMilestone) => {
     if (event.generation === contactTileGenerationRef.current) {
+      const completeLayer = lastCompleteContactMapRef.current;
+      if (
+        completeLayer?.visibleLayerComplete === true
+        && completeLayer.renderGeneration === event.generation
+        && completeLayer.isTransientResolutionPreview !== true
+      ) {
+        logContactMemoryCheckpoint({
+          stage: "react_commit",
+          generation: event.generation,
+          targetResolution: completeLayer.resolution,
+          payloadBytes: (completeLayer.tiles ?? []).reduce(
+            (total, tile) => total + contactTileRetainedValueBytes(tile),
+            0,
+          ),
+          itemCount: event.canvasCount,
+          frontendTimestamp: event.commitTimestamp,
+        });
+      }
       contactTilePerformance.markReactCommit(
         event.generation,
         event.canvasCount,
@@ -1327,6 +1448,18 @@ export function App() {
       && completeLayer.isTransientResolutionPreview !== true
     );
     if (paintsTerminalLayer) {
+      logContactMemoryCheckpoint({
+        stage: "first_paint",
+        generation: event.generation,
+        targetResolution: completeLayer?.resolution ?? resolutionToBasePairs(
+          latestUiStateRef.current.contact.resolution,
+        ),
+        payloadBytes: (completeLayer?.tiles ?? []).reduce(
+          (total, tile) => total + contactTileRetainedValueBytes(tile),
+          0,
+        ),
+        itemCount: event.canvasCount,
+      });
       setContactTileDeltaStream((current) => (
         current?.generation === event.generation ? null : current
       ));
@@ -2425,6 +2558,7 @@ export function App() {
       contactResolutionResponsiveness.retargetGeneration(generation);
     }
     if (!contactCoolPath || viewAssemblyLayout.blocks.length === 0) {
+      lastWebContentMemoryLoadRef.current = null;
       setContactMap((current) => (current === null ? current : null));
       contactTileCacheLru.clear();
       contactTileCacheRef.current = new Map();
@@ -2457,6 +2591,24 @@ export function App() {
         `Waiting to switch from unavailable ${uiState.contact.resolution} .mcool resolution`,
       );
       return;
+    }
+
+    const previousWebContentMemoryLoad = lastWebContentMemoryLoadRef.current;
+    const webContentMemoryReason = previousWebContentMemoryLoad === null
+      || previousWebContentMemoryLoad.coolPath !== contactCoolPath
+      ? "cold_load"
+      : previousWebContentMemoryLoad.targetResolution !== targetResolution
+        ? "resolution_switch"
+        : null;
+    lastWebContentMemoryLoadRef.current = { coolPath: contactCoolPath, targetResolution };
+    if (!panPreviewActive && webContentMemoryReason) {
+      void invoke("start_contact_webcontent_memory_monitor", {
+        request: {
+          generation,
+          targetResolution,
+          reason: webContentMemoryReason,
+        },
+      }).catch(() => undefined);
     }
 
     // Registration is asynchronous but independent of generation begin. Start
@@ -3034,23 +3186,31 @@ export function App() {
               contactTileBackendRequestIdRef.current = nextRequestId;
               return nextRequestId;
             },
-            load: (backendRequestId, requestedTiles) => (
-              streamContactTileDeltasWithLayoutHandle(
+            load: (backendRequestId, requestedTiles) => {
+              const request = {
+                requestId: backendRequestId,
+                generation,
+                purpose: "visible" as const,
+                coolPath: contactCoolPath,
+                baseResolution: mainLodPlan.sourceResolution,
+                sourceResolution: mainLodPlan.sourceResolution,
+                targetResolution: mainLodPlan.targetResolution,
+                tileSizeBins: lodTileSizeBins,
+                normalization,
+                tiles: requestedTiles,
+                adaptiveRefinement: false,
+              };
+              if (contactMainLodOneShotEnabled) {
+                return loadContactTilesWithLayoutHandle(
+                  contactLayoutHandleRegistry,
+                  viewContactLayoutBlocks,
+                  request,
+                );
+              }
+              return streamContactTileDeltasWithLayoutHandle(
                 contactLayoutHandleRegistry,
                 viewContactLayoutBlocks,
-                {
-                  requestId: backendRequestId,
-                  generation,
-                  purpose: "visible",
-                  coolPath: contactCoolPath,
-                  baseResolution: mainLodPlan.sourceResolution,
-                  sourceResolution: mainLodPlan.sourceResolution,
-                  targetResolution: mainLodPlan.targetResolution,
-                  tileSizeBins: lodTileSizeBins,
-                  normalization,
-                  tiles: requestedTiles,
-                  adaptiveRefinement: false,
-                },
+                request,
                 {
                   onStart: mainLodDirectDeltaStreamMode !== "disabled"
                     ? (accumulator) => {
@@ -3099,8 +3259,8 @@ export function App() {
                   // atomic swap.
                   onPreviewChunk: undefined,
                 },
-              )
-            ),
+              );
+            },
           });
           const visibleLoadPromise = loadVisibleTiles();
           // The visible invoke is queued first. Start one bounded leading-edge
@@ -4307,6 +4467,13 @@ export function App() {
       contactTileBackendRequestIdRef.current = nextRequestId;
       activeRequestId = nextRequestId;
       activeContactOverviewRequestIdRef.current = nextRequestId;
+      logContactMemoryCheckpoint({
+        stage: "overview_start",
+        generation,
+        requestId: nextRequestId,
+        targetResolution: plan.targetResolution,
+        itemCount: plan.targetBins,
+      });
       try {
         const response = await loadContactOverviewWithLayoutHandle(
           contactLayoutHandleRegistry,
@@ -6212,9 +6379,7 @@ export function App() {
       onContactViewportPreview={handleContactViewportPreview}
       onContactResolutionPreview={handleContactResolutionPreview}
       contactPanPrefetchBridge={contactPanPrefetchBridge}
-      onContactTileLayerCommit={contactTilePerformance.enabled
-        ? handleContactTileLayerCommit
-        : undefined}
+      onContactTileLayerCommit={handleContactTileLayerCommit}
       onContactTileLayerPaintComplete={handleContactTileLayerPaintComplete}
     />
   );

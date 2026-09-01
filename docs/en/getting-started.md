@@ -6,6 +6,23 @@ between evidence and edits explicit.
 If the input files have not been generated yet, follow
 [Prepare input files](user-guide/input-preparation.md) first.
 
+## Download the example data
+
+Download [`examples.tar.gz`](https://github.com/wangyibin/C-Studio/releases/download/v0.5.0/examples.tar.gz)
+from the [C-Studio v0.5.0 release](https://github.com/wangyibin/C-Studio/releases/tag/v0.5.0),
+then extract the archive. To open an extracted example, choose
+**Add Data → Load project folder…** and select its project directory.
+
+The archive contains these example files:
+
+```text
+groups.final.agp
+alfalfa.mapq1.mcool
+alfalfa.coverage.bedgraph
+ref.align.paf
+alfalfa.p_utg.noseq.gfa
+```
+
 ## 1. Prepare a project directory
 
 For a real project, place copies of the inputs in one dedicated directory. An
@@ -28,9 +45,10 @@ See [project data](user-guide/project-data.md) for the exact rules.
 Choose **Add Data → Load project folder…**. Alternatively, use the individual
 entries below **Add Data**.
 
-To inspect the bundled development example, choose **Load example project**.
-That helper currently resolves files from the source checkout and should not be
-treated as verified packaged-app data.
+When running from a source checkout, **Load example project** can open the
+checkout's local `examples/` directory. In a packaged application, download and
+extract the v0.5.0 example archive as described above, then load an example
+project directory manually.
 
 ## 3. Check the workspace
 

@@ -85,11 +85,19 @@ export interface ContactTileGpuRendererOptions {
   virtualTextureEnabled?: boolean;
   performanceEnabled?: boolean;
   emitPerformance?: (line: string) => void;
+  onTextureUpload?: (milestone: ContactTileGpuUploadMilestone) => void;
   clock?: () => number;
   uploadBudgetBytes?: number;
   uploadBudgetMilliseconds?: number;
   requestFrame?: (callback: FrameRequestCallback) => number;
   cancelFrame?: (handle: number) => void;
+}
+
+export interface ContactTileGpuUploadMilestone {
+  generation: number | null;
+  resolution: number | null;
+  uploadCount: number;
+  textureBytes: number;
 }
 
 export interface ContactTileGpuOverview {
@@ -1731,6 +1739,7 @@ export function createContactTileGpuRenderer(
   let hasPresentedFrontFrame = false;
   let virtualTextureState: VirtualTextureState | null = null;
   let sourceLayoutTextureState: SourceLayoutTextureState | null = null;
+  let reportedTextureUploadCount = 0;
   let scheduledUploadFrame: number | null = null;
   let nextUploadRequestId = 1;
 
@@ -1781,10 +1790,29 @@ export function createContactTileGpuRenderer(
     uploadContext.performance.cacheBytes = textureBytes;
   };
   const emitPerformanceIfChanged = () => {
+    updatePerformanceCacheState();
+    const uploadCount = uploadContext.performance.uploads
+      + uploadContext.performance.virtualTextureUploads
+      + uploadContext.performance.sourceLayoutUploads;
+    if (uploadCount > reportedTextureUploadCount) {
+      reportedTextureUploadCount = uploadCount;
+      const activeScene = deltaScene ?? scene;
+      try {
+        options.onTextureUpload?.({
+          generation: activeScene?.generation ?? null,
+          resolution: activeScene?.resolution ?? null,
+          uploadCount,
+          textureBytes: uploadContext.performance.cacheBytes
+            + uploadContext.performance.virtualTextureBytes
+            + uploadContext.performance.sourceLayoutBytes,
+        });
+      } catch {
+        // Memory diagnostics must never interrupt WebGL presentation.
+      }
+    }
     if (!performanceEnabled) {
       return;
     }
-    updatePerformanceCacheState();
     const signature = `${uploadContext.performance.uploads}:${uploadContext.performance.evictions}:${uploadContext.performance.scenePromotions}:${uploadContext.performance.scenePromotionMisses}:${uploadContext.performance.virtualTextureUploads}:${uploadContext.performance.virtualTextureFallbacks}:${uploadContext.performance.virtualTextureRebuilds}:${uploadContext.performance.sourceLayoutDraws}:${uploadContext.performance.sourceLayoutUploads}:${uploadContext.performance.framebufferSwaps}:${uploadContext.performance.uploadQueueFrames}:${uploadContext.performance.uploadQueueDeferredFrames}:${uploadContext.performance.uploadQueueBytes}:${uploadContext.performance.uploadQueueMaxFrameBytes}:${uploadContext.performance.uploadFenceSignals}:${uploadContext.performance.uploadFenceWaitFrames}:${textureCache.size}:${textureBytes}`;
     if (signature === uploadContext.performance.lastEmissionSignature) {
       return;

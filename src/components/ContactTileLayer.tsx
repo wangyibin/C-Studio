@@ -33,6 +33,7 @@ import {
 import { canonicalContactTile, contactTileKey } from "../state/contactTiles";
 import type { ContactViewport } from "../state/contactViewport";
 import { isContactTilePerformanceEnabled } from "../state/contactTilePerformance";
+import { logContactMemoryCheckpoint } from "../state/contactMemoryCheckpoints";
 import type { ContactColormap } from "../state/uiState";
 import {
   contactOverviewFloatTextureData,
@@ -1284,6 +1285,17 @@ function ContactTileSharedGpuCanvas({
     const renderer = createContactTileGpuRenderer(canvas, contactTileGpuSharedTextureBudgetBytes, {
       performanceEnabled: isContactTilePerformanceEnabled(),
       emitPerformance: emitContactTileGpuPerformance,
+      onTextureUpload: ({ generation, resolution, textureBytes, uploadCount }) => {
+        if (generation !== null && resolution !== null) {
+          logContactMemoryCheckpoint({
+            stage: "webgl_upload",
+            generation,
+            targetResolution: resolution,
+            payloadBytes: textureBytes,
+            itemCount: uploadCount,
+          });
+        }
+      },
     });
     if (!renderer) {
       traceContactPanCamera("gpu_unavailable", { reason: "renderer-create-failed" });
@@ -1743,6 +1755,17 @@ function ContactTileGpuCanvas({
     const renderer = createContactTileGpuRenderer(canvas, textureBudgetBytes, {
       performanceEnabled: isContactTilePerformanceEnabled(),
       emitPerformance: emitContactTileGpuPerformance,
+      onTextureUpload: ({ generation, resolution, textureBytes, uploadCount }) => {
+        if (generation !== null && resolution !== null) {
+          logContactMemoryCheckpoint({
+            stage: "webgl_upload",
+            generation,
+            targetResolution: resolution,
+            payloadBytes: textureBytes,
+            itemCount: uploadCount,
+          });
+        }
+      },
     });
     if (!renderer) {
       onUnavailable();

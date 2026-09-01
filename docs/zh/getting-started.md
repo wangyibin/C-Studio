@@ -4,6 +4,23 @@
 
 如果尚未生成输入文件，请先按[准备输入文件](user-guide/input-preparation.md)操作。
 
+## 下载示例数据
+
+从 [C-Studio v0.5.0 Release](https://github.com/wangyibin/C-Studio/releases/tag/v0.5.0)
+下载 [`examples.tar.gz`](https://github.com/wangyibin/C-Studio/releases/download/v0.5.0/examples.tar.gz)
+并解压。若要打开解压后的示例，请选择 **Add Data → Load project folder…**，
+然后选中对应的项目目录。
+
+压缩包包含以下示例文件：
+
+```text
+groups.final.agp
+alfalfa.mapq1.mcool
+alfalfa.coverage.bedgraph
+ref.align.paf
+alfalfa.p_utg.noseq.gfa
+```
+
 ## 1. 准备项目目录
 
 处理真实项目时，建议把输入文件的副本放到一个独立目录中。组装编辑需要 AGP，
@@ -26,8 +43,9 @@ my-project/
 选择 **Add Data → Load project folder…**。也可以使用 **Add Data** 下的
 单文件入口逐个加载。
 
-若要检查随源码提供的开发示例，选择 **Load example project**。当前该功能从源码
-检出目录解析文件，不能视为已经验证过的安装包内置数据。
+从源码检出目录运行时，**Load example project** 可以打开检出目录中的
+`examples/` 目录。使用安装包时，请按上文下载并解压 v0.5.0 示例数据，
+再手动加载对应的示例项目目录。
 
 ## 3. 检查工作区
 

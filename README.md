@@ -12,6 +12,23 @@ the source of truth.
 
 ![C-Studio overview](docs/C-Studio_Figure1_overview.png)
 
+## Example data
+
+Download [`examples.tar.gz`](https://github.com/wangyibin/C-Studio/releases/download/v0.5.0/examples.tar.gz)
+from the [C-Studio v0.5.0 release](https://github.com/wangyibin/C-Studio/releases/tag/v0.5.0).
+Extract the archive, then load an extracted project directory with
+**Add Data → Load project folder…**.
+
+The archive contains these example files:
+
+```text
+groups.final.agp
+alfalfa.mapq1.mcool
+alfalfa.coverage.bedgraph
+ref.align.paf
+alfalfa.p_utg.noseq.gfa
+```
+
 ## Documentation
 
 - English: [online documentation](https://wangyibin.github.io/C-Studio/latest/)

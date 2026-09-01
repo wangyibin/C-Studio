@@ -2,6 +2,7 @@ mod commands;
 mod contact_display_cache;
 mod contact_display_memory_cache;
 mod contact_lod_cache;
+mod webcontent_memory;
 
 use tauri::Manager;
 
@@ -22,6 +23,7 @@ pub fn run() {
         .manage(commands::ContactDisplayMemoryCacheState::default())
         .manage(commands::ContactTileRequestState::default())
         .manage(commands::ContactLayoutRegistryState::default())
+        .manage(webcontent_memory::WebContentMemoryMonitorState::default())
         .manage(commands::SourceContactCacheState::default())
         .manage(commands::CoverageCacheState::default())
         .manage(commands::SyntenyCacheState::default())
@@ -53,6 +55,8 @@ pub fn run() {
             commands::log_contact_pan_camera_trace,
             commands::log_gfa_frontend_performance,
             commands::begin_contact_tile_generation,
+            commands::start_contact_webcontent_memory_monitor,
+            commands::log_contact_webcontent_memory_checkpoint,
             commands::prewarm_contact_normalizations,
             commands::cancel_contact_normalization_prewarm,
             commands::prewarm_contact_resolution_reader,
