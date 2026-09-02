@@ -510,6 +510,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#download-the-example-data" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Download the example data
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#1-prepare-a-project-directory" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1032,6 +1043,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#download-the-example-data" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Download the example data
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#1-prepare-a-project-directory" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1120,15 +1142,27 @@
 between evidence and edits explicit.</p>
 <p>If the input files have not been generated yet, follow
 <a href="../user-guide/input-preparation/">Prepare input files</a> first.</p>
+<h2 id="download-the-example-data">Download the example data<a class="headerlink" href="#download-the-example-data" title="Permanent link">&para;</a></h2>
+<p>Download <a href="https://github.com/wangyibin/C-Studio/releases/download/v0.5.0/examples.tar.gz"><code>examples.tar.gz</code></a>
+from the <a href="https://github.com/wangyibin/C-Studio/releases/tag/v0.5.0">C-Studio v0.5.0 release</a>,
+then extract the archive. To open an extracted example, choose
+<strong>Add Data → Load project folder…</strong> and select its project directory.</p>
+<p>The archive contains these example files:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>groups.final.agp
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>alfalfa.mapq1.mcool
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>alfalfa.coverage.bedgraph
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>ref.align.paf
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>alfalfa.p_utg.noseq.gfa
+</span></code></pre></div>
 <h2 id="1-prepare-a-project-directory">1. Prepare a project directory<a class="headerlink" href="#1-prepare-a-project-directory" title="Permanent link">&para;</a></h2>
 <p>For a real project, place copies of the inputs in one dedicated directory. An
 AGP is required for assembly editing. Other evidence is optional.</p>
-<p><div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>my-project/
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── assembly.agp
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── contacts.mcool
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>├── alignments.paf
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>├── coverage.bedgraph
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>└── assembly.gfa
+<p><div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>my-project/
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>├── assembly.agp
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>├── contacts.mcool
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>├── alignments.paf
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>├── coverage.bedgraph
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>└── assembly.gfa
 </span></code></pre></div>
 Only the top level is scanned. If a data type has several candidates,
 C-Studio loads one deterministic candidate and reports the others as skipped.
@@ -1136,9 +1170,10 @@ See <a href="../user-guide/project-data/">project data</a> for the exact rules.<
 <h2 id="2-load-data">2. Load data<a class="headerlink" href="#2-load-data" title="Permanent link">&para;</a></h2>
 <p>Choose <strong>Add Data → Load project folder…</strong>. Alternatively, use the individual
 entries below <strong>Add Data</strong>.</p>
-<p>To inspect the bundled development example, choose <strong>Load example project</strong>.
-That helper currently resolves files from the source checkout and should not be
-treated as verified packaged-app data.</p>
+<p>When running from a source checkout, <strong>Load example project</strong> can open the
+checkout's local <code>examples/</code> directory. In a packaged application, download and
+extract the v0.5.0 example archive as described above, then load an example
+project directory manually.</p>
 <h2 id="3-check-the-workspace">3. Check the workspace<a class="headerlink" href="#3-check-the-workspace" title="Permanent link">&para;</a></h2>
 <p>Confirm the status bar and <strong>Project Info</strong> show the expected assembly and
 matrix. Then inspect:</p>
