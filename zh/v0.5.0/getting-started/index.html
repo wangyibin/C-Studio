@@ -510,6 +510,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        下载示例数据
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#1" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1032,6 +1043,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        下载示例数据
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#1" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1118,23 +1140,36 @@
 <h1 id="_1">快速开始<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
 <p>下面的流程会保留可恢复的源 AGP，并明确区分证据与编辑操作。</p>
 <p>如果尚未生成输入文件，请先按<a href="../user-guide/input-preparation/">准备输入文件</a>操作。</p>
+<h2 id="_2">下载示例数据<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
+<p>从 <a href="https://github.com/wangyibin/C-Studio/releases/tag/v0.5.0">C-Studio v0.5.0 Release</a>
+下载 <a href="https://github.com/wangyibin/C-Studio/releases/download/v0.5.0/examples.tar.gz"><code>examples.tar.gz</code></a>
+并解压。若要打开解压后的示例，请选择 <strong>Add Data → Load project folder…</strong>，
+然后选中对应的项目目录。</p>
+<p>压缩包包含以下示例文件：</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>groups.final.agp
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>alfalfa.mapq1.mcool
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>alfalfa.coverage.bedgraph
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>ref.align.paf
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>alfalfa.p_utg.noseq.gfa
+</span></code></pre></div>
 <h2 id="1">1. 准备项目目录<a class="headerlink" href="#1" title="Permanent link">&para;</a></h2>
 <p>处理真实项目时，建议把输入文件的副本放到一个独立目录中。组装编辑需要 AGP，
 其他证据均为可选。</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>my-project/
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── assembly.agp
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>├── contacts.mcool
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>├── alignments.paf
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>├── coverage.depth
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>└── assembly.gfa
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>my-project/
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>├── assembly.agp
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>├── contacts.mcool
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>├── alignments.paf
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>├── coverage.depth
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>└── assembly.gfa
 </span></code></pre></div>
 <p>程序只扫描目录顶层。同一类型存在多个候选文件时，C-Studio 会按确定性规则加载
 一个，并把其他候选报告为已跳过。精确规则见<a href="../user-guide/project-data/">项目数据</a>。</p>
 <h2 id="2">2. 加载数据<a class="headerlink" href="#2" title="Permanent link">&para;</a></h2>
 <p>选择 <strong>Add Data → Load project folder…</strong>。也可以使用 <strong>Add Data</strong> 下的
 单文件入口逐个加载。</p>
-<p>若要检查随源码提供的开发示例，选择 <strong>Load example project</strong>。当前该功能从源码
-检出目录解析文件，不能视为已经验证过的安装包内置数据。</p>
+<p>从源码检出目录运行时，<strong>Load example project</strong> 可以打开检出目录中的
+<code>examples/</code> 目录。使用安装包时，请按上文下载并解压 v0.5.0 示例数据，
+再手动加载对应的示例项目目录。</p>
 <h2 id="3">3. 检查工作区<a class="headerlink" href="#3" title="Permanent link">&para;</a></h2>
 <p>先确认状态栏和 <strong>Project Info</strong> 显示了预期的组装与矩阵，再检查：</p>
 <ul>
