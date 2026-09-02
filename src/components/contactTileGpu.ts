@@ -3604,12 +3604,25 @@ export function createContactTileGpuRenderer(
       return;
     }
     // Pretext/Juicebox-style camera navigation: the visible textures are
-    // sampled through one page-table draw. The established per-tile path is
-    // retained only for unsupported drivers or incomplete page coverage.
+    // sampled through one page-table draw. Once that atomic path owns a
+    // presented front, an exact-page miss must retain the old complete frame;
+    // clearing into the legacy overview + resident-tile draw would expose a
+    // mixed-resolution checkerboard during the drag.
     const activeScene = scene;
-    const drawn = activeScene?.sourceLayout
-      ? drawVirtualTexturePan(activeScene)
-      : (activeScene && drawVirtualTexturePan(activeScene)) || draw(true);
+    const atomicVirtualPanActive = Boolean(
+      activeScene
+      && virtualResources
+      && virtualTextureState
+      && hasPresentedFrontFrame
+      && framePresentation
+      && virtualTextureState.resolution === activeScene.resolution
+      && virtualTextureState.tileSizeBins === activeScene.tileSizeBins,
+    );
+    const virtualDrawn = activeScene && drawVirtualTexturePan(activeScene);
+    const legacyDrawn = !virtualDrawn && !atomicVirtualPanActive
+      ? draw(true)
+      : false;
+    const drawn = Boolean(virtualDrawn || legacyDrawn);
     if (drawn) {
       pendingAppendedDescriptors.clear();
     }

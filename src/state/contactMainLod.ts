@@ -1,5 +1,6 @@
 import type { ContactViewport } from "./contactViewport";
 import { contactResolutionAtOrAbove } from "./contactOverviewTiles";
+import type { ContactMapTileKey } from "./contactTiles";
 
 export const maxExactMainContactTiles = 16;
 export const maxExactMainContactBinsPerPixel = 2;
@@ -18,6 +19,14 @@ export const contactMainLodTileCacheLimits = Object.freeze({
   maxTiles: 64,
   maxCells: 1_500_000,
 });
+/**
+ * Whole-level residency is reserved for genuinely small interaction LODs. The
+ * GPU byte cap is deliberately below the atlas and frontend cache budgets so
+ * the current exact layer, overview, page table, and staging frame still have
+ * headroom. Finer levels keep using viewport + directional-corridor streaming.
+ */
+export const contactMainLodWholeResidencyBudgetBytes = 16 * 1024 * 1024;
+export const contactMainLodR16fBytesPerTexel = 2;
 // Adaptive 2.5 Mb refinement can descend to 1 kb around AGP boundaries. Keep
 // that expensive path inside one local 2x2 tile neighborhood; wider exact
 // views use the native stored level without recursive refinement.
@@ -48,6 +57,83 @@ export interface ContactMainLodPlan {
   targetResolution: number;
   viewport: ContactViewport;
   binsPerPixel: number;
+}
+
+export interface ContactMainLodWholeResidencyPlan {
+  axisTileCount: number;
+  estimatedBytes: number;
+  estimatedCells: number;
+  tiles: ContactMapTileKey[];
+}
+
+/**
+ * Return the complete canonical upper-triangle tile set only when its dense
+ * R16F representation also fits every dedicated main-LOD cache safety valve.
+ * A null result is the explicit signal to stay on bounded viewport streaming.
+ */
+export function buildContactMainLodWholeResidencyPlan({
+  totalSpanBp,
+  resolution,
+  tileSizeBins = contactMainLodTileSizeBins,
+  bytesPerTexel = contactMainLodR16fBytesPerTexel,
+  budgetBytes = contactMainLodWholeResidencyBudgetBytes,
+  maxTiles = contactMainLodTileCacheLimits.maxTiles,
+  maxCells = contactMainLodTileCacheLimits.maxCells,
+}: {
+  totalSpanBp: number;
+  resolution: number;
+  tileSizeBins?: number;
+  bytesPerTexel?: number;
+  budgetBytes?: number;
+  maxTiles?: number;
+  maxCells?: number;
+}): ContactMainLodWholeResidencyPlan | null {
+  const values = [
+    totalSpanBp,
+    resolution,
+    tileSizeBins,
+    bytesPerTexel,
+    budgetBytes,
+    maxTiles,
+    maxCells,
+  ];
+  if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+    return null;
+  }
+
+  const tileSpanBp = resolution * tileSizeBins;
+  if (!Number.isSafeInteger(tileSpanBp)) {
+    return null;
+  }
+  const axisTileCount = Math.ceil(totalSpanBp / tileSpanBp);
+  const tileCount = axisTileCount * (axisTileCount + 1) / 2;
+  const cellsPerTile = tileSizeBins * tileSizeBins;
+  const estimatedCells = tileCount * cellsPerTile;
+  const estimatedBytes = estimatedCells * bytesPerTexel;
+  if (
+    !Number.isSafeInteger(tileCount)
+    || !Number.isSafeInteger(cellsPerTile)
+    || !Number.isSafeInteger(estimatedCells)
+    || !Number.isSafeInteger(estimatedBytes)
+    || tileCount > maxTiles
+    || estimatedCells > maxCells
+    || estimatedBytes > budgetBytes
+  ) {
+    return null;
+  }
+
+  const tiles: ContactMapTileKey[] = [];
+  for (let tileY = 0; tileY < axisTileCount; tileY += 1) {
+    for (let tileX = 0; tileX <= tileY; tileX += 1) {
+      tiles.push({ tileX, tileY });
+    }
+  }
+  return {
+    axisTileCount,
+    estimatedBytes,
+    estimatedCells,
+    tiles,
+  };
 }
 
 /** A same-resolution plan would only move identical tiles into a cold LOD cache. */

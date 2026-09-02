@@ -117,6 +117,7 @@ import {
 } from "./state/contactOverviewTiles";
 import {
   buildContactMainLodPlan,
+  buildContactMainLodWholeResidencyPlan,
   combineContactMainLodVisibleBatches,
   contactMainLodPlanChangesSampling,
   contactMainLodPrefetchBatchSize,
@@ -2784,6 +2785,13 @@ export function App() {
         normalization,
         viewAssemblyLayout.projectionBlocks,
       );
+      const wholeResidencyPlan = !panPreviewActive
+        ? buildContactMainLodWholeResidencyPlan({
+            totalSpanBp,
+            resolution: mainLodPlan.targetResolution,
+            tileSizeBins: lodTileSizeBins,
+          })
+        : null;
       const untouchedLodWorld = buildContactTileWorld({
         viewport,
         prefetchViewport,
@@ -2800,11 +2808,12 @@ export function App() {
       const warmKeys = untouchedLodWorld.prefetchTiles
         .map(lodCacheKeyForTile)
         .filter((key) => !visibleKeys.has(key));
+      const wholeResidencyKeys = wholeResidencyPlan?.tiles.map(lodCacheKeyForTile) ?? [];
       contactMainLodTileCacheLru.touch(
         lodLayerScope,
-        [...warmKeys, ...visibleKeys],
+        [...wholeResidencyKeys, ...warmKeys, ...visibleKeys],
         {
-          keys: visibleKeys,
+          keys: new Set([...wholeResidencyKeys, ...visibleKeys]),
           scopes: new Set([lodLayerScope.id]),
         },
       );
@@ -2825,6 +2834,7 @@ export function App() {
         lodLayerScope,
         lodCacheKeyForTile,
         lodWorld,
+        wholeResidencyPlan,
       };
     })();
     // Advance/cancel exactly once for this generation. Large views deliberately
@@ -2832,7 +2842,8 @@ export function App() {
     const retainedRequestIds = mainLodTileState
       ? contactMainLodTileFlightsRef.current.requestIdsFor(
           mainLodTileState.lodScope,
-          mainLodTileState.lodWorld.prefetchTiles,
+          mainLodTileState.wholeResidencyPlan?.tiles
+            ?? mainLodTileState.lodWorld.prefetchTiles,
           mainLodTileState.lodCacheKeyForTile,
         )
       : contactTileFlightsRef.current.requestIdsFor(
@@ -2848,6 +2859,7 @@ export function App() {
         lodLayerScope: mainLodLayerScope,
         lodCacheKeyForTile: mainLodCacheKeyForTile,
         lodWorld: mainLodWorld,
+        wholeResidencyPlan: mainLodWholeResidencyPlan,
       } = mainLodTileState!;
       if (panPerformancePreview) {
         contactPanPerformance.startGeneration({
@@ -2862,7 +2874,8 @@ export function App() {
         }
       }
       const mainLodProtectedKeys = new Set(
-        mainLodWorld.prefetchTiles.map(mainLodCacheKeyForTile),
+        (mainLodWholeResidencyPlan?.tiles ?? mainLodWorld.prefetchTiles)
+          .map(mainLodCacheKeyForTile),
       );
       const assemblingMainLodVisibleTiles = new Map(
         mainLodWorld.cachedVisibleTiles.map((tile) => [
@@ -3088,6 +3101,15 @@ export function App() {
             mainLodPlan.targetResolution,
             lodTileSizeBins,
           );
+          if (!panPreviewActive && mainLodWholeResidencyPlan) {
+            contactPanPrefetchBridge.publishGpuResident({
+              tiles,
+              dataScope: `${mainLodScope}|${normalization}`,
+              generation,
+              resolution: mainLodPlan.targetResolution,
+              tileSizeBins: lodTileSizeBins,
+            });
+          }
           if (layerComplete && !panPreviewActive) {
             lastCompleteContactMapRef.current = updatedMainLodMap;
           }
@@ -3305,6 +3327,23 @@ export function App() {
             return;
           }
           commitMainLodTiles("prefetch", loadedTiles);
+        }
+        if (mainLodWholeResidencyPlan && !documentIsHidden()) {
+          // Warm the remaining small interaction level in one backend scan.
+          // The strict dense-byte/cell/tile gate above prevents fine levels
+          // from turning this optimization into whole-genome materialization.
+          const remainingWholeLevelTiles = mainLodWholeResidencyPlan.tiles.filter(
+            (tile) => !contactMainLodTileCacheRef.current.has(
+              mainLodCacheKeyForTile(tile),
+            ),
+          );
+          if (remainingWholeLevelTiles.length > 0) {
+            const loadedTiles = await loadMainLodPrefetchTiles(remainingWholeLevelTiles);
+            if (cancelled || generation !== contactTileGenerationRef.current) {
+              return;
+            }
+            commitMainLodTiles("prefetch", loadedTiles);
+          }
         }
       })().catch((error) => {
         if (

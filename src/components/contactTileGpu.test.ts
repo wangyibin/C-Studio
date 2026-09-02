@@ -966,6 +966,55 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
+  it("holds the complete front during pan instead of mixing overview and exact pages", () => {
+    const { canvas, blitFramebuffer, clear, drawArrays } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const overview = contactOverviewFloatTextureData({
+      resolution: 100,
+      viewport: { xStart: 0, xEnd: 800, yStart: 0, yEnd: 400 },
+      cells: [{ xBin: 0, yBin: 0, count: 35 }],
+    }, 4);
+    expect(renderer?.setScene({
+      descriptors: [{
+        key: "0:0:source",
+        tile: {
+          tileX: 0,
+          tileY: 0,
+          cells: [{ xBin: 0, yBin: 0, count: 4 }],
+        },
+        transpose: false,
+      }],
+      generation: 1,
+      overview,
+      resolution: 100,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 },
+      renderStyle: {
+        colormap: "Reds" as const,
+        colorScale: { log: false, min: 0, max: 35 },
+      },
+    })).toBe(true);
+    const frontDraws = drawArrays.mock.calls.length;
+    const frontClears = clear.mock.calls.length;
+    const frontPresentations = blitFramebuffer.mock.calls.length;
+    const fallbacks = renderer?.performanceSnapshot().virtualTextureFallbacks ?? 0;
+
+    // Page (1, 0) is represented by the overview but has not arrived as an
+    // exact tile. Pointer motion must leave the prior complete FBO untouched.
+    renderer?.setPanViewport({ xStart: 0, xEnd: 800, yStart: 0, yEnd: 400 });
+
+    expect(drawArrays).toHaveBeenCalledTimes(frontDraws);
+    expect(clear).toHaveBeenCalledTimes(frontClears);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(frontPresentations);
+    expect(renderer?.performanceSnapshot().virtualTextureFallbacks)
+      .toBe(fallbacks + 1);
+    renderer?.destroy();
+  });
+
   it("rejects virtual pages outside the non-negative safe tile grid", () => {
     expect(contactTileVirtualPagePlan([{
       key: "invalid",

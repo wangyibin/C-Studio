@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   buildContactMainLodPlan,
+  buildContactMainLodWholeResidencyPlan,
   combineContactMainLodVisibleBatches,
   contactMainLodPlanChangesSampling,
+  contactMainLodR16fBytesPerTexel,
   contactMainLodTileCacheLimits,
   contactMainLodTileSizeBins,
   contactMainLodVisibleBatchSize,
+  contactMainLodWholeResidencyBudgetBytes,
   maxAdaptiveMcoolExactTiles,
   shouldUseContactMainLod,
 } from "./contactMainLod";
@@ -68,6 +71,54 @@ describe("main contact-map LOD planning", () => {
       maxTiles: 64,
       maxCells: 1_500_000,
     });
+  });
+
+  it("keeps the complete 2.5 Mb alfalfa interaction level inside the hard budget", () => {
+    const plan = buildContactMainLodWholeResidencyPlan({
+      totalSpanBp: 3_165_218_438,
+      resolution: 2_500_000,
+    });
+
+    expect(plan).toMatchObject({
+      axisTileCount: 5,
+      estimatedCells: 15 * 256 * 256,
+      estimatedBytes: 15 * 256 * 256 * contactMainLodR16fBytesPerTexel,
+    });
+    expect(plan?.tiles).toHaveLength(15);
+    expect(plan?.tiles[0]).toEqual({ tileX: 0, tileY: 0 });
+    expect(plan!.tiles[plan!.tiles.length - 1]).toEqual({ tileX: 4, tileY: 4 });
+    expect(plan!.estimatedBytes).toBeLessThan(contactMainLodWholeResidencyBudgetBytes);
+  });
+
+  it("keeps finer alfalfa levels on bounded viewport streaming", () => {
+    expect(buildContactMainLodWholeResidencyPlan({
+      totalSpanBp: 3_165_218_438,
+      resolution: 1_000_000,
+    })).toBeNull();
+    expect(buildContactMainLodWholeResidencyPlan({
+      totalSpanBp: 3_165_218_438,
+      resolution: 500_000,
+    })).toBeNull();
+  });
+
+  it("rejects a whole level when its dense R16F bytes cross the explicit cap", () => {
+    const input = {
+      totalSpanBp: 1_000,
+      resolution: 100,
+      tileSizeBins: 4,
+      maxTiles: 100,
+      maxCells: 10_000,
+    };
+    const expectedBytes = 6 * 4 * 4 * contactMainLodR16fBytesPerTexel;
+
+    expect(buildContactMainLodWholeResidencyPlan({
+      ...input,
+      budgetBytes: expectedBytes,
+    })?.estimatedBytes).toBe(expectedBytes);
+    expect(buildContactMainLodWholeResidencyPlan({
+      ...input,
+      budgetBytes: expectedBytes - 1,
+    })).toBeNull();
   });
 
   it("reuses overlapping coarse tiles and requests only the newly exposed edge", () => {
