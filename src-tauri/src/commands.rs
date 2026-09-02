@@ -1164,6 +1164,13 @@ pub enum ContactWebContentMemoryCheckpointStage {
     WebglUpload,
     FirstPaint,
     OverviewStart,
+    OverviewDrawEntry,
+    OverviewContextAcquired,
+    OverviewCreateImageDataBefore,
+    OverviewImageDataCreated,
+    OverviewRgbaComplete,
+    OverviewPutImageDataBefore,
+    OverviewPutImageDataAfter,
 }
 
 impl ContactWebContentMemoryCheckpointStage {
@@ -1175,6 +1182,13 @@ impl ContactWebContentMemoryCheckpointStage {
             Self::WebglUpload => "webgl_upload",
             Self::FirstPaint => "first_paint",
             Self::OverviewStart => "overview_start",
+            Self::OverviewDrawEntry => "overview_draw_entry",
+            Self::OverviewContextAcquired => "overview_context_acquired",
+            Self::OverviewCreateImageDataBefore => "overview_create_image_data_before",
+            Self::OverviewImageDataCreated => "overview_image_data_created",
+            Self::OverviewRgbaComplete => "overview_rgba_complete",
+            Self::OverviewPutImageDataBefore => "overview_put_image_data_before",
+            Self::OverviewPutImageDataAfter => "overview_put_image_data_after",
         }
     }
 }

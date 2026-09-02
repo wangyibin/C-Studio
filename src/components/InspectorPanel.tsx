@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { LocateFixed, Maximize2 } from "lucide-react";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
-import { contactColorCss } from "../state/contactColor";
+import {
+  contactColorLut,
+  contactColorLutIndex,
+} from "../state/contactColor";
 import {
   contactCountSampleForColorScale,
   estimateContactColorScale,
@@ -9,6 +12,10 @@ import {
   type ContactColorScale,
 } from "../state/contactColorScale";
 import { forEachContactTileCell } from "../state/contactTileData";
+import {
+  logContactMemoryCheckpoint,
+  type ContactMemoryCheckpointStage,
+} from "../state/contactMemoryCheckpoints";
 import {
   assemblyCopyInstanceId,
   assemblyCopyIntervalGroups,
@@ -34,11 +41,11 @@ import {
 } from "./SyntenyDotplot";
 import type { SyntenyView } from "../state/syntenyView";
 import {
-  contactNormalizationForBackend,
   type OperationRecord,
   type UiAction,
   type UiState,
 } from "../state/uiState";
+import { contactNavigationOverviewNormalization } from "../state/contactOverviewTiles";
 import { fitContextMenuToViewport } from "./AssemblyContextMenu";
 import { GfaPreviewCard } from "./GfaGraphPanel";
 import { AssemblyPlacementRecommendationCard } from "./AssemblyPlacementRecommendationCard";
@@ -73,7 +80,6 @@ interface InspectorPanelProps {
 
 export function InspectorPanel({
   dataset,
-  contactMap,
   overviewContactMap,
   presentedContactViewport = null,
   status,
@@ -193,7 +199,6 @@ export function InspectorPanel({
         </div>
         {uiState.activeOverviewMode === "overview" ? (
           <ContactOverview
-            contactMap={contactMap}
             overviewContactMap={overviewContactMap}
             presentedContactViewport={presentedContactViewport}
             totalSpanBp={Math.max(
@@ -240,7 +245,7 @@ export function InspectorPanel({
           blocks={assemblyBlocks}
           selection={uiState.assembly.selection}
           overviewContactMap={overviewContactMap}
-          expectedNormalization={contactNormalizationForBackend(uiState.normalization)}
+          expectedNormalization={contactNavigationOverviewNormalization}
           pafRecords={pafRecords}
           gfaDocument={gfaDocument}
           onLoadEndpointHiCBatch={onLoadGfaEndpointHiCBatch}
@@ -1044,7 +1049,6 @@ function formatCount(count: number, singular: string, plural = `${singular}s`) {
 }
 
 interface ContactOverviewProps {
-  contactMap: ContactMapView | null;
   overviewContactMap: ContactMapView | null;
   presentedContactViewport: ContactViewport | null;
   totalSpanBp: number;
@@ -1053,14 +1057,13 @@ interface ContactOverviewProps {
   onExpand: () => void;
 }
 
-export function contactOverviewMapForDisplayedNormalization(
-  contactMap: ContactMapView | null,
+export function contactNavigationOverviewMap(
   overviewContactMap: ContactMapView | null,
 ): ContactMapView | null {
-  if (overviewContactMap?.normalization === contactMap?.normalization) {
-    return overviewContactMap;
-  }
-  return null;
+  return (overviewContactMap?.normalization ?? "raw")
+    === contactNavigationOverviewNormalization
+    ? overviewContactMap
+    : null;
 }
 
 /** Keep the overview window on the camera already presented by the main heatmap. */
@@ -1093,7 +1096,6 @@ export function contactOverviewWindowViewport(
 }
 
 function ContactOverview({
-  contactMap,
   overviewContactMap,
   presentedContactViewport,
   totalSpanBp,
@@ -1102,10 +1104,7 @@ function ContactOverview({
   onExpand,
 }: ContactOverviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const displayedOverview = contactOverviewMapForDisplayedNormalization(
-    contactMap,
-    overviewContactMap,
-  );
+  const displayedOverview = contactNavigationOverviewMap(overviewContactMap);
   // Keep the transitional pixels and their coordinate span from the same
   // last-complete snapshot. A copy/delete edit swaps both atomically.
   const displayedTotalSpanBp = Math.max(
@@ -1207,8 +1206,8 @@ function ContactOverview({
       <canvas
         ref={canvasRef}
         className="overview-heatmap-canvas"
-        width="320"
-        height="320"
+        width={contactOverviewRasterSize}
+        height={contactOverviewRasterSize}
         aria-hidden="true"
       />
       <button
@@ -1250,18 +1249,48 @@ export function drawOverviewHeatmap(
   if (!canvas) {
     return;
   }
+  logOverviewRasterMemoryCheckpoint(
+    "overview_draw_entry",
+    contactMap,
+    0,
+  );
 
   const context = canvas.getContext("2d");
   if (!context) {
     return;
   }
+  logOverviewRasterMemoryCheckpoint(
+    "overview_context_acquired",
+    contactMap,
+    0,
+  );
 
-  const { width, height } = canvas;
-  context.clearRect(0, 0, width, height);
-  context.fillStyle = "#ffffff";
-  context.fillRect(0, 0, width, height);
+  if (
+    canvas.width !== contactOverviewRasterSize
+    || canvas.height !== contactOverviewRasterSize
+  ) {
+    canvas.width = contactOverviewRasterSize;
+    canvas.height = contactOverviewRasterSize;
+  }
+  logOverviewRasterMemoryCheckpoint(
+    "overview_create_image_data_before",
+    contactMap,
+    0,
+  );
+  const imageData = context.createImageData(
+    contactOverviewRasterSize,
+    contactOverviewRasterSize,
+  );
+  const pixels = imageData.data;
+  logOverviewRasterMemoryCheckpoint(
+    "overview_image_data_created",
+    contactMap,
+    pixels.byteLength,
+  );
+  pixels.fill(255);
 
   if (!contactMap) {
+    context.putImageData(imageData, 0, 0);
     return;
   }
 
@@ -1269,35 +1298,38 @@ export function drawOverviewHeatmap(
     contactCountSampleForColorScale(contactMap),
     uiState.contact.colorScale.log,
   );
-  const binSize = Math.max(1, (contactMap.resolution / Math.max(1, totalSpanBp)) * width);
+  const safeTotalSpanBp = Math.max(1, totalSpanBp);
+  const binSize = Math.max(
+    1,
+    (contactMap.resolution / safeTotalSpanBp) * contactOverviewRasterSize,
+  );
+  const colorLut = contactColorLut(uiState.contact.colormap, 0.9);
 
   const drawCell = (xBin: number, yBin: number, count: number) => {
     drawOverviewCell(
-      context,
+      pixels,
       xBin,
       yBin,
       count,
       contactMap.resolution,
-      totalSpanBp,
-      width,
-      height,
+      safeTotalSpanBp,
       binSize,
       scale,
       uiState.contact.colormap,
+      colorLut,
     );
     if (xBin !== yBin) {
       drawOverviewCell(
-        context,
+        pixels,
         yBin,
         xBin,
         count,
         contactMap.resolution,
-        totalSpanBp,
-        width,
-        height,
+        safeTotalSpanBp,
         binSize,
         scale,
         uiState.contact.colormap,
+        colorLut,
       );
     }
   };
@@ -1311,26 +1343,121 @@ export function drawOverviewHeatmap(
       drawCell(cell.xBin, cell.yBin, cell.count);
     }
   }
+  logOverviewRasterMemoryCheckpoint(
+    "overview_rgba_complete",
+    contactMap,
+    pixels.byteLength,
+  );
+  logOverviewRasterMemoryCheckpoint(
+    "overview_put_image_data_before",
+    contactMap,
+    pixels.byteLength,
+  );
+  context.putImageData(imageData, 0, 0);
+  logOverviewRasterMemoryCheckpoint(
+    "overview_put_image_data_after",
+    contactMap,
+    pixels.byteLength,
+  );
+}
+
+const contactOverviewRasterSize = 320;
+
+function logOverviewRasterMemoryCheckpoint(
+  stage: Extract<
+    ContactMemoryCheckpointStage,
+    | "overview_draw_entry"
+    | "overview_context_acquired"
+    | "overview_create_image_data_before"
+    | "overview_image_data_created"
+    | "overview_rgba_complete"
+    | "overview_put_image_data_before"
+    | "overview_put_image_data_after"
+  >,
+  contactMap: ContactMapView | null,
+  payloadBytes: number,
+) {
+  const generation = contactMap?.renderGeneration;
+  if (!generation) {
+    return;
+  }
+  logContactMemoryCheckpoint({
+    stage,
+    generation,
+    targetResolution: contactMap.resolution,
+    payloadBytes,
+    itemCount: contactOverviewRasterSize * contactOverviewRasterSize,
+  });
 }
 
 function drawOverviewCell(
-  context: CanvasRenderingContext2D,
+  pixels: Uint8ClampedArray,
   xBin: number,
   yBin: number,
   count: number,
   resolution: number,
   totalSpanBp: number,
-  width: number,
-  height: number,
   binSize: number,
   scale: Pick<ContactColorScale, "log" | "min" | "max">,
   colormap: UiState["contact"]["colormap"],
+  colorLut: Uint8ClampedArray,
 ) {
-  const x = ((xBin * resolution) / totalSpanBp) * width;
-  const y = ((yBin * resolution) / totalSpanBp) * height;
+  const x = ((xBin * resolution) / totalSpanBp) * contactOverviewRasterSize;
+  const y = ((yBin * resolution) / totalSpanBp) * contactOverviewRasterSize;
+  const rawLeft = Math.floor(x);
+  const rawTop = Math.floor(y);
+  const rawRight = Math.max(rawLeft + 1, Math.ceil(x + binSize));
+  const rawBottom = Math.max(rawTop + 1, Math.ceil(y + binSize));
+  if (
+    rawLeft >= contactOverviewRasterSize
+    || rawTop >= contactOverviewRasterSize
+    || rawRight <= 0
+    || rawBottom <= 0
+  ) {
+    return;
+  }
+  const left = Math.max(0, rawLeft);
+  const top = Math.max(0, rawTop);
+  const right = Math.min(contactOverviewRasterSize, rawRight);
+  const bottom = Math.min(contactOverviewRasterSize, rawBottom);
   const intensity = normalizeContactValue(count, scale);
-  context.fillStyle = contactColorCss(colormap, intensity);
-  context.fillRect(x, y, binSize, binSize);
+  const colorOffset = contactColorLutIndex(colormap, intensity) * 4;
+  for (let pixelY = top; pixelY < bottom; pixelY += 1) {
+    for (let pixelX = left; pixelX < right; pixelX += 1) {
+      blendOverviewPixel(
+        pixels,
+        (pixelY * contactOverviewRasterSize + pixelX) * 4,
+        colorLut,
+        colorOffset,
+      );
+    }
+  }
+}
+
+function blendOverviewPixel(
+  pixels: Uint8ClampedArray,
+  pixelOffset: number,
+  colorLut: Uint8ClampedArray,
+  colorOffset: number,
+) {
+  const alpha = colorLut[colorOffset + 3];
+  if (alpha === 255) {
+    pixels[pixelOffset] = colorLut[colorOffset];
+    pixels[pixelOffset + 1] = colorLut[colorOffset + 1];
+    pixels[pixelOffset + 2] = colorLut[colorOffset + 2];
+  } else if (alpha > 0) {
+    const inverseAlpha = 255 - alpha;
+    pixels[pixelOffset] = Math.round(
+      (colorLut[colorOffset] * alpha + pixels[pixelOffset] * inverseAlpha) / 255,
+    );
+    pixels[pixelOffset + 1] = Math.round(
+      (colorLut[colorOffset + 1] * alpha + pixels[pixelOffset + 1] * inverseAlpha) / 255,
+    );
+    pixels[pixelOffset + 2] = Math.round(
+      (colorLut[colorOffset + 2] * alpha + pixels[pixelOffset + 2] * inverseAlpha) / 255,
+    );
+  }
+  pixels[pixelOffset + 3] = 255;
 }
 
 interface SyntenyPreviewProps {

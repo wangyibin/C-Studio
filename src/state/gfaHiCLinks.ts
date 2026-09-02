@@ -65,6 +65,52 @@ export function buildLengthNormalizedGfaHiCLinks(
   maxLinks = maximumGfaHiCLinks,
   partnersPerUnitig?: number,
 ): GfaHiCLink[] {
+  return buildLengthNormalizedGfaHiCLinksInternal(
+    contactMap,
+    assemblyBlocks,
+    graphNodes,
+    maxLinks,
+    partnersPerUnitig,
+  );
+}
+
+/**
+ * Build only links incident to the currently selected placement block.
+ *
+ * The focused memberships prevent a coarse bin containing many unrelated
+ * contigs from expanding into the full all-by-all pair set. The final list is
+ * additionally bounded per selected unitig, preserving the recommendation
+ * shortlist without paying the whole-assembly allocation cost on cold load.
+ */
+export function buildSelectedLengthNormalizedGfaHiCLinks(
+  contactMap: ContactMapView,
+  assemblyBlocks: ReadonlyArray<ContactMapLayoutBlock>,
+  graphNodes: ReadonlyArray<Pick<GfaGraphNode, "id" | "occurrenceId">>,
+  selectedNodeIds: ReadonlySet<string>,
+  maxLinks = maximumGfaHiCLinks,
+  partnersPerSelectedUnitig?: number,
+): GfaHiCLink[] {
+  if (selectedNodeIds.size === 0) {
+    return [];
+  }
+  return buildLengthNormalizedGfaHiCLinksInternal(
+    contactMap,
+    assemblyBlocks,
+    graphNodes,
+    maxLinks,
+    partnersPerSelectedUnitig,
+    selectedNodeIds,
+  );
+}
+
+function buildLengthNormalizedGfaHiCLinksInternal(
+  contactMap: ContactMapView,
+  assemblyBlocks: ReadonlyArray<ContactMapLayoutBlock>,
+  graphNodes: ReadonlyArray<Pick<GfaGraphNode, "id" | "occurrenceId">>,
+  maxLinks: number,
+  partnersPerUnitig: number | undefined,
+  selectedNodeIds?: ReadonlySet<string>,
+): GfaHiCLink[] {
   if (
     !Number.isFinite(contactMap.resolution)
     || contactMap.resolution <= 0
@@ -110,14 +156,19 @@ export function buildLengthNormalizedGfaHiCLinks(
     eligibleBlocks,
     contactMap.resolution,
   );
+  const selectedMembershipsByBin = selectedNodeIds
+    ? filterMembershipsByNodeIds(membershipsByBin, selectedNodeIds, true)
+    : null;
+  const candidateMembershipsByBin = selectedNodeIds
+    ? filterMembershipsByNodeIds(membershipsByBin, selectedNodeIds, false)
+    : null;
   const countsByPair = new Map<string, AggregatedPair>();
 
-  forEachContactOverviewCell(contactMap, (xBin, yBin, count) => {
-    if (!Number.isFinite(count) || count <= 0) {
-      return;
-    }
-    const xMemberships = membershipsByBin.get(xBin);
-    const yMemberships = membershipsByBin.get(yBin);
+  const aggregateMembershipPairs = (
+    xMemberships: ReadonlyArray<BinMembership> | undefined,
+    yMemberships: ReadonlyArray<BinMembership> | undefined,
+    count: number,
+  ) => {
     if (!xMemberships || !yMemberships) {
       return;
     }
@@ -149,6 +200,29 @@ export function buildLengthNormalizedGfaHiCLinks(
         }
       }
     }
+  };
+  forEachContactOverviewCell(contactMap, (xBin, yBin, count) => {
+    if (!Number.isFinite(count) || count <= 0) {
+      return;
+    }
+    if (selectedMembershipsByBin && candidateMembershipsByBin) {
+      aggregateMembershipPairs(
+        selectedMembershipsByBin.get(xBin),
+        candidateMembershipsByBin.get(yBin),
+        count,
+      );
+      aggregateMembershipPairs(
+        selectedMembershipsByBin.get(yBin),
+        candidateMembershipsByBin.get(xBin),
+        count,
+      );
+      return;
+    }
+    aggregateMembershipPairs(
+      membershipsByBin.get(xBin),
+      membershipsByBin.get(yBin),
+      count,
+    );
   });
 
   const allRanked = [...countsByPair.values()]
@@ -174,7 +248,9 @@ export function buildLengthNormalizedGfaHiCLinks(
     ));
   const ranked = partnersPerUnitig === undefined
     ? allRanked.slice(0, maxLinks)
-    : selectPartnersForEveryUnitig(allRanked, partnersPerUnitig);
+    : selectedNodeIds
+      ? selectPartnersForSelectedUnitigs(allRanked, selectedNodeIds, partnersPerUnitig)
+      : selectPartnersForEveryUnitig(allRanked, partnersPerUnitig);
   const maximumScore = ranked[0]?.normalizedCountPerMb2 ?? 0;
 
   return ranked.map((pair) => ({
@@ -185,6 +261,23 @@ export function buildLengthNormalizedGfaHiCLinks(
     normalizedCountPerMb2: pair.normalizedCountPerMb2,
     lineWidth: hiCLinkLineWidth(pair.normalizedCountPerMb2, maximumScore),
   }));
+}
+
+function filterMembershipsByNodeIds(
+  membershipsByBin: ReadonlyMap<number, ReadonlyArray<BinMembership>>,
+  selectedNodeIds: ReadonlySet<string>,
+  selected: boolean,
+) {
+  const filtered = new Map<number, BinMembership[]>();
+  for (const [bin, memberships] of membershipsByBin) {
+    const matches = memberships.filter((membership) => (
+      selectedNodeIds.has(membership.id) === selected
+    ));
+    if (matches.length > 0) {
+      filtered.set(bin, matches);
+    }
+  }
+  return filtered;
 }
 
 /**
@@ -203,6 +296,27 @@ function selectPartnersForEveryUnitig(
     incidentRanks.set(pair.source, sourceRank);
     incidentRanks.set(pair.target, targetRank);
     return sourceRank <= partnersPerUnitig || targetRank <= partnersPerUnitig;
+  });
+}
+
+function selectPartnersForSelectedUnitigs(
+  ranked: ReadonlyArray<AggregatedPair>,
+  selectedNodeIds: ReadonlySet<string>,
+  partnersPerSelectedUnitig: number,
+) {
+  const incidentRanks = new Map<string, number>();
+  return ranked.filter((pair) => {
+    const selectedId = selectedNodeIds.has(pair.source)
+      ? pair.source
+      : selectedNodeIds.has(pair.target)
+        ? pair.target
+        : null;
+    if (!selectedId) {
+      return false;
+    }
+    const rank = (incidentRanks.get(selectedId) ?? 0) + 1;
+    incidentRanks.set(selectedId, rank);
+    return rank <= partnersPerSelectedUnitig;
   });
 }
 

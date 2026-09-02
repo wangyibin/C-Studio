@@ -110,9 +110,10 @@ import {
 import { contactNormalizationPrewarmResolutions } from "./state/contactNormalizationPrewarm";
 import {
   buildContactOverviewTilePlan,
+  contactNavigationOverviewFromCoveringMap,
+  contactNavigationOverviewNormalization,
   retainContactOverviewRequestId,
   shouldResumeContactBackgroundSchedulingAfterFailure,
-  wholeAssemblyOverviewFromCoveringMap,
 } from "./state/contactOverviewTiles";
 import {
   buildContactMainLodPlan,
@@ -463,6 +464,10 @@ const contactMainLodEnabled = import.meta.env.VITE_CSTUDIO_MAIN_LOD !== "0";
 // Default to the bounded one-shot dense response for the main visible LOD.
 // Set to 0 only for an explicit Channel-versus-direct A/B replay.
 const contactMainLodOneShotEnabled = import.meta.env.VITE_CSTUDIO_MAIN_LOD_ONE_SHOT !== "0";
+const contactOverviewEnabled = import.meta.env.VITE_CSTUDIO_CONTACT_OVERVIEW !== "0";
+const contactOverviewRenderEnabled = (
+  import.meta.env.VITE_CSTUDIO_CONTACT_OVERVIEW_RENDER !== "0"
+);
 
 function yieldToProjectLoadPaint() {
   if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
@@ -2364,12 +2369,13 @@ export function App() {
   ]);
 
   useEffect(() => {
-    // A different matrix or normalization must never inherit the old overview.
+    // A different matrix must never inherit the old overview. Normalization is
+    // intentionally excluded: the navigation overview remains a stable raw map.
     // Layout edits are intentionally excluded: the last complete whole-genome
     // frame remains visible until its replacement is ready.
     overviewContactMapRef.current = null;
     setOverviewContactMap(null);
-  }, [contactCoolPath, uiState.normalization]);
+  }, [contactCoolPath]);
 
   useEffect(() => {
     if (
@@ -2952,10 +2958,10 @@ export function App() {
         });
       };
       const reuseMainLodAsOverview = (map: ContactMapView) => {
-        if (contactTileReplacementPreviewActive) {
+        if (!contactOverviewEnabled || contactTileReplacementPreviewActive) {
           return;
         }
-        const reusableOverview = wholeAssemblyOverviewFromCoveringMap(
+        const reusableOverview = contactNavigationOverviewFromCoveringMap(
           map,
           viewAssemblyLayout.totalSpan,
         );
@@ -4379,7 +4385,11 @@ export function App() {
       overviewContactMapRef.current = null;
       setOverviewContactMap(null);
     };
-    if (!contactCoolPath || canonicalViewAssemblyLayout.blocks.length === 0) {
+    if (
+      !contactOverviewEnabled
+      || !contactCoolPath
+      || canonicalViewAssemblyLayout.blocks.length === 0
+    ) {
       clearStaleOverview();
       return;
     }
@@ -4390,7 +4400,7 @@ export function App() {
       totalSpanBp,
       contactAvailableResolutions,
     );
-    const normalization = contactNormalizationForBackend(uiState.normalization);
+    const normalization = contactNavigationOverviewNormalization;
     const overviewScope = contactTileScope(
       overviewCoolPath,
       plan.targetResolution,
@@ -4499,6 +4509,7 @@ export function App() {
           layoutBlocks: canonicalViewAssemblyLayout.blocks,
           layoutScope: overviewScope,
           visibleLayerComplete: true,
+          renderGeneration: generation,
         };
         overviewContactMapRef.current = overviewMap;
         setOverviewContactMap(overviewMap);
@@ -4552,7 +4563,6 @@ export function App() {
     canonicalViewContactLayoutBlocks,
     contactAvailableResolutions,
     contactCoolPath,
-    uiState.normalization,
   ]);
 
   useEffect(() => {
@@ -6320,7 +6330,9 @@ export function App() {
         : contactTileDeltaStream}
       contactIsMcool={contactIsMcool}
       contactAvailableResolutions={contactAvailableResolutions}
-      overviewContactMap={overviewContactMap}
+      overviewContactMap={
+        contactOverviewEnabled && contactOverviewRenderEnabled ? overviewContactMap : null
+      }
       syntenyView={syntenyView}
       coverageView={coverageView}
       pafRecords={pafRecords}

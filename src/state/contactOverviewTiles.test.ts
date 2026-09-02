@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   buildContactOverviewTilePlan,
+  contactNavigationOverviewFromCoveringMap,
+  contactNavigationOverviewNormalization,
   contactResolutionAtOrAbove,
   closestContactResolution,
   contactOverviewBaseIsCompatible,
@@ -178,5 +180,21 @@ describe("contact overview reuse", () => {
       ...map,
       viewport: { ...map.viewport, xStart: 1 },
     }, 10_000_000_000)).toBeNull();
+  });
+
+  it("keeps the navigation overview raw when the main normalization changes", () => {
+    const rawMap = {
+      resolution: 10_000,
+      normalization: contactNavigationOverviewNormalization,
+      viewport: { xStart: 0, xEnd: 1_000, yStart: 0, yEnd: 1_000 },
+      cells: [],
+      visibleLayerComplete: true,
+    };
+
+    expect(contactNavigationOverviewFromCoveringMap(rawMap, 1_000)).toBe(rawMap);
+    expect(contactNavigationOverviewFromCoveringMap({
+      ...rawMap,
+      normalization: "ice",
+    }, 1_000)).toBeNull();
   });
 });

@@ -13,6 +13,7 @@ import {
   contactTileGpuDrawCoverageIsComplete,
   contactTileGpuSceneTextureFormat,
   contactTileGpuSceneCanUseRetainedPanViewport,
+  contactTileGpuEnabled,
   contactTileGpuTexturePreference,
   contactTileGpuUploadBatch,
   contactTileGpuUploadPlan,
@@ -1274,9 +1275,18 @@ describe("contactTileFloatTextureData", () => {
   });
 
   it("enables the virtual texture path by default with an explicit diagnostic opt-out", () => {
-    expect(contactTileGpuVirtualTextureEnabled("")).toBe(true);
-    expect(contactTileGpuVirtualTextureEnabled("?cstudioVirtualTexture=1")).toBe(true);
-    expect(contactTileGpuVirtualTextureEnabled("?cstudioVirtualTexture=0")).toBe(false);
+    expect(contactTileGpuVirtualTextureEnabled("", undefined)).toBe(true);
+    expect(contactTileGpuVirtualTextureEnabled("", "1")).toBe(true);
+    expect(contactTileGpuVirtualTextureEnabled("", "0")).toBe(false);
+    expect(contactTileGpuVirtualTextureEnabled("?cstudioVirtualTexture=1", "0")).toBe(true);
+    expect(contactTileGpuVirtualTextureEnabled("?cstudioVirtualTexture=0", "1")).toBe(false);
+  });
+
+  it("allows the complete GPU renderer to be disabled for a fallback A/B", () => {
+    expect(contactTileGpuEnabled("", undefined)).toBe(true);
+    expect(contactTileGpuEnabled("", "0")).toBe(false);
+    expect(contactTileGpuEnabled("?cstudioGpuRenderer=1", "0")).toBe(true);
+    expect(contactTileGpuEnabled("?cstudioGpuRenderer=0", "1")).toBe(false);
   });
 
   it("preserves the final canvas surface for WKWebView compositing", () => {

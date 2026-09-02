@@ -6,7 +6,14 @@ export type ContactMemoryCheckpointStage =
   | "react_commit"
   | "webgl_upload"
   | "first_paint"
-  | "overview_start";
+  | "overview_start"
+  | "overview_draw_entry"
+  | "overview_context_acquired"
+  | "overview_create_image_data_before"
+  | "overview_image_data_created"
+  | "overview_rgba_complete"
+  | "overview_put_image_data_before"
+  | "overview_put_image_data_after";
 
 export interface ContactMemoryCheckpoint {
   stage: ContactMemoryCheckpointStage;

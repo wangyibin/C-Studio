@@ -4,6 +4,7 @@ import type { ContactViewport } from "./contactViewport";
 import type { ContactNormalization } from "./uiState";
 
 export const overviewTargetBins = 320;
+export const contactNavigationOverviewNormalization: ContactNormalization = "raw";
 const fallbackCoolResolution = 1_000;
 
 export interface ContactOverviewTilePlan {
@@ -93,6 +94,21 @@ export function wholeAssemblyOverviewFromCoveringMap(
       yEnd: span,
     },
   };
+}
+
+/**
+ * The inspector overview is a stable navigation image, not a quantitative
+ * extension of the selected main-heatmap normalization. Reuse a covering main
+ * layer only when it already has the overview's fixed raw-data semantics.
+ */
+export function contactNavigationOverviewFromCoveringMap(
+  map: ContactMapView,
+  totalSpanBp: number,
+): ContactMapView | null {
+  if ((map.normalization ?? "raw") !== contactNavigationOverviewNormalization) {
+    return null;
+  }
+  return wholeAssemblyOverviewFromCoveringMap(map, totalSpanBp);
 }
 
 type ContactOverviewGenerationReadiness = Omit<

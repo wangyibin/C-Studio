@@ -81,6 +81,7 @@ export interface ContactTileGpuPerformanceSnapshot {
 }
 
 export interface ContactTileGpuRendererOptions {
+  enabled?: boolean;
   texturePreference?: ContactTileGpuTexturePreference;
   virtualTextureEnabled?: boolean;
   performanceEnabled?: boolean;
@@ -1389,8 +1390,18 @@ export function contactTileGpuTexturePreference(
 
 export function contactTileGpuVirtualTextureEnabled(
   search = typeof location === "undefined" ? "" : location.search,
+  buildToggle = import.meta.env.VITE_CSTUDIO_GPU_VIRTUAL_TEXTURE,
 ) {
-  return new URLSearchParams(search).get("cstudioVirtualTexture") !== "0";
+  const queryToggle = new URLSearchParams(search).get("cstudioVirtualTexture");
+  return (queryToggle ?? buildToggle) !== "0";
+}
+
+export function contactTileGpuEnabled(
+  search = typeof location === "undefined" ? "" : location.search,
+  buildToggle = import.meta.env.VITE_CSTUDIO_GPU_RENDERER,
+) {
+  const queryToggle = new URLSearchParams(search).get("cstudioGpuRenderer");
+  return (queryToggle ?? buildToggle) !== "0";
 }
 
 /** Convert the mutable streamed accumulator into the single-channel texture layout. */
@@ -1634,6 +1645,9 @@ export function createContactTileGpuRenderer(
   textureBudgetBytes = contactTileGpuTextureBudgetBytes,
   options: ContactTileGpuRendererOptions = {},
 ): ContactTileGpuRenderer | null {
+  if (!(options.enabled ?? contactTileGpuEnabled())) {
+    return null;
+  }
   const gl = canvas.getContext("webgl2", {
     alpha: false,
     antialias: false,

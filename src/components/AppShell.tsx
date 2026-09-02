@@ -81,6 +81,10 @@ import {
   type SyntenySelectionModifiers,
 } from "./SyntenyDotplot";
 
+const contactInspectorOverviewEnabled = (
+  import.meta.env.VITE_CSTUDIO_INSPECTOR_OVERVIEW !== "0"
+);
+
 interface AppShellProps {
   dataset: ExampleDatasetSummary | null;
   contactMap: ContactMapView | null;
@@ -1510,7 +1514,7 @@ export function AppShell({
             <InspectorPanel
               dataset={dataset}
               contactMap={contactMap}
-              overviewContactMap={overviewContactMap}
+              overviewContactMap={contactInspectorOverviewEnabled ? overviewContactMap : null}
               presentedContactViewport={presentedContactViewport}
               status={status}
               statusMessage={statusMessage}

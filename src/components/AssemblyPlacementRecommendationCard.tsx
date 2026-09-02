@@ -21,7 +21,7 @@ import type {
   GfaEndpointHiCLoadResult,
 } from "../state/gfaEndpointHiC";
 import {
-  buildLengthNormalizedGfaHiCLinks,
+  buildSelectedLengthNormalizedGfaHiCLinks,
   gfaHiCContactMapUsesLayout,
   maximumGfaHiCLinks,
 } from "../state/gfaHiCLinks";
@@ -92,15 +92,12 @@ export function AssemblyPlacementRecommendationCard({
     && gfaHiCContactMapUsesLayout(overviewContactMap, blocks)
     && (overviewContactMap.normalization ?? "raw") === expectedNormalization,
   );
-  const coarseLinks = useMemo(() => overviewContactMap && overviewReady
-    ? buildLengthNormalizedGfaHiCLinks(
-      overviewContactMap,
-      blocks,
-      blocks.map((block) => ({ id: block.id, occurrenceId: block.id })),
-      maximumGfaHiCLinks,
-      recommendationSyntenyMatchingPartnerLimit,
-    )
-    : [], [blocks, overviewContactMap, overviewReady]);
+  const coarseLinks = useMemo(() => placementRecommendationCoarseLinks(
+    overviewContactMap,
+    blocks,
+    selection,
+    expectedNormalization,
+  ), [blocks, expectedNormalization, overviewContactMap, selection]);
   const gfaEdges = useMemo(() => gfaDocument
     ? buildGfaAssemblyGraph(gfaDocument, blocks, Number.POSITIVE_INFINITY).edges
     : [], [blocks, gfaDocument]);
@@ -592,6 +589,33 @@ export function AssemblyPlacementRecommendationCard({
         Hold Preview to inspect the proposed layout; release to return. Only Apply edits the AGP and creates one undoable operation.
       </p>
     </div>
+  );
+}
+
+export function placementRecommendationCoarseLinks(
+  overviewContactMap: ContactMapView | null,
+  blocks: ReadonlyArray<ContactMapLayoutBlock>,
+  selection: AssemblySelection | null,
+  expectedNormalization: ContactNormalization,
+) {
+  if (
+    !overviewContactMap
+    || !gfaHiCContactMapUsesLayout(overviewContactMap, blocks)
+    || (overviewContactMap.normalization ?? "raw") !== expectedNormalization
+  ) {
+    return [];
+  }
+  const selected = selectedPlacementBlock(blocks, selection);
+  if ("status" in selected) {
+    return [];
+  }
+  return buildSelectedLengthNormalizedGfaHiCLinks(
+    overviewContactMap,
+    blocks,
+    blocks.map((block) => ({ id: block.id, occurrenceId: block.id })),
+    new Set(selected.blocks.map((block) => block.id)),
+    maximumGfaHiCLinks,
+    recommendationSyntenyMatchingPartnerLimit,
   );
 }
 

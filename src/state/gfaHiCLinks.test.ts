@@ -3,6 +3,7 @@ import type { ContactMapView } from "../App";
 import type { GfaGraphNode } from "./gfa";
 import {
   buildLengthNormalizedGfaHiCLinks,
+  buildSelectedLengthNormalizedGfaHiCLinks,
   gfaHiCContactMapUsesLayout,
 } from "./gfaHiCLinks";
 import type { ContactMapLayoutBlock } from "./importers";
@@ -163,5 +164,50 @@ describe("length-normalized GFA Hi-C links", () => {
       ["a", "b"],
       ["c", "d"],
     ]);
+  });
+
+  it("limits focused aggregation to selected-by-candidate links", () => {
+    const blocks = [
+      block("a", 0, 1_000_000),
+      block("b", 1_000_000, 2_000_000),
+      block("c", 2_000_000, 3_000_000),
+      block("d", 3_000_000, 4_000_000),
+    ];
+    const links = buildSelectedLengthNormalizedGfaHiCLinks(
+      contactMap(blocks, [
+        { xBin: 1, yBin: 2, count: 1_000 },
+        { xBin: 0, yBin: 1, count: 8 },
+        { xBin: 0, yBin: 2, count: 3 },
+        { xBin: 0, yBin: 3, count: 1 },
+      ]),
+      blocks,
+      blocks.map(({ id }) => node(id)),
+      new Set(["a"]),
+      10,
+      2,
+    );
+
+    expect(links.map((link) => [link.source, link.target])).toEqual([
+      ["a", "b"],
+      ["a", "c"],
+    ]);
+    expect(links.every((link) => link.source === "a" || link.target === "a")).toBe(true);
+  });
+
+  it("does not traverse overview cells without a selected placement block", () => {
+    const blocks = [block("a", 0, 1_000_000), block("b", 1_000_000, 2_000_000)];
+    const map = contactMap(blocks, []);
+    Object.defineProperty(map.cells, Symbol.iterator, {
+      value: () => {
+        throw new Error("overview cells should remain untouched");
+      },
+    });
+
+    expect(buildSelectedLengthNormalizedGfaHiCLinks(
+      map,
+      blocks,
+      blocks.map(({ id }) => node(id)),
+      new Set(),
+    )).toEqual([]);
   });
 });

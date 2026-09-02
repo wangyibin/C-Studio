@@ -1,14 +1,20 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { createInitialUiState } from "../state/uiState";
-import { contactColorCss } from "../state/contactColor";
+import { contactColorLut } from "../state/contactColor";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
-  contactOverviewMapForDisplayedNormalization,
+  contactNavigationOverviewMap,
   contactOverviewWindowViewport,
   drawOverviewHeatmap,
   InspectorPanel,
 } from "./InspectorPanel";
+
+const logContactMemoryCheckpointMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../state/contactMemoryCheckpoints", () => ({
+  logContactMemoryCheckpoint: logContactMemoryCheckpointMock,
+}));
 
 const status: AppStatus = {
   version: "test",
@@ -36,62 +42,107 @@ const contactMap: ContactMapView = {
   resolution: 1000,
   viewport: { xStart: 0, xEnd: 1000, yStart: 0, yEnd: 1000 },
   cells: [{ xBin: 0, yBin: 0, count: 12 }],
+  renderGeneration: 42,
 };
 
 describe("InspectorPanel", () => {
-  it("draws the overview with the active main-heatmap colormap", () => {
+  it("rasterizes the overview into one fixed ImageData upload", () => {
+    logContactMemoryCheckpointMock.mockClear();
     const uiState = createInitialUiState("ready");
     uiState.contact.colormap = "Rose";
+    const imageData = {
+      data: new Uint8ClampedArray(320 * 320 * 4),
+      width: 320,
+      height: 320,
+    } as ImageData;
     const context = {
       clearRect: vi.fn(),
+      createImageData: vi.fn(() => imageData),
       fillRect: vi.fn(),
       fillStyle: "",
+      putImageData: vi.fn(),
     };
+    const getContext = vi.fn(() => context);
     const canvas = {
-      width: 100,
-      height: 100,
-      getContext: vi.fn(() => context),
+      width: 320,
+      height: 320,
+      getContext,
     } as unknown as HTMLCanvasElement;
 
     drawOverviewHeatmap(canvas, contactMap, uiState, 1_000);
 
-    expect(context.fillStyle).toBe(contactColorCss("Rose", 1));
-    expect(context.fillRect).toHaveBeenCalledTimes(2);
+    expect(context.createImageData).toHaveBeenCalledOnce();
+    expect(context.putImageData).toHaveBeenCalledOnce();
+    expect(context.putImageData).toHaveBeenCalledWith(imageData, 0, 0);
+    expect(context.clearRect).not.toHaveBeenCalled();
+    expect(context.fillRect).not.toHaveBeenCalled();
+    expect([...imageData.data.slice(0, 4)]).toEqual([
+      ...contactColorLut("Rose").slice(255 * 4, 255 * 4 + 4),
+    ]);
+    expect(logContactMemoryCheckpointMock.mock.calls.map(([checkpoint]) => (
+      checkpoint.stage
+    ))).toEqual([
+      "overview_draw_entry",
+      "overview_context_acquired",
+      "overview_create_image_data_before",
+      "overview_image_data_created",
+      "overview_rgba_complete",
+      "overview_put_image_data_before",
+      "overview_put_image_data_after",
+    ]);
+    expect(logContactMemoryCheckpointMock).toHaveBeenNthCalledWith(1, {
+      stage: "overview_draw_entry",
+      generation: 42,
+      targetResolution: 1000,
+      payloadBytes: 0,
+      itemCount: 320 * 320,
+    });
+    expect(logContactMemoryCheckpointMock).toHaveBeenNthCalledWith(4, {
+      stage: "overview_image_data_created",
+      generation: 42,
+      targetResolution: 1000,
+      payloadBytes: 320 * 320 * 4,
+      itemCount: 320 * 320,
+    });
+    expect(logContactMemoryCheckpointMock.mock.invocationCallOrder[0]).toBeLessThan(
+      getContext.mock.invocationCallOrder[0],
+    );
+    expect(getContext.mock.invocationCallOrder[0]).toBeLessThan(
+      logContactMemoryCheckpointMock.mock.invocationCallOrder[1],
+    );
+    expect(logContactMemoryCheckpointMock.mock.invocationCallOrder[2]).toBeLessThan(
+      context.createImageData.mock.invocationCallOrder[0],
+    );
+    expect(context.createImageData.mock.invocationCallOrder[0]).toBeLessThan(
+      logContactMemoryCheckpointMock.mock.invocationCallOrder[3],
+    );
+    expect(logContactMemoryCheckpointMock.mock.invocationCallOrder[5]).toBeLessThan(
+      context.putImageData.mock.invocationCallOrder[0],
+    );
+    expect(context.putImageData.mock.invocationCallOrder[0]).toBeLessThan(
+      logContactMemoryCheckpointMock.mock.invocationCallOrder[6],
+    );
   });
 
-  it("does not show an overview from a different normalization", () => {
-    const rawMap = { ...contactMap, normalization: "raw" as const };
-    const iceOverview = {
+  it("keeps the raw navigation overview when the main normalization changes", () => {
+    const rawOverview = {
       ...contactMap,
-      normalization: "ice" as const,
+      normalization: "raw" as const,
       cells: [{ xBin: 0, yBin: 0, count: 24 }],
     };
 
-    expect(
-      contactOverviewMapForDisplayedNormalization(rawMap, iceOverview),
-    ).toBeNull();
-    expect(
-      contactOverviewMapForDisplayedNormalization(
-        { ...rawMap, normalization: "ice" },
-        iceOverview,
-      ),
-    ).toBe(iceOverview);
+    expect(contactNavigationOverviewMap(rawOverview)).toBe(rawOverview);
+    expect(contactNavigationOverviewMap({
+      ...rawOverview,
+      normalization: "ice",
+    })).toBeNull();
   });
 
   it("never stretches the local viewport map into the whole-genome overview", () => {
-    const rawMap = { ...contactMap, normalization: "raw" as const };
-
-    expect(
-      contactOverviewMapForDisplayedNormalization(rawMap, null),
-    ).toBeNull();
+    expect(contactNavigationOverviewMap(null)).toBeNull();
   });
 
   it("retains the last complete overview while a new layout is loading", () => {
-    const currentLayoutMap = {
-      ...contactMap,
-      normalization: "raw" as const,
-      layoutScope: "layout-b-visible",
-    };
     const lastCompleteOverview = {
       ...contactMap,
       normalization: "raw" as const,
@@ -99,12 +150,7 @@ describe("InspectorPanel", () => {
       viewport: { xStart: 0, xEnd: 5_000_000, yStart: 0, yEnd: 5_000_000 },
     };
 
-    expect(
-      contactOverviewMapForDisplayedNormalization(
-        currentLayoutMap,
-        lastCompleteOverview,
-      ),
-    ).toBe(lastCompleteOverview);
+    expect(contactNavigationOverviewMap(lastCompleteOverview)).toBe(lastCompleteOverview);
   });
 
   it("keeps the overview window on the main heatmap's presented camera", () => {
