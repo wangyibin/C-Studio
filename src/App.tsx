@@ -107,7 +107,12 @@ import {
   interleaveContactPrefetchBatches,
   scheduleContactIdleTask,
 } from "./state/contactResolutionPrefetch";
-import { contactNormalizationPrewarmResolutions } from "./state/contactNormalizationPrewarm";
+import {
+  buildContactNormalizationWeightPrewarmPlan,
+  contactNormalizationBackgroundWorkBlocked,
+  contactNormalizationPrewarmResolutions,
+  retainContactNormalizationHistory,
+} from "./state/contactNormalizationPrewarm";
 import {
   buildContactOverviewTilePlan,
   contactNavigationOverviewFromCoveringMap,
@@ -117,6 +122,7 @@ import {
 } from "./state/contactOverviewTiles";
 import {
   buildContactMainLodPlan,
+  buildContactMainLodNormalizationResidencyPlan,
   buildContactMainLodWholeResidencyPlan,
   combineContactMainLodVisibleBatches,
   contactMainLodPlanChangesSampling,
@@ -406,6 +412,10 @@ interface PrewarmContactNormalizationsResponse {
   prepared: number;
   failed: number;
   cancelled: boolean;
+  available: Array<{
+    resolution: number;
+    normalization: ContactNormalization;
+  }>;
 }
 
 interface PrewarmContactResolutionReaderResponse {
@@ -520,30 +530,28 @@ export function buildContactPanPrefetchPlan({
     contactTileSizeBins,
     totalSpanBp,
   );
-  const adaptiveMcoolPolicy = normalization === "raw"
-    && selectedResolution === 2_500_000
+  const coarseMcoolResidencyPolicy = selectedResolution === 2_500_000
     && coolPath.toLowerCase().endsWith(".mcool");
-  const candidateMainLodPlan = contactMainLodEnabled || adaptiveMcoolPolicy
+  const adaptiveMcoolPolicy = normalization === "raw" && coarseMcoolResidencyPolicy;
+  const candidateMainLodPlan = contactMainLodEnabled || coarseMcoolResidencyPolicy
     ? buildContactMainLodPlan({
         viewport,
         selectedResolution,
         viewportWidthPx,
         viewportHeightPx,
         visibleTileCount: exactTiles.length,
-        exactTileLimit: adaptiveMcoolPolicy
+        exactTileLimit: coarseMcoolResidencyPolicy
           ? maxAdaptiveMcoolExactTiles
           : maxExactMainContactTiles,
       }, availableResolutions)
     : null;
   // A tile-count boundary can move by a few tiles when the camera crosses a
-  // 256-bin edge. If the resulting LOD plan samples the exact same stored and
-  // displayed resolution, switching pipelines only abandons the warm exact
-  // cache and starts a duplicate cold load. Keep the adaptive 2.5 Mb safety
-  // policy, but otherwise stay on the ordinary tile pipeline until LOD
-  // actually changes the sampling resolution.
+  // 256-bin edge. Keep ordinary layers warm unless sampling changes, except at
+  // the bounded 2.5 Mb MCOOL interaction layer: every normalization uses the
+  // same dense main-LOD cache there so a prepared variant can switch atomically.
   const mainLodPlan = candidateMainLodPlan
     && (
-      adaptiveMcoolPolicy
+      coarseMcoolResidencyPolicy
       || contactMainLodPlanChangesSampling(candidateMainLodPlan, selectedResolution)
     )
     ? candidateMainLodPlan
@@ -1229,6 +1237,7 @@ export function App() {
   const contactMainLodTileFlightsRef = useRef(
     new ContactTileFlightRegistry<ContactMapTile>(),
   );
+  const contactNormalizationHistoryRef = useRef<ContactNormalization[]>([]);
   const normalizationPrewarmRequestIdRef = useRef<number | null>(null);
   const resolutionReaderPrewarmRequestIdRef = useRef<number | null>(null);
   const resolutionReaderPrewarmTimerRef = useRef<number | null>(null);
@@ -2444,20 +2453,19 @@ export function App() {
     contactTileSizeBins,
     effectiveContactTileTotalSpanBp,
   ).length;
-  const effectiveUsesAdaptiveMcoolExactPolicy = (
-    contactNormalizationForBackend(uiState.normalization) === "raw"
-    && effectiveContactTileResolution === 2_500_000
+  const effectiveUsesCoarseMcoolResidencyPolicy = (
+    effectiveContactTileResolution === 2_500_000
     && contactCoolPath?.toLowerCase().endsWith(".mcool") === true
   );
   const effectiveContactMainLodPlan = (
-    contactMainLodEnabled || effectiveUsesAdaptiveMcoolExactPolicy
+    contactMainLodEnabled || effectiveUsesCoarseMcoolResidencyPolicy
   ) ? buildContactMainLodPlan({
       viewport: effectiveContactTileViewport,
       selectedResolution: effectiveContactTileResolution,
       viewportWidthPx: uiState.contact.viewportWidthPx,
       viewportHeightPx: uiState.contact.viewportHeightPx,
       visibleTileCount: effectiveExactVisibleTileCount,
-      exactTileLimit: effectiveUsesAdaptiveMcoolExactPolicy
+      exactTileLimit: effectiveUsesCoarseMcoolResidencyPolicy
         ? maxAdaptiveMcoolExactTiles
         : maxExactMainContactTiles,
     }, contactAvailableResolutions)
@@ -2639,6 +2647,10 @@ export function App() {
       : contactTilePreviewViewport ?? pendingPanPerformancePreviewRef.current;
     const tileSizeBins = contactTileSizeBins;
     const normalization = contactNormalizationForBackend(uiState.normalization);
+    contactNormalizationHistoryRef.current = retainContactNormalizationHistory(
+      contactNormalizationHistoryRef.current,
+      normalization,
+    );
     const publishPanPrefetchTiles = (
       tiles: readonly ContactMapTile[],
       resolution: number,
@@ -2726,20 +2738,21 @@ export function App() {
       cache: contactTileCacheRef.current,
       cacheKeyForTile,
     });
-    const usesAdaptiveMcoolExactPolicy = normalization === "raw"
-      && targetResolution === 2_500_000
+    const usesCoarseMcoolResidencyPolicy = targetResolution === 2_500_000
       && contactCoolPath.toLowerCase().endsWith(".mcool");
-    // The adaptive 2.5 Mb safety boundary is not a diagnostic toggle: even a
-    // build with general main-canvas LOD disabled must not fan out recursive
-    // 1 kb refinement beyond the local exact limit.
-    const candidateMainLodPlan = contactMainLodEnabled || usesAdaptiveMcoolExactPolicy
+    const usesAdaptiveMcoolExactPolicy = normalization === "raw"
+      && usesCoarseMcoolResidencyPolicy;
+    // The 2.5 Mb MCOOL boundary is also the normalization-switch interaction
+    // layer. Raw may refine locally, while every mode uses the same bounded
+    // dense cache and never fans out a whole-genome fine refinement.
+    const candidateMainLodPlan = contactMainLodEnabled || usesCoarseMcoolResidencyPolicy
       ? buildContactMainLodPlan({
           viewport,
           selectedResolution: targetResolution,
           viewportWidthPx: uiState.contact.viewportWidthPx,
           viewportHeightPx: uiState.contact.viewportHeightPx,
           visibleTileCount: tileWorld.visibleTiles.length,
-          exactTileLimit: usesAdaptiveMcoolExactPolicy
+          exactTileLimit: usesCoarseMcoolResidencyPolicy
             ? maxAdaptiveMcoolExactTiles
             : maxExactMainContactTiles,
         }, contactAvailableResolutions)
@@ -2748,11 +2761,11 @@ export function App() {
     // because viewport alignment changed the canonical tile count around the
     // threshold. A no-op LOD (same source and target resolution) has identical
     // data but would force a second cold request and make pan release look
-    // stalled. Adaptive 2.5 Mb refinement remains deliberately bounded by the
+    // stalled. The 2.5 Mb MCOOL interaction layer deliberately stays on the
     // LOD path even when its displayed resolution is unchanged.
     const mainLodPlan = candidateMainLodPlan
       && (
-        usesAdaptiveMcoolExactPolicy
+        usesCoarseMcoolResidencyPolicy
         || contactMainLodPlanChangesSampling(candidateMainLodPlan, targetResolution)
       )
       ? candidateMainLodPlan
@@ -4614,12 +4627,43 @@ export function App() {
       return;
     }
 
+    const activeNormalization = contactNormalizationForBackend(uiState.normalization);
+    const selectedResolution = resolutionToBasePairs(uiState.contact.resolution);
+    const totalSpanBp = Math.max(selectedResolution, viewAssemblyLayout.totalSpan);
+    const activePrefetchPlan = buildContactPanPrefetchPlan({
+      availableResolutions: contactAvailableResolutions,
+      coolPath: contactCoolPath,
+      normalization: activeNormalization,
+      selectedResolution,
+      totalSpanBp,
+      viewport: committedContactTileViewport,
+      viewportHeightPx: uiState.contact.viewportHeightPx,
+      viewportWidthPx: uiState.contact.viewportWidthPx,
+    });
+    const normalizationResolution = activePrefetchPlan.sourceResolution
+      ?? selectedResolution;
     const resolutions = contactNormalizationPrewarmResolutions(
-      resolutionToBasePairs(uiState.contact.resolution),
+      normalizationResolution,
       contactAvailableResolutions,
       contactIsMcool,
     );
-    if (resolutions.length === 0) {
+    const weightPrewarmPlan = buildContactNormalizationWeightPrewarmPlan({
+      activeNormalization,
+      history: contactNormalizationHistoryRef.current,
+      resolution: normalizationResolution,
+      totalSpanBp,
+    });
+    const wholeResidencyPlan = activePrefetchPlan.usesMainLod
+      ? buildContactMainLodWholeResidencyPlan({
+          totalSpanBp,
+          resolution: activePrefetchPlan.targetResolution,
+          tileSizeBins: activePrefetchPlan.tileSizeBins,
+        })
+      : null;
+    if (
+      resolutions.length === 0
+      || (weightPrewarmPlan.normalizations.length === 0 && !wholeResidencyPlan)
+    ) {
       return;
     }
 
@@ -4645,51 +4689,206 @@ export function App() {
       if (!requestIsCurrent()) {
         return;
       }
-      if (
-        contactTileFlightsRef.current.size > 0
-        || normalizationPrewarmRequestIdRef.current !== null
-        || resolutionReaderPrewarmRequestIdRef.current !== null
-      ) {
+      if (contactNormalizationBackgroundWorkBlocked({
+        tileFlights: contactTileFlightsRef.current.size,
+        mainLodFlights: contactMainLodTileFlightsRef.current.size,
+        normalizationPrewarmActive: normalizationPrewarmRequestIdRef.current !== null,
+        resolutionReaderPrewarmActive: resolutionReaderPrewarmRequestIdRef.current !== null,
+      })) {
         scheduleAttempt();
         return;
       }
 
-      const requestId = contactTileBackendRequestIdRef.current + 1;
-      contactTileBackendRequestIdRef.current = requestId;
-      normalizationPrewarmRequestIdRef.current = requestId;
       let response: PrewarmContactNormalizationsResponse | null = null;
-      try {
-        response = await invoke<PrewarmContactNormalizationsResponse>(
-          "prewarm_contact_normalizations",
-          {
-            request: {
-              requestId,
-              generation,
-              coolPath: contactCoolPath,
-              resolutions,
+      if (weightPrewarmPlan.normalizations.length > 0) {
+        const requestId = contactTileBackendRequestIdRef.current + 1;
+        contactTileBackendRequestIdRef.current = requestId;
+        normalizationPrewarmRequestIdRef.current = requestId;
+        try {
+          response = await invoke<PrewarmContactNormalizationsResponse>(
+            "prewarm_contact_normalizations",
+            {
+              request: {
+                requestId,
+                generation,
+                coolPath: contactCoolPath,
+                resolutions,
+                normalizations: weightPrewarmPlan.normalizations,
+              },
             },
-          },
-        );
-      } catch (error) {
-        if (requestIsCurrent() && isContactTileRequestCancelled(error)) {
-          scheduleAttempt();
-        }
-        return;
-      } finally {
-        if (normalizationPrewarmRequestIdRef.current === requestId) {
-          normalizationPrewarmRequestIdRef.current = null;
+          );
+        } catch {
+          // Idle normalization work is opportunistic. A foreground interaction
+          // owns the next attempt; never enter a cancel -> timer -> retry loop.
+          return;
+        } finally {
+          if (normalizationPrewarmRequestIdRef.current === requestId) {
+            normalizationPrewarmRequestIdRef.current = null;
+          }
         }
       }
 
-      if (!requestIsCurrent() || response === null) {
+      if (!requestIsCurrent() || response?.cancelled) {
         return;
       }
-      if (response.cancelled) {
-        scheduleAttempt();
-      } else if (response.failed > 0) {
+      if (response && response.failed > 0) {
         dispatchUi({
           type: "appendLog",
           message: `Background normalization prewarm skipped ${response.failed} unavailable calculation${response.failed === 1 ? "" : "s"}`,
+        });
+      }
+      if (!wholeResidencyPlan) {
+        return;
+      }
+
+      const availableNormalizations = new Set<ContactNormalization>([
+        "raw",
+        activeNormalization,
+      ]);
+      for (const available of response?.available ?? []) {
+        if (available.resolution === normalizationResolution) {
+          availableNormalizations.add(available.normalization);
+        }
+      }
+      const residencyPlan = buildContactMainLodNormalizationResidencyPlan({
+        activeNormalization,
+        availableNormalizations: [...availableNormalizations],
+        history: contactNormalizationHistoryRef.current,
+        wholeResidencyPlan,
+      });
+      const activeCacheKeyForTile = createContactTileCacheKeyResolver(
+        contactCoolPath,
+        activePrefetchPlan.targetResolution,
+        activePrefetchPlan.tileSizeBins,
+        activeNormalization,
+        viewAssemblyLayout.projectionBlocks,
+      );
+      const activeLayerScopeId = `main-lod|${contactTileDataScope(
+        contactCoolPath,
+        activePrefetchPlan.targetResolution,
+        activePrefetchPlan.tileSizeBins,
+        activeNormalization,
+      )}`;
+      const activeProtectedKeys = new Set(
+        wholeResidencyPlan.tiles.map(activeCacheKeyForTile),
+      );
+
+      for (const candidateNormalization of residencyPlan.normalizations) {
+        if (
+          candidateNormalization === activeNormalization
+          || !requestIsCurrent()
+          || contactTileFlightsRef.current.size > 0
+          || contactMainLodTileFlightsRef.current.size > 0
+        ) {
+          continue;
+        }
+        const candidatePlan = buildContactPanPrefetchPlan({
+          availableResolutions: contactAvailableResolutions,
+          coolPath: contactCoolPath,
+          normalization: candidateNormalization,
+          selectedResolution,
+          totalSpanBp,
+          viewport: committedContactTileViewport,
+          viewportHeightPx: uiState.contact.viewportHeightPx,
+          viewportWidthPx: uiState.contact.viewportWidthPx,
+        });
+        if (
+          !candidatePlan.usesMainLod
+          || candidatePlan.targetResolution !== activePrefetchPlan.targetResolution
+          || candidatePlan.tileSizeBins !== activePrefetchPlan.tileSizeBins
+        ) {
+          continue;
+        }
+        const candidateScope = contactTileScope(
+          contactCoolPath,
+          candidatePlan.targetResolution,
+          candidatePlan.tileSizeBins,
+          candidateNormalization,
+          viewAssemblyLayout.projectionBlocks,
+        );
+        const candidateCacheKeyForTile = createContactTileCacheKeyResolver(
+          contactCoolPath,
+          candidatePlan.targetResolution,
+          candidatePlan.tileSizeBins,
+          candidateNormalization,
+          viewAssemblyLayout.projectionBlocks,
+        );
+        const cachedTiles = wholeResidencyPlan.tiles
+          .map((tile) => contactMainLodTileCacheLru.peek(candidateCacheKeyForTile(tile)))
+          .filter((tile): tile is ContactMapTile => Boolean(tile));
+        const missingTiles = wholeResidencyPlan.tiles.filter(
+          (tile) => !contactMainLodTileCacheLru.has(candidateCacheKeyForTile(tile)),
+        );
+        let loadedTiles: ContactMapTile[] = [];
+        if (missingTiles.length > 0) {
+          try {
+            loadedTiles = await contactMainLodTileFlightsRef.current.loadBatch({
+              scope: candidateScope,
+              tiles: missingTiles,
+              cacheKeyForTile: candidateCacheKeyForTile,
+              nextRequestId: () => {
+                const requestId = contactTileBackendRequestIdRef.current + 1;
+                contactTileBackendRequestIdRef.current = requestId;
+                return requestId;
+              },
+              load: (requestId, requestedTiles) => loadContactTilesWithLayoutHandle(
+                contactLayoutHandleRegistry,
+                viewContactLayoutBlocks,
+                {
+                  requestId,
+                  generation,
+                  purpose: "adjacent_prefetch",
+                  coolPath: contactCoolPath,
+                  baseResolution: candidatePlan.baseResolution,
+                  sourceResolution: candidatePlan.sourceResolution,
+                  targetResolution: candidatePlan.targetResolution,
+                  tileSizeBins: candidatePlan.tileSizeBins,
+                  normalization: candidateNormalization,
+                  tiles: requestedTiles,
+                  adaptiveRefinement: candidatePlan.adaptiveRefinement,
+                },
+              ),
+            });
+          } catch {
+            if (!requestIsCurrent()) {
+              return;
+            }
+            continue;
+          }
+          if (!requestIsCurrent()) {
+            return;
+          }
+          const candidateLayerScope = {
+            id: `main-lod|${contactTileDataScope(
+              contactCoolPath,
+              candidatePlan.targetResolution,
+              candidatePlan.tileSizeBins,
+              candidateNormalization,
+            )}`,
+            resolution: candidatePlan.targetResolution,
+          };
+          contactMainLodTileCacheLru.merge(
+            candidateLayerScope,
+            loadedTiles.map((tile) => ({
+              key: candidateCacheKeyForTile(tile),
+              value: tile,
+              cellCount: contactTileCellCount(tile),
+              valueBytes: contactTileRetainedValueBytes(tile),
+            })),
+            {
+              recency: "background",
+              keys: activeProtectedKeys,
+              scopes: new Set([activeLayerScopeId, candidateLayerScope.id]),
+            },
+          );
+          contactMainLodTileCacheRef.current = contactMainLodTileCacheLru.toMap();
+        }
+        contactPanPrefetchBridge.publishGpuResident({
+          tiles: [...cachedTiles, ...loadedTiles],
+          dataScope: `${candidateScope}|${candidateNormalization}`,
+          generation,
+          resolution: candidatePlan.targetResolution,
+          tileSizeBins: candidatePlan.tileSizeBins,
         });
       }
     };
@@ -4718,8 +4917,16 @@ export function App() {
     contactAvailableResolutions,
     contactCoolPath,
     contactIsMcool,
+    contactMainLodTileCacheLru,
+    contactPanPrefetchBridge,
+    canonicalViewAssemblyLayout,
+    canonicalViewContactLayoutBlocks,
+    effectiveContactTileViewportRequestKey,
     paintedContactTileGeneration,
     uiState.contact.resolution,
+    uiState.contact.viewportHeightPx,
+    uiState.contact.viewportWidthPx,
+    uiState.normalization,
   ]);
 
   useEffect(() => {

@@ -2181,6 +2181,74 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
+  it("switches to a fully prefetched normalization without another atlas upload", () => {
+    const {
+      canvas,
+      blitFramebuffer,
+      drawArrays,
+      texSubImage3D,
+    } = mockWebGlCanvas();
+    const frames = mockFrameScheduler();
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+      requestFrame: frames.requestFrame,
+      cancelFrame: frames.cancelFrame,
+    });
+    const renderStyle = {
+      colormap: "Reds" as const,
+      colorScale: { log: false, min: 0, max: 10 },
+    };
+    const rawTile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 0, yBin: 0, count: 9 }],
+    };
+    expect(renderer?.setScene({
+      dataScope: "layout|raw",
+      descriptors: [{ key: "0:0:source", tile: rawTile, transpose: false }],
+      generation: 7,
+      resolution: 2_500_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 10_000_000, yStart: 0, yEnd: 10_000_000 },
+      renderStyle,
+    })).toBe(true);
+    frames.flushAll();
+
+    const krTile = {
+      tileX: 0,
+      tileY: 0,
+      cells: [{ xBin: 0, yBin: 0, count: 6 }],
+    };
+    const drawsBeforeWarm = drawArrays.mock.calls.length;
+    const presentationsBeforeWarm = blitFramebuffer.mock.calls.length;
+    expect(renderer?.ingestPrefetchedPages({
+      tiles: [krTile],
+      dataScope: "layout|kr",
+      generation: 7,
+      resolution: 2_500_000,
+      tileSizeBins: 4,
+    })).toBe(true);
+    frames.flushAll();
+    expect(drawArrays).toHaveBeenCalledTimes(drawsBeforeWarm);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(presentationsBeforeWarm);
+
+    const uploadsBeforeSwitch = texSubImage3D.mock.calls.length;
+    expect(renderer?.setScene({
+      dataScope: "layout|kr",
+      descriptors: [{ key: "0:0:source", tile: krTile, transpose: false }],
+      generation: 8,
+      resolution: 2_500_000,
+      tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 10_000_000, yStart: 0, yEnd: 10_000_000 },
+      renderStyle,
+    })).toBe(true);
+    expect(texSubImage3D).toHaveBeenCalledTimes(uploadsBeforeSwitch);
+    renderer?.destroy();
+  });
+
   it("drops stale neighboring-resolution batches before scheduling a GPU upload", () => {
     const { canvas, texSubImage3D } = mockWebGlCanvas();
     const frames = mockFrameScheduler();

@@ -399,6 +399,24 @@ describe("contact map layer publishing", () => {
     )).toBe(true);
   });
 
+  it("keeps the prior normalization visible until the replacement is complete", () => {
+    const rawComplete = {
+      ...previousComplete,
+      normalization: "raw" as const,
+      layoutScope: "dataset|100000|256|raw|layout-a",
+    };
+    const krScope = "dataset|100000|256|kr|layout-a";
+
+    expect(shouldHoldPreviousContactMapFrame(
+      rawComplete,
+      100_000,
+      256,
+      krScope,
+    )).toBe(true);
+    expect(shouldPublishContactMapLayer(true, false)).toBe(false);
+    expect(shouldPublishContactMapLayer(true, true)).toBe(true);
+  });
+
   it("retains the complete front surface for a same-resolution viewport move", () => {
     const translatedViewport = {
       xStart: 1_000_000,

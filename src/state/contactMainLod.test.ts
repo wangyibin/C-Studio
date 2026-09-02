@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildContactMainLodPlan,
+  buildContactMainLodNormalizationResidencyPlan,
   buildContactMainLodWholeResidencyPlan,
   combineContactMainLodVisibleBatches,
   contactMainLodPlanChangesSampling,
@@ -67,9 +68,10 @@ describe("main contact-map LOD planning", () => {
   it("keeps coarse navigation tiles in a bounded cache separate from exact tiles", () => {
     expect(contactMainLodTileSizeBins).toBe(256);
     expect(contactMainLodTileCacheLimits).toEqual({
-      maxScopes: 4,
-      maxTiles: 64,
-      maxCells: 1_500_000,
+      maxScopes: 5,
+      maxTiles: 96,
+      maxCells: 6_000_000,
+      maxBytes: 32 * 1024 * 1024,
     });
   });
 
@@ -99,6 +101,40 @@ describe("main contact-map LOD planning", () => {
       totalSpanBp: 3_165_218_438,
       resolution: 500_000,
     })).toBeNull();
+  });
+
+  it("fits all coarse alfalfa normalization variants under one combined budget", () => {
+    const wholeResidencyPlan = buildContactMainLodWholeResidencyPlan({
+      totalSpanBp: 3_165_218_438,
+      resolution: 2_500_000,
+    });
+    const plan = buildContactMainLodNormalizationResidencyPlan({
+      activeNormalization: "raw",
+      availableNormalizations: ["raw", "ice", "kr", "vc", "vc_sqrt"],
+      history: ["raw", "kr"],
+      wholeResidencyPlan: wholeResidencyPlan!,
+    });
+
+    expect(plan.normalizations).toEqual(["raw", "kr", "ice", "vc", "vc_sqrt"]);
+    expect(plan.tileCount).toBe(75);
+    expect(plan.estimatedBytes).toBe(5 * 15 * 256 * 256 * 2);
+    expect(plan.estimatedBytes).toBeLessThan(16 * 1024 * 1024);
+  });
+
+  it("keeps the active coarse normalization when variants cross the combined cap", () => {
+    const wholeResidencyPlan = buildContactMainLodWholeResidencyPlan({
+      totalSpanBp: 3_165_218_438,
+      resolution: 2_500_000,
+    });
+    const plan = buildContactMainLodNormalizationResidencyPlan({
+      activeNormalization: "vc",
+      availableNormalizations: ["raw", "ice", "kr", "vc", "vc_sqrt"],
+      history: ["vc", "raw", "kr"],
+      wholeResidencyPlan: wholeResidencyPlan!,
+      budgetBytes: wholeResidencyPlan!.estimatedBytes * 2,
+    });
+
+    expect(plan.normalizations).toEqual(["vc", "raw"]);
   });
 
   it("rejects a whole level when its dense R16F bytes cross the explicit cap", () => {

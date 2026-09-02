@@ -30,4 +30,34 @@ describe("resolution prefetch planning", () => {
     });
     expect(plan.visibleTiles).toHaveLength(6);
   });
+
+  it("uses the same bounded 2.5 Mb interaction LOD for Raw and KR", () => {
+    const totalSpanBp = 3_165_218_438;
+    const input = {
+      availableResolutions: [1_000, 10_000, 100_000, 500_000, 2_500_000],
+      coolPath: "/tmp/alfalfa.mcool",
+      selectedResolution: 2_500_000,
+      totalSpanBp,
+      viewport: {
+        xStart: 0,
+        xEnd: totalSpanBp,
+        yStart: 0,
+        yEnd: totalSpanBp,
+      },
+      viewportHeightPx: 1_200,
+      viewportWidthPx: 1_200,
+    };
+    const raw = buildContactPanPrefetchPlan({ ...input, normalization: "raw" });
+    const kr = buildContactPanPrefetchPlan({ ...input, normalization: "kr" });
+
+    expect(raw).toMatchObject({
+      targetResolution: 5_000_000,
+      usesMainLod: true,
+    });
+    expect(kr).toMatchObject({
+      targetResolution: raw.targetResolution,
+      tileSizeBins: raw.tileSizeBins,
+      usesMainLod: true,
+    });
+  });
 });

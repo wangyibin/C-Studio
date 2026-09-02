@@ -2,7 +2,7 @@ use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Read, Write},
     ops::{Deref, DerefMut},
@@ -657,7 +657,7 @@ impl Drop for ContactTileStageSpan<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContactNormalizationRequest {
     #[default]
@@ -1212,6 +1212,7 @@ pub struct PrewarmContactNormalizationsRequest {
     pub generation: u64,
     pub cool_path: String,
     pub resolutions: Vec<u64>,
+    pub normalizations: Vec<ContactNormalizationRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1246,11 +1247,19 @@ pub struct PrewarmContactResolutionReaderResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PrewarmedContactNormalization {
+    pub resolution: u64,
+    pub normalization: ContactNormalizationRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PrewarmContactNormalizationsResponse {
     pub pixels_prepared: bool,
     pub prepared: usize,
     pub failed: usize,
     pub cancelled: bool,
+    pub available: Vec<PrewarmedContactNormalization>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2917,6 +2926,13 @@ pub async fn prewarm_contact_normalizations(
     if resolutions.is_empty() {
         return Err("normalization prewarm requires at least one resolution".to_string());
     }
+    let mut normalizations = request.normalizations;
+    normalizations.retain(|normalization| *normalization != ContactNormalizationRequest::Raw);
+    let mut seen_normalizations = HashSet::new();
+    normalizations.retain(|normalization| seen_normalizations.insert(*normalization));
+    if normalizations.len() > 4 {
+        return Err("normalization prewarm accepts at most four methods".to_string());
+    }
 
     request_state.register_current_generation(request.request_id, request.generation)?;
     let task_request_state = request_state.inner().clone();
@@ -2933,15 +2949,10 @@ pub async fn prewarm_contact_normalizations(
         let should_cancel = || {
             task_request_state.is_normalization_prewarm_cancelled(request_id)
         };
-        let normalizations = [
-            cstudio_core::contact_normalization::ContactNormalization::Kr,
-            cstudio_core::contact_normalization::ContactNormalization::Ice,
-            cstudio_core::contact_normalization::ContactNormalization::Vc,
-            cstudio_core::contact_normalization::ContactNormalization::VcSqrt,
-        ];
         let mut prepared = 0_usize;
         let mut failed = 0_usize;
         let mut cancelled = false;
+        let mut available = Vec::new();
         // Tile scans now use bounded bin1-offset slices. Do not recreate the
         // complete resident bin2/count columns from this idle task.
         let pixels_prepared = false;
@@ -2950,14 +2961,21 @@ pub async fn prewarm_contact_normalizations(
             if cancelled {
                 break;
             }
-            for normalization in normalizations {
+            for normalization_request in normalizations.iter().copied() {
+                let normalization = normalization_request.into();
                 match prewarm_available_contact_normalization_at_resolution_cancellable(
                     &cool_path,
                     Some(resolution),
                     normalization,
                     &should_cancel,
                 ) {
-                    Ok(true) => prepared = prepared.saturating_add(1),
+                    Ok(true) => {
+                        prepared = prepared.saturating_add(1);
+                        available.push(PrewarmedContactNormalization {
+                            resolution,
+                            normalization: normalization_request,
+                        });
+                    }
                     Ok(false) => {}
                     Err(cstudio_core::CStudioError::RequestCancelled) => {
                         cancelled = true;
@@ -2997,6 +3015,7 @@ pub async fn prewarm_contact_normalizations(
             prepared,
             failed,
             cancelled,
+            available,
         }
     })
     .await
@@ -6607,8 +6626,8 @@ mod tests {
         CoverageViewFromBedGraphRequest, CoverageViewRequest, GfaBandageLayoutEdgeRequest,
         GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest, PafRecordRequest,
         PersistentDisplayCacheContext, PersistentDisplayTileAccumulator, PersistentDisplayTilePlan,
-        SyntenyViewRequest, DISPLAY_CACHE_COPY_SEMANTICS_VERSION,
-        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
+        PrewarmContactNormalizationsRequest, SyntenyViewRequest,
+        DISPLAY_CACHE_COPY_SEMANTICS_VERSION, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
 
     #[test]
@@ -8166,6 +8185,27 @@ mod tests {
         assert_eq!(
             ContactNormalizationRequest::Kr.cache_key(),
             "kr_assembly_v1"
+        );
+    }
+
+    #[test]
+    fn normalization_prewarm_request_selects_explicit_methods() {
+        let request: PrewarmContactNormalizationsRequest =
+            serde_json::from_value(serde_json::json!({
+                "requestId": 9,
+                "generation": 7,
+                "coolPath": "/tmp/example.mcool",
+                "resolutions": [2_500_000],
+                "normalizations": ["kr", "vc_sqrt"]
+            }))
+            .expect("selective normalization prewarm request");
+
+        assert_eq!(
+            request.normalizations,
+            vec![
+                ContactNormalizationRequest::Kr,
+                ContactNormalizationRequest::VcSqrt,
+            ]
         );
     }
 

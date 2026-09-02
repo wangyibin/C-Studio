@@ -1,6 +1,8 @@
 import type { ContactViewport } from "./contactViewport";
 import { contactResolutionAtOrAbove } from "./contactOverviewTiles";
+import { contactNormalizationModes } from "./contactNormalizationPrewarm";
 import type { ContactMapTileKey } from "./contactTiles";
+import type { ContactNormalization } from "./uiState";
 
 export const maxExactMainContactTiles = 16;
 export const maxExactMainContactBinsPerPixel = 2;
@@ -15,9 +17,10 @@ export const maxContactMainLodPrefetchTiles = 8;
  * therefore enforced by a dedicated LRU owned by the main LOD layer.
  */
 export const contactMainLodTileCacheLimits = Object.freeze({
-  maxScopes: 4,
-  maxTiles: 64,
-  maxCells: 1_500_000,
+  maxScopes: 5,
+  maxTiles: 96,
+  maxCells: 6_000_000,
+  maxBytes: 32 * 1024 * 1024,
 });
 /**
  * Whole-level residency is reserved for genuinely small interaction LODs. The
@@ -27,6 +30,8 @@ export const contactMainLodTileCacheLimits = Object.freeze({
  */
 export const contactMainLodWholeResidencyBudgetBytes = 16 * 1024 * 1024;
 export const contactMainLodR16fBytesPerTexel = 2;
+export const contactMainLodWholeResidencyMaxTiles = 64;
+export const contactMainLodWholeResidencyMaxCells = 1_500_000;
 // Adaptive 2.5 Mb refinement can descend to 1 kb around AGP boundaries. Keep
 // that expensive path inside one local 2x2 tile neighborhood; wider exact
 // views use the native stored level without recursive refinement.
@@ -66,6 +71,13 @@ export interface ContactMainLodWholeResidencyPlan {
   tiles: ContactMapTileKey[];
 }
 
+export interface ContactMainLodNormalizationResidencyPlan {
+  estimatedBytes: number;
+  estimatedCells: number;
+  normalizations: ContactNormalization[];
+  tileCount: number;
+}
+
 /**
  * Return the complete canonical upper-triangle tile set only when its dense
  * R16F representation also fits every dedicated main-LOD cache safety valve.
@@ -77,8 +89,8 @@ export function buildContactMainLodWholeResidencyPlan({
   tileSizeBins = contactMainLodTileSizeBins,
   bytesPerTexel = contactMainLodR16fBytesPerTexel,
   budgetBytes = contactMainLodWholeResidencyBudgetBytes,
-  maxTiles = contactMainLodTileCacheLimits.maxTiles,
-  maxCells = contactMainLodTileCacheLimits.maxCells,
+  maxTiles = contactMainLodWholeResidencyMaxTiles,
+  maxCells = contactMainLodWholeResidencyMaxCells,
 }: {
   totalSpanBp: number;
   resolution: number;
@@ -133,6 +145,63 @@ export function buildContactMainLodWholeResidencyPlan({
     estimatedBytes,
     estimatedCells,
     tiles,
+  };
+}
+
+/**
+ * Fit complete coarse display variants into one shared CPU/GPU budget. The
+ * active normalization is first, the most recently used alternatives follow,
+ * and cold modes are admitted only while every cache safety valve still fits.
+ */
+export function buildContactMainLodNormalizationResidencyPlan({
+  activeNormalization,
+  availableNormalizations,
+  history,
+  wholeResidencyPlan,
+  budgetBytes = contactMainLodWholeResidencyBudgetBytes,
+  maxTiles = contactMainLodTileCacheLimits.maxTiles,
+  maxCells = contactMainLodTileCacheLimits.maxCells,
+}: {
+  activeNormalization: ContactNormalization;
+  availableNormalizations: readonly ContactNormalization[];
+  history: readonly ContactNormalization[];
+  wholeResidencyPlan: ContactMainLodWholeResidencyPlan;
+  budgetBytes?: number;
+  maxTiles?: number;
+  maxCells?: number;
+}): ContactMainLodNormalizationResidencyPlan {
+  const available = new Set<ContactNormalization>([
+    activeNormalization,
+    ...availableNormalizations,
+  ]);
+  const ordered = [
+    activeNormalization,
+    ...history,
+    ...contactNormalizationModes,
+  ];
+  const normalizations: ContactNormalization[] = [];
+  const seen = new Set<ContactNormalization>();
+  const tileCountPerNormalization = wholeResidencyPlan.tiles.length;
+  for (const normalization of ordered) {
+    if (seen.has(normalization) || !available.has(normalization)) {
+      continue;
+    }
+    seen.add(normalization);
+    const variantCount = normalizations.length + 1;
+    if (
+      variantCount * wholeResidencyPlan.estimatedBytes > budgetBytes
+      || variantCount * wholeResidencyPlan.estimatedCells > maxCells
+      || variantCount * tileCountPerNormalization > maxTiles
+    ) {
+      break;
+    }
+    normalizations.push(normalization);
+  }
+  return {
+    estimatedBytes: normalizations.length * wholeResidencyPlan.estimatedBytes,
+    estimatedCells: normalizations.length * wholeResidencyPlan.estimatedCells,
+    normalizations,
+    tileCount: normalizations.length * tileCountPerNormalization,
   };
 }
 

@@ -389,6 +389,30 @@ describe("contact tile presentation buffer", () => {
     expect(staged.stagingSlot).toBe(1);
   });
 
+  it("keeps the old normalization visible until the complete target can stage", () => {
+    const presented = contactTileFrame(1, 2_500_000);
+    presented.contactMap.normalization = "raw";
+    const incomplete = contactTileFrame(2, 2_500_000, 10, false);
+    incomplete.contactMap.normalization = "kr";
+    const initial = createContactTileLayerBufferState(presented);
+
+    expect(syncContactTileLayerBuffer(initial, incomplete, false)).toBe(initial);
+
+    const complete = {
+      ...incomplete,
+      contactMap: {
+        ...incomplete.contactMap,
+        visibleLayerComplete: true,
+      },
+    } satisfies ContactTileLayerFrame;
+    const staged = syncContactTileLayerBuffer(initial, complete, false);
+
+    expect(staged.frontSlot).toBe(0);
+    expect(staged.stagingSlot).toBe(1);
+    expect(staged.slots[0]?.contactMap.normalization).toBe("raw");
+    expect(staged.slots[1]?.contactMap.normalization).toBe("kr");
+  });
+
   it("keeps the presented frame and its color scale frozen while a target is loading", () => {
     const presented = contactTileFrame(1, 1_000, 10);
     const initial = createContactTileLayerBufferState(presented);
