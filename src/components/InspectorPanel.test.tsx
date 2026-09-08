@@ -5,6 +5,7 @@ import { contactColorLut } from "../state/contactColor";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   contactNavigationOverviewMap,
+  contactOverviewViewportAtRatio,
   contactOverviewWindowViewport,
   drawOverviewHeatmap,
   InspectorPanel,
@@ -175,6 +176,36 @@ describe("InspectorPanel", () => {
       1_000_000_000,
       uiState,
     )).not.toEqual(presentedViewport);
+  });
+
+  it("moves an Overview target upward from the lower genome edge", () => {
+    const uiState = createInitialUiState("ready");
+    uiState.contact.viewportSpanMb = 100;
+    uiState.contact.viewportWidthPx = 500;
+    uiState.contact.viewportHeightPx = 500;
+    const lowerEdge = contactOverviewViewportAtRatio(
+      { x: 0.75, y: 0.98 },
+      400_000_000,
+      uiState.contact,
+    );
+    const movedUp = contactOverviewViewportAtRatio(
+      { x: 0.75, y: 0.75 },
+      400_000_000,
+      uiState.contact,
+    );
+
+    expect(lowerEdge).toEqual({
+      xStart: 250_000_000,
+      xEnd: 350_000_000,
+      yStart: 300_000_000,
+      yEnd: 400_000_000,
+    });
+    expect(movedUp).toEqual({
+      xStart: 250_000_000,
+      xEnd: 350_000_000,
+      yStart: 250_000_000,
+      yEnd: 350_000_000,
+    });
   });
 
   it("binds the overview to the active contact map", () => {

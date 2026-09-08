@@ -40,6 +40,7 @@ pub fn run() {
             commands::load_gfa_file,
             commands::load_agp_bundle,
             commands::load_project_directory,
+            commands::download_remote_source,
             commands::write_agp_file,
             commands::overwrite_agp_file,
             commands::write_agp_bundle,

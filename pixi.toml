@@ -31,6 +31,9 @@ tauri-dev = { cmd = "npm run tauri -- dev --features portable-hdf5", depends-on 
 package-test = { cmd = "npm test", depends-on = ["package-install"] }
 package-frontend = { cmd = "npm run build", depends-on = ["package-install"] }
 package-rust-check = "cargo check --manifest-path src-tauri/Cargo.toml --features portable-hdf5"
+server-check = "cargo check --manifest-path crates/cstudio-server/Cargo.toml --features portable-hdf5"
+server-test = "cargo test --manifest-path crates/cstudio-server/Cargo.toml"
+server-build = "cargo build --release --manifest-path crates/cstudio-server/Cargo.toml --features portable-hdf5"
 package-macos = { cmd = "node scripts/package-macos.mjs", depends-on = ["package-install"], env = { APPLE_SIGNING_IDENTITY = "-" } }
 package-windows = { cmd = "node scripts/package-windows.mjs", depends-on = ["package-install"] }
 

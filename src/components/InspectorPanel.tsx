@@ -61,6 +61,9 @@ interface InspectorPanelProps {
   isAgpDirty?: boolean;
   uiState: UiState;
   onUiAction: (action: UiAction) => void;
+  onContactViewportPreview?: (viewport: ContactViewport) => void;
+  onContactViewportCommit?: (viewport: ContactViewport) => void;
+  onContactViewportCancel?: () => void;
   syntenyView: SyntenyView | null;
   assemblyBlocks: ContactMapLayoutBlock[];
   viewAssemblyBlocks?: ContactMapLayoutBlock[];
@@ -87,6 +90,9 @@ export function InspectorPanel({
   isAgpDirty = false,
   uiState,
   onUiAction,
+  onContactViewportPreview = () => undefined,
+  onContactViewportCommit = () => undefined,
+  onContactViewportCancel = () => undefined,
   syntenyView,
   assemblyBlocks,
   viewAssemblyBlocks = assemblyBlocks,
@@ -211,7 +217,9 @@ export function InspectorPanel({
                 : dataset?.agp_layout.totalSpan ?? 0,
             )}
             uiState={uiState}
-            onUiAction={onUiAction}
+            onViewportPreview={onContactViewportPreview}
+            onViewportCommit={onContactViewportCommit}
+            onViewportCancel={onContactViewportCancel}
             onExpand={onExpandHeatmap}
           />
         ) : uiState.activeOverviewMode === "synteny" ? (
@@ -340,8 +348,11 @@ export function InspectorPanel({
               <dd>{dataset.agp_path ? `${dataset.agp_path}${isAgpDirty ? "*" : ""}` : "Not loaded"}</dd>
             </div>
             <div>
-              <dt>Contact Map (.mcool)</dt>
-              <dd>{dataset.mcool_path || "Not loaded"}</dd>
+              <dt>Contact Map (.cool/.mcool)</dt>
+              <dd>
+                {/^https?:\/\//i.test(dataset.cool_path) ? "Remote · " : ""}
+                {dataset.mcool_path || "Not loaded"}
+              </dd>
             </div>
             <div>
               <dt>Matrix size</dt>
@@ -367,7 +378,7 @@ export function InspectorPanel({
               <dd>Not loaded</dd>
             </div>
             <div>
-              <dt>Contact Map (.mcool)</dt>
+              <dt>Contact Map (.cool/.mcool)</dt>
               <dd>Not loaded</dd>
             </div>
             <div>
@@ -1053,7 +1064,9 @@ interface ContactOverviewProps {
   presentedContactViewport: ContactViewport | null;
   totalSpanBp: number;
   uiState: UiState;
-  onUiAction: (action: UiAction) => void;
+  onViewportPreview: (viewport: ContactViewport) => void;
+  onViewportCommit: (viewport: ContactViewport) => void;
+  onViewportCancel: () => void;
   onExpand: () => void;
 }
 
@@ -1095,12 +1108,33 @@ export function contactOverviewWindowViewport(
   });
 }
 
+export function contactOverviewViewportAtRatio(
+  ratio: { x: number; y: number },
+  totalSpanBp: number,
+  contact: Pick<
+    UiState["contact"],
+    "viewportSpanMb" | "viewportWidthPx" | "viewportHeightPx"
+  >,
+): ContactViewport {
+  return buildCenteredContactViewport({
+    centerMb: (ratio.x + ratio.y) * totalSpanBp / 2_000_000,
+    centerXMb: ratio.x * totalSpanBp / 1_000_000,
+    centerYMb: ratio.y * totalSpanBp / 1_000_000,
+    totalSpanBp,
+    windowSizeBp: contact.viewportSpanMb * 1_000_000,
+    viewportWidthPx: contact.viewportWidthPx,
+    viewportHeightPx: contact.viewportHeightPx,
+  });
+}
+
 function ContactOverview({
   overviewContactMap,
   presentedContactViewport,
   totalSpanBp,
   uiState,
-  onUiAction,
+  onViewportPreview,
+  onViewportCommit,
+  onViewportCancel,
   onExpand,
 }: ContactOverviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -1160,7 +1194,7 @@ function ContactOverview({
     const ratio = ratioFromEvent(event);
     dragRatioRef.current = ratio;
     setDragRatio(ratio);
-    moveMainViewport(ratio, true);
+    onViewportPreview(viewportFromRatio(ratio));
   }
 
   function moveDrag(event: React.PointerEvent<HTMLDivElement>) {
@@ -1168,7 +1202,7 @@ function ContactOverview({
       const ratio = ratioFromEvent(event);
       dragRatioRef.current = ratio;
       setDragRatio(ratio);
-      moveMainViewport(ratio, true);
+      onViewportPreview(viewportFromRatio(ratio));
     }
   }
 
@@ -1176,22 +1210,21 @@ function ContactOverview({
     const ratio = ratioFromEvent(event);
     dragRatioRef.current = null;
     setDragRatio(null);
-    moveMainViewport(ratio, false);
+    onViewportCommit(viewportFromRatio(ratio));
   }
 
   function cancelDrag() {
     dragRatioRef.current = null;
     setDragRatio(null);
+    onViewportCancel();
   }
 
-  function moveMainViewport(ratio: { x: number; y: number }, transient: boolean) {
-    onUiAction({
-      type: "setContactViewportCenterFromOverview",
-      xRatio: ratio.x,
-      yRatio: ratio.y,
-      totalSpanMb,
-      transient,
-    });
+  function viewportFromRatio(ratio: { x: number; y: number }) {
+    return contactOverviewViewportAtRatio(
+      ratio,
+      displayedTotalSpanBp,
+      uiState.contact,
+    );
   }
 
   return (

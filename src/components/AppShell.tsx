@@ -72,7 +72,10 @@ import {
   updateHiddenChromosomeSelection,
 } from "../state/chromosomeVisibility";
 import type { ContactMapLayoutBlock } from "../state/importers";
-import { ContactMapViewport } from "./ContactMapViewport";
+import {
+  ContactMapViewport,
+  type ContactViewportNavigationController,
+} from "./ContactMapViewport";
 import { GfaGraphPanel } from "./GfaGraphPanel";
 import { HeatmapToolbar } from "./HeatmapToolbar";
 import { InspectorPanel } from "./InspectorPanel";
@@ -120,6 +123,7 @@ interface AppShellProps {
   onAgpFileSelected: (file: File) => void;
   onGfaFileSelected: (file: File) => void;
   onContactFileSelected: () => void;
+  onRemoteContactFileSelected: () => void;
   onPafFileRequested: () => void;
   onPafFileSelected: (file: File) => void;
   onCoverageFileRequested: () => void;
@@ -228,6 +232,7 @@ export function AppShell({
   onAgpFileSelected,
   onGfaFileSelected,
   onContactFileSelected,
+  onRemoteContactFileSelected,
   onPafFileRequested,
   onPafFileSelected,
   onCoverageFileRequested,
@@ -280,6 +285,9 @@ export function AppShell({
   const [presentedContactViewport, setPresentedContactViewport] = useState<ContactViewport | null>(
     null,
   );
+  const contactViewportNavigationControllerRef = useRef<
+    ContactViewportNavigationController | null
+  >(null);
   const [gfaPanelHeight, setGfaPanelHeight] = useState<number | null>(null);
   const [confirmingClearData, setConfirmingClearData] = useState(false);
   const [confirmingReloadAssembly, setConfirmingReloadAssembly] = useState(false);
@@ -300,9 +308,25 @@ export function AppShell({
   const appMenuRef = useRef<HTMLDetailsElement>(null);
   const chromosomeFilterMenuRef = useRef<HTMLDetailsElement>(null);
   const syntenySelectionAnchorRef = useRef<string | null>(null);
+  const handleViewportNavigationControllerChange = useCallback(
+    (controller: ContactViewportNavigationController | null) => {
+      contactViewportNavigationControllerRef.current = controller;
+    },
+    [],
+  );
+  const previewContactViewportFromOverview = useCallback((viewport: ContactViewport) => {
+    contactViewportNavigationControllerRef.current?.preview(viewport);
+  }, []);
+  const commitContactViewportFromOverview = useCallback((viewport: ContactViewport) => {
+    contactViewportNavigationControllerRef.current?.commit(viewport);
+  }, []);
+  const cancelContactViewportFromOverview = useCallback(() => {
+    contactViewportNavigationControllerRef.current?.cancel();
+  }, []);
   const agpImported = Boolean(dataset?.agp_path || uiState.assembly.blocks.length > 0);
   const sourceAssemblyAvailable = Boolean(dataset?.agp_layout.blocks.length);
   const contactImported = Boolean(dataset?.mcool_path || dataset?.cool_path || contactMap);
+  const contactImportedRemotely = /^https?:\/\//i.test(dataset?.cool_path ?? "");
   const coverageImported = Boolean(dataset?.coverage_path || coverageView);
   const syntenyImported = Boolean(pafImported || pafRecords.length || syntenyView);
   const gfaImported = gfaDocument !== null;
@@ -982,6 +1006,12 @@ export function AppShell({
                   ) : null}
                 </div>
                 <span className="popover-divider" aria-hidden="true" />
+                <button
+                  type="button"
+                  onClick={() => runAddDataAction(onRemoteContactFileSelected)}
+                >
+                  <span>Remote project or file…</span>
+                </button>
                 <button type="button" onClick={() => runAddDataAction(onLoadExample)}>
                   <span>Load example project</span>
                 </button>
@@ -1393,6 +1423,7 @@ export function AppShell({
                   onContactPanTilePrefetch={onContactPanTilePrefetch}
                   onContactViewportPreview={onContactViewportPreview}
                   onPresentedViewportChange={setPresentedContactViewport}
+                  onViewportNavigationControllerChange={handleViewportNavigationControllerChange}
                   contactPanPrefetchBridge={contactPanPrefetchBridge}
                   onContactTileLayerCommit={onContactTileLayerCommit}
                   onContactTileLayerPaintComplete={onContactTileLayerPaintComplete}
@@ -1521,6 +1552,9 @@ export function AppShell({
               isAgpDirty={isAgpDirty}
               uiState={uiState}
               onUiAction={onUiAction}
+              onContactViewportPreview={previewContactViewportFromOverview}
+              onContactViewportCommit={commitContactViewportFromOverview}
+              onContactViewportCancel={cancelContactViewportFromOverview}
               syntenyView={syntenyView}
               assemblyBlocks={activeAssemblyBlocks}
               viewAssemblyBlocks={viewAssemblyBlocks}
@@ -1546,7 +1580,10 @@ export function AppShell({
         <span>
           Normalization: {uiState.normalization}{displayedNormalizationLabel}
         </span>
-        <span>Matrix: {fileName(dataset?.mcool_path ?? dataset?.cool_path, "None")}</span>
+        <span>
+          Matrix: {contactImportedRemotely ? "Remote · " : ""}
+          {fileName(dataset?.mcool_path ?? dataset?.cool_path, "None")}
+        </span>
         <span>Assembly: {dataset?.agp_path ? displayedAssemblyFileName : "None"}</span>
         <span>Tool: {uiState.selectedTool}</span>
         <span>X: {uiState.contact.viewportCenterXMb.toFixed(2)} Mb</span>

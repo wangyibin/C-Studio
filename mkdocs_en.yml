@@ -91,6 +91,7 @@ nav:
   - User guide:
       - Prepare input files: user-guide/input-preparation.md
       - Project data: user-guide/project-data.md
+      - Remote projects and files: user-guide/remote-contact-service.md
       - Interface: user-guide/interface.md
       - Navigation and selection: user-guide/navigation-selection.md
       - Assembly editing: user-guide/assembly-editing.md

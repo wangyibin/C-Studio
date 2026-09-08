@@ -71,6 +71,7 @@ export interface PlacementRecommendation extends PlacementRecommendationCandidat
   gfaMatchCount: number;
   contactScore: number;
   coarseScore: number;
+  binnedAlleleScore: number;
   backgroundScore: number;
   pafAdjacencyMatchCount: number;
   copyAmbiguous: boolean;
@@ -122,6 +123,7 @@ export interface PlacementRecommendationPlan {
   candidates: PlacementRecommendationCandidate[];
   requests: GfaEndpointHiCLoadRequest[];
   coarseLinks: GfaHiCLink[];
+  binnedAlleleLinks: GfaHiCLink[];
   gfaEdges: GfaGraphEdge[];
   syntenyMaskByPair: ReadonlyMap<string, SyntenyAlleleSignalMask>;
   syntenyAnchors: ReferenceSyntenyAnchor[];
@@ -243,6 +245,7 @@ export function buildPlacementRecommendationPlan({
   syntenyAnchors = [],
   syntenyAlleleEdges = [],
   hicAllelePairs = [],
+  binnedAlleleLinks = [],
   overviewPartnerLimit = defaultOverviewPartnerLimit,
   gfaPartnerLimit = defaultGfaPartnerLimit,
   syntenyPartnerLimitPerSide = defaultSyntenyPartnerLimitPerSide,
@@ -256,6 +259,7 @@ export function buildPlacementRecommendationPlan({
   syntenyAnchors?: ReadonlyArray<ReferenceSyntenyAnchor>;
   syntenyAlleleEdges?: ReadonlyArray<ReferenceSyntenyAlleleEdge>;
   hicAllelePairs?: ReadonlyArray<HiCAlleleConcordancePair>;
+  binnedAlleleLinks?: ReadonlyArray<GfaHiCLink>;
   overviewPartnerLimit?: number;
   gfaPartnerLimit?: number;
   syntenyPartnerLimitPerSide?: number;
@@ -306,8 +310,20 @@ export function buildPlacementRecommendationPlan({
     .map((link) => applySyntenyMaskToCoarseLink(link, syntenyMaskByPair))
     .filter((link): link is GfaHiCLink => link !== null)
     .sort(compareCoarseLinks);
+  const incidentCoarsePairKeys = new Set(incidentCoarseLinks.map((link) => (
+    unorderedPairKey(link.source, link.target)
+  )));
+  const incidentBinnedAlleleLinks = [...new Map(binnedAlleleLinks
+    .filter((link) => (
+      selectedIdSet.has(link.source) !== selectedIdSet.has(link.target)
+    ))
+    .map((link) => applySyntenyMaskToCoarseLink(link, syntenyMaskByPair))
+    .filter((link): link is GfaHiCLink => link !== null)
+    .filter((link) => !incidentCoarsePairKeys.has(unorderedPairKey(link.source, link.target)))
+    .sort(compareCoarseLinks)
+    .map((link) => [unorderedPairKey(link.source, link.target), link])).values()];
   const coarsePartnerIds = occupancyTierPartnerIds(
-    incidentCoarseLinks,
+    [...incidentCoarseLinks, ...incidentBinnedAlleleLinks].sort(compareCoarseLinks),
     selectedIdSet,
     blocksById,
     occupiedObjectIds,
@@ -375,6 +391,7 @@ export function buildPlacementRecommendationPlan({
     candidates,
     requests: [...requestsByKey.values()],
     coarseLinks: incidentCoarseLinks,
+    binnedAlleleLinks: incidentBinnedAlleleLinks,
     gfaEdges: incidentGfaEdges,
     syntenyMaskByPair,
     syntenyAnchors: [...syntenyAnchors],
@@ -828,6 +845,10 @@ export function rankPlacementRecommendations(
     unorderedPairKey(link.source, link.target),
     link.normalizedCountPerMb2,
   ]));
+  const binnedAlleleByPair = new Map(plan.binnedAlleleLinks.map((link) => [
+    unorderedPairKey(link.source, link.target),
+    link.normalizedCountPerMb2,
+  ]));
   const selected: SelectedPlacementBlock = {
     blocks: plan.selectedBlocks,
     unitIds: [],
@@ -861,20 +882,6 @@ export function rankPlacementRecommendations(
     ));
     const supported = evidence.filter((junction) => junction.normalizedCountPerMb2 > 0);
     const gfaMatchCount = evidence.filter((junction) => junction.gfaMatch).length;
-    const occupancyConflicts = plan.occupancyConflicts.filter(
-      (conflict) => conflict.targetObjectId === candidate.targetObjectId,
-    );
-    if (
-      supported.length === 0
-      && gfaMatchCount === 0
-      && pafAdjacencyMatchCount === 0
-      && occupancyConflicts.length === 0
-    ) {
-      return [];
-    }
-    const contactScore = supported.length >= 2
-      ? Math.sqrt(supported[0].normalizedCountPerMb2 * supported[1].normalizedCountPerMb2)
-      : supported[0]?.normalizedCountPerMb2 ?? 0;
     const coarseValues = junctions
       .map((junction) => coarseByPair.get(unorderedPairKey(
         junction.selectedBlock.id,
@@ -884,6 +891,31 @@ export function rankPlacementRecommendations(
     const coarseScore = coarseValues.length >= 2
       ? Math.sqrt(coarseValues[0] * coarseValues[1])
       : coarseValues[0] ?? 0;
+    const binnedAlleleValues = junctions
+      .map((junction) => binnedAlleleByPair.get(unorderedPairKey(
+        junction.selectedBlock.id,
+        junction.partnerBlockId,
+      )) ?? 0)
+      .filter((value) => value > 0);
+    const binnedAlleleScore = binnedAlleleValues.length >= 2
+      ? Math.sqrt(binnedAlleleValues[0] * binnedAlleleValues[1])
+      : binnedAlleleValues[0] ?? 0;
+    const occupancyConflicts = plan.occupancyConflicts.filter(
+      (conflict) => conflict.targetObjectId === candidate.targetObjectId,
+    );
+    if (
+      supported.length === 0
+      && gfaMatchCount === 0
+      && pafAdjacencyMatchCount === 0
+      && occupancyConflicts.length === 0
+      && coarseScore === 0
+      && binnedAlleleScore === 0
+    ) {
+      return [];
+    }
+    const contactScore = supported.length >= 2
+      ? Math.sqrt(supported[0].normalizedCountPerMb2 * supported[1].normalizedCountPerMb2)
+      : supported[0]?.normalizedCountPerMb2 ?? 0;
     const backgroundScore = aggregateBackgroundScore(evidence);
     const bestEndpointMatchCount = supported.filter((junction) => junction.bestEndpointMatch).length;
     const syntenyPrunedJunctionCount = evidence.filter(
@@ -911,6 +943,7 @@ export function rankPlacementRecommendations(
       gfaMatchCount,
       contactScore,
       coarseScore,
+      binnedAlleleScore,
       backgroundScore,
       pafAdjacencyMatchCount,
       copyAmbiguous: plan.copyAmbiguous,
@@ -1388,6 +1421,7 @@ function compareRecommendations(
     || right.gfaMatchCount - left.gfaMatchCount
     || right.contactScore - left.contactScore
     || right.coarseScore - left.coarseScore
+    || right.binnedAlleleScore - left.binnedAlleleScore
     || Number(right.isCurrent) - Number(left.isCurrent)
     || left.targetObjectId.localeCompare(right.targetObjectId)
     || left.visualPosition - right.visualPosition

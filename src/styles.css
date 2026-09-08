@@ -1829,6 +1829,91 @@ button {
   box-shadow: var(--shadow);
 }
 
+.remote-contact-dialog {
+  display: grid;
+  gap: 14px;
+  width: min(520px, calc(100vw - 40px));
+  padding: 20px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.remote-contact-dialog header,
+.remote-contact-dialog label {
+  display: grid;
+  gap: 6px;
+}
+
+.remote-contact-dialog h2,
+.remote-contact-dialog p {
+  margin: 0;
+}
+
+.remote-contact-dialog h2 {
+  color: var(--text);
+  font-size: 17px;
+}
+
+.remote-contact-dialog header p,
+.remote-contact-dialog label span,
+.remote-contact-dialog label small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.remote-contact-dialog input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-strong);
+  color: var(--text);
+  font: inherit;
+}
+
+.remote-contact-dialog input:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent);
+  outline-offset: 1px;
+}
+
+.remote-contact-dialog .remote-contact-error {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.remote-contact-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.remote-contact-dialog footer button {
+  min-width: 82px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-strong);
+  color: var(--text);
+}
+
+.remote-contact-dialog footer .remote-contact-confirm {
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--border));
+  background: var(--accent);
+  color: var(--surface);
+}
+
+.remote-contact-dialog footer button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
 .gfa-placement-dialog {
   display: grid;
   gap: 14px;

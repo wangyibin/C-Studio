@@ -39,7 +39,10 @@ import {
 import { assemblyShortcutIntent } from "../state/assemblyShortcuts";
 import { contactColorLut } from "../state/contactColor";
 import { traceContactPanCamera } from "../state/contactPanCameraTrace";
-import type { ContactPanPreview } from "../state/contactPanPerformance";
+import {
+  contactViewportPreviewIsPan,
+  type ContactPanPreview,
+} from "../state/contactPanPerformance";
 import type {
   ContactGpuResidentPrefetchBatch,
   ContactPanPrefetchBatch,
@@ -120,6 +123,12 @@ export function contactViewportForPlacementPreview(
     : committedViewport;
 }
 
+export interface ContactViewportNavigationController {
+  preview: (viewport: ContactViewport) => void;
+  commit: (viewport: ContactViewport) => void;
+  cancel: () => void;
+}
+
 interface ContactMapViewportProps {
   dataset: ExampleDatasetSummary | null;
   assemblyBlocks?: ContactMapLayoutBlock[];
@@ -140,6 +149,9 @@ interface ContactMapViewportProps {
   onContactPanTilePrefetch?: (preview: ContactPanPreview) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
   onPresentedViewportChange?: (viewport: ContactViewport | null) => void;
+  onViewportNavigationControllerChange?: (
+    controller: ContactViewportNavigationController | null,
+  ) => void;
   contactPanPrefetchBridge?: ContactPanPrefetchBridge;
   onContactTileLayerCommit?: (event: ContactTileRenderMilestone) => void;
   onContactTileLayerPaintComplete?: (event: ContactTileRenderMilestone) => void;
@@ -1351,6 +1363,7 @@ export function ContactMapViewport({
   onContactPanTilePrefetch,
   onContactViewportPreview,
   onPresentedViewportChange,
+  onViewportNavigationControllerChange,
   contactPanPrefetchBridge,
   useStoredResolutionOptions = false,
   availableResolutionBasePairs = [],
@@ -1368,6 +1381,11 @@ export function ContactMapViewport({
   const contactTileLayerRef = useRef<HTMLDivElement>(null);
   const contactTileTransformRef = useRef<HTMLDivElement>(null);
   const contactTilePanRendererRef = useRef<ContactTileGpuRenderer | null>(null);
+  const viewportNavigationControllerRef = useRef<ContactViewportNavigationController>({
+    preview: () => undefined,
+    commit: () => undefined,
+    cancel: () => undefined,
+  });
   useEffect(() => {
     let presentationFrame: number | null = null;
     let pendingBatches: ContactPanPrefetchBatch[] = [];
@@ -1660,13 +1678,24 @@ export function ContactMapViewport({
     ? presentationContactMap.viewport
     : liveViewport;
   const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
+  const navigationViewport = contactVisibleInteractionViewport(
+    displayViewport,
+    pendingCommittedPanViewportRef.current,
+    dragState?.previewViewport
+      ?? (contactViewportPreview && contactViewportPreviewIsPan(contactViewportPreview)
+        ? contactViewportPreview.viewport
+        : null),
+  );
   usePrePaintEffect(() => {
-    onPresentedViewportChange?.(displayViewport);
+    // A compositor-shifted retained frame is already visible in the target
+    // camera even before the replacement tiles paint. Publish that camera to
+    // the Overview and axis navigators so their windows do not snap back.
+    onPresentedViewportChange?.(navigationViewport);
   }, [
-    displayViewport.xEnd,
-    displayViewport.xStart,
-    displayViewport.yEnd,
-    displayViewport.yStart,
+    navigationViewport.xEnd,
+    navigationViewport.xStart,
+    navigationViewport.yEnd,
+    navigationViewport.yStart,
     onPresentedViewportChange,
   ]);
   useEffect(() => () => onPresentedViewportChange?.(null), [onPresentedViewportChange]);
@@ -1780,12 +1809,16 @@ export function ContactMapViewport({
   latestDisplayContactMapRef.current = displayContactMap;
   const viewportXStartMb = displayViewport.xStart / 1_000_000;
   const viewportXEndMb = displayViewport.xEnd / 1_000_000;
-  const viewportXCenterMb = (viewportXStartMb + viewportXEndMb) / 2 || uiState.contact.viewportCenterXMb;
   const viewportYStartMb = displayViewport.yStart / 1_000_000;
   const viewportYEndMb = displayViewport.yEnd / 1_000_000;
-  const viewportYCenterMb = (viewportYStartMb + viewportYEndMb) / 2 || uiState.contact.viewportCenterYMb;
   const viewportXSpanMb = Math.max(0.000001, viewportXEndMb - viewportXStartMb);
   const viewportYSpanMb = Math.max(0.000001, viewportYEndMb - viewportYStartMb);
+  const viewportXCenterMb = (
+    navigationViewport.xStart + navigationViewport.xEnd
+  ) / 2_000_000 || uiState.contact.viewportCenterXMb;
+  const viewportYCenterMb = (
+    navigationViewport.yStart + navigationViewport.yEnd
+  ) / 2_000_000 || uiState.contact.viewportCenterYMb;
   const layoutChangePlan = useMemo(
     () => presentationContactMap?.layoutBlocks
       ? buildContactLayoutRasterPlan(presentationContactMap.layoutBlocks, activeAssemblyBlocks)
@@ -2892,7 +2925,7 @@ export function ContactMapViewport({
     setAssemblyBoundaryPanViewport(next);
   }
 
-  function previewAxisNavigator(axis: "x" | "y", centerRatio: number) {
+  function previewNavigationViewport(previewViewport: ContactViewport) {
     if (!liveContactMap) {
       return;
     }
@@ -2902,7 +2935,23 @@ export function ContactMapViewport({
       return;
     }
 
-    const previewViewport = contactViewportForAxisNavigator({
+    const sourceContactMap = latestDisplayContactMapRef.current ?? liveContactMap;
+    if (!panLoadingSuspendedRef.current) {
+      panLoadingSuspendedRef.current = true;
+      contactTilePanRendererRef.current?.discardPrefetchedPages();
+      onContactPanGestureStart?.();
+    }
+    preparePanViewport(previewViewport);
+    schedulePanTransform(
+      sourceContactMap,
+      { ...sourceContactMap, viewport: previewViewport },
+      bounds.width,
+      bounds.height,
+    );
+  }
+
+  function axisNavigatorViewport(axis: "x" | "y", centerRatio: number) {
+    return contactViewportForAxisNavigator({
       axis,
       centerRatio,
       totalSpanMb,
@@ -2912,21 +2961,13 @@ export function ContactMapViewport({
       centerXMb: uiState.contact.viewportCenterXMb,
       centerYMb: uiState.contact.viewportCenterYMb,
     });
-    if (!panLoadingSuspendedRef.current) {
-      panLoadingSuspendedRef.current = true;
-      contactTilePanRendererRef.current?.discardPrefetchedPages();
-      onContactPanGestureStart?.();
-    }
-    preparePanViewport(previewViewport);
-    schedulePanTransform(
-      liveContactMap,
-      { ...liveContactMap, viewport: previewViewport },
-      bounds.width,
-      bounds.height,
-    );
   }
 
-  function cancelAxisNavigatorPreview() {
+  function previewAxisNavigator(axis: "x" | "y", centerRatio: number) {
+    previewNavigationViewport(axisNavigatorViewport(axis, centerRatio));
+  }
+
+  function cancelNavigationPreview() {
     cancelScheduledPanFrame();
     resetPanTransform();
     panLoadingSuspendedRef.current = false;
@@ -2935,15 +2976,28 @@ export function ContactMapViewport({
     onContactViewportPreview?.(null);
   }
 
-  function commitAxisNavigator(axis: "x" | "y", centerRatio: number) {
-    previewAxisNavigator(axis, centerRatio);
-    // Do not let the final preview animation frame reapply the old annotation
-    // transform after the committed viewport cleared it in the layout phase.
+  function commitNavigationViewport(finalViewport: ContactViewport) {
+    previewNavigationViewport(finalViewport);
     cancelScheduledPanFrame();
+    const bounds = currentCanvasFrameBounds();
+    const sourceContactMap = latestDisplayContactMapRef.current ?? liveContactMap;
+    if (sourceContactMap && bounds && bounds.width > 0 && bounds.height > 0) {
+      applyPanTransform(
+        sourceContactMap,
+        { ...sourceContactMap, viewport: finalViewport },
+        bounds.width,
+        bounds.height,
+      );
+      // Register the retained target before React clears the transient preview.
+      // The common presentation handoff releases it only after this exact
+      // viewport has painted, matching pointer and wheel panning.
+      pendingCommittedPanViewportRef.current = finalViewport;
+    } else {
+      pendingCommittedPanViewportRef.current = null;
+    }
     onUiAction({
-      type: "setContactViewportAxisFromNavigator",
-      axis,
-      ratio: centerRatio,
+      type: "commitContactViewportPan",
+      viewport: finalViewport,
       totalSpanMb,
     });
     panLoadingSuspendedRef.current = false;
@@ -2951,6 +3005,28 @@ export function ContactMapViewport({
     resetPanPrefetchPrediction();
     onContactViewportPreview?.(null);
   }
+
+  function commitAxisNavigator(axis: "x" | "y", centerRatio: number) {
+    commitNavigationViewport(axisNavigatorViewport(axis, centerRatio));
+  }
+
+  viewportNavigationControllerRef.current = {
+    preview: previewNavigationViewport,
+    commit: commitNavigationViewport,
+    cancel: cancelNavigationPreview,
+  };
+  useEffect(() => {
+    if (!onViewportNavigationControllerChange) {
+      return;
+    }
+    const controller: ContactViewportNavigationController = {
+      preview: (viewport) => viewportNavigationControllerRef.current.preview(viewport),
+      commit: (viewport) => viewportNavigationControllerRef.current.commit(viewport),
+      cancel: () => viewportNavigationControllerRef.current.cancel(),
+    };
+    onViewportNavigationControllerChange(controller);
+    return () => onViewportNavigationControllerChange(null);
+  }, [onViewportNavigationControllerChange]);
 
   function handleAssemblyDoubleClick(event: React.MouseEvent<HTMLDivElement>) {
     const bounds = currentCanvasFrameBounds(event.currentTarget);
@@ -3522,7 +3598,7 @@ export function ContactMapViewport({
             homologPattern={homologPattern}
             ariaLabel="Y axis whole-genome navigator"
             onPreview={(ratio) => previewAxisNavigator("y", ratio)}
-            onPreviewCancel={cancelAxisNavigatorPreview}
+            onPreviewCancel={cancelNavigationPreview}
             onCommit={(ratio) => commitAxisNavigator("y", ratio)}
           />
         </div>
@@ -3537,7 +3613,7 @@ export function ContactMapViewport({
             homologPattern={homologPattern}
             ariaLabel="X axis whole-genome navigator"
             onPreview={(ratio) => previewAxisNavigator("x", ratio)}
-            onPreviewCancel={cancelAxisNavigatorPreview}
+            onPreviewCancel={cancelNavigationPreview}
             onCommit={(ratio) => commitAxisNavigator("x", ratio)}
           />
         </div>

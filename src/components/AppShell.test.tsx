@@ -69,6 +69,7 @@ function renderShell(
       onAgpFileSelected={() => undefined}
       onGfaFileSelected={() => undefined}
       onContactFileSelected={() => undefined}
+      onRemoteContactFileSelected={() => undefined}
       onPafFileRequested={() => undefined}
       onPafFileSelected={() => undefined}
       onCoverageFileRequested={() => undefined}
@@ -122,9 +123,16 @@ describe("AppShell confirmed workspace", () => {
     expect(markup).toContain("Assembly (.agp)");
     expect(markup).toContain("Assembly graph (.gfa)");
     expect(markup).toContain("Contact map (.cool/.mcool)");
+    expect(markup).toContain("Remote project or file…");
     expect(markup).toContain("Synteny alignments (.paf)");
     expect(markup).toContain("Coverage track");
     expect(markup).toContain("Load example project");
+    const coverageIndex = markup.indexOf("Coverage track");
+    const remoteProjectIndex = markup.indexOf("Remote project or file…");
+    const exampleProjectIndex = markup.indexOf("Load example project");
+    expect(remoteProjectIndex).toBeGreaterThan(coverageIndex);
+    expect(remoteProjectIndex).toBeLessThan(exampleProjectIndex);
+    expect(markup.slice(remoteProjectIndex, exampleProjectIndex)).not.toContain("popover-divider");
     expect(markup).toContain("Reload assembly…");
     expect(markup).toContain('title="No source AGP loaded"');
     expect(markup).toContain("Clear all loaded data…");

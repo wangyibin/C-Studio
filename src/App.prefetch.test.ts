@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { buildContactPanPrefetchPlan } from "./App";
+import {
+  buildContactPanPrefetchPlan,
+  contactViewportPresentationRequestKey,
+} from "./App";
 
 describe("resolution prefetch planning", () => {
+  it("re-presents a settled camera even when its tile-grid key is unchanged", () => {
+    const tileGridKey = "100000:256=>1:1|1:2=>1:1|1:2=>background";
+
+    expect(contactViewportPresentationRequestKey(tileGridKey, 7)).toBe(
+      `${tileGridKey}|camera:7`,
+    );
+    expect(contactViewportPresentationRequestKey(tileGridKey, 8)).not.toBe(
+      contactViewportPresentationRequestKey(tileGridKey, 7),
+    );
+  });
+
   it("warms the screen-scale LOD used by a whole-genome 2.5 Mb switch", () => {
     const totalSpanBp = 10_370_812_184;
     const plan = buildContactPanPrefetchPlan({

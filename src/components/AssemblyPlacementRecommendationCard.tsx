@@ -24,6 +24,7 @@ import {
   buildSelectedLengthNormalizedGfaHiCLinks,
   gfaHiCContactMapUsesLayout,
   maximumGfaHiCLinks,
+  type GfaHiCLink,
 } from "../state/gfaHiCLinks";
 import type {
   HiCAlleleConcordanceBatchLoader,
@@ -253,6 +254,13 @@ export function AssemblyPlacementRecommendationCard({
       ? syntenyPruning.maskByPair
       : hicAlleleMaskByPair
   ), [hasPafEvidence, hicAlleleMaskByPair, syntenyPruning.maskByPair]);
+  const binnedAlleleLinks = useMemo(() => placementRecommendationBinnedAlleleLinks(
+    overviewContactMap,
+    blocks,
+    selection,
+    expectedNormalization,
+    hicAllelePairs,
+  ), [blocks, expectedNormalization, hicAllelePairs, overviewContactMap, selection]);
   const plan = useMemo(() => buildPlacementRecommendationPlan({
     blocks,
     selection,
@@ -263,9 +271,11 @@ export function AssemblyPlacementRecommendationCard({
     syntenyAnchors: syntenyPruning.anchors,
     syntenyAlleleEdges: syntenyPruning.alleleEdges,
     hicAllelePairs: highConfidenceHiCAllelePairs,
+    binnedAlleleLinks,
     overviewPartnerLimit: recommendationOverviewPartnerLimit,
   }), [
     blocks,
+    binnedAlleleLinks,
     coarseLinks,
     gfaEdges,
     alleleMaskByPair,
@@ -528,7 +538,7 @@ export function AssemblyPlacementRecommendationCard({
         <p className="placement-recommendation-status error">{loadState.reason}</p>
       ) : recommendations.length === 0 ? (
         <p className="placement-recommendation-status">
-          No candidate has usable endpoint contact or oriented GFA support.
+          No candidate has usable endpoint, coarse/binned Hi-C, or oriented GFA support.
         </p>
       ) : (
         <ol className="placement-recommendation-list">
@@ -619,6 +629,105 @@ export function placementRecommendationCoarseLinks(
   );
 }
 
+export function placementRecommendationBinnedAlleleLinks(
+  overviewContactMap: ContactMapView | null,
+  blocks: ReadonlyArray<ContactMapLayoutBlock>,
+  selection: AssemblySelection | null,
+  expectedNormalization: ContactNormalization,
+  hicAllelePairs: ReadonlyArray<HiCAlleleConcordancePair>,
+) {
+  if (
+    !overviewContactMap
+    || !gfaHiCContactMapUsesLayout(overviewContactMap, blocks)
+    || (overviewContactMap.normalization ?? "raw") !== expectedNormalization
+  ) {
+    return [];
+  }
+  const selected = selectedPlacementBlock(blocks, selection);
+  if ("status" in selected) {
+    return [];
+  }
+  const selectedIds = new Set(selected.blocks.map((block) => block.id));
+  const selectedIdsByPartner = new Map<string, Set<string>>();
+  for (const pair of hicAllelePairs) {
+    if (pair.confidence !== "supported") {
+      continue;
+    }
+    const leftSelected = selectedIds.has(pair.leftBlockId);
+    const rightSelected = selectedIds.has(pair.rightBlockId);
+    if (leftSelected === rightSelected) {
+      continue;
+    }
+    const selectedId = leftSelected ? pair.leftBlockId : pair.rightBlockId;
+    const partnerId = leftSelected ? pair.rightBlockId : pair.leftBlockId;
+    const values = selectedIdsByPartner.get(partnerId) ?? new Set<string>();
+    values.add(selectedId);
+    selectedIdsByPartner.set(partnerId, values);
+  }
+  const partnerIds = new Set(selectedIdsByPartner.keys());
+  if (partnerIds.size === 0) {
+    return [];
+  }
+  const blocksById = new Map(blocks.map((block) => [block.id, block]));
+  const neighborhoodLinks = buildSelectedLengthNormalizedGfaHiCLinks(
+    overviewContactMap,
+    blocks,
+    blocks.map((block) => ({ id: block.id, occurrenceId: block.id })),
+    partnerIds,
+    maximumGfaHiCLinks,
+    recommendationSyntenyMatchingPartnerLimit,
+  );
+  const projectedByPair = new Map<string, GfaHiCLink>();
+  for (const neighborhoodLink of neighborhoodLinks) {
+    const sourceIsPartner = partnerIds.has(neighborhoodLink.source);
+    const targetIsPartner = partnerIds.has(neighborhoodLink.target);
+    if (sourceIsPartner === targetIsPartner) {
+      continue;
+    }
+    const partnerId = sourceIsPartner ? neighborhoodLink.source : neighborhoodLink.target;
+    const targetId = sourceIsPartner ? neighborhoodLink.target : neighborhoodLink.source;
+    if (selectedIds.has(targetId) || partnerIds.has(targetId)) {
+      continue;
+    }
+    const targetBlock = blocksById.get(targetId);
+    if (!targetBlock) {
+      continue;
+    }
+    for (const selectedId of selectedIdsByPartner.get(partnerId) ?? []) {
+      const selectedBlock = blocksById.get(selectedId);
+      if (!selectedBlock) {
+        continue;
+      }
+      const selectedLengthMb = Math.max(
+        1,
+        selectedBlock.visualEnd - selectedBlock.visualStart,
+      ) / 1_000_000;
+      const targetLengthMb = Math.max(
+        1,
+        targetBlock.visualEnd - targetBlock.visualStart,
+      ) / 1_000_000;
+      const link: GfaHiCLink = {
+        id: `hic-binned-allele-neighborhood:${partnerId}:${targetId}:${selectedId}`,
+        source: selectedId,
+        target: targetId,
+        rawCount: neighborhoodLink.rawCount,
+        normalizedCountPerMb2: neighborhoodLink.rawCount / (selectedLengthMb * targetLengthMb),
+        lineWidth: neighborhoodLink.lineWidth,
+      };
+      const key = [selectedId, targetId].sort().join("\u0000");
+      const current = projectedByPair.get(key);
+      if (!current || link.normalizedCountPerMb2 > current.normalizedCountPerMb2) {
+        projectedByPair.set(key, link);
+      }
+    }
+  }
+  return [...projectedByPair.values()].sort((left, right) => (
+    right.normalizedCountPerMb2 - left.normalizedCountPerMb2
+    || right.rawCount - left.rawCount
+    || left.id.localeCompare(right.id)
+  ));
+}
+
 function PlacementRecommendationItem({
   recommendation,
   blocks,
@@ -680,6 +789,20 @@ function PlacementRecommendationItem({
         ) : null}
         {recommendation.contactScore > 0 ? (
           <span>{formatScore(recommendation.contactScore)} signal/Mb²</span>
+        ) : null}
+        {recommendation.coarseScore > 0
+        && recommendation.supportedJunctionCount === 0
+        && recommendation.gfaMatchCount === 0
+        && recommendation.pafAdjacencyMatchCount === 0
+        && recommendation.occupancyConflicts.length === 0 ? (
+          <span>Coarse Hi-C only · {formatScore(recommendation.coarseScore)} signal/Mb²</span>
+        ) : null}
+        {recommendation.binnedAlleleScore > 0
+        && recommendation.supportedJunctionCount === 0
+        && recommendation.gfaMatchCount === 0
+        && recommendation.pafAdjacencyMatchCount === 0
+        && recommendation.occupancyConflicts.length === 0 ? (
+          <span>Binned allelic Hi-C only · {formatScore(recommendation.binnedAlleleScore)} signal/Mb²</span>
         ) : null}
       </div>
       <div className="placement-recommendation-actions">

@@ -328,6 +328,56 @@ describe("assembly placement recommendation", () => {
     expect(ranked).toHaveLength(3);
   });
 
+  it("keeps coarse-only Hi-C candidates as review suggestions", () => {
+    const plan = buildPlacementRecommendationPlan({
+      blocks,
+      selection,
+      coarseLinks: [coarse("b", "d", 80)],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    const ranked = rankPlacementRecommendations(plan, new Map(), blocks);
+
+    expect(ranked).toHaveLength(3);
+    expect(ranked.every((recommendation) => (
+      recommendation.targetObjectId === "Chr02"
+      && recommendation.confidence === "review"
+      && recommendation.supportedJunctionCount === 0
+      && recommendation.contactScore === 0
+      && recommendation.coarseScore === 80
+    ))).toBe(true);
+  });
+
+  it("uses projected binned-allele Hi-C neighborhoods as a review-only placement fallback", () => {
+    const plan = buildPlacementRecommendationPlan({
+      blocks,
+      selection,
+      coarseLinks: [],
+      binnedAlleleLinks: [coarse("b", "d", 80)],
+    });
+    expect(plan.status).toBe("ready");
+    if (plan.status !== "ready") return;
+
+    expect(plan.coarseLinks).toEqual([]);
+    expect(plan.binnedAlleleLinks).toHaveLength(1);
+    expect(plan.candidates.some((candidate) => (
+      candidate.targetObjectId === "Chr02"
+    ))).toBe(true);
+
+    const ranked = rankPlacementRecommendations(plan, new Map(), blocks);
+
+    expect(ranked).toHaveLength(3);
+    expect(ranked.every((recommendation) => (
+      recommendation.targetObjectId === "Chr02"
+      && recommendation.confidence === "review"
+      && recommendation.supportedJunctionCount === 0
+      && recommendation.contactScore === 0
+      && recommendation.coarseScore === 0
+      && recommendation.binnedAlleleScore === 80
+    ))).toBe(true);
+  });
+
   it("demotes exact-source conflicts without starving compatible chromosome groups", () => {
     const copyBlocks = [
       block("g1-left", "Chr03g1", 0),

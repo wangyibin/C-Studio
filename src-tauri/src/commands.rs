@@ -1,10 +1,18 @@
 use flate2::read::MultiGzDecoder;
+use percent_encoding::percent_decode_str;
+use regex::Regex;
+use reqwest::{
+    blocking::{Client as HttpClient, Response as HttpResponse},
+    header::AUTHORIZATION,
+    Url,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
@@ -910,6 +918,17 @@ pub struct ImportedProjectDirectory {
     pub coverage: Option<ImportedProjectFile>,
     pub contact: Option<ImportedProjectFile>,
     pub ignored_candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedRemoteSource {
+    pub source_url: String,
+    pub mode: String,
+    pub file_kind: Option<String>,
+    pub project: ImportedProjectDirectory,
+    pub downloaded_files: usize,
+    pub downloaded_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2015,6 +2034,24 @@ fn load_gfa_file_from_path(path: &Path) -> Result<ImportedProjectTextFile, Strin
 #[tauri::command]
 pub fn load_project_directory(path: String) -> Result<ImportedProjectDirectory, String> {
     scan_project_directory(Path::new(&path))
+}
+
+#[tauri::command]
+pub async fn download_remote_source(
+    app_handle: tauri::AppHandle,
+    url: String,
+    bearer_token: Option<String>,
+) -> Result<ImportedRemoteSource, String> {
+    let cache_root = app_handle
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("remote-import-v1");
+    tauri::async_runtime::spawn_blocking(move || {
+        download_remote_source_to_cache(&url, bearer_token.as_deref(), &cache_root)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -6030,6 +6067,452 @@ fn sort_project_contact_candidates(candidates: &mut [PathBuf]) {
     });
 }
 
+const MAX_REMOTE_DIRECTORY_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RemoteFileKind {
+    Agp,
+    Contact,
+    Coverage,
+    Paf,
+    Gfa,
+}
+
+impl RemoteFileKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Agp => "agp",
+            Self::Contact => "contact",
+            Self::Coverage => "coverage",
+            Self::Paf => "paf",
+            Self::Gfa => "gfa",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RemoteLink {
+    url: Url,
+    filename: String,
+}
+
+fn remote_url_input_with_default_scheme(input: &str) -> String {
+    if input.starts_with("//") {
+        format!("http:{input}")
+    } else if input.split_once("://").is_some_and(|(scheme, _)| {
+        let mut characters = scheme.chars();
+        characters
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic())
+            && characters.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            })
+    }) {
+        input.to_string()
+    } else {
+        format!("http://{input}")
+    }
+}
+
+fn validate_remote_url(input: &str) -> Result<Url, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("enter a remote project or file address".to_string());
+    }
+    let normalized = remote_url_input_with_default_scheme(trimmed);
+    let mut url =
+        Url::parse(&normalized).map_err(|error| format!("invalid remote URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("remote project/file URLs must use HTTP or HTTPS".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("put credentials in the bearer token field, not in the URL".to_string());
+    }
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn validate_followed_remote_url(url: &Url) -> Result<(), String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("the remote server redirected to a non-HTTP URL".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("the remote server redirected to a URL containing credentials".to_string());
+    }
+    Ok(())
+}
+
+fn decoded_remote_filename(url: &Url) -> Result<String, String> {
+    let encoded = url
+        .path_segments()
+        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .ok_or_else(|| "the remote URL does not name a file".to_string())?;
+    let decoded = percent_decode_str(encoded).decode_utf8_lossy();
+    let mut filename = decoded
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    filename = filename.trim().to_string();
+    if filename.is_empty() || matches!(filename.as_str(), "." | "..") {
+        return Err("the remote URL has an unsafe or empty filename".to_string());
+    }
+    Ok(filename)
+}
+
+fn remote_file_kind(filename: &str) -> Option<RemoteFileKind> {
+    let path = Path::new(filename);
+    if has_data_suffix(path, &["agp"]) {
+        Some(RemoteFileKind::Agp)
+    } else if has_plain_suffix(path, &["cool", "mcool"]) {
+        Some(RemoteFileKind::Contact)
+    } else if has_data_suffix(path, &["depth", "bedgraph", "bg"]) {
+        Some(RemoteFileKind::Coverage)
+    } else if has_data_suffix(path, &["paf"]) {
+        Some(RemoteFileKind::Paf)
+    } else if has_data_suffix(path, &["gfa", "gfa1"]) {
+        Some(RemoteFileKind::Gfa)
+    } else {
+        None
+    }
+}
+
+fn remote_cache_key(url: &Url) -> String {
+    let digest = Sha256::digest(url.as_str().as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn remote_http_client() -> Result<HttpClient, String> {
+    HttpClient::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(24 * 60 * 60))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent(concat!("C-Studio/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| format!("could not initialize the HTTP client: {error}"))
+}
+
+fn remote_get(
+    client: &HttpClient,
+    url: &Url,
+    bearer_token: Option<&str>,
+) -> Result<HttpResponse, String> {
+    let mut request = client.get(url.clone());
+    if let Some(token) = bearer_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = request
+        .send()
+        .map_err(|error| format!("could not download {url}: {error}"))?;
+    validate_followed_remote_url(response.url())?;
+    response
+        .error_for_status()
+        .map_err(|error| format!("remote server rejected {url}: {error}"))
+}
+
+fn html_href_values(html: &str) -> Vec<String> {
+    let expression = Regex::new(r#"(?i)href\s*=\s*["']([^"']+)["']"#)
+        .expect("static href expression must compile");
+    expression
+        .captures_iter(html)
+        .filter_map(|capture| capture.get(1))
+        .map(|value| {
+            value
+                .as_str()
+                .replace("&amp;", "&")
+                .replace("&#38;", "&")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+        })
+        .collect()
+}
+
+fn same_remote_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn remote_directory_links(directory_url: &Url, html: &str) -> Vec<RemoteLink> {
+    let mut base = directory_url.clone();
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
+    base.set_query(None);
+    base.set_fragment(None);
+
+    let mut seen = BTreeSet::new();
+    let mut links = Vec::new();
+    for href in html_href_values(html) {
+        let Ok(mut link) = base.join(&href) else {
+            continue;
+        };
+        link.set_fragment(None);
+        if !same_remote_origin(&base, &link) {
+            continue;
+        }
+        let Some(relative_path) = link.path().strip_prefix(base.path()) else {
+            continue;
+        };
+        if relative_path.is_empty() || relative_path.contains('/') {
+            continue;
+        }
+        let Ok(filename) = decoded_remote_filename(&link) else {
+            continue;
+        };
+        if seen.insert(link.as_str().to_string()) {
+            links.push(RemoteLink {
+                url: link,
+                filename,
+            });
+        }
+    }
+    links
+}
+
+fn read_remote_directory_index(
+    client: &HttpClient,
+    url: &Url,
+    bearer_token: Option<&str>,
+) -> Result<(Url, Vec<RemoteLink>), String> {
+    let response = remote_get(client, url, bearer_token)?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REMOTE_DIRECTORY_INDEX_BYTES)
+    {
+        return Err("remote directory listing is larger than 4 MiB".to_string());
+    }
+    let final_url = response.url().clone();
+    let mut limited = response.take(MAX_REMOTE_DIRECTORY_INDEX_BYTES + 1);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read the remote directory listing: {error}"))?;
+    if bytes.len() as u64 > MAX_REMOTE_DIRECTORY_INDEX_BYTES {
+        return Err("remote directory listing is larger than 4 MiB".to_string());
+    }
+    let html = String::from_utf8(bytes).map_err(|_| {
+        "remote project address did not return a UTF-8 directory listing".to_string()
+    })?;
+    let links = remote_directory_links(&final_url, &html);
+    Ok((final_url, links))
+}
+
+fn download_remote_file(
+    client: &HttpClient,
+    link: &RemoteLink,
+    bearer_token: Option<&str>,
+    destination: &Path,
+) -> Result<u64, String> {
+    let mut response = remote_get(client, &link.url, bearer_token)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "remote cache destination has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{}.part-{}-{nonce}",
+        link.filename,
+        std::process::id()
+    ));
+    let copy_result = (|| -> Result<u64, String> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        let bytes = io::copy(&mut response, &mut file)
+            .map_err(|error| format!("download of {} failed: {error}", link.url))?;
+        file.flush().map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        Ok(bytes)
+    })();
+    let bytes = match copy_result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|error| {
+            format!(
+                "could not replace cached file {}: {error}",
+                destination.display()
+            )
+        })?;
+    }
+    fs::rename(&temporary, destination).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!(
+            "could not finalize cached file {}: {error}",
+            destination.display()
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn empty_imported_remote_project(directory: String) -> ImportedProjectDirectory {
+    ImportedProjectDirectory {
+        directory,
+        agp: None,
+        history: None,
+        gfa: None,
+        paf: None,
+        coverage: None,
+        contact: None,
+        ignored_candidates: Vec::new(),
+    }
+}
+
+fn set_imported_remote_file(
+    project: &mut ImportedProjectDirectory,
+    kind: RemoteFileKind,
+    file: ImportedProjectFile,
+) {
+    match kind {
+        RemoteFileKind::Agp => project.agp = Some(file),
+        RemoteFileKind::Contact => project.contact = Some(file),
+        RemoteFileKind::Coverage => project.coverage = Some(file),
+        RemoteFileKind::Paf => project.paf = Some(file),
+        RemoteFileKind::Gfa => project.gfa = Some(file),
+    }
+}
+
+fn download_remote_source_to_cache(
+    input_url: &str,
+    bearer_token: Option<&str>,
+    cache_root: &Path,
+) -> Result<ImportedRemoteSource, String> {
+    let url = validate_remote_url(input_url)?;
+    let client = remote_http_client()?;
+    if let Ok(filename) = decoded_remote_filename(&url) {
+        if let Some(kind) = remote_file_kind(&filename) {
+            let destination_root = cache_root.join(remote_cache_key(&url));
+            let destination = destination_root.join(&filename);
+            let link = RemoteLink {
+                url: url.clone(),
+                filename,
+            };
+            let downloaded_bytes =
+                download_remote_file(&client, &link, bearer_token, &destination)?;
+            let mut project = empty_imported_remote_project(url.to_string());
+            set_imported_remote_file(&mut project, kind, imported_project_file(&destination)?);
+            return Ok(ImportedRemoteSource {
+                source_url: url.to_string(),
+                mode: "file".to_string(),
+                file_kind: Some(kind.label().to_string()),
+                project,
+                downloaded_files: 1,
+                downloaded_bytes,
+            });
+        }
+    }
+
+    let (directory_url, links) = read_remote_directory_index(&client, &url, bearer_token)?;
+    let mut candidates = BTreeMap::<RemoteFileKind, Vec<RemoteLink>>::new();
+    for link in &links {
+        if let Some(kind) = remote_file_kind(&link.filename) {
+            candidates.entry(kind).or_default().push(link.clone());
+        }
+    }
+    for (kind, values) in &mut candidates {
+        values.sort_by_key(|candidate| {
+            let contact_priority = if *kind == RemoteFileKind::Contact
+                && candidate.filename.to_ascii_lowercase().ends_with(".mcool")
+            {
+                0
+            } else {
+                1
+            };
+            (contact_priority, candidate.filename.to_ascii_lowercase())
+        });
+    }
+    if candidates.values().all(Vec::is_empty) {
+        return Err("no supported files were found in the remote directory (.agp, .cool/.mcool, .depth/.bedgraph/.bg, .paf, .gfa, optionally .gz)".to_string());
+    }
+
+    let destination_root = cache_root.join(remote_cache_key(&directory_url));
+    fs::create_dir_all(&destination_root).map_err(|error| error.to_string())?;
+    let mut project = empty_imported_remote_project(directory_url.to_string());
+    let mut downloaded_bytes = 0_u64;
+    let mut downloaded_files = 0_usize;
+    for (kind, values) in &candidates {
+        let Some(selected) = values.first() else {
+            continue;
+        };
+        let destination = destination_root.join(&selected.filename);
+        downloaded_bytes = downloaded_bytes
+            .checked_add(download_remote_file(
+                &client,
+                selected,
+                bearer_token,
+                &destination,
+            )?)
+            .ok_or_else(|| "remote project byte count overflowed".to_string())?;
+        downloaded_files += 1;
+        set_imported_remote_file(&mut project, *kind, imported_project_file(&destination)?);
+        project.ignored_candidates.extend(
+            values
+                .iter()
+                .skip(1)
+                .map(|candidate| candidate.url.to_string()),
+        );
+    }
+
+    if let Some(agp) = project.agp.as_ref() {
+        let expected_history = history_sidecar_path(Path::new(&agp.name));
+        let expected_name = expected_history
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if let Some(history) = links
+            .iter()
+            .find(|link| link.filename.eq_ignore_ascii_case(expected_name))
+        {
+            let destination = destination_root.join(expected_name);
+            downloaded_bytes = downloaded_bytes
+                .checked_add(download_remote_file(
+                    &client,
+                    history,
+                    bearer_token,
+                    &destination,
+                )?)
+                .ok_or_else(|| "remote project byte count overflowed".to_string())?;
+            downloaded_files += 1;
+            project.history = Some(imported_project_file(&destination)?);
+        }
+    }
+
+    Ok(ImportedRemoteSource {
+        source_url: directory_url.to_string(),
+        mode: "project".to_string(),
+        file_kind: None,
+        project,
+        downloaded_files,
+        downloaded_bytes,
+    })
+}
+
 fn scan_project_directory(directory: &Path) -> Result<ImportedProjectDirectory, String> {
     if !directory.is_dir() {
         return Err("selected project path is not a directory".to_string());
@@ -6617,18 +7100,89 @@ mod tests {
         history_sidecar_path, layout_gfa_bandage_response, load_agp_bundle,
         load_gfa_file_from_path, load_paf_text_from_path, load_project_directory, open_text_reader,
         persistent_contact_lod_cache_enabled_for_path, persistent_display_tile_plans,
-        persistent_lod_cache_key, prepare_paf_file_with_cache, sort_project_contact_candidates,
-        write_agp_bundle, write_agp_file, write_existing_agp_path, BedGraphRecordRequest,
-        ContactMapBinRequest, ContactMapCellResponse, ContactMapLayoutBlockRequest,
-        ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest, ContactMapTileResponse,
-        ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest, ContactMapViewRequest,
-        ContactMapViewportRequest, ContactNormalizationRequest, ContactTileRequestPurpose,
-        CoverageViewFromBedGraphRequest, CoverageViewRequest, GfaBandageLayoutEdgeRequest,
-        GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest, PafRecordRequest,
-        PersistentDisplayCacheContext, PersistentDisplayTileAccumulator, PersistentDisplayTilePlan,
-        PrewarmContactNormalizationsRequest, SyntenyViewRequest,
-        DISPLAY_CACHE_COPY_SEMANTICS_VERSION, MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
+        persistent_lod_cache_key, prepare_paf_file_with_cache, remote_cache_key,
+        remote_directory_links, remote_file_kind, sort_project_contact_candidates,
+        validate_remote_url, write_agp_bundle, write_agp_file, write_existing_agp_path,
+        BedGraphRecordRequest, ContactMapBinRequest, ContactMapCellResponse,
+        ContactMapLayoutBlockRequest, ContactMapOverviewFromCoolRequest, ContactMapTileKeyRequest,
+        ContactMapTileResponse, ContactMapTilesFromCoolRequest, ContactMapViewFromCoolRequest,
+        ContactMapViewRequest, ContactMapViewportRequest, ContactNormalizationRequest,
+        ContactTileRequestPurpose, CoverageViewFromBedGraphRequest, CoverageViewRequest,
+        GfaBandageLayoutEdgeRequest, GfaBandageLayoutNodeRequest, GfaBandageLayoutRequest,
+        PafRecordRequest, PersistentDisplayCacheContext, PersistentDisplayTileAccumulator,
+        PersistentDisplayTilePlan, PrewarmContactNormalizationsRequest, RemoteFileKind,
+        SyntenyViewRequest, DISPLAY_CACHE_COPY_SEMANTICS_VERSION,
+        MAX_CONTACT_OVERVIEW_AGGREGATE_CELLS,
     };
+
+    #[test]
+    fn classifies_supported_remote_project_files_without_guessing_txt_files() {
+        assert_eq!(remote_file_kind("assembly.agp"), Some(RemoteFileKind::Agp));
+        assert_eq!(remote_file_kind("graph.gfa.gz"), Some(RemoteFileKind::Gfa));
+        assert_eq!(
+            remote_file_kind("alignments.paf"),
+            Some(RemoteFileKind::Paf)
+        );
+        assert_eq!(
+            remote_file_kind("coverage.bg"),
+            Some(RemoteFileKind::Coverage)
+        );
+        assert_eq!(
+            remote_file_kind("contacts.mcool"),
+            Some(RemoteFileKind::Contact)
+        );
+        assert_eq!(remote_file_kind("ambiguous.txt"), None);
+        assert_eq!(remote_file_kind("contacts.mcool.gz"), None);
+    }
+
+    #[test]
+    fn discovers_only_same_origin_immediate_children_from_directory_html() {
+        let base = reqwest::Url::parse("http://localhost:2222/project/").unwrap();
+        let links = remote_directory_links(
+            &base,
+            r#"
+              <a href="input.agp">AGP</a>
+              <a href="input.mcool?download=1&amp;raw=1">MCOOL</a>
+              <a href="nested/ignored.gfa">Nested</a>
+              <a href="../outside.paf">Parent</a>
+              <a href="https://example.org/foreign.bg">Foreign</a>
+            "#,
+        );
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["input.agp", "input.mcool"]
+        );
+        assert_eq!(
+            links[1].url.as_str(),
+            "http://localhost:2222/project/input.mcool?download=1&raw=1"
+        );
+    }
+
+    #[test]
+    fn remote_urls_reject_embedded_credentials_and_use_stable_cache_keys() {
+        assert!(validate_remote_url("ftp://example.org/data/input.mcool").is_err());
+        assert!(validate_remote_url("http://user:secret@example.org/input.mcool").is_err());
+        assert_eq!(
+            validate_remote_url("localhost:2222/project/")
+                .unwrap()
+                .as_str(),
+            "http://localhost:2222/project/"
+        );
+        assert_eq!(
+            validate_remote_url("example.org/input.mcool")
+                .unwrap()
+                .as_str(),
+            "http://example.org/input.mcool"
+        );
+        let first = validate_remote_url("https://example.org/a/input.mcool").unwrap();
+        let same = validate_remote_url("https://example.org/a/input.mcool#view").unwrap();
+        let second = validate_remote_url("https://example.org/b/input.mcool").unwrap();
+        assert_eq!(remote_cache_key(&first), remote_cache_key(&same));
+        assert_ne!(remote_cache_key(&first), remote_cache_key(&second));
+    }
 
     #[test]
     fn contact_tile_delta_stream_uses_a_small_first_chunk_then_the_steady_threshold() {

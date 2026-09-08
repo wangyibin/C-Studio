@@ -3,6 +3,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { message, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { AppShell } from "./components/AppShell";
+import {
+  RemoteContactDialog,
+  type RemoteContactDialogValue,
+} from "./components/RemoteContactDialog";
 import { exportAgpText } from "./state/agpExport";
 import {
   agpAutoSaveDelayMs,
@@ -93,6 +97,16 @@ import {
   contactLayoutRegistrationBlocks,
   ContactLayoutHandleRegistry,
 } from "./state/contactLayoutHandle";
+import {
+  forgetRemoteContactSource,
+  isRemoteContactPath,
+  isRemoteContactServiceUrl,
+  loadRemoteContactMetadata,
+  loadRemoteContactOverview,
+  loadRemoteContactTiles,
+  rememberRemoteContactSource,
+  remoteContactIdentifier,
+} from "./state/remoteContact";
 import { ContactTileFlightRegistry } from "./state/contactTileRequests";
 import {
   createContactTilePerformanceTracker,
@@ -340,6 +354,17 @@ interface ImportedProjectDirectory {
   ignoredCandidates: string[];
 }
 
+type ImportedRemoteFileKind = "agp" | "contact" | "coverage" | "paf" | "gfa";
+
+interface ImportedRemoteSource {
+  sourceUrl: string;
+  mode: "project" | "file";
+  fileKind: ImportedRemoteFileKind | null;
+  project: ImportedProjectDirectory;
+  downloadedFiles: number;
+  downloadedBytes: number;
+}
+
 interface ImportedAgpBundle {
   agp: ImportedProjectTextFile;
   history: ImportedProjectTextFile | null;
@@ -503,6 +528,14 @@ function emitContactPanPrefetchPerformance(
   emitContactFrontendPerformanceLine(formatContactPanPrefetchPerformanceLog(record));
 }
 
+/** Re-present an exact settled camera without weakening tile-grid request deduplication. */
+export function contactViewportPresentationRequestKey(
+  tileRequestKey: string,
+  commitRevision: number,
+) {
+  return `${tileRequestKey}|camera:${Math.max(0, Math.floor(commitRevision))}`;
+}
+
 export function buildContactPanPrefetchPlan({
   availableResolutions,
   coolPath,
@@ -662,6 +695,9 @@ function loadContactOverviewWithLayoutHandle(
     viewport: ContactMapView["viewport"];
   },
 ) {
+  if (isRemoteContactPath(request.coolPath)) {
+    return loadRemoteContactOverview(layoutBlocks, request);
+  }
   return registry.run(
     layoutBlocks,
     registerContactMapLayout,
@@ -698,11 +734,29 @@ function contactMapTilesFromDecodedBinary(
   ];
 }
 
+async function loadRemoteContactTilesDecoded(
+  layoutBlocks: ContactMapLayoutBlock[],
+  request: ContactTileHandleRequest,
+) {
+  const rawResponse = await loadRemoteContactTiles(layoutBlocks, request);
+  const decoded = decodeContactTileBinaryV1(rawResponse);
+  if (decoded.tileSizeBins !== request.tileSizeBins) {
+    throw new Error(
+      `contact tile binary size mismatch: expected ${request.tileSizeBins}, got ${decoded.tileSizeBins}`,
+    );
+  }
+  return decoded;
+}
+
 function loadContactTilesWithLayoutHandle(
   registry: ContactLayoutHandleRegistry,
   layoutBlocks: ContactMapLayoutBlock[],
   request: ContactTileHandleRequest,
 ) {
+  if (isRemoteContactPath(request.coolPath)) {
+    return loadRemoteContactTilesDecoded(layoutBlocks, request)
+      .then(contactMapTilesFromDecodedBinary);
+  }
   let attempt = 0;
   return registry.run(
     layoutBlocks,
@@ -894,6 +948,22 @@ function streamContactTilesWithLayoutHandle(
   chunks: ContactMapTileKey[][],
   onChunk: (tiles: ContactMapTile[]) => void,
 ) {
+  if (isRemoteContactPath(request.coolPath)) {
+    return (async () => {
+      const streamedTiles: ContactMapTile[] = [];
+      for (const chunk of chunks) {
+        if (chunk.length === 0) continue;
+        const decoded = await loadRemoteContactTilesDecoded(layoutBlocks, {
+          ...request,
+          tiles: chunk,
+        });
+        const tiles = contactMapTilesFromDecodedBinary(decoded);
+        streamedTiles.push(...tiles);
+        onChunk(tiles);
+      }
+      return streamedTiles;
+    })();
+  }
   let attempt = 0;
   return registry.run(
     layoutBlocks,
@@ -1039,6 +1109,25 @@ function streamContactTileDeltasWithLayoutHandle(
     onPreviewChunk?: (batch: ContactTileDeltaPreviewBatch) => void;
   },
 ) {
+  if (isRemoteContactPath(request.coolPath)) {
+    return (async () => {
+      const accumulator = new ContactTileDeltaAccumulator(
+        request.tiles,
+        request.tileSizeBins,
+      );
+      callbacks.onStart?.(accumulator);
+      const decoded = await loadRemoteContactTilesDecoded(layoutBlocks, request);
+      const changedTileKeys = [
+        ...accumulator.merge(decoded.tiles),
+        ...accumulator.mergeDenseComplete(decoded.denseTiles ?? []),
+      ];
+      if (changedTileKeys.length > 0) {
+        callbacks.onDelta?.();
+        callbacks.onPreviewChunk?.(accumulator.previewBatch(changedTileKeys));
+      }
+      return accumulator.finish();
+    })();
+  }
   return registry.run(
     layoutBlocks,
     registerContactMapLayout,
@@ -1151,6 +1240,7 @@ function streamContactTileDeltasWithLayoutHandle(
 export function App() {
   const [status, setStatus] = useState<AppStatus>(browserFallbackStatus);
   const [dataset, setDataset] = useState<ExampleDatasetSummary | null>(null);
+  const [remoteContactDialogOpen, setRemoteContactDialogOpen] = useState(false);
   const [contactAvailableResolutions, setContactAvailableResolutions] = useState<number[]>([]);
   const [contactSources, setContactSources] = useState<ContactSourceMetadata[]>([]);
   const [contactMap, setContactMap] = useState<ContactMapView | null>(null);
@@ -1163,6 +1253,7 @@ export function App() {
   const [contactTilePreviewViewport, setContactTilePreviewViewport] = useState<
     ContactPanPreview | null
   >(null);
+  const [contactViewportCommitRevision, setContactViewportCommitRevision] = useState(0);
   const [placementPreview, setPlacementPreview] = useState<
     PlacementRecommendation | null
   >(null);
@@ -1423,6 +1514,11 @@ export function App() {
         startedAt,
       );
     }
+    if (action.type === "commitContactViewportPan") {
+      // Tile requests remain grid-deduplicated while every settled camera gets
+      // one presentation pass, including moves that stay inside the same tiles.
+      setContactViewportCommitRevision((revision) => revision + 1);
+    }
     dispatchUi(action);
   }, [contactResolutionResponsiveness, contactTilePerformance]);
   const handleContactTileLayerCommit = useCallback((event: ContactTileRenderMilestone) => {
@@ -1583,6 +1679,7 @@ export function App() {
       resolution === null
       || !contactCoolPath
       || !contactIsMcool
+      || isRemoteContactPath(contactCoolPath)
       || resolution === currentContactResolutionRef.current
     ) {
       return;
@@ -2482,13 +2579,16 @@ export function App() {
     contactTilePreviewViewport,
   );
   const contactTilePanPreviewActive = contactViewportPreviewIsPan(contactTilePreviewViewport);
-  const effectiveContactTileViewportRequestKey = contactTileViewportRequestKey(
-    effectiveContactTileViewport,
-    effectiveContactTilePrefetchViewport,
-    effectiveContactTileRequestGridResolution,
-    contactTileSizeBins,
-    effectiveContactTileTotalSpanBp,
-    contactTilePreviewViewport?.urgentPrefetchTileCount ?? 0,
+  const effectiveContactTileViewportRequestKey = contactViewportPresentationRequestKey(
+    contactTileViewportRequestKey(
+      effectiveContactTileViewport,
+      effectiveContactTilePrefetchViewport,
+      effectiveContactTileRequestGridResolution,
+      contactTileSizeBins,
+      effectiveContactTileTotalSpanBp,
+      contactTilePreviewViewport?.urgentPrefetchTileCount ?? 0,
+    ),
+    contactViewportCommitRevision,
   );
 
   useEffect(() => {
@@ -2629,9 +2729,11 @@ export function App() {
     // Registration is asynchronous but independent of generation begin. Start
     // it immediately so the first visible tile request normally sees a warm
     // handle; failures are removed from the registry and surface on actual use.
-    void contactLayoutHandleRegistry
-      .prepare(viewContactLayoutBlocks, registerContactMapLayout)
-      .catch(() => undefined);
+    if (!isRemoteContactPath(contactCoolPath)) {
+      void contactLayoutHandleRegistry
+        .prepare(viewContactLayoutBlocks, registerContactMapLayout)
+        .catch(() => undefined);
+    }
 
     let cancelled = false;
     let adjacentPrefetchFirstFrame: number | null = null;
@@ -4621,6 +4723,7 @@ export function App() {
     const generation = paintedContactTileGeneration;
     if (
       !contactCoolPath
+      || isRemoteContactPath(contactCoolPath)
       || generation === null
       || generation !== contactTileGenerationRef.current
     ) {
@@ -5089,6 +5192,7 @@ export function App() {
   async function loadExamples() {
     setCoverageView(null);
     setSyntenyView(null);
+    forgetRemoteContactSource(dataset?.cool_path);
     try {
       const [summary, gfaText] = await Promise.all([
         invoke<ExampleDatasetSummary>("load_example_dataset"),
@@ -5330,6 +5434,7 @@ export function App() {
         return;
       }
       const selected = await invoke<ImportedContactFile>("load_contact_file", { path });
+      forgetRemoteContactSource(dataset?.cool_path);
 
       setDataset((current) => ({
         ...buildDatasetSummary({
@@ -5361,8 +5466,201 @@ export function App() {
     }
   }
 
+  async function importRemoteContactService(value: RemoteContactDialogValue) {
+    try {
+      const { datasetUrl, metadata } = await loadRemoteContactMetadata(
+        value.datasetUrl,
+        value.bearerToken,
+      );
+      const identifier = remoteContactIdentifier(datasetUrl, metadata.format);
+      rememberRemoteContactSource(identifier, {
+        datasetUrl,
+        bearerToken: value.bearerToken,
+      });
+      if (dataset?.cool_path !== identifier) {
+        forgetRemoteContactSource(dataset?.cool_path);
+      }
+      setDataset((current) => buildDatasetSummary({
+        agpPath: current?.agp_path ?? "",
+        mcoolPath: metadata.name,
+        coolPath: identifier,
+        pafPath: current?.paf_path ?? null,
+        agpLines: current?.agp_lines ?? 0,
+        agpObjects: current?.agp_objects ?? 0,
+        agpComponents: current?.agp_components ?? 0,
+        agpGaps: current?.agp_gaps ?? 0,
+        maxObjectSpan: current?.max_object_span ?? 0,
+        mcoolSizeBytes: metadata.sizeBytes,
+        coveragePath: current?.coverage_path ?? null,
+        agpLayout: current?.agp_layout ?? emptyAgpLayout(),
+        availableResolutions: metadata.availableResolutions,
+        contactSources: metadata.sources,
+      }));
+      setContactAvailableResolutions(metadata.availableResolutions);
+      setContactSources(metadata.sources);
+      setRemoteContactDialogOpen(false);
+      setStatusMessage(`Remote contact map connected: ${metadata.name}`);
+      dispatchUi({
+        type: "appendLog",
+        message: `Remote contact map connected: ${metadata.name} (${datasetUrl})`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`Remote contact connection failed: ${message}`);
+      dispatchUi({ type: "appendLog", message: `Remote contact connection failed: ${message}` });
+      throw error;
+    }
+  }
+
+  async function importDownloadedRemoteFile(result: ImportedRemoteSource) {
+    const kind = result.fileKind;
+    if (!kind) throw new Error("The downloaded remote file has no recognized data type");
+
+    if (kind === "agp" && result.project.agp) {
+      const bundle = await invoke<ImportedAgpBundle>("load_agp_bundle", {
+        path: result.project.agp.path,
+      });
+      const summary = summarizeAgpText(bundle.agp.text);
+      const agpLayout = parseAgpLayout(bundle.agp.text);
+      const canonicalAgp = exportAgpText(agpLayout.blocks);
+      const restoredHistory = restoreImportedHistory(
+        bundle.history?.text ?? null,
+        canonicalAgp,
+        bundle.history?.name ?? operationHistoryFilename(bundle.agp.name),
+      );
+      sourceAgpRef.current = sourceAgpSnapshot(agpLayout, bundle.agp.path);
+      savedAgpPathRef.current = null;
+      setSavedAgpPath(null);
+      setSavedAgpText(canonicalAgp);
+      setSavedHistoryIdentity(historyIdentityForArchive(restoredHistory));
+      setDataset((current) => buildDatasetSummary({
+        agpPath: bundle.agp.path,
+        mcoolPath: current?.mcool_path ?? "",
+        coolPath: current?.cool_path ?? "",
+        pafPath: current?.paf_path ?? null,
+        agpLines: summary.lineCount,
+        agpObjects: summary.objectCount,
+        agpComponents: summary.componentCount,
+        agpGaps: summary.gapCount,
+        maxObjectSpan: summary.maxObjectSpan,
+        mcoolSizeBytes: current?.mcool_size_bytes ?? 0,
+        coveragePath: current?.coverage_path ?? null,
+        agpLayout,
+        availableResolutions: current?.available_resolutions,
+        contactSources: current?.contact_sources,
+      }));
+      dispatchAssemblyImport(agpLayout.blocks, restoredHistory);
+      dispatchUi({ type: "setOverviewMode", mode: "overview" });
+      dispatchUi({ type: "fitContactViewport", totalSpanMb: agpLayout.totalSpan / 1_000_000 });
+    } else if (kind === "contact" && result.project.contact) {
+      const selected = await invoke<ImportedContactFile>("load_contact_file", {
+        path: result.project.contact.path,
+      });
+      forgetRemoteContactSource(dataset?.cool_path);
+      setDataset((current) => buildDatasetSummary({
+        agpPath: current?.agp_path ?? "",
+        mcoolPath: selected.name,
+        coolPath: selected.path,
+        pafPath: current?.paf_path ?? null,
+        agpLines: current?.agp_lines ?? 0,
+        agpObjects: current?.agp_objects ?? 0,
+        agpComponents: current?.agp_components ?? 0,
+        agpGaps: current?.agp_gaps ?? 0,
+        maxObjectSpan: current?.max_object_span ?? 0,
+        mcoolSizeBytes: selected.size_bytes,
+        coveragePath: current?.coverage_path ?? null,
+        agpLayout: current?.agp_layout ?? emptyAgpLayout(),
+        availableResolutions: selected.available_resolutions,
+        contactSources: selected.sources,
+      }));
+      setContactAvailableResolutions(selected.available_resolutions ?? []);
+      setContactSources(selected.sources ?? []);
+    } else if (kind === "coverage" && result.project.coverage) {
+      const selected = await invoke<ImportedContactFile>("load_coverage_file", {
+        path: result.project.coverage.path,
+      });
+      setCoverageRecords([]);
+      setDataset((current) => buildDatasetSummary({
+        agpPath: current?.agp_path ?? "",
+        mcoolPath: current?.mcool_path ?? "",
+        coolPath: current?.cool_path ?? "",
+        pafPath: current?.paf_path ?? null,
+        agpLines: current?.agp_lines ?? 0,
+        agpObjects: current?.agp_objects ?? 0,
+        agpComponents: current?.agp_components ?? 0,
+        agpGaps: current?.agp_gaps ?? 0,
+        maxObjectSpan: current?.max_object_span ?? 0,
+        mcoolSizeBytes: current?.mcool_size_bytes ?? 0,
+        coveragePath: selected.path,
+        agpLayout: current?.agp_layout ?? emptyAgpLayout(),
+        availableResolutions: current?.available_resolutions,
+        contactSources: current?.contact_sources,
+      }));
+    } else if (kind === "paf" && result.project.paf) {
+      const selected = await invoke<PreparedPafFile>("prepare_paf_file", {
+        path: result.project.paf.path,
+      });
+      setPafPath(selected.path);
+      setPafRecords(selected.records);
+      setPafImported(true);
+      setDataset((current) => current ? { ...current, paf_path: selected.path } : current);
+      dispatchUi({ type: "setOverviewMode", mode: "overview" });
+    } else if (kind === "gfa" && result.project.gfa) {
+      const selected = await invoke<ImportedProjectTextFile>("load_gfa_file", {
+        path: result.project.gfa.path,
+      });
+      const document = parseGfaText(selected.text, selected.name);
+      if (document.summary.segmentCount === 0) {
+        throw new Error(`${selected.name}: no GFA S records found`);
+      }
+      setGfaDocument(document);
+      dispatchUi({ type: "setOverviewMode", mode: "overview" });
+    } else {
+      throw new Error(`The downloaded ${kind} file is missing from the import result`);
+    }
+
+    const filename = result.project[kind]?.name ?? result.sourceUrl;
+    setStatusMessage(`Remote file downloaded and opened: ${filename}`);
+    dispatchUi({
+      type: "appendLog",
+      message: `Remote ${kind} file downloaded and opened: ${result.sourceUrl} (${result.downloadedBytes.toLocaleString()} bytes)`,
+    });
+  }
+
+  async function importRemoteSource(value: RemoteContactDialogValue) {
+    if (isRemoteContactServiceUrl(value.datasetUrl)) {
+      await importRemoteContactService(value);
+      return;
+    }
+    if (!("__TAURI_INTERNALS__" in window)) {
+      throw new Error("Remote project and file downloads are available in the desktop app");
+    }
+    try {
+      setStatusMessage(`Downloading remote data: ${value.datasetUrl}`);
+      const result = await invoke<ImportedRemoteSource>("download_remote_source", {
+        url: value.datasetUrl,
+        bearerToken: value.bearerToken?.trim() || null,
+      });
+      if (result.mode === "project") {
+        const loaded = await loadProjectFiles(result.project);
+        if (!loaded) throw new Error("one or more downloaded project files could not be opened");
+        dispatchUi({
+          type: "appendLog",
+          message: `Remote project downloaded: ${result.sourceUrl}; ${result.downloadedFiles} files, ${result.downloadedBytes.toLocaleString()} bytes`,
+        });
+      } else {
+        await importDownloadedRemoteFile(result);
+      }
+      setRemoteContactDialogOpen(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusMessage(`Remote data import failed: ${message}`);
+      dispatchUi({ type: "appendLog", message: `Remote data import failed: ${message}` });
+      throw error;
+    }
+  }
+
   async function loadProjectDirectory() {
-    let loadStage = "directory scan";
     try {
       const path = await open({
         title: "Select a C-Studio project folder",
@@ -5374,6 +5672,19 @@ export function App() {
         return;
       }
       const project = await invoke<ImportedProjectDirectory>("load_project_directory", { path });
+      await loadProjectFiles(project);
+    } catch (error) {
+      setStatusMessage(`Project load failed during directory scan: ${String(error)}`);
+      dispatchUi({
+        type: "appendLog",
+        message: `Project load failed during directory scan: ${String(error)}`,
+      });
+    }
+  }
+
+  async function loadProjectFiles(project: ImportedProjectDirectory) {
+    let loadStage = "project initialization";
+    try {
       clearAllLoadedData(false);
 
       const loaded: string[] = [];
@@ -5524,9 +5835,11 @@ export function App() {
         type: "appendLog",
         message: `Project folder loaded: ${project.directory}; ${loaded.join(", ")}${skipped ? `; skipped duplicate candidates: ${project.ignoredCandidates.join(", ")}` : ""}`,
       });
+      return true;
     } catch (error) {
       setStatusMessage(`Project load failed during ${loadStage}: ${String(error)}`);
       dispatchUi({ type: "appendLog", message: `Project load failed during ${loadStage}: ${String(error)}` });
+      return false;
     }
   }
 
@@ -5706,6 +6019,7 @@ export function App() {
   }
 
   function unloadContactData() {
+    forgetRemoteContactSource(dataset?.cool_path);
     setDataset((current) => current ? {
       ...current,
       mcool_path: "",
@@ -5730,6 +6044,7 @@ export function App() {
   }
 
   function clearAllLoadedData(announce = true) {
+    forgetRemoteContactSource(dataset?.cool_path);
     const generation = contactTileGenerationRef.current + 1;
     contactTileGenerationRef.current = generation;
     contactTilePerformance.supersedeBefore(generation);
@@ -6187,6 +6502,7 @@ export function App() {
                 purpose: "endpoint_evidence",
                 coolPath: contactCoolPath,
                 baseResolution: representative.sourceResolution,
+                sourceResolution: representative.sourceResolution,
                 targetResolution: representative.targetResolution,
                 tileSizeBins: representative.tileSizeBins,
                 normalization,
@@ -6389,6 +6705,7 @@ export function App() {
                 purpose: "endpoint_evidence",
                 coolPath: contactCoolPath,
                 baseResolution: representative.sourceResolution,
+                sourceResolution: representative.sourceResolution,
                 targetResolution: representative.targetResolution,
                 tileSizeBins: representative.tileSizeBins,
                 normalization,
@@ -6568,7 +6885,8 @@ export function App() {
   ]);
 
   return (
-    <AppShell
+    <>
+      <AppShell
       dataset={dataset}
       contactMap={contactMapWithSourceLayout}
       contactTileDeltaStream={contactTileReplacementPreviewActive
@@ -6608,6 +6926,7 @@ export function App() {
       onAgpFileSelected={importAgpFile}
       onGfaFileSelected={importGfaFile}
       onContactFileSelected={importContactFile}
+      onRemoteContactFileSelected={() => setRemoteContactDialogOpen(true)}
       onPafFileRequested={requestPafFile}
       onPafFileSelected={importPafFile}
       onCoverageFileRequested={requestCoverageFile}
@@ -6639,7 +6958,13 @@ export function App() {
       contactPanPrefetchBridge={contactPanPrefetchBridge}
       onContactTileLayerCommit={handleContactTileLayerCommit}
       onContactTileLayerPaintComplete={handleContactTileLayerPaintComplete}
-    />
+      />
+      <RemoteContactDialog
+        open={remoteContactDialogOpen}
+        onClose={() => setRemoteContactDialogOpen(false)}
+        onConnect={importRemoteSource}
+      />
+    </>
   );
 }
 
