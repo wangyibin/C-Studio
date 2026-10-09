@@ -93,12 +93,13 @@ nav:
   - 用户指南:
       - 准备输入文件: user-guide/input-preparation.md
       - 项目数据: user-guide/project-data.md
-      - 远程项目和文件: user-guide/remote-contact-service.md
+      - 使用远程文件: user-guide/remote-contact-service.md
       - 界面说明: user-guide/interface.md
       - 导航与选择: user-guide/navigation-selection.md
       - 组装编辑: user-guide/assembly-editing.md
       - 证据视图: user-guide/evidence.md
   - Misc:
+      - 远程服务部署与缓存: reference/remote-service.md
       - 数据格式: reference/formats.md
       - 键盘快捷键: reference/shortcuts.md
       - 当前限制: reference/limitations.md

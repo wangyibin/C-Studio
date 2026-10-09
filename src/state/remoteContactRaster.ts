@@ -1,3 +1,4 @@
+import type { RemoteImageTileLayer } from "./remoteImageTiles";
 import { contactTilesForViewport } from "./contactTiles";
 import type { ContactMapView } from "../App";
 import type { ContactMapLayoutBlock } from "./importers";
@@ -9,9 +10,21 @@ import type { ContactViewport } from "./contactViewport";
 
 export interface RemoteRasterFrame {
   image: HTMLImageElement;
+  tileLayer?: RemoteImageTileLayer;
+  /** Dataset identity for retaining a front frame while a new layout renders. */
+  sourcePath?: string;
   /** Immutable image coordinates, independent of the live pan camera. */
   viewport: ContactViewport;
   scaleMax: number;
+}
+
+/** Keep the complete front frame, including its original layout and camera. */
+export function retainRemoteContactFrame(
+  current: ContactMapView | null,
+  path: string,
+  nextLayout: readonly ContactMapLayoutBlock[],
+): ContactMapView | null {
+  return nextLayout.length > 0 && current?.raster?.sourcePath === path ? current : null;
 }
 
 export function remoteRasterSize(width: number, height: number) {
@@ -80,7 +93,7 @@ export async function loadRemoteRaster(input: {
       resolution, requestedResolution: input.sourceResolution,
       normalization: input.normalization, viewport: input.viewport,
       cells: [], visibleLayerComplete: true,
-      raster: { image, viewport: input.viewport, scaleMax },
+      raster: { image, viewport: input.viewport, scaleMax, sourcePath: input.path },
     };
   } finally {
     signal.removeEventListener("abort", abort);
@@ -93,6 +106,14 @@ export function drawRemoteRaster(
   context: CanvasRenderingContext2D, raster: RemoteRasterFrame,
   viewport: ContactViewport, x: number, y: number, width: number, height: number,
 ) {
+  // Paint fixed tiles underneath the exact settled image. Only newly exposed
+  // areas use the tile grid; the authoritative viewport retains pixel parity.
+  for (const frame of raster.tileLayer?.frames() ?? []) {
+    if (frame.viewport.xEnd > viewport.xStart && frame.viewport.xStart < viewport.xEnd
+      && frame.viewport.yEnd > viewport.yStart && frame.viewport.yStart < viewport.yEnd) {
+      drawRemoteRaster(context, frame, viewport, x, y, width, height);
+    }
+  }
   const xs = Math.max(1, viewport.xEnd - viewport.xStart);
   const ys = Math.max(1, viewport.yEnd - viewport.yStart);
   context.save();

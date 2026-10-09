@@ -3,6 +3,8 @@
 See [Prepare input files](input-preparation.md) for commands that generate AGP,
 COOL/MCOOL, PAF, coverage, and GFA inputs.
 
+**Data on a server?** See [Using remote files](remote-contact-service.md) to choose server-side computation or a local download.
+
 ## Supported inputs
 
 | Evidence | Extensions | Role | Required for editing? |

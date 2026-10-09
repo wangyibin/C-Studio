@@ -7,6 +7,18 @@ if (process.platform !== "darwin") {
   process.exit(1);
 }
 
+// Build for the native architecture so the Rust target and the Pixi dylibs
+// bundled below always match, on both Intel and Apple Silicon Macs.
+const nativeTargets = {
+  arm64: "aarch64-apple-darwin",
+  x64: "x86_64-apple-darwin",
+};
+const target = nativeTargets[process.arch];
+if (!target) {
+  console.error(`error: unsupported macOS architecture: ${process.arch}`);
+  process.exit(1);
+}
+
 const projectRoot = process.cwd();
 const environmentPrefix = process.env.CONDA_PREFIX
   ? resolve(process.env.CONDA_PREFIX)
@@ -46,7 +58,7 @@ const result = spawnSync(
     "--",
     "build",
     "--target",
-    "aarch64-apple-darwin",
+    target,
     "--features",
     "portable-hdf5",
     "--bundles",

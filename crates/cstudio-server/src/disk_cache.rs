@@ -83,7 +83,7 @@ impl DiskCache {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.len() != 69
                 || !name.ends_with(".tile")
-                || !name[..64].bytes().all(|b| b.is_ascii_hexdigit())
+                || !name.as_bytes()[..64].iter().all(|b| b.is_ascii_hexdigit())
             {
                 continue;
             }
@@ -190,6 +190,13 @@ impl DiskCache {
         }
         let checksum = Sha256::digest(&bytes);
         bytes.extend_from_slice(&checksum);
+        self.store_bytes(key, bytes);
+    }
+    fn store_bytes(&self, key: &str, bytes: Vec<u8>) {
+        let size = bytes.len();
+        if size > MAX_ENTRY || size as u64 > self.budget {
+            return;
+        }
         let name = format!("{}.tile", digest(key.as_bytes()));
         let temp = self.root.join(format!(
             ".{}-{}.tmp",
@@ -233,6 +240,47 @@ impl DiskCache {
             tracing::warn!(error=%e,"disk cache write skipped");
         }
     }
+    /// Finished PNGs share the same disk budget and atomic/checksummed storage.
+    pub(super) fn put_blob(&self, key: &str, payload: &[u8]) {
+        if payload.len().saturating_add(key.len()).saturating_add(44) > MAX_ENTRY {
+            return;
+        }
+        let mut bytes = b"CSBLOB01".to_vec();
+        bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(payload);
+        let checksum = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&checksum);
+        self.store_bytes(key, bytes);
+    }
+    pub(super) fn get_blob(&self, key: &str) -> Option<Vec<u8>> {
+        let name = format!("{}.tile", digest(key.as_bytes()));
+        let path = self.root.join(&name);
+        let meta = fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > MAX_ENTRY as u64 {
+            return None;
+        }
+        let bytes = fs::read(&path).ok()?;
+        if bytes.len() < 44 || &bytes[..8] != b"CSBLOB01" {
+            return None;
+        }
+        let end = bytes.len() - 32;
+        if Sha256::digest(&bytes[..end]).as_slice() != &bytes[end..] {
+            return None;
+        }
+        let n = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+        if 12usize.checked_add(n)? > end || bytes.get(12..12 + n)? != key.as_bytes() {
+            return None;
+        }
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        if let Some(entry) = self.index.lock().unwrap().files.get_mut(&name) {
+            entry.1 = SystemTime::now();
+        }
+        if let Ok(file) = fs::File::open(path) {
+            let _ = file.set_modified(SystemTime::now());
+        }
+        Some(bytes[12 + n..end].to_vec())
+    }
     pub(super) fn status(&self) -> serde_json::Value {
         let i = self.index.lock().unwrap();
         serde_json::json!({"enabled":true,"bytes":i.bytes,"budgetBytes":self.budget,"entries":i.files.len(),"hits":self.hits.load(Ordering::Relaxed),"writes":self.writes.load(Ordering::Relaxed)})
@@ -241,6 +289,31 @@ impl DiskCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persistent_images_share_budget_and_reject_corruption() {
+        let root = std::env::temp_dir().join(format!(
+            "cstudio-image-test-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cache = DiskCache::new(root.clone(), 180).unwrap();
+        cache.put_blob("image-v1-A", b"png payload");
+        drop(cache);
+        let cache = DiskCache::new(root.clone(), 180).unwrap();
+        assert_eq!(cache.get_blob("image-v1-A").unwrap(), b"png payload");
+        assert!(cache.get_blob("image-v1-B").is_none());
+        fs::write(
+            root.join(format!("{}.tile", digest(b"image-v1-A"))),
+            b"corrupt",
+        )
+        .unwrap();
+        assert!(cache.get_blob("image-v1-A").is_none());
+        for i in 0..10 {
+            cache.put_blob(&format!("image-{i}"), b"PNG");
+        }
+        assert!(cache.index.lock().unwrap().bytes <= 180);
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn restart_corruption_and_budget() {
         let root = std::env::temp_dir().join(format!(

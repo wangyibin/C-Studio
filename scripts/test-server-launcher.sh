@@ -40,4 +40,21 @@ if "$launcher" status "$port" >/dev/null; then echo 'Stopped service is still ru
 read -r second_token < "$state/token"
 [[ "$first_token" == "$second_token" ]]
 "$launcher" stop "$port" > /dev/null
+"$launcher" --no-token "$fixture_path" "$port" > "$scratch/no-token-output"
+grep -q 'Bearer token: not required' "$scratch/no-token-output"
+grep -q "http://127.0.0.1:$port/" "$scratch/no-token-output"
+read -r no_token_pid < "$state/pid"
+args=$(ps -ww -p "$no_token_pid" -o args=)
+[[ "$args" == *"--bind 127.0.0.1:$port --dataset "* && "$args" != *"--token-file"* ]]
+curl --noproxy "*" -fsS "http://127.0.0.1:$port/v1/datasets/project/metadata" > "$scratch/anonymous-metadata"
+grep -q 'png-v1' "$scratch/anonymous-metadata"
+"$launcher" stop "$port" > /dev/null
+"$launcher" "$fixture_path" "$port" > "$scratch/no-token-restart-output"
+grep -q 'Bearer token: not required' "$scratch/no-token-restart-output"
+curl --noproxy "*" -fsS "http://127.0.0.1:$port/v1/datasets/project/metadata" > /dev/null
+"$launcher" stop "$port" > /dev/null
+"$launcher" --token "$fixture_path" "$port" > "$scratch/token-restored-output"
+[[ $(curl --noproxy "*" -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/datasets/project/metadata") == 401 ]]
+"$launcher" stop "$port" > /dev/null
 printf 'Launcher smoke test passed: start, authenticated metadata, duplicate guard, status, stop, restart, stable token, paths with spaces.\n'
+printf 'No-token mode passed: loopback listener, anonymous metadata, persistent mode, restore authentication.\n'

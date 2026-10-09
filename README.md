@@ -33,3 +33,26 @@ alfalfa.p_utg.noseq.gfa
 
 - English: [online documentation](https://wangyibin.github.io/C-Studio/latest/)
 - 中文：[在线文档](https://wangyibin.github.io/C-Studio/zh/latest/)
+- Remote files / 远程文件：[English](docs/en/user-guide/remote-contact-service.md) · [中文](docs/zh/user-guide/remote-contact-service.md)
+
+## Desktop release builds
+
+Run **Package desktop apps and cool2mcool** in GitHub Actions with `target=all`
+to build macOS Apple Silicon, macOS Intel, and Windows packages. Set
+`release_tag` to an existing `v*` tag to publish the packages and `SHA256SUMS`
+to its GitHub Release; leave it empty to upload workflow artifacts only.
+
+macOS packages use separate architecture names: `C-Studio-arm64.app.zip` and
+`*_aarch64.dmg` for Apple Silicon, `C-Studio-x64.app.zip` and `*_x64.dmg` for
+Intel. The release workflow requires both architectures before publishing.
+
+For a local macOS release build, run:
+
+```bash
+pixi run --locked -e package package-macos
+```
+
+The packaging task builds for the current Mac's architecture and bundles its
+matching Pixi `libiconv` dependency. Outputs are under
+`src-tauri/target/aarch64-apple-darwin/release/bundle/` on Apple Silicon or
+`src-tauri/target/x86_64-apple-darwin/release/bundle/` on Intel.

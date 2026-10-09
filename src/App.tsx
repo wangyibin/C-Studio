@@ -1,7 +1,8 @@
+import { RemoteImageTileLayer, remoteImageTileGrid } from "./state/remoteImageTiles";
 import { RemoteRasterFlight } from "./state/remoteRasterFlight";
 import type { ContactViewport } from "./state/contactViewport";
 import { remoteRenderPlan } from "./state/remoteRenderPlan";
-import { remotePanRequest, remotePanWarmViewport, remoteRasterCovers, loadRemoteRaster, type RemoteRasterFrame } from "./state/remoteContactRaster";
+import { remotePanWarmViewport, remoteRasterCovers, loadRemoteRaster, retainRemoteContactFrame, type RemoteRasterFrame } from "./state/remoteContactRaster";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { message, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -1251,6 +1252,7 @@ export function App() {
   const [contactSources, setContactSources] = useState<ContactSourceMetadata[]>([]);
   const [contactMap, setContactMap] = useState<ContactMapView | null>(null);
   const remotePanFrameRef = useRef<{ key: string; map: ContactMapView } | null>(null);
+  const remoteImageLayerRef = useRef<{key:string; layout:object; layer:RemoteImageTileLayer} | null>(null);
   const remoteRasterFlight = useRef(new RemoteRasterFlight<ContactMapView>()).current;
   const remotePanPrefetchRef = useRef<((viewport: ContactViewport) => void) | null>(null);
   const [contactGpuSourceLayout, setContactGpuSourceLayout] = useState<
@@ -2620,11 +2622,10 @@ export function App() {
         uiState.normalization, remoteRenderStyleKey, uiState.contact.viewportWidthPx,
         uiState.contact.viewportHeightPx, viewport.xEnd - viewport.xStart,
         viewport.yEnd - viewport.yStart]);
-      let panRequest = remotePanRequest(viewport, uiState.contact.viewportWidthPx,
-        uiState.contact.viewportHeightPx, effectiveContactTileTotalSpanBp);
-      if (plan.adaptiveRefinement || contactTilesForViewport(panRequest.viewport, plan.targetResolution, 256).length > 64) {
-        panRequest = { viewport, width: uiState.contact.viewportWidthPx, height: uiState.contact.viewportHeightPx };
-      }
+      // Fixed image tiles provide overscan. Keep the authoritative raster at
+      // the exact visible camera so settling never resamples a padded frame.
+      const panRequest = { viewport, width: uiState.contact.viewportWidthPx,
+        height: uiState.contact.viewportHeightPx };
       const scaleKey = `raster|${contactAutoColorScaleKey(contactCoolPath!,
         plan.targetResolution, 256, uiState.contact.colorScale.log)}`;
       const cachedScale = uiState.contact.colorScale.auto
@@ -2635,7 +2636,31 @@ export function App() {
         colormap: uiState.contact.colormap,
         colorScale: cachedScale ? { ...cachedScale, auto: false } : uiState.contact.colorScale,
       }, signal);
-      return { frameKey, panRequest, scaleKey, cachedScale, load };
+      const attachTiles = (map: ContactMapView): ContactMapView => {
+        if (!map.raster || plan.adaptiveRefinement) return map;
+        let entry = remoteImageLayerRef.current;
+        if (!entry || entry.key !== frameKey || entry.layout !== viewAssemblyLayout.blocks) {
+          entry?.layer.dispose();
+          const scale = { ...uiState.contact.colorScale, auto: false, min: 0, max: map.raster.scaleMax };
+          if (!uiState.contact.colorScale.auto) scale.min = uiState.contact.colorScale.min;
+          const layer = new RemoteImageTileLayer(
+            remoteImageTileGrid(viewport, uiState.contact.viewportWidthPx, uiState.contact.viewportHeightPx, plan.targetResolution),
+            effectiveContactTileTotalSpanBp,
+            async (tile, signal) => {
+              const loaded = await loadRemoteRaster({ path: contactCoolPath!, layoutBlocks: viewContactLayoutBlocks,
+                ...tile, sourceResolution: plan.sourceResolution, targetResolution: plan.targetResolution,
+                normalization: contactNormalizationForBackend(uiState.normalization), colormap: uiState.contact.colormap,
+                colorScale: scale }, signal);
+              return loaded.raster!;
+            },
+          );
+          entry = {key:frameKey, layout:viewAssemblyLayout.blocks,layer};
+          remoteImageLayerRef.current = entry;
+        }
+        entry.layer.prefetch(viewport);
+        return {...map, raster:{...map.raster, tileLayer:entry.layer}};
+      };
+      return { frameKey, panRequest, scaleKey, cachedScale, load, attachTiles };
   }, [contactCoolPath, effectiveContactTileResolution, effectiveContactTileTotalSpanBp,
     contactAvailableResolutions, contactIsMcool, contactMainLodEnabled,
     uiState.contact.viewportWidthPx, uiState.contact.viewportHeightPx, uiState.normalization,
@@ -2645,6 +2670,11 @@ export function App() {
     remotePanPrefetchRef.current = remoteRendering && contactCoolPath ? (viewport) => {
       if (!viewContactLayoutBlocks.length) return;
       const request = prepareRemoteRaster(viewport);
+      const layer = remoteImageLayerRef.current;
+      if (layer?.key === request.frameKey && layer.layout === viewAssemblyLayout.blocks) {
+        layer.layer.prefetch(viewport);
+        return;
+      }
       const previous = remotePanFrameRef.current;
       if (previous?.key === request.frameKey && previous.map.layoutBlocks === viewAssemblyLayout.blocks
         && previous.map.raster && remoteRasterCovers(previous.map.raster.viewport,
@@ -2655,7 +2685,10 @@ export function App() {
         imageViewport: request.panRequest.viewport, preview: true, load: request.load,
       })?.catch(() => { /* A settled request retries and reports failures. */ });
     } : null;
-    return () => { remotePanPrefetchRef.current = null; remoteRasterFlight.clear(); };
+    return () => {
+      remotePanPrefetchRef.current = null; remoteRasterFlight.clear();
+      remoteImageLayerRef.current?.layer.dispose(); remoteImageLayerRef.current = null;
+    };
   }, [remoteRendering, contactCoolPath, prepareRemoteRaster, viewAssemblyLayout.blocks, remoteRasterFlight,
     effectiveContactTileTotalSpanBp]);
 
@@ -2664,12 +2697,12 @@ export function App() {
       // Pointer motion warms an image; only settled cameras publish it to React.
       if (contactTilePanPreviewActive) return;
       const viewport = effectiveContactTileViewport;
-      const { frameKey, panRequest, scaleKey, cachedScale, load } = prepareRemoteRaster(viewport);
+      const { frameKey, panRequest, scaleKey, cachedScale, load, attachTiles } = prepareRemoteRaster(viewport);
       const previous = remotePanFrameRef.current;
       if (previous?.key === frameKey
         && previous.map.layoutBlocks === viewAssemblyLayout.blocks
         && previous.map.raster && remoteRasterCovers(previous.map.raster.viewport, viewport)) {
-        setContactMap({ ...previous.map, viewport, renderGeneration: ++contactTileGenerationRef.current });
+        setContactMap({ ...attachTiles(previous.map), viewport, renderGeneration: ++contactTileGenerationRef.current });
         setStatusMessage("Server image reused for pan");
         return;
       }
@@ -2686,15 +2719,17 @@ export function App() {
       contactMainLodTileFlightsRef.current.clear();
       lastCompleteContactMapRef.current = null;
       contactPanPrefetchQueue.clearPending();
-      // Retain only a compatible image while panning; edits invalidate it.
-      setContactMap((current) => current?.raster && current.layoutBlocks === viewAssemblyLayout.blocks
-        ? current : null);
+      // Edits invalidate request/cache reuse, not the front surface. Retain its
+      // layout and camera until the replacement PNG and annotations can switch
+      // together; clearing it briefly applies the local 3x canvas CSS to a PNG.
+      setContactMap((current) => retainRemoteContactFrame(current, contactCoolPath, viewContactLayoutBlocks));
       if (!viewContactLayoutBlocks.length) return;
+      remoteImageLayerRef.current?.layer.pause();
       void remoteRasterFlight.request({ key: frameKey, layout: viewAssemblyLayout.blocks,
         viewport, imageViewport: panRequest.viewport, preview: false, load,
       })!.then((map) => {
           if (controller.signal.aborted || generation !== contactTileGenerationRef.current) return;
-          const presented = { ...map, viewport, renderGeneration: generation, layoutBlocks: viewAssemblyLayout.blocks };
+          const presented = { ...attachTiles(map), viewport, renderGeneration: generation, layoutBlocks: viewAssemblyLayout.blocks };
           remotePanFrameRef.current = { key: frameKey, map: presented };
           setContactMap(presented);
           if (uiState.contact.colorScale.auto && map.raster) {

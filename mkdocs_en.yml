@@ -91,12 +91,13 @@ nav:
   - User guide:
       - Prepare input files: user-guide/input-preparation.md
       - Project data: user-guide/project-data.md
-      - Remote projects and files: user-guide/remote-contact-service.md
+      - Using remote files: user-guide/remote-contact-service.md
       - Interface: user-guide/interface.md
       - Navigation and selection: user-guide/navigation-selection.md
       - Assembly editing: user-guide/assembly-editing.md
       - Evidence views: user-guide/evidence.md
   - Misc:
+      - Remote service deployment: reference/remote-service.md
       - Data formats: reference/formats.md
       - Keyboard shortcuts: reference/shortcuts.md
       - Current limitations: reference/limitations.md

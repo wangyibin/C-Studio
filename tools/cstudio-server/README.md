@@ -13,6 +13,18 @@ in an updated C-Studio client. Load the matching AGP to edit the assembly.
 启动器自动生成连接密码并在后台运行，复制输出的 URL 和 Bearer token 到客户端即可。
 普通用户可运行，不需要 sudo、Rust、Node.js 或桌面环境。
 
+For SSH-tunnel access without a token / 通过 SSH 隧道连接、不使用 token：
+
+```bash
+./cstudio --no-token /data/project/input.mcool
+```
+
+This mode listens only on `127.0.0.1`. Forward the port over SSH and leave the
+client's Bearer token field empty. The mode is remembered per port; ordinary
+restarts keep it. Stop the service and start with `--token` to restore authentication.
+此模式只监听服务器本机地址，通过 SSH 转发后在客户端将 token 留空即可。
+每个端口会记住该设置，重启无需重复传参；停止服务后用 `--token` 启动可恢复认证。
+
 ```bash
 ./cstudio status           # Show connection details / 查看连接信息
 ./cstudio stop             # Stop / 停止

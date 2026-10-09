@@ -6848,3 +6848,20 @@ summary:focus-visible,
   padding-inline: 3px;
   white-space: nowrap;
 }
+
+/* Remote images are composed in the live camera, independently of overlay pans. */
+.contact-map-buffer-canvas.remote-image-canvas {
+  width: 100%;
+  height: 100%;
+  left: 0;
+  top: 0;
+}
+
+.contact-map .contact-assembly-boundary-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  pointer-events: none;
+}

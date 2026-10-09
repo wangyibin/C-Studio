@@ -25,10 +25,24 @@ concurrency:
 
 jobs:
   package-macos:
-    name: macOS Apple Silicon
+    name: macOS ${{ matrix.platform_name }}
     if: inputs.target == 'all'
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform_name: Apple Silicon
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+            asset_arch: arm64
+            binary_arch: arm64
+          - platform_name: Intel
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            asset_arch: x64
+            binary_arch: x86_64
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -49,19 +63,24 @@ jobs:
       - name: Build macOS app and DMG
         run: pixi run --locked -e package package-macos
 
+      - name: Verify macOS executable architecture
+        run: >-
+          lipo -verify_arch ${{ matrix.binary_arch }}
+          "src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/C-Studio.app/Contents/MacOS/c-studio"
+
       - name: Archive macOS app bundle
         run: >-
           ditto -c -k --sequesterRsrc --keepParent
-          "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/C-Studio.app"
-          "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/C-Studio-arm64.app.zip"
+          "src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/C-Studio.app"
+          "src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/C-Studio-${{ matrix.asset_arch }}.app.zip"
 
       - name: Upload macOS packages
         uses: actions/upload-artifact@v4
         with:
-          name: c-studio-macos-arm64-${{ github.run_number }}
+          name: c-studio-macos-${{ matrix.asset_arch }}-${{ github.run_number }}
           path: |
-            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.zip
-            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/*.zip
+            src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 7
 
@@ -233,8 +252,10 @@ jobs:
           required_patterns=('*.exe' '*.msi')
           if [[ "$PACKAGE_TARGET" == 'all' ]]; then
             required_patterns+=(
-              '*.zip'
-              '*.dmg'
+              'C-Studio-arm64.app.zip'
+              'C-Studio-x64.app.zip'
+              '*_aarch64.dmg'
+              '*_x64.dmg'
               'cool2mcool-*-linux-x86_64.tar.gz'
               'cool2mcool-*-linux-aarch64.tar.gz'
               'cool2mcool-*-macos-arm64.tar.gz'

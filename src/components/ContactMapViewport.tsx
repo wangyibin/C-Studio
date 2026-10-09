@@ -1,4 +1,5 @@
 import { drawRemoteRaster, remoteRasterSize } from "../state/remoteContactRaster";
+import { drawContactAssemblyBoundaries } from "./contactAssemblyCanvas";
 import {
   ArrowDownLeft,
   ArrowDownRight,
@@ -1400,6 +1401,8 @@ export function ContactMapViewport({
     contactTilePanRendererRef.current?.discardPrefetchedPages();
   }, [uiState.contact.resolution, uiState.normalization]);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
+  const assemblyBoundaryCanvasRef = useRef<HTMLCanvasElement>(null);
+  const assemblyBoundariesRef = useRef<readonly ContactTileGpuBoundary[]>([]);
   const assemblySelectionBandsRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const latestContactMapRef = useRef<ContactMapView | null>(null);
@@ -1810,7 +1813,8 @@ export function ContactMapViewport({
   )
     ? activeAssemblyBlocks
     : presentationContactMap?.layoutBlocks ?? activeAssemblyBlocks;
-  const usesDomAssemblyBoundaries = !gpuAssemblyBoundariesActive;
+  const usesCanvasAssemblyBoundaries = Boolean(presentationContactMap?.raster);
+  const usesDomAssemblyBoundaries = !gpuAssemblyBoundariesActive && !usesCanvasAssemblyBoundaries;
   const assemblyModel = useMemo(() => buildAssemblyEditModel(assemblyBlocks), [assemblyBlocks]);
   const assemblyHitTestIndex = useMemo(
     () => buildAssemblyHitTestIndex(assemblyModel),
@@ -1832,6 +1836,22 @@ export function ContactMapViewport({
       uiState.assembly.showContigBoxes,
     ],
   );
+  assemblyBoundariesRef.current = gpuAssemblyBoundaries;
+  usePrePaintEffect(() => {
+    if (!usesCanvasAssemblyBoundaries) return;
+    const bounds = canvasFrameBoundsRef.current;
+    if (!bounds) return;
+    drawContactAssemblyBoundaries(
+      assemblyBoundaryCanvasRef.current,
+      gpuAssemblyBoundaries,
+      dragStateRef.current?.previewViewport
+        ?? wheelPanSessionRef.current?.previewViewport
+        ?? pendingCommittedPanViewportRef.current ?? displayViewport,
+      bounds.width,
+      bounds.height,
+    );
+  }, [gpuAssemblyBoundaries, usesCanvasAssemblyBoundaries, displayViewport,
+    uiState.contact.viewportWidthPx, uiState.contact.viewportHeightPx]);
   const selectedAssemblyBlockIds = useMemo(
     () => new Set(selectedBlockIds(assemblyModel.blocks, uiState.assembly.selection)),
     [assemblyModel, uiState.assembly.selection],
@@ -2406,6 +2426,15 @@ export function ContactMapViewport({
           latestUiStateRef.current,
         );
       }
+      const map = latestDisplayContactMapRef.current;
+      if (map?.raster) {
+        drawContactAssemblyBoundaries(
+          assemblyBoundaryCanvasRef.current, assemblyBoundariesRef.current,
+          dragStateRef.current?.previewViewport ?? wheelPanSessionRef.current?.previewViewport
+            ?? pendingCommittedPanViewportRef.current ?? map.viewport,
+          bounds.width, bounds.height,
+        );
+      }
     };
     reportMetricsAndRedraw();
     const observer = typeof ResizeObserver === "undefined"
@@ -2427,8 +2456,29 @@ export function ContactMapViewport({
     usesTiledRenderer,
   ]);
 
+  // Decoded tiles paint during the gesture without publishing a React frame or
+  // changing the coordinate system of chromosome overlays and hit testing.
+  useEffect(() => {
+    const layer = displayContactMap?.raster?.tileLayer;
+    if (!layer) return;
+    let frame: number | null = null;
+    const unsubscribe = layer.subscribe(() => {
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        const map = latestDisplayContactMapRef.current;
+        if (map?.raster?.tileLayer !== layer) return;
+        const viewport = dragStateRef.current?.previewViewport
+          ?? wheelPanSessionRef.current?.previewViewport
+          ?? pendingCommittedPanViewportRef.current ?? map.viewport;
+        drawContactMapBuffer(canvasRef.current, {...map, viewport}, latestUiStateRef.current);
+      });
+    });
+    return () => { unsubscribe(); if (frame !== null) window.cancelAnimationFrame(frame); };
+  }, [displayContactMap?.raster?.tileLayer]);
+
   usePrePaintEffect(() => {
-    if (usesTiledRenderer || !displayContactMap) {
+    if (usesTiledRenderer) {
       prepaintedCellContactMapRef.current = null;
       return;
     }
@@ -2438,8 +2488,10 @@ export function ContactMapViewport({
     }
     const frame = canvasFrameRef.current;
     if (frame) {
-      resizeContactMapCanvas(canvas, frame, Boolean(displayContactMap.raster));
+      resizeContactMapCanvas(canvas, frame, Boolean(displayContactMap?.raster));
     }
+    // Unload/dataset changes must clear before paint too, so stale pixels cannot
+    // survive a switch between screen-sized PNG and the local overscan canvas.
     drawContactMapBuffer(canvas, displayContactMap, uiState);
     // A new Canvas2D target can commit hundreds of milliseconds before it is
     // actually painted. Keep the shifted front surface until the common
@@ -2460,7 +2512,10 @@ export function ContactMapViewport({
     }
     redrawAnimationFrameRef.current = window.requestAnimationFrame(() => {
       redrawAnimationFrameRef.current = null;
-      drawContactMapBuffer(canvasRef.current, displayContactMap, uiState);
+      drawContactMapBuffer(canvasRef.current, displayContactMap?.raster ? {
+        ...displayContactMap, viewport: dragStateRef.current?.previewViewport
+          ?? wheelPanSessionRef.current?.previewViewport ?? pendingCommittedPanViewportRef.current ?? displayContactMap.viewport,
+      } : displayContactMap, uiState);
       if (pendingCommittedPanViewportRef.current === null) {
         resetPanTransform();
       }
@@ -2688,7 +2743,7 @@ export function ContactMapViewport({
     //
     // Legacy DOM boundaries still need bounded pre-mounting. GPU boundaries
     // already live in the retained scene and require no React update here.
-    if (usesDomAssemblyBoundaries) {
+    if (usesDomAssemblyBoundaries && !assemblyBoundaryCanvasRef.current) {
       prefetchAssemblyBoundaryViewport(previewViewport);
     }
     if (liveContactMap?.raster) {
@@ -2797,7 +2852,16 @@ export function ContactMapViewport({
     });
 
     if (canvasRef.current) {
-      canvasRef.current.style.transform = transform;
+      if (sourceContactMap.raster) {
+        canvasRef.current.style.transform = "";
+        drawContactMapBuffer(canvasRef.current, {...sourceContactMap, viewport:previewContactMap.viewport}, latestUiStateRef.current);
+        drawContactAssemblyBoundaries(
+          assemblyBoundaryCanvasRef.current, assemblyBoundariesRef.current,
+          previewContactMap.viewport, width, height,
+        );
+      } else {
+        canvasRef.current.style.transform = transform;
+      }
     }
     if (contactTileTransformRef.current) {
       if (contactTilePanRendererRef.current) {
@@ -3443,11 +3507,14 @@ export function ContactMapViewport({
             {!usesTiledRenderer ? (
               <canvas
                 ref={canvasRef}
-                className={`contact-map-buffer-canvas ${hasContactMap ? "loaded-contact-canvas" : "empty-contact-canvas"}`}
+                className={`contact-map-buffer-canvas ${displayContactMap?.raster ? "remote-image-canvas" : ""} ${hasContactMap ? "loaded-contact-canvas" : "empty-contact-canvas"}`}
                 width="2880"
                 height="2880"
                 aria-label={hasContactMap ? "Imported contact map" : "Contact map canvas placeholder"}
               />
+            ) : null}
+            {usesCanvasAssemblyBoundaries ? (
+              <canvas ref={assemblyBoundaryCanvasRef} className="contact-assembly-boundary-canvas" aria-hidden="true" />
             ) : null}
             {usesTiledRenderer || contactTileDeltaStream ? (
               <ContactTileLayer
@@ -4326,8 +4393,7 @@ function resizeContactMapCanvas(
   const bounds = frame.getBoundingClientRect();
   const rasterSize = remoteRasterSize(bounds.width, bounds.height);
   const targetSize = remoteRaster
-    ? { width: Math.min(maxContactCanvasSide, rasterSize.width * 3),
-      height: Math.min(maxContactCanvasSide, rasterSize.height * 3) }
+    ? rasterSize
     : contactCanvasBackingSizeFromBounds(bounds, window.devicePixelRatio || 1);
   if (!targetSize) {
     return false;
@@ -4386,13 +4452,9 @@ function drawContactMapBuffer(
     context.clearRect(0, 0, width, height);
     context.fillStyle = "#ffffff";
     context.fillRect(0, 0, width, height);
-    const spanX = contactMap.viewport.xEnd - contactMap.viewport.xStart;
-    const spanY = contactMap.viewport.yEnd - contactMap.viewport.yStart;
-    // Paint the prefetched margins into the translated canvas backing surface.
-    drawRemoteRaster(context, contactMap.raster, {
-      xStart: contactMap.viewport.xStart - spanX, xEnd: contactMap.viewport.xEnd + spanX,
-      yStart: contactMap.viewport.yStart - spanY, yEnd: contactMap.viewport.yEnd + spanY,
-    }, 0, 0, width, height);
+    // Remote frames use one screen-sized surface. The image grid can advance
+    // indefinitely without exhausting a translated three-screen backing canvas.
+    drawRemoteRaster(context, contactMap.raster, contactMap.viewport, 0, 0, width, height);
     return;
   }
 

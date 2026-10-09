@@ -7,15 +7,24 @@ usage() {
   cat <<'HELP'
 Usage:
   ./cstudio /absolute/path/input.mcool [port]   Start in the background
+  ./cstudio --no-token /path/input.mcool [port] Localhost/SSH, no token
+  ./cstudio --token /path/input.mcool [port]    Restore token authentication
   ./cstudio status [port]                      Show connection details
   ./cstudio stop [port]                        Stop this service
 
 Default port: 8787. No root, Rust, Node.js or desktop environment is needed.
+The authentication mode is remembered per port across restarts.
 Use within a trusted private network; public access requires an HTTPS proxy.
 HELP
 }
 [[ $# -gt 0 ]] || { usage; exit 0; }
 [[ "$1" != --help && "$1" != -h ]] || { usage; exit 0; }
+requested_mode=""
+case "$1" in
+  --no-token) requested_mode=no-token; shift ;;
+  --token) requested_mode=token; shift ;;
+esac
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
 [[ $# -le 2 ]] || { usage >&2; exit 2; }
 action=$1
 port=${2:-8787}
@@ -33,6 +42,7 @@ fi
 trap 'rmdir -- "$state/lock" 2>/dev/null || true' EXIT
 pid_file="$state/pid"
 token_file="$state/token"
+mode_file="$state/auth-mode"
 log_file="$state/server.log"
 
 # Never send a signal to a reused PID or an unrelated process.
@@ -42,21 +52,35 @@ read_pid() {
   [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   local args
-  args=$(ps -p "$pid" -o args= 2>/dev/null) || return 1
-  [[ "$args" == *"$binary --bind 0.0.0.0:$port --token-file $token_file --dataset "* ]]
+  args=$(ps -ww -p "$pid" -o args= 2>/dev/null) || return 1
+  case "$args" in
+    *"$binary --bind 0.0.0.0:$port --token-file $token_file --dataset "*) running_mode=token ;;
+    *"$binary --bind 127.0.0.1:$port --dataset "*) running_mode=no-token ;;
+    *) return 1 ;;
+  esac
 }
 
 connection() {
   local address
-  address=$(hostname -I 2>/dev/null | awk '{print $1}') || true
-  [[ -n "$address" ]] || address=$(hostname)
+  if [[ "$running_mode" == no-token ]]; then
+    address=127.0.0.1
+  else
+    address=$(hostname -I 2>/dev/null | awk '{print $1}') || true
+    [[ -n "$address" ]] || address=$(hostname)
+  fi
   printf '\nC-Studio server is running (PID %s).\n' "$pid"
   printf 'In C-Studio: Add Data → Remote project or file…\n'
   printf 'URL:          http://%s:%s/v1/datasets/project\n' "$address" "$port"
-  printf 'Bearer token: %s\n' "$(cat -- "$token_file")"
+  if [[ "$running_mode" == no-token ]]; then
+    printf 'Bearer token: not required (leave empty). Connect through an SSH tunnel.\n'
+  else
+    printf 'Bearer token: %s\n' "$(cat -- "$token_file")"
+  fi
   printf 'Log:          %s\n' "$log_file"
   printf 'Stop:         ./cstudio stop %s\n' "$port"
-  printf 'If the address is unreachable, use this server’s private IP and allow port %s.\n' "$port"
+  if [[ "$running_mode" == token ]]; then
+    printf 'If the address is unreachable, use this server’s private IP and allow port %s.\n' "$port"
+  fi
 }
 
 case "$action" in
@@ -90,16 +114,25 @@ if read_pid; then
   connection
   echo "To change data, stop it first, or choose another port."; exit 1
 fi
-if [[ ! -s "$token_file" ]]; then
-  od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$token_file"
-  printf '\n' >> "$token_file"
+mode=token
+if [[ -f "$mode_file" ]]; then read -r mode < "$mode_file"; fi
+mode=${requested_mode:-$mode}
+case "$mode" in token|no-token) ;; *) echo "Invalid saved authentication mode: $mode" >&2; exit 2 ;; esac
+server_args=(--bind "127.0.0.1:$port")
+if [[ "$mode" == token ]]; then
+  if [[ ! -s "$token_file" ]]; then
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$token_file"
+    printf '\n' >> "$token_file"
+  fi
+  chmod 600 "$token_file"
+  server_args=(--bind "0.0.0.0:$port" --token-file "$token_file")
 fi
-chmod 600 "$token_file"
+printf '%s\n' "$mode" > "$mode_file"
 : > "$log_file"
-RUST_LOG=cstudio_server=info nohup "$binary" \
-  --bind "0.0.0.0:$port" --token-file "$token_file" \
+RUST_LOG=cstudio_server=info nohup "$binary" "${server_args[@]}" \
   --dataset "project=$dataset_path" > "$log_file" 2>&1 < /dev/null &
 pid=$!
+running_mode=$mode
 printf '%s\n' "$pid" > "$pid_file"
 printf 'Starting C-Studio server…\n'
 for ((i=0; i<100; i++)); do

@@ -1,30 +1,36 @@
 # C-Studio
 ![](https://img.shields.io/github/languages/top/wangyibin/C-Studio) ![](https://img.shields.io/github/commit-activity/m/wangyibin/C-Studio) ![](https://img.shields.io/github/last-commit/wangyibin/C-Studio) ![](https://img.shields.io/github/contributors/wangyibin/C-Studio) ![](https://img.shields.io/github/languages/code-size/wangyibin/C-Studio) ![platforms](https://img.shields.io/badge/platforms-macos%20|%20windows-blue) [![](https://img.shields.io/github/downloads/wangyibin/C-Studio/total?style=flat)](https://github.com/wangyibin/C-Studio/releases)
 
-> ⚠️ **开发状态：**C-Studio 仍在积极开发中，功能和界面可能发生变化。
+> ⚠️ **开发状态：**C-Studio 仍处于早期开发阶段，功能和界面可能发生变化。
 
-C-Studio 是一个处于早期阶段的桌面应用，用于检查染色体尺度组装、对照多类证据，
-并由用户主动编辑 AGP。当前应用由 Tauri 2、React、TypeScript 和 Rust 构建。
+C-Studio 是用于检查和手动校订染色体级基因组组装的桌面应用。你可以结合接触图、
+共线性、覆盖度和组装图，调整 AGP 中的序列顺序、方向和位置。各证据视图会随
+组装编辑同步更新，便于对照编辑前后的结果。
 
-![图 1：C-Studio 将组装状态与证据视图汇集到同步工作区。](assets/C-Studio_Figure1_overview.png)
+当前应用使用 Tauri 2、React、TypeScript 和 Rust 构建。
 
-*图 1｜C-Studio 将 AGP、三维接触、共线性、覆盖度和组装图证据汇集到可感知拷贝的
-同步校订工作区。*
+![图 1：C-Studio 的组装编辑与证据视图。](assets/C-Studio_Figure1_overview.png)
 
-!!! important "当前范围"
+*图 1｜C-Studio 在同一工作区中展示 AGP 组装布局、三维接触、共线性、覆盖度和
+组装图，并能区分同一源序列的不同拷贝。各视图随编辑同步更新。*
 
-    本文档描述当前实现。C-Studio 提供证据辅助的校订工作流，
-    但**不会**替用户判断生物学上正确的断点、方向、分组或拷贝数。
+!!! important "校订结果需要由用户判断"
 
-## C-Studio 汇集的内容
+    本文档介绍当前已实现的功能。C-Studio 提供用于校订的证据和编辑工具，
+    断点、方向、分组和拷贝数是否符合生物学实际，仍需由用户判断。
 
-- AGP 组装结构与可编辑的 contig 放置
-- `.mcool` 接触矩阵
-- PAF 共线性比对
-- BedGraph 覆盖度轨道
-- GFA 组装图拓扑及可选的端点级三维接触证据
-- 感知拷贝的选择、编辑、历史、撤销、重做和 AGP 导出
-- 与编辑后 AGP 一同保存、可兼容恢复的操作历史 sidecar
+## 可以加载和编辑什么
+
+AGP 定义组装结构。你可以选择和编辑其中的 contig，区分同一源序列的不同拷贝，
+并导出编辑后的 AGP。编辑过程会记录操作历史，支持撤销和重做；随 AGP 保存的
+历史文件与组装匹配时，重新打开项目后也能恢复编辑历史。
+
+校订时可以对照以下证据：
+
+- `.mcool` 接触矩阵；
+- PAF 共线性比对；
+- BedGraph 覆盖度轨道；
+- GFA 组装图，以及可选的序列端点之间的三维接触证据。
 
 ```mermaid
 flowchart LR
@@ -38,18 +44,19 @@ flowchart LR
     H --> O["编辑后的 AGP"]
 ```
 
-## 证据与权威来源
+## 组装布局与证据的关系
 
-当前编辑中的 AGP 布局是排序、方向、边界和导出的权威来源。接触矩阵、PAF、
-覆盖度和 GFA 都是证据视图；它们会随编辑后布局同步，但不会被静默改写，也不会
-自行决定编辑操作。
+序列的排列顺序、方向、边界及导出结果均以当前 AGP 组装布局为准。接触矩阵、PAF、
+覆盖度和 GFA 按照这一布局显示，原始证据数据不会因组装编辑而被改写。所有编辑
+都需要由用户发起。
 
 ## 从这里开始
 
 1. [安装或构建 C-Studio](installation.md)。
 2. [准备 AGP 和证据文件](user-guide/input-preparation.md)。
-3. 按照[首个项目流程](getting-started.md)操作。
-4. 加载真实数据前阅读[项目文件发现规则](user-guide/project-data.md)。
+3. 按照[快速开始](getting-started.md)加载数据、尝试编辑并保存结果。
+4. 加载真实数据前，阅读[项目数据](user-guide/project-data.md)，了解目录扫描和文件选择规则。
 5. 启用自动保存或删除拷贝前阅读[组装编辑](user-guide/assembly-editing.md)。
 
-[当前限制](reference/limitations.md)页面区分了已实现功能与打包、平台和验证缺口。
+[当前限制](reference/limitations.md)说明了已实现的功能，以及安装包、平台支持和
+验证方面尚未完成的工作。

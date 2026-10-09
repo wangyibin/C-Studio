@@ -2,6 +2,8 @@
 
 AGP、COOL/MCOOL、PAF、覆盖度和 GFA 的生成命令见[准备输入文件](input-preparation.md)。
 
+**数据在服务器上？** 见[使用远程文件](remote-contact-service.md)，选择服务器计算或下载到本地。
+
 ## 支持的输入
 
 | 证据 | 扩展名 | 作用 | 编辑是否必需 |

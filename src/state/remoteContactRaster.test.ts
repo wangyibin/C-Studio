@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { drawRemoteRaster, loadRemoteRaster, remoteRasterSize } from "./remoteContactRaster";
+import { drawRemoteRaster, loadRemoteRaster, remoteRasterSize, retainRemoteContactFrame } from "./remoteContactRaster";
+import type { ContactMapView } from "../App";
+import { splitContigAtVisualPosition } from "./assemblyEditing";
 import { rememberRemoteContactSource, forgetRemoteContactSource, remoteContactIdentifier, usesRemoteRendering } from "./remoteContact";
 
 const datasetUrl = "http://localhost:8787/v1/datasets/test";
@@ -55,6 +57,7 @@ describe("remote raster transport and presentation", () => {
     expect(JSON.parse(options.body).colorLut).toHaveLength(1024);
     expect(map.cells).toEqual([]); expect(map.tiles).toBeUndefined();
     expect(map.raster?.image).toBeDefined();
+    expect(map.raster?.sourcePath).toBe(path);
     expect(revoke).toHaveBeenCalledWith("blob:frame");
   });
   it("releases URLs after decode errors", async () => {
@@ -79,6 +82,31 @@ describe("remote raster transport and presentation", () => {
     expect(context.drawImage).toHaveBeenCalledWith(image, 0, 100, 400, 400);
     expect(context.clip).toHaveBeenCalledOnce();
     expect(context.restore).toHaveBeenCalledOnce();
+  });
+});
+
+describe("remote edit front-frame retention", () => {
+  const blocks = [{id:"chr1:contig1",objectId:"chr1",sourceId:"contig1",
+    sourceStart:0,sourceEnd:1000,visualStart:0,visualEnd:1000,orientation:"+" as const}];
+  const current: ContactMapView = {
+    resolution:10, cells:[], viewport, layoutBlocks:blocks,
+    raster:{image:{} as HTMLImageElement,viewport,scaleMax:10,sourcePath:path},
+  };
+  it("keeps original image, layout and camera together while a cut with a gap renders", () => {
+    const split = splitContigAtVisualPosition(blocks, blocks[0].id, 500);
+    expect(split).toHaveLength(2);
+    expect(split[1].visualEnd).toBe(1100);
+    const retained = retainRemoteContactFrame(current, path, split);
+    expect(retained).toBe(current);
+    expect(retained?.layoutBlocks).toBe(blocks);
+    expect(retained?.raster?.viewport).toBe(viewport);
+    expect(retained?.viewport).toBe(viewport);
+  });
+  it("does not retain another dataset, an empty layout, or a local matrix frame", () => {
+    expect(retainRemoteContactFrame(current, 'another-dataset', blocks)).toBeNull();
+    expect(retainRemoteContactFrame(current, path, [])).toBeNull();
+    expect(retainRemoteContactFrame({...current,raster:undefined}, path, blocks)).toBeNull();
+    expect(retainRemoteContactFrame(null, path, blocks)).toBeNull();
   });
 });
 

@@ -1,5 +1,6 @@
 //! Bounded server-side contact rasterization. No contact arrays cross the network.
 use super::*;
+mod encoded;
 mod warming;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -80,7 +81,7 @@ pub(super) async fn cache_status(
     authorize(&headers, &state)?;
     dataset(&state, &id)?;
     Ok(Json(
-        serde_json::json!({"disk":disk_cache::global().map(|d|d.status()).unwrap_or_else(||serde_json::json!({"enabled":false})),"warming":warming::status()}),
+        serde_json::json!({"disk":disk_cache::global().map(|d|d.status()).unwrap_or_else(||serde_json::json!({"enabled":false})),"warming":warming::status(),"images":encoded::status()}),
     ))
 }
 
@@ -189,14 +190,16 @@ pub(super) async fn render_handler(
     let cancelled = guard.0.clone();
     let warm_request = request.clone();
     let warm_dataset = Arc::clone(&dataset);
-    let (bytes, resolution, scale_max, source_resolution, cache_hit) =
+    let (bytes, resolution, scale_max, source_resolution, cache_hit, image_hit) =
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            compute(&dataset, request, &cancelled)
+            encoded::render(&dataset, request, &cancelled)
         })
         .await
         .map_err(|e| ApiError::internal(format!("render worker failed: {e}")))??;
-    warming::neighbors(state.clone(), warm_dataset, warm_request);
+    if !image_hit {
+        warming::neighbors(state.clone(), warm_dataset, warm_request);
+    }
     let mut response = Response::new(Body::from(bytes));
     for (key, value) in [
         ("content-type", "image/png".to_string()),
@@ -210,6 +213,10 @@ pub(super) async fn render_handler(
                 "render;dur={:.3}",
                 handler_started.elapsed().as_secs_f64() * 1000.0
             ),
+        ),
+        (
+            "x-cstudio-image-cache",
+            if image_hit { "hit" } else { "miss" }.to_string(),
         ),
         ("x-cstudio-render-contract", "desktop-v1".to_string()),
         ("x-cstudio-resolution", resolution.to_string()),
@@ -691,7 +698,7 @@ fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn request() -> RenderRequest {
+    pub(super) fn request() -> RenderRequest {
         RenderRequest {
             source_resolution: 10,
             target_resolution: None,

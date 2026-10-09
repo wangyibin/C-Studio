@@ -288,6 +288,7 @@ fn router(state: AppState) -> Router {
             axum::http::HeaderName::from_static("x-cstudio-scale-max"),
             axum::http::HeaderName::from_static("x-cstudio-source-resolution"),
             axum::http::HeaderName::from_static("x-cstudio-cache"),
+            axum::http::HeaderName::from_static("x-cstudio-image-cache"),
             axum::http::HeaderName::from_static("x-cstudio-render-contract"),
         ])
         .allow_origin(Any)
