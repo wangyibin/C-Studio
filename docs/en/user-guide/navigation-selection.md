@@ -15,8 +15,13 @@
 When resolution is locked with **L**, Command/Control + scroll zooms the
 viewport around the pointer without switching the selected matrix level.
 
+The heatmap fills the available plotting area with the same genomic length per
+pixel on both axes. Wider windows show more sequence horizontally; taller
+windows show more sequence vertically. Resizing preserves square matrix bins.
+Areas beyond the assembly end remain empty; zoom in to view a smaller interval.
+
 The whole-genome navigators along the axes can also move one axis independently.
-All viewport changes are clamped to the assembly extent.
+Pan positions are constrained by the assembly extent.
 
 ## Jump to a region
 

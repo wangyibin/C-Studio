@@ -1,3 +1,7 @@
+import { RemoteRasterFlight } from "./state/remoteRasterFlight";
+import type { ContactViewport } from "./state/contactViewport";
+import { remoteRenderPlan } from "./state/remoteRenderPlan";
+import { remotePanRequest, remotePanWarmViewport, remoteRasterCovers, loadRemoteRaster, type RemoteRasterFrame } from "./state/remoteContactRaster";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { message, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -98,10 +102,12 @@ import {
   ContactLayoutHandleRegistry,
 } from "./state/contactLayoutHandle";
 import {
+  usesRemoteRendering,
   forgetRemoteContactSource,
   isRemoteContactPath,
   isRemoteContactServiceUrl,
   loadRemoteContactMetadata,
+  loadRemoteAssembly,
   loadRemoteContactOverview,
   loadRemoteContactTiles,
   rememberRemoteContactSource,
@@ -129,7 +135,6 @@ import {
 } from "./state/contactNormalizationPrewarm";
 import {
   buildContactOverviewTilePlan,
-  contactNavigationOverviewFromCoveringMap,
   contactNavigationOverviewNormalization,
   retainContactOverviewRequestId,
   shouldResumeContactBackgroundSchedulingAfterFailure,
@@ -263,6 +268,7 @@ export interface ContactMapCell {
 }
 
 export interface ContactMapView {
+  raster?: RemoteRasterFrame;
   resolution: number;
   /** User-selected mcool level fulfilled by this frame; LOD may be coarser. */
   requestedResolution?: number;
@@ -1244,6 +1250,9 @@ export function App() {
   const [contactAvailableResolutions, setContactAvailableResolutions] = useState<number[]>([]);
   const [contactSources, setContactSources] = useState<ContactSourceMetadata[]>([]);
   const [contactMap, setContactMap] = useState<ContactMapView | null>(null);
+  const remotePanFrameRef = useRef<{ key: string; map: ContactMapView } | null>(null);
+  const remoteRasterFlight = useRef(new RemoteRasterFlight<ContactMapView>()).current;
+  const remotePanPrefetchRef = useRef<((viewport: ContactViewport) => void) | null>(null);
   const [contactGpuSourceLayout, setContactGpuSourceLayout] = useState<
     ContactGpuSourceLayoutView | null
   >(null);
@@ -1462,8 +1471,8 @@ export function App() {
   const suspendContactTileLoadingForPan = useCallback(() => {
     // Advance the backend exactly once for the whole gesture. Every diagonal
     // prefetch frontier then shares this generation and its per-tile flights.
-    void beginContactPanGeneration().promise;
-  }, [beginContactPanGeneration]);
+    if (!usesRemoteRendering(dataset?.cool_path)) void beginContactPanGeneration().promise;
+  }, [beginContactPanGeneration, dataset?.cool_path]);
   const handleContactViewportPreview = useCallback((preview: ContactPanPreview | null) => {
     if (contactViewportPreviewIsPan(preview)) {
       pendingPanPerformancePreviewRef.current = preview;
@@ -1661,6 +1670,7 @@ export function App() {
     };
   }, [contactMap, contactResolutionResponsiveness, uiState.contact.resolution]);
   const contactCoolPath = dataset?.cool_path ?? null;
+  const remoteRendering = usesRemoteRendering(contactCoolPath);
   const contactIsMcool = contactCoolPath?.toLowerCase().endsWith(".mcool") ?? false;
   const handleContactResolutionPreview = useCallback((resolution: ContactResolution | null) => {
     contactResolutionPreviewRef.current = resolution;
@@ -1878,6 +1888,10 @@ export function App() {
   isAgpDirtyRef.current = isAgpDirty;
   const backgroundAssemblyLayout = useDebouncedValue(viewAssemblyLayout, secondaryTrackRequestDelayMs);
   const handleContactPanTilePrefetch = useCallback((preview: ContactPanPreview) => {
+    if (contactCoolPath && usesRemoteRendering(contactCoolPath)) {
+      remotePanPrefetchRef.current?.(preview.viewport);
+      return;
+    }
     if (!contactCoolPath || viewAssemblyLayout.blocks.length === 0) {
       return;
     }
@@ -2225,6 +2239,7 @@ export function App() {
   useEffect(() => {
     if (
       !contactCoolPath
+      || usesRemoteRendering(contactCoolPath)
       || !contactSourceAddressSpace
       || contactSourceResolution.unresolvedSourceIds.length > 0
       || viewContactLayoutBlocks.length === 0
@@ -2544,7 +2559,7 @@ export function App() {
     effectiveContactTileResolution,
     viewAssemblyLayout.totalSpan,
   );
-  const effectiveExactVisibleTileCount = contactTilesForViewport(
+  const effectiveExactVisibleTileCount = remoteRendering ? 0 : contactTilesForViewport(
     effectiveContactTileViewport,
     effectiveContactTileResolution,
     contactTileSizeBins,
@@ -2554,7 +2569,7 @@ export function App() {
     effectiveContactTileResolution === 2_500_000
     && contactCoolPath?.toLowerCase().endsWith(".mcool") === true
   );
-  const effectiveContactMainLodPlan = (
+  const effectiveContactMainLodPlan = !remoteRendering && (
     contactMainLodEnabled || effectiveUsesCoarseMcoolResidencyPolicy
   ) ? buildContactMainLodPlan({
       viewport: effectiveContactTileViewport,
@@ -2579,7 +2594,8 @@ export function App() {
     contactTilePreviewViewport,
   );
   const contactTilePanPreviewActive = contactViewportPreviewIsPan(contactTilePreviewViewport);
-  const effectiveContactTileViewportRequestKey = contactViewportPresentationRequestKey(
+  const effectiveContactTileViewportRequestKey = remoteRendering
+    ? JSON.stringify(effectiveContactTileViewport) : contactViewportPresentationRequestKey(
     contactTileViewportRequestKey(
       effectiveContactTileViewport,
       effectiveContactTilePrefetchViewport,
@@ -2591,7 +2607,108 @@ export function App() {
     contactViewportCommitRevision,
   );
 
+  const remoteRenderViewportKey = remoteRendering ? JSON.stringify(effectiveContactTileViewport) : "";
+  const remoteRenderStyleKey = remoteRendering
+    ? JSON.stringify([uiState.contact.colormap, uiState.contact.colorScale.auto
+      ? { auto: true, log: uiState.contact.colorScale.log } : uiState.contact.colorScale]) : "";
+
+  const prepareRemoteRaster = useCallback((viewport: ContactViewport) => {
+      const plan = remoteRenderPlan(viewport, effectiveContactTileResolution,
+        uiState.contact.viewportWidthPx, uiState.contact.viewportHeightPx,
+        effectiveContactTileTotalSpanBp, contactAvailableResolutions, contactIsMcool, contactMainLodEnabled);
+      const frameKey = JSON.stringify([contactCoolPath, plan.sourceResolution, plan.targetResolution, plan.adaptiveRefinement,
+        uiState.normalization, remoteRenderStyleKey, uiState.contact.viewportWidthPx,
+        uiState.contact.viewportHeightPx, viewport.xEnd - viewport.xStart,
+        viewport.yEnd - viewport.yStart]);
+      let panRequest = remotePanRequest(viewport, uiState.contact.viewportWidthPx,
+        uiState.contact.viewportHeightPx, effectiveContactTileTotalSpanBp);
+      if (plan.adaptiveRefinement || contactTilesForViewport(panRequest.viewport, plan.targetResolution, 256).length > 64) {
+        panRequest = { viewport, width: uiState.contact.viewportWidthPx, height: uiState.contact.viewportHeightPx };
+      }
+      const scaleKey = `raster|${contactAutoColorScaleKey(contactCoolPath!,
+        plan.targetResolution, 256, uiState.contact.colorScale.log)}`;
+      const cachedScale = uiState.contact.colorScale.auto
+        ? autoColorScaleCacheRef.current.get(scaleKey) : undefined;
+      const load = (signal: AbortSignal) => loadRemoteRaster({
+        path: contactCoolPath!, layoutBlocks: viewContactLayoutBlocks, ...panRequest, ...plan,
+        normalization: contactNormalizationForBackend(uiState.normalization),
+        colormap: uiState.contact.colormap,
+        colorScale: cachedScale ? { ...cachedScale, auto: false } : uiState.contact.colorScale,
+      }, signal);
+      return { frameKey, panRequest, scaleKey, cachedScale, load };
+  }, [contactCoolPath, effectiveContactTileResolution, effectiveContactTileTotalSpanBp,
+    contactAvailableResolutions, contactIsMcool, contactMainLodEnabled,
+    uiState.contact.viewportWidthPx, uiState.contact.viewportHeightPx, uiState.normalization,
+    remoteRenderStyleKey, viewContactLayoutBlocks]);
+
   useEffect(() => {
+    remotePanPrefetchRef.current = remoteRendering && contactCoolPath ? (viewport) => {
+      if (!viewContactLayoutBlocks.length) return;
+      const request = prepareRemoteRaster(viewport);
+      const previous = remotePanFrameRef.current;
+      if (previous?.key === request.frameKey && previous.map.layoutBlocks === viewAssemblyLayout.blocks
+        && previous.map.raster && remoteRasterCovers(previous.map.raster.viewport,
+          remotePanWarmViewport(viewport, effectiveContactTileTotalSpanBp))) return;
+      // Warm the image without publishing React state during pointer motion.
+      void remoteRasterFlight.request({ key: request.frameKey, layout: viewAssemblyLayout.blocks,
+        viewport: remotePanWarmViewport(viewport, effectiveContactTileTotalSpanBp),
+        imageViewport: request.panRequest.viewport, preview: true, load: request.load,
+      })?.catch(() => { /* A settled request retries and reports failures. */ });
+    } : null;
+    return () => { remotePanPrefetchRef.current = null; remoteRasterFlight.clear(); };
+  }, [remoteRendering, contactCoolPath, prepareRemoteRaster, viewAssemblyLayout.blocks, remoteRasterFlight,
+    effectiveContactTileTotalSpanBp]);
+
+  useEffect(() => {
+    if (remoteRendering && contactCoolPath) {
+      // Pointer motion warms an image; only settled cameras publish it to React.
+      if (contactTilePanPreviewActive) return;
+      const viewport = effectiveContactTileViewport;
+      const { frameKey, panRequest, scaleKey, cachedScale, load } = prepareRemoteRaster(viewport);
+      const previous = remotePanFrameRef.current;
+      if (previous?.key === frameKey
+        && previous.map.layoutBlocks === viewAssemblyLayout.blocks
+        && previous.map.raster && remoteRasterCovers(previous.map.raster.viewport, viewport)) {
+        setContactMap({ ...previous.map, viewport, renderGeneration: ++contactTileGenerationRef.current });
+        setStatusMessage("Server image reused for pan");
+        return;
+      }
+      const generation = ++contactTileGenerationRef.current;
+      setStatusMessage("Rendering contact map on server…");
+      const controller = new AbortController();
+      setContactTileDeltaStream(null);
+      setContactGpuSourceLayout(null);
+      contactTileCacheLru.clear();
+      contactTileCacheRef.current = new Map();
+      contactMainLodTileCacheLru.clear();
+      contactMainLodTileCacheRef.current = new Map();
+      contactTileFlightsRef.current.clear();
+      contactMainLodTileFlightsRef.current.clear();
+      lastCompleteContactMapRef.current = null;
+      contactPanPrefetchQueue.clearPending();
+      // Retain only a compatible image while panning; edits invalidate it.
+      setContactMap((current) => current?.raster && current.layoutBlocks === viewAssemblyLayout.blocks
+        ? current : null);
+      if (!viewContactLayoutBlocks.length) return;
+      void remoteRasterFlight.request({ key: frameKey, layout: viewAssemblyLayout.blocks,
+        viewport, imageViewport: panRequest.viewport, preview: false, load,
+      })!.then((map) => {
+          if (controller.signal.aborted || generation !== contactTileGenerationRef.current) return;
+          const presented = { ...map, viewport, renderGeneration: generation, layoutBlocks: viewAssemblyLayout.blocks };
+          remotePanFrameRef.current = { key: frameKey, map: presented };
+          setContactMap(presented);
+          if (uiState.contact.colorScale.auto && map.raster) {
+            const scale = cachedScale ?? { auto: true, log: uiState.contact.colorScale.log,
+              min: 0, max: map.raster.scaleMax };
+            autoColorScaleCacheRef.current.set(scaleKey, scale);
+            dispatchUi({ type: "setAutoColorScale", scale });
+          }
+          setStatusMessage(`Server rendered contact map · ${map.resolution} bp display bins`);
+        }).catch((error) => {
+          if (!controller.signal.aborted) setStatusMessage(`Server render failed: ${String(error)}`);
+        });
+      return () => { controller.abort(); };
+    }
     const panPreviewActive = contactTilePanPreviewActive;
     const pendingPanPreview = pendingPanPerformancePreviewRef.current;
     const panGenerationStart = contactPanGenerationStartRef.current;
@@ -3047,6 +3164,7 @@ export function App() {
           contactTileReplacementPreviewActive
           || !uiState.contact.colorScale.auto
           || !hasContactMapData(map)
+          || !map.visibleLayerComplete
         ) {
           return;
         }
@@ -3085,19 +3203,6 @@ export function App() {
           });
         });
       };
-      const reuseMainLodAsOverview = (map: ContactMapView) => {
-        if (!contactOverviewEnabled || contactTileReplacementPreviewActive) {
-          return;
-        }
-        const reusableOverview = contactNavigationOverviewFromCoveringMap(
-          map,
-          viewAssemblyLayout.totalSpan,
-        );
-        if (reusableOverview) {
-          overviewContactMapRef.current = reusableOverview;
-          setOverviewContactMap(reusableOverview);
-        }
-      };
       const initialMainLodMap = mainLodMapForWorld(mainLodWorld);
       let mainLodVisibleReady = mainLodWorld.missingVisibleTiles.length === 0;
       publishPanPrefetchTiles(
@@ -3110,7 +3215,6 @@ export function App() {
           applyMainLodAutoColorScale(initialMainLodMap);
           lastCompleteContactMapRef.current = initialMainLodMap;
           setContactMap(initialMainLodMap);
-          reuseMainLodAsOverview(initialMainLodMap);
         }
       } else {
         const displayedMainLod = displayContactMapForPendingLayer(
@@ -3240,7 +3344,6 @@ export function App() {
           if (kind === "visible" && layerComplete) {
             mainLodVisibleReady = true;
             if (!panPreviewActive) {
-              reuseMainLodAsOverview(updatedMainLodMap);
               setStatusMessage(
                 `Contact map tiled LOD at ${formatBasePairResolution(mainLodPlan.targetResolution)}`,
               );
@@ -3582,6 +3685,7 @@ export function App() {
         contactTileReplacementPreviewActive
         || !uiState.contact.colorScale.auto
         || !hasContactMapData(map)
+        || !map.visibleLayerComplete
       ) {
         return;
       }
@@ -4508,6 +4612,11 @@ export function App() {
       cancelAdjacentIdleTask?.();
     };
   }, [
+    remoteRendering,
+    remoteRenderViewportKey,
+    remoteRenderStyleKey,
+    prepareRemoteRaster,
+    remoteRasterFlight,
     contactMainLodTileCacheLru,
     contactTileCacheLru,
     contactPanPerformance,
@@ -4546,6 +4655,28 @@ export function App() {
     ) {
       clearStaleOverview();
       return;
+    }
+    if (remoteRendering) {
+      clearStaleOverview();
+      const controller = new AbortController();
+      const totalSpan = Math.max(1, canonicalViewAssemblyLayout.totalSpan);
+      const plan = buildContactOverviewTilePlan(totalSpan, contactAvailableResolutions);
+      void loadRemoteRaster({
+        path: contactCoolPath, layoutBlocks: canonicalViewContactLayoutBlocks,
+        viewport: { xStart: 0, xEnd: totalSpan, yStart: 0, yEnd: totalSpan },
+        sourceResolution: plan.sourceResolution, targetResolution: plan.targetResolution, tileSizeBins: plan.targetBins, overview: true, width: 320, height: 320,
+        normalization: contactNavigationOverviewNormalization,
+        colormap: uiState.contact.colormap,
+        colorScale: { ...uiState.contact.colorScale, auto: true },
+      }, controller.signal).then((map) => {
+        if (controller.signal.aborted) return;
+        const overview = { ...map, layoutBlocks: canonicalViewAssemblyLayout.blocks };
+        overviewContactMapRef.current = overview;
+        setOverviewContactMap(overview);
+      }).catch((error) => {
+        if (!controller.signal.aborted) dispatchUi({ type: "appendLog", message: `Server overview failed: ${String(error)}` });
+      });
+      return () => controller.abort();
     }
     const overviewCoolPath = contactCoolPath;
 
@@ -4713,6 +4844,8 @@ export function App() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [
+    remoteRendering,
+    remoteRenderStyleKey,
     canonicalViewAssemblyLayout,
     canonicalViewContactLayoutBlocks,
     contactAvailableResolutions,
@@ -5472,10 +5605,22 @@ export function App() {
         value.datasetUrl,
         value.bearerToken,
       );
+      // Preserve an assembly already being edited. Empty sessions receive the server AGP.
+      const remoteAssembly = metadata.assembly && !dataset?.agp_components
+        ? await loadRemoteAssembly(datasetUrl, value.bearerToken) : null;
+      if (remoteAssembly) {
+        const layout = parseAgpLayout(remoteAssembly.text);
+        const sources = new Map(metadata.sources.map((source) => [source.name, source.length]));
+        if (!layout.blocks.length || layout.blocks.some((block) =>
+          !sources.has(block.sourceId) || block.sourceEnd > sources.get(block.sourceId)!)) {
+          throw new Error("Remote AGP components do not match the contact map sources");
+        }
+      }
       const identifier = remoteContactIdentifier(datasetUrl, metadata.format);
       rememberRemoteContactSource(identifier, {
         datasetUrl,
         bearerToken: value.bearerToken,
+        serverRendering: metadata.renderModes?.includes("png-v1") === true,
       });
       if (dataset?.cool_path !== identifier) {
         forgetRemoteContactSource(dataset?.cool_path);
@@ -5496,10 +5641,13 @@ export function App() {
         availableResolutions: metadata.availableResolutions,
         contactSources: metadata.sources,
       }));
+      if (remoteAssembly) {
+        await importAgpFile(new File([remoteAssembly.text], remoteAssembly.name, { type: "text/plain" }));
+      }
       setContactAvailableResolutions(metadata.availableResolutions);
       setContactSources(metadata.sources);
       setRemoteContactDialogOpen(false);
-      setStatusMessage(`Remote contact map connected: ${metadata.name}`);
+      setStatusMessage(`Remote contact map connected (${metadata.renderModes?.includes("png-v1") ? "server rendering" : "client rendering; upgrade server for lower memory"}): ${metadata.name}`);
       dispatchUi({
         type: "appendLog",
         message: `Remote contact map connected: ${metadata.name} (${datasetUrl})`,

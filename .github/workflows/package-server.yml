@@ -1,0 +1,42 @@
+name: Package C-Studio server
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          pixi-version: v0.75.0
+          environments: package
+          locked: true
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./crates/cstudio-server -> target"
+      - name: Test server
+        run: pixi run --locked -e package cargo test --locked --manifest-path crates/cstudio-server/Cargo.toml --features portable-hdf5
+      - name: Build archive
+        run: pixi run --locked -e package bash scripts/package-server.sh
+      - name: Test launcher lifecycle
+        run: bash scripts/test-server-launcher.sh crates/cstudio-server/target/release/cstudio-server examples/input.1k_allres.mcool
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cstudio-server-${{ matrix.platform }}
+          path: output/server-packages/*
+          if-no-files-found: error

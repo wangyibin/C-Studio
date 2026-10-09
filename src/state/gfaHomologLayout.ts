@@ -1095,8 +1095,12 @@ export function gfaSmoothLinkCurve(
   };
 }
 
+// Reuse the same locale/options instead of constructing a collator for every
+// comparison when sorting thousands of unanchored scaffolds.
+const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
 function naturalCompare(left: string, right: string) {
-  return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+  return naturalCollator.compare(left, right);
 }
 
 function assemblyBlockKey(node: GfaHomologLayoutNode) {

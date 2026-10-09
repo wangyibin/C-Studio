@@ -1,3 +1,4 @@
+import { drawRemoteRaster, remoteRasterSize } from "../state/remoteContactRaster";
 import {
   ArrowDownLeft,
   ArrowDownRight,
@@ -782,32 +783,6 @@ export function assemblyShiftClickIntent(
 
 export function contactViewportSizePxFromBounds(bounds: { width: number; height: number }) {
   const side = Math.min(bounds.width, bounds.height);
-
-  return Number.isFinite(side) && side > 0 ? side : null;
-}
-
-export function contactSquarePlotSidePx({
-  layoutRight,
-  layoutBottom,
-  stageLeft,
-  stageTop,
-  navigatorWidth,
-  navigatorHeight,
-  paddingRight = 0,
-  paddingBottom = 0,
-}: {
-  layoutRight: number;
-  layoutBottom: number;
-  stageLeft: number;
-  stageTop: number;
-  navigatorWidth: number;
-  navigatorHeight: number;
-  paddingRight?: number;
-  paddingBottom?: number;
-}) {
-  const availableWidth = layoutRight - paddingRight - stageLeft - navigatorWidth;
-  const availableHeight = layoutBottom - paddingBottom - stageTop - navigatorHeight;
-  const side = Math.floor(Math.min(availableWidth, availableHeight));
 
   return Number.isFinite(side) && side > 0 ? side : null;
 }
@@ -1609,7 +1584,9 @@ export function ContactMapViewport({
     ? presentedContactCoverageFrame
     : null;
   const usesAtomicCoverageFrame = Boolean(
-    !replacementHeatmapReady
+    !incomingContactMap?.raster
+    && !synchronizedFrame?.contactMap.raster
+    && !replacementHeatmapReady
     && hasCoverageTrack
     && uiState.tracks.coverageVisible
     && synchronizedFrame,
@@ -2397,9 +2374,8 @@ export function ContactMapViewport({
 
   usePrePaintEffect(() => {
     const layout = mapLayoutRef.current;
-    const stage = mapContentRef.current;
     const frame = canvasFrameRef.current;
-    if (!layout || !stage || !frame) {
+    if (!layout || !frame) {
       return;
     }
 
@@ -2407,26 +2383,6 @@ export function ContactMapViewport({
       refreshCanvasFrameBounds(frame);
     };
     const reportMetricsAndRedraw = () => {
-      const layoutBounds = layout.getBoundingClientRect();
-      const stageBounds = stage.getBoundingClientRect();
-      const navigatorCorner = layout.querySelector<HTMLElement>(".map-navigator-corner");
-      const navigatorBounds = navigatorCorner?.getBoundingClientRect();
-      const layoutStyle = window.getComputedStyle(layout);
-      const squareSidePx = contactSquarePlotSidePx({
-        layoutRight: layoutBounds.right,
-        layoutBottom: layoutBounds.bottom,
-        stageLeft: stageBounds.left,
-        stageTop: stageBounds.top,
-        navigatorWidth: navigatorBounds?.width ?? 0,
-        navigatorHeight: navigatorBounds?.height ?? 0,
-        paddingRight: Number.parseFloat(layoutStyle.paddingRight) || 0,
-        paddingBottom: Number.parseFloat(layoutStyle.paddingBottom) || 0,
-      });
-      if (squareSidePx === null) {
-        return;
-      }
-      layout.style.setProperty("--contact-map-square-size", `${squareSidePx}px`);
-
       const bounds = refreshCanvasFrameBounds(frame);
       if (!bounds) {
         return;
@@ -2443,7 +2399,7 @@ export function ContactMapViewport({
       }
 
       const canvas = canvasRef.current;
-      if (canvas && resizeContactMapCanvas(canvas, frame)) {
+      if (canvas && resizeContactMapCanvas(canvas, frame, Boolean(latestDisplayContactMapRef.current?.raster))) {
         drawContactMapBuffer(
           canvas,
           latestDisplayContactMapRef.current,
@@ -2456,11 +2412,11 @@ export function ContactMapViewport({
       ? null
       : new ResizeObserver(reportMetricsAndRedraw);
     observer?.observe(layout);
+    observer?.observe(frame);
     window.addEventListener("scroll", updateCachedBounds, true);
     return () => {
       observer?.disconnect();
       window.removeEventListener("scroll", updateCachedBounds, true);
-      layout.style.removeProperty("--contact-map-square-size");
       canvasFrameBoundsRef.current = null;
     };
   }, [
@@ -2482,7 +2438,7 @@ export function ContactMapViewport({
     }
     const frame = canvasFrameRef.current;
     if (frame) {
-      resizeContactMapCanvas(canvas, frame);
+      resizeContactMapCanvas(canvas, frame, Boolean(displayContactMap.raster));
     }
     drawContactMapBuffer(canvas, displayContactMap, uiState);
     // A new Canvas2D target can commit hundreds of milliseconds before it is
@@ -2734,6 +2690,13 @@ export function ContactMapViewport({
     // already live in the retained scene and require no React update here.
     if (usesDomAssemblyBoundaries) {
       prefetchAssemblyBoundaryViewport(previewViewport);
+    }
+    if (liveContactMap?.raster) {
+      // Remote images have their own coverage and bounded flight, independent
+      // of the local matrix tile grid. Check each camera, without React state.
+      onContactPanTilePrefetch?.({ viewport: previewViewport, prefetchViewport: previewViewport,
+        sequence: ++panPreviewSequenceRef.current, pointerTimestamp: performance.now() });
+      return;
     }
     const prefetchChannel = contactPanPrefetchChannel(
       Boolean(onContactPanTilePrefetch),
@@ -4358,9 +4321,14 @@ export function contactCanvasBackingSizeFromBounds(
 function resizeContactMapCanvas(
   canvas: HTMLCanvasElement,
   frame: HTMLElement,
+  remoteRaster = false,
 ): boolean {
   const bounds = frame.getBoundingClientRect();
-  const targetSize = contactCanvasBackingSizeFromBounds(bounds, window.devicePixelRatio || 1);
+  const rasterSize = remoteRasterSize(bounds.width, bounds.height);
+  const targetSize = remoteRaster
+    ? { width: Math.min(maxContactCanvasSide, rasterSize.width * 3),
+      height: Math.min(maxContactCanvasSide, rasterSize.height * 3) }
+    : contactCanvasBackingSizeFromBounds(bounds, window.devicePixelRatio || 1);
   if (!targetSize) {
     return false;
   }
@@ -4411,6 +4379,20 @@ function drawContactMapBuffer(
     && (contactMap.cachedTiles?.length ?? 0) === 0
     && contactMap.cells.length === 0
   ) {
+    return;
+  }
+
+  if (contactMap.raster) {
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, width, height);
+    const spanX = contactMap.viewport.xEnd - contactMap.viewport.xStart;
+    const spanY = contactMap.viewport.yEnd - contactMap.viewport.yStart;
+    // Paint the prefetched margins into the translated canvas backing surface.
+    drawRemoteRaster(context, contactMap.raster, {
+      xStart: contactMap.viewport.xStart - spanX, xEnd: contactMap.viewport.xEnd + spanX,
+      yStart: contactMap.viewport.yStart - spanY, yEnd: contactMap.viewport.yEnd + spanY,
+    }, 0, 0, width, height);
     return;
   }
 

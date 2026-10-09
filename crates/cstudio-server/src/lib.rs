@@ -1,3 +1,8 @@
+mod raster;
+mod disk_cache;
+mod layouts;
+mod assembly;
+
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path as AxumPath, State},
@@ -52,20 +57,25 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone)]
 struct AppState {
+    layouts: Arc<std::sync::Mutex<layouts::Registry>>,
     datasets: Arc<BTreeMap<String, Arc<Dataset>>>,
     bearer_token: Option<Arc<str>>,
+    render_slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug)]
 struct Dataset {
     path: PathBuf,
     metadata: DatasetMetadata,
+    assembly: Option<assembly::RemoteAssembly>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DatasetMetadata {
     pub api_version: u16,
+    pub render_modes: Vec<String>,
+    pub assembly: Option<String>,
     pub id: String,
     pub name: String,
     pub format: String,
@@ -248,6 +258,7 @@ impl IntoResponse for ApiError {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    disk_cache::configure(config.bind.port());
     let state = build_state(&config)?;
     if !config.bind.ip().is_loopback()
         && state.bearer_token.is_none()
@@ -272,6 +283,13 @@ pub async fn serve(config: ServerConfig) -> Result<(), Box<dyn std::error::Error
 
 fn router(state: AppState) -> Router {
     let cors = CorsLayer::new()
+        .expose_headers([
+            axum::http::HeaderName::from_static("x-cstudio-resolution"),
+            axum::http::HeaderName::from_static("x-cstudio-scale-max"),
+            axum::http::HeaderName::from_static("x-cstudio-source-resolution"),
+            axum::http::HeaderName::from_static("x-cstudio-cache"),
+            axum::http::HeaderName::from_static("x-cstudio-render-contract"),
+        ])
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
@@ -279,6 +297,10 @@ fn router(state: AppState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/datasets", get(list_datasets_handler))
         .route("/v1/datasets/{id}/metadata", get(metadata_handler))
+        .route("/v1/datasets/{id}/assembly", get(assembly::handler))
+        .route("/v1/datasets/{id}/render", post(raster::render_handler))
+        .route("/v1/datasets/{id}/layouts", post(layouts::handler))
+        .route("/v1/datasets/{id}/cache", get(raster::cache_status))
         .route("/v1/datasets/{id}/tiles", post(tiles_handler))
         .route("/v1/datasets/{id}/overview", post(overview_handler))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -306,8 +328,10 @@ fn build_state(config: &ServerConfig) -> Result<AppState, Box<dyn std::error::Er
         .transpose()?
         .map(Arc::<str>::from);
     Ok(AppState {
+        layouts: layouts::registry(),
         datasets: Arc::new(datasets),
         bearer_token,
+        render_slots: Arc::new(tokio::sync::Semaphore::new(2)),
     })
 }
 
@@ -364,8 +388,11 @@ impl Dataset {
                 length: source.length,
             })
             .collect();
+        let assembly = assembly::discover(&path)?;
         let metadata = DatasetMetadata {
             api_version: API_VERSION,
+            render_modes: vec!["png-v1".to_string()],
+            assembly: assembly.as_ref().map(|value| value.name.clone()),
             id,
             name: path
                 .file_name()
@@ -377,7 +404,7 @@ impl Dataset {
             available_resolutions,
             sources,
         };
-        Ok(Self { path, metadata })
+        Ok(Self { path, metadata, assembly })
     }
 }
 

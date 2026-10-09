@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Launcher shipped next to the prebuilt cstudio-server executable.
+set -euo pipefail
+umask 077
+
+usage() {
+  cat <<'HELP'
+Usage:
+  ./cstudio /absolute/path/input.mcool [port]   Start in the background
+  ./cstudio status [port]                      Show connection details
+  ./cstudio stop [port]                        Stop this service
+
+Default port: 8787. No root, Rust, Node.js or desktop environment is needed.
+Use within a trusted private network; public access requires an HTTPS proxy.
+HELP
+}
+[[ $# -gt 0 ]] || { usage; exit 0; }
+[[ "$1" != --help && "$1" != -h ]] || { usage; exit 0; }
+[[ $# -le 2 ]] || { usage >&2; exit 2; }
+action=$1
+port=${2:-8787}
+[[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || {
+  echo "Invalid port: $port" >&2; exit 2;
+}
+port=$((10#$port))
+package_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+binary="$package_dir/cstudio-server"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/cstudio-server/$port"
+mkdir -p -- "$state"
+if ! mkdir -- "$state/lock" 2>/dev/null; then
+  echo "Another launcher is active for port $port. Try again shortly." >&2; exit 1
+fi
+trap 'rmdir -- "$state/lock" 2>/dev/null || true' EXIT
+pid_file="$state/pid"
+token_file="$state/token"
+log_file="$state/server.log"
+
+# Never send a signal to a reused PID or an unrelated process.
+read_pid() {
+  pid=""
+  [[ ! -f "$pid_file" ]] || read -r pid < "$pid_file" || true
+  [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  local args
+  args=$(ps -p "$pid" -o args= 2>/dev/null) || return 1
+  [[ "$args" == *"$binary --bind 0.0.0.0:$port --token-file $token_file --dataset "* ]]
+}
+
+connection() {
+  local address
+  address=$(hostname -I 2>/dev/null | awk '{print $1}') || true
+  [[ -n "$address" ]] || address=$(hostname)
+  printf '\nC-Studio server is running (PID %s).\n' "$pid"
+  printf 'In C-Studio: Add Data → Remote project or file…\n'
+  printf 'URL:          http://%s:%s/v1/datasets/project\n' "$address" "$port"
+  printf 'Bearer token: %s\n' "$(cat -- "$token_file")"
+  printf 'Log:          %s\n' "$log_file"
+  printf 'Stop:         ./cstudio stop %s\n' "$port"
+  printf 'If the address is unreachable, use this server’s private IP and allow port %s.\n' "$port"
+}
+
+case "$action" in
+  status)
+    if read_pid; then
+      if grep -q 'C-Studio data service listening' "$log_file"; then connection
+      else printf 'Service process is starting (PID %s). Log: %s\n' "$pid" "$log_file"; fi
+    else echo "No managed service is running on port $port."; exit 1; fi
+    exit 0 ;;
+  stop)
+    if read_pid; then
+      kill -TERM "$pid"
+      for ((i=0; i<50; i++)); do
+        if ! read_pid; then rm -f -- "$pid_file"; echo "C-Studio server stopped."; exit 0; fi
+        sleep 0.1
+      done
+      echo "Shutdown requested. Check ./cstudio status $port shortly."
+    else echo "No managed service is running on port $port."; fi
+    exit 0 ;;
+esac
+
+[[ -x "$binary" ]] || {
+  echo "Missing cstudio-server executable. Extract the complete package for your Linux architecture." >&2
+  exit 1
+}
+[[ -f "$action" && -r "$action" ]] || { echo "Cannot read dataset: $action" >&2; exit 2; }
+case "$action" in *.cool|*.mcool) ;; *) echo "Dataset must end in .cool or .mcool" >&2; exit 2 ;; esac
+dataset_path="$(cd -- "$(dirname -- "$action")" && pwd -P)/$(basename -- "$action")"
+if read_pid; then
+  echo "A service is already running on port $port; no dataset was replaced."
+  connection
+  echo "To change data, stop it first, or choose another port."; exit 1
+fi
+if [[ ! -s "$token_file" ]]; then
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$token_file"
+  printf '\n' >> "$token_file"
+fi
+chmod 600 "$token_file"
+: > "$log_file"
+RUST_LOG=cstudio_server=info nohup "$binary" \
+  --bind "0.0.0.0:$port" --token-file "$token_file" \
+  --dataset "project=$dataset_path" > "$log_file" 2>&1 < /dev/null &
+pid=$!
+printf '%s\n' "$pid" > "$pid_file"
+printf 'Starting C-Studio server…\n'
+for ((i=0; i<100; i++)); do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "Startup failed:" >&2
+    cat -- "$log_file" >&2
+    rm -f -- "$pid_file"
+    exit 1
+  fi
+  if grep -q 'C-Studio data service listening' "$log_file"; then
+    connection; exit 0
+  fi
+  sleep 0.1
+done
+printf 'Still loading the dataset. Check ./cstudio status %s\nLog: %s\n' "$port" "$log_file"

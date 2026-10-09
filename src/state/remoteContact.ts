@@ -3,6 +3,8 @@ import type { ContactNormalization } from "./uiState";
 
 export interface RemoteContactMetadata {
   apiVersion: number;
+  renderModes?: string[];
+  assembly?: string | null;
   id: string;
   name: string;
   format: "cool" | "mcool";
@@ -49,6 +51,7 @@ export interface RemoteContactOverviewResponse {
 
 interface RemoteContactSource {
   datasetUrl: string;
+  serverRendering?: boolean;
   bearerToken?: string;
 }
 
@@ -123,7 +126,7 @@ export function isRemoteContactPath(path: string | null | undefined): path is st
 
 export function rememberRemoteContactSource(
   identifier: string,
-  source: { datasetUrl: string; bearerToken?: string },
+  source: { datasetUrl: string; bearerToken?: string; serverRendering?: boolean },
 ) {
   if (!isRemoteContactPath(identifier)) {
     throw new Error("Remote contact identifier must end in contact.cool or contact.mcool");
@@ -131,6 +134,7 @@ export function rememberRemoteContactSource(
   const bearerToken = source.bearerToken?.trim();
   remoteContactSources.set(identifier, {
     datasetUrl: normalizeRemoteDatasetUrl(source.datasetUrl),
+    serverRendering: source.serverRendering === true,
     ...(bearerToken ? { bearerToken } : {}),
   });
 }
@@ -284,4 +288,103 @@ export async function loadRemoteContactOverview(
     }),
   });
   return response.json() as Promise<RemoteContactOverviewResponse>;
+}
+
+export function usesRemoteRendering(identifier: string | null | undefined): boolean {
+  return Boolean(identifier && remoteContactSources.get(identifier)?.serverRendering);
+}
+
+// Weak layout keys do not retain edited/closed assemblies. One registration is
+// shared by main/overview/prefetch, independent of any one caller's abort signal.
+type LayoutRegistration = { source: RemoteContactSource; promise: Promise<string | null>; key?: string; shared?: Promise<string | null> };
+const registeredLayouts = new WeakMap<object, LayoutRegistration>();
+const layoutContentRegistrations = new WeakMap<RemoteContactSource, Map<string, Promise<string | null>>>();
+const legacyLayoutServers = new WeakSet<RemoteContactSource>();
+async function registerRenderLayout(source: RemoteContactSource, blocks: ContactMapLayoutBlock[]): Promise<string | null> {
+  if (legacyLayoutServers.has(source)) return null;
+  const existing = registeredLayouts.get(blocks);
+  if (existing?.source === source) return existing.promise;
+  const entry: LayoutRegistration = { source, promise: Promise.resolve(null) };
+  entry.promise = (async () => {
+    const body = JSON.stringify({ layoutBlocks: layoutPayload(blocks) });
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
+    const key = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+    entry.key = key;
+    let revisions = layoutContentRegistrations.get(source);
+    if (!revisions) { revisions = new Map(); layoutContentRegistrations.set(source, revisions); }
+    const shared = revisions.get(key);
+    if (shared) { entry.shared = shared; return shared; }
+    const registration = (async () => {
+    const response = await fetch(`${source.datasetUrl}/layouts`, {
+      method: "POST", headers: headersFor(source, true), body,
+    });
+    if (response.status === 404 || response.status === 405) {
+      await response.body?.cancel(); legacyLayoutServers.add(source); return null;
+    }
+    if (!response.ok) throw await responseError(response);
+    const value = await response.json();
+    if (typeof value.layoutId !== "string" || !value.layoutId) throw new Error("Invalid remote layout revision");
+    return value.layoutId as string;
+    })();
+    entry.shared = registration;
+    if (revisions.size >= 32) revisions.delete(revisions.keys().next().value!);
+    revisions.set(key, registration);
+    try { return await registration; } catch (error) {
+      if (revisions.get(key) === registration) revisions.delete(key);
+      throw error;
+    }
+  })().catch((error) => { if (registeredLayouts.get(blocks) === entry) registeredLayouts.delete(blocks); throw error; });
+  registeredLayouts.set(blocks, entry);
+  return entry.promise;
+}
+
+export async function fetchRemoteRender(
+  identifier: string, payload: unknown, signal: AbortSignal, layoutBlocks?: ContactMapLayoutBlock[],
+): Promise<Response> {
+  const source = sourceFor(identifier);
+  let layoutId = layoutBlocks ? await registerRenderLayout(source, layoutBlocks) : null;
+  let renewed = false;
+  // Busy responses contain no queued computation. Back off and stop on viewport replacement.
+  for (let attempt = 0; ; attempt += 1) {
+    signal.throwIfAborted();
+    const registration = layoutBlocks ? registeredLayouts.get(layoutBlocks) : undefined;
+    const response = await fetch(`${source.datasetUrl}/render`, {
+      method: "POST", headers: headersFor(source, true),
+      body: JSON.stringify(layoutBlocks ? { ...(payload as object),
+        ...(layoutId ? { layoutId } : { layoutBlocks: layoutPayload(layoutBlocks) }) } : payload), signal,
+    });
+    if (response.status === 410 && layoutBlocks && layoutId && !renewed) {
+      await response.body?.cancel();
+      if (registeredLayouts.get(layoutBlocks) === registration) registeredLayouts.delete(layoutBlocks);
+      const revisions = layoutContentRegistrations.get(source);
+      if (revisions && registration?.key && revisions.get(registration.key) === registration.shared) revisions.delete(registration.key);
+      layoutId = await registerRenderLayout(source, layoutBlocks); renewed = true; continue;
+    }
+    if (response.status !== 429 || attempt >= 8) {
+      if (!response.ok) throw await responseError(response);
+      return response;
+    }
+    await response.body?.cancel();
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => { clearTimeout(timer); reject(signal.reason); };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", abort);
+        resolve();
+      }, Math.min(150 * 2 ** attempt, 1500));
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    });
+  }
+}
+
+/** Fetch only the dataset-scoped endpoint; never send credentials to a metadata URL. */
+export async function loadRemoteAssembly(datasetUrl: string, bearerToken?: string): Promise<{name: string; text: string}> {
+  const response = await fetchChecked(`${normalizeRemoteDatasetUrl(datasetUrl)}/assembly`, {
+    headers: headersFor({ datasetUrl, bearerToken }),
+  });
+  const value = await response.json() as {name?: unknown; text?: unknown};
+  if (typeof value.name !== "string" || typeof value.text !== "string" || !value.text.trim()) {
+    throw new Error("Remote assembly is empty or invalid");
+  }
+  return {name: value.name, text: value.text};
 }

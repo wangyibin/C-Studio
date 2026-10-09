@@ -237,3 +237,8 @@ function interpolateColorStops(stops: readonly number[], value: number) {
   );
   return (channel(16) << 16) | (channel(8) << 8) | channel(0);
 }
+
+/** Shared by remote PNG and local palette quantization. */
+export function contactPaletteStopCount(colormap: ContactColormap): number {
+  return colormap === "Reds" || isContinuousColormap(colormap) ? 0 : discreteColormapStops[colormap].length;
+}

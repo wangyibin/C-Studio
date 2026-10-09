@@ -14,6 +14,7 @@ import {
 } from "./uiState";
 import type { ContactMapLayoutBlock } from "./importers";
 import { selectedBlockIds } from "./assemblyEditing";
+import { buildCenteredContactViewport } from "./contactViewport";
 
 describe("reduceUiState", () => {
   const assemblyBlocks = [
@@ -804,7 +805,12 @@ describe("reduceUiState", () => {
     expect(zoomedIn.contact.resolution).toBe("500 kb");
   });
 
-  it("reveals more sequence without deforming bins when the viewport aspect changes", () => {
+  it.each([
+    { width: 1200, height: 800, xSpan: 300, ySpan: 200 },
+    { width: 800, height: 1200, xSpan: 200, ySpan: 300 },
+  ])("reveals more sequence without deforming bins at $width x $height", ({
+    width, height, xSpan, ySpan,
+  }) => {
     let state = createInitialUiState("Browser preview mode");
     state = reduceUiState(state, {
       type: "setContactViewportMetrics",
@@ -818,15 +824,26 @@ describe("reduceUiState", () => {
     state = reduceUiState(state, {
       type: "setContactViewportMetrics",
       viewportSizePx: 800,
-      viewportWidthPx: 1200,
-      viewportHeightPx: 800,
+      viewportWidthPx: width,
+      viewportHeightPx: height,
       totalSpanMb: 500,
     });
 
     expect(state.contact.viewportSpanMb).toBe(200);
     expect(state.contact.resolution).toBe("250 kb");
-    expect(state.contact.viewportWidthPx * 0.25 / 300).toBe(1);
-    expect(state.contact.viewportHeightPx * 0.25 / state.contact.viewportSpanMb).toBe(1);
+    const viewport = buildCenteredContactViewport({
+      centerMb: state.contact.viewportCenterMb,
+      centerXMb: state.contact.viewportCenterXMb,
+      centerYMb: state.contact.viewportCenterYMb,
+      totalSpanBp: state.contact.totalSpanMb * 1_000_000,
+      windowSizeBp: state.contact.viewportSpanMb * 1_000_000,
+      viewportWidthPx: state.contact.viewportWidthPx,
+      viewportHeightPx: state.contact.viewportHeightPx,
+    });
+    expect(viewport.xEnd - viewport.xStart).toBe(xSpan * 1_000_000);
+    expect(viewport.yEnd - viewport.yStart).toBe(ySpan * 1_000_000);
+    expect(width * 250_000 / (viewport.xEnd - viewport.xStart)).toBe(1);
+    expect(height * 250_000 / (viewport.yEnd - viewport.yStart)).toBe(1);
   });
 
   it("keeps the same scale and resolution while resizing a locked viewport", () => {

@@ -178,6 +178,7 @@ pub struct ContactMapChunkProjector<'a> {
     last_y_source: Option<(&'a str, usize)>,
     indexed_source_slots: Vec<Option<Option<usize>>>,
     requested_tiles: Option<RequestedTileFilter>,
+    symmetric_view: bool,
     aggregate: ContactMapAggregate,
 }
 
@@ -217,8 +218,18 @@ impl<'a> ContactMapChunkProjector<'a> {
             last_y_source: None,
             indexed_source_slots: Vec::new(),
             requested_tiles: None,
+            symmetric_view: false,
             aggregate: ContactMapAggregate::Sparse(HashMap::new()),
         })
+    }
+
+    /// Opt-in screen raster projection: retain either half of an off-diagonal
+    /// viewport once, using canonical sparse keys. Existing tile callers retain
+    /// the original triangular projection semantics.
+    pub fn new_for_symmetric_view(query: &'a ContactMapQuery) -> CStudioResult<Self> {
+        let mut projector = Self::new(query)?;
+        projector.symmetric_view = true;
+        Ok(projector)
     }
 
     /// Builds an exact dense aggregate whose allocation is bounded by the
@@ -236,6 +247,7 @@ impl<'a> ContactMapChunkProjector<'a> {
             last_y_source: None,
             indexed_source_slots: Vec::new(),
             requested_tiles: None,
+            symmetric_view: false,
             aggregate: ContactMapAggregate::Dense(DenseContactMapAggregate::new(query, max_cells)?),
         })
     }
@@ -357,6 +369,7 @@ impl<'a> ContactMapChunkProjector<'a> {
             };
             Self::push_visual_contact(
                 self.query,
+                self.symmetric_view,
                 self.requested_tiles.as_ref(),
                 &mut self.aggregate,
                 x,
@@ -396,6 +409,7 @@ impl<'a> ContactMapChunkProjector<'a> {
                 };
                 Self::push_visual_contact(
                     self.query,
+                    self.symmetric_view,
                     self.requested_tiles.as_ref(),
                     &mut self.aggregate,
                     x,
@@ -423,6 +437,7 @@ impl<'a> ContactMapChunkProjector<'a> {
 
     fn push_visual_contact(
         query: &ContactMapQuery,
+        symmetric_view: bool,
         requested_tiles: Option<&RequestedTileFilter>,
         aggregate: &mut ContactMapAggregate,
         x: u64,
@@ -430,7 +445,8 @@ impl<'a> ContactMapChunkProjector<'a> {
         count: f64,
     ) {
         let (visual_x, visual_y) = if x <= y { (x, y) } else { (y, x) };
-        if !query.viewport.contains(visual_x, visual_y) {
+        if !query.viewport.contains(visual_x, visual_y)
+            && !(symmetric_view && query.viewport.contains(visual_y, visual_x)) {
             return;
         }
         let x_bin = visual_x / query.target_resolution;
@@ -715,6 +731,24 @@ mod tests {
         },
         CStudioError,
     };
+
+    #[test]
+    fn symmetric_view_keeps_off_diagonal_cells_once_without_changing_default() {
+        let mut query = ContactMapQuery { base_resolution: 10, target_resolution: 10,
+            viewport: Viewport { x_start: 50, x_end: 100, y_start: 0, y_end: 50 },
+            layout_blocks: vec![LayoutBlock { id: "a".into(), source_id: "a".into(),
+                source_start: 0, source_end: 100, visual_start: 0, orientation: Orientation::Forward }] };
+        let mut original = ContactMapChunkProjector::new(&query).unwrap();
+        original.push_contact("a", 10, "a", 70, 9.0);
+        assert!(original.take_view().cells.is_empty());
+        let mut symmetric = ContactMapChunkProjector::new_for_symmetric_view(&query).unwrap();
+        symmetric.push_contact("a", 10, "a", 70, 9.0);
+        assert_eq!(symmetric.take_view().cells, vec![ContactMapCell {x_bin:1,y_bin:7,count:9.0}]);
+        query.viewport = Viewport {x_start:0,x_end:100,y_start:0,y_end:100};
+        let mut symmetric = ContactMapChunkProjector::new_for_symmetric_view(&query).unwrap();
+        symmetric.push_contact("a", 10, "a", 70, 9.0);
+        assert_eq!(symmetric.take_view().cells[0].count, 9.0);
+    }
 
     #[test]
     fn cancellation_stops_before_consuming_contact_aggregation_input() {

@@ -152,3 +152,23 @@ describe("remote contact dataset URLs", () => {
     forgetRemoteContactSource(identifier);
   });
 });
+
+describe("remote assembly", () => {
+  it("loads the authenticated dataset AGP without downloading the matrix", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({name:"groups.agp", text:"agp contents"})));
+    vi.stubGlobal("fetch", fetchMock);
+    const { loadRemoteAssembly } = await import("./remoteContact");
+    expect(await loadRemoteAssembly("https://example.org/v1/datasets/a", "secret"))
+      .toEqual({name:"groups.agp", text:"agp contents"});
+    expect(fetchMock).toHaveBeenCalledWith("https://example.org/v1/datasets/a/assembly", {
+      headers: {Authorization: "Bearer secret"},
+    });
+  });
+  it("surfaces missing and invalid AGP responses", async () => {
+    const { loadRemoteAssembly } = await import("./remoteContact");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response('{"error":"No AGP"}', {status:404})));
+    await expect(loadRemoteAssembly("https://example.org/v1/datasets/a")).rejects.toThrow("No AGP");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response('{"name":"a.agp","text":""}')));
+    await expect(loadRemoteAssembly("https://example.org/v1/datasets/a")).rejects.toThrow("empty or invalid");
+  });
+});

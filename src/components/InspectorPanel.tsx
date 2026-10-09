@@ -1,3 +1,4 @@
+import { drawRemoteRaster } from "../state/remoteContactRaster";
 import { useEffect, useRef, useState } from "react";
 import { LocateFixed, Maximize2 } from "lucide-react";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
@@ -1304,6 +1305,14 @@ export function drawOverviewHeatmap(
   ) {
     canvas.width = contactOverviewRasterSize;
     canvas.height = contactOverviewRasterSize;
+  }
+  if (contactMap?.raster) {
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, contactOverviewRasterSize, contactOverviewRasterSize);
+    drawRemoteRaster(context, contactMap.raster,
+      { xStart: 0, yStart: 0, xEnd: totalSpanBp, yEnd: totalSpanBp },
+      0, 0, contactOverviewRasterSize, contactOverviewRasterSize);
+    return;
   }
   logOverviewRasterMemoryCheckpoint(
     "overview_create_image_data_before",

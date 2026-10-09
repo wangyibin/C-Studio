@@ -14,7 +14,7 @@ import {
   Undo2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
@@ -506,10 +506,12 @@ export function AppShell({
   useEffect(() => {
     changePlacementPreview(null);
   }, [activeAssemblyBlocks, changePlacementPreview, placementSelectionKey, uiState.normalization]);
-  const gfaHomologs = classifyGfaScaffolds(
+  // Camera updates do not change scaffold classification. In large AGPs,
+  // sorting every scaffold here blocks pointer-up and delays the next render.
+  const gfaHomologs = useMemo(() => classifyGfaScaffolds(
     [...new Set(activeAssemblyBlocks.map((block) => block.objectId))],
     gfaHomologPattern,
-  );
+  ), [activeAssemblyBlocks, gfaHomologPattern]);
   const chromosomeIds = chromosomeVisibility.chromosomeIds;
   const unanchoredObjectIds = chromosomeVisibility.unanchoredIds;
   const visibleChromosomeCount = chromosomeIds.filter(
