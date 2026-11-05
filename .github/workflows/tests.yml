@@ -1,0 +1,100 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend and curation workflow
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Unit, component and file workflow tests
+        run: npm run test:ci
+      - name: Type-check and build frontend
+        run: npm run build
+      - name: Preserve test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-test-report
+          path: test-results/vitest.xml
+          if-no-files-found: warn
+          retention-days: 30
+
+  rust:
+    name: Rust (${{ matrix.name }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Bound memory use when this same workflow runs under local amd64 emulation.
+      max-parallel: 1
+      matrix:
+        include:
+          - name: core
+            directory: crates/cstudio-core
+            args: --features portable-hdf5
+          - name: desktop
+            directory: src-tauri
+            args: --features portable-hdf5
+          - name: server
+            directory: crates/cstudio-server
+            args: --features portable-hdf5
+          - name: cool2mcool
+            directory: tools/cool2mcool
+            args: ''
+    env:
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config zlib1g-dev
+      - name: Install Tauri system libraries
+        if: matrix.name == 'desktop'
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ matrix.directory }} -> target'
+      - name: Run Rust tests with the committed lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          {
+            git rev-parse HEAD
+            rustc --version
+            cargo --version
+            cargo test --locked --manifest-path '${{ matrix.directory }}/Cargo.toml' ${{ matrix.args }}
+          } 2>&1 | tee 'test-results/${{ matrix.name }}.log'
+      - name: Preserve Rust test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-log-${{ matrix.name }}
+          path: test-results/${{ matrix.name }}.log
+          if-no-files-found: warn
+          retention-days: 30

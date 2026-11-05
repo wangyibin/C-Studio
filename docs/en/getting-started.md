@@ -89,7 +89,7 @@ have no copies left.
 
 ## 6. Save an edited AGP
 
-Press ++cmd+s++ on macOS or ++ctrl+s++ on Windows, or click the save icon.
+Press ++cmd+s++ on macOS or ++ctrl+s++ on Windows / Linux, or click the save icon.
 C-Studio saves the edited AGP and a same-prefix `.history.json` sidecar that
 contains the compatible undo/redo timeline.
 

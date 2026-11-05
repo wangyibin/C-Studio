@@ -69,6 +69,6 @@ restore the initially loaded AGP while retaining other evidence sources.
 ## Platform note
 
 The desktop application uses Tauri's native dialog plugin for project folders
-and individual data files on macOS and Windows. A complete real-Windows
-click-through remains a separate release QA step. Browser preview can fall back
+and individual data files on macOS, Windows, and Linux. Full native Windows
+and Linux interaction checks remain separate release QA steps. Browser preview can fall back
 to web inputs for text files, but it does not provide the desktop HDF5 backend.

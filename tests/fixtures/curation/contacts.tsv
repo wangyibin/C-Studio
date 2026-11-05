@@ -1,0 +1,6 @@
+source1	start1	source2	start2	count
+ctgA	0	ctgA	1000	2
+ctgA	1000	ctgB	0	3
+ctgB	0	ctgB	3000	5
+ctgB	2000	ctgD	0	11
+ctgC	0	ctgD	3000	7

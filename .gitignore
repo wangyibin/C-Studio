@@ -10,6 +10,7 @@ site/
 build/
 out/
 coverage/
+test-results/
 target/
 src-tauri/target/
 crates/**/target/

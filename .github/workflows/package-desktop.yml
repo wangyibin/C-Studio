@@ -1,18 +1,13 @@
 name: Package desktop apps and cool2mcool
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
-      target:
-        description: Packages to build
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - windows
       release_tag:
-        description: Optional v* tag to publish, or to supplement with Windows packages
+        description: Optional existing v* tag to build and publish macOS, Windows and Linux desktop packages
         required: false
         type: string
 
@@ -26,7 +21,6 @@ concurrency:
 jobs:
   package-macos:
     name: macOS ${{ matrix.platform_name }}
-    if: inputs.target == 'all'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -46,6 +40,13 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Verify desktop release version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+        run: node scripts/release-version.mjs
 
       - name: Set up Pixi package environment
         uses: prefix-dev/setup-pixi@v0.10.1
@@ -65,8 +66,9 @@ jobs:
 
       - name: Verify macOS executable architecture
         run: >-
-          lipo -verify_arch ${{ matrix.binary_arch }}
+          lipo
           "src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/C-Studio.app/Contents/MacOS/c-studio"
+          -verify_arch ${{ matrix.binary_arch }}
 
       - name: Archive macOS app bundle
         run: >-
@@ -84,6 +86,71 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  package-linux:
+    name: Linux x64
+    # Build on the oldest supported base to keep the glibc requirement low.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Verify desktop release version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+        run: node scripts/release-version.mjs
+
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl wget file patchelf \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libfuse2
+
+      - name: Set up Pixi package environment
+        uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          pixi-version: v0.75.0
+          environments: package
+          locked: true
+          cache: true
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Test packaging validation
+        run: pixi run --locked -e package node --test scripts/test-package-linux.mjs scripts/test-release-local.mjs
+
+      - name: Build Linux Debian package and AppImage
+        run: pixi run --locked -e package package-linux
+
+      - name: Check Linux runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=src-tauri/target/x86_64-unknown-linux-gnu/release/c-studio
+          dependencies=$(ldd "$binary")
+          printf '%s\n' "$dependencies"
+          if grep -E 'not found|\.pixi/|libhdf5' <<< "$dependencies"; then
+            echo 'Linux desktop must use system runtime libraries and statically linked HDF5.'
+            exit 1
+          fi
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-studio-linux-x64-${{ github.run_number }}
+          path: |
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
   package-windows:
     name: Windows x64
     runs-on: windows-latest
@@ -91,6 +158,13 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Verify desktop release version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+        run: node scripts/release-version.mjs
 
       - name: Set up Pixi package environment
         uses: prefix-dev/setup-pixi@v0.10.1
@@ -120,7 +194,6 @@ jobs:
 
   package-cool2mcool:
     name: cool2mcool ${{ matrix.platform_name }}
-    if: inputs.target == 'all'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -139,6 +212,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up Pixi cool2mcool environment
         uses: prefix-dev/setup-pixi@v0.10.1
@@ -193,20 +268,16 @@ jobs:
     if: >-
       ${{
         always() &&
-        inputs.release_tag != '' &&
+        (inputs.release_tag != '' || github.ref_type == 'tag') &&
         needs.package-windows.result == 'success' &&
-        (
-          inputs.target == 'windows' ||
-          (
-            inputs.target == 'all' &&
-            needs.package-macos.result == 'success' &&
-            needs.package-cool2mcool.result == 'success'
-          )
-        )
+        needs.package-macos.result == 'success' &&
+        needs.package-linux.result == 'success' &&
+        needs.package-cool2mcool.result == 'success'
       }}
     needs:
       - package-macos
       - package-windows
+      - package-linux
       - package-cool2mcool
     runs-on: ubuntu-latest
     permissions:
@@ -219,22 +290,9 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Download existing release assets
-        if: inputs.target == 'windows'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          gh release view "$RELEASE_TAG" >/dev/null
-          mkdir existing-release-assets
-          gh release download "$RELEASE_TAG" --dir existing-release-assets
-
       - name: Prepare release assets and checksums
         env:
-          PACKAGE_TARGET: ${{ inputs.target }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -242,6 +300,10 @@ jobs:
           mkdir release-files
           while IFS= read -r -d '' source; do
             name=$(basename "$source")
+            if [[ ! -s "$source" ]]; then
+              echo "Empty release asset: $name"
+              exit 1
+            fi
             if [[ -e "release-files/$name" ]]; then
               echo "Duplicate release asset name: $name"
               exit 1
@@ -249,18 +311,19 @@ jobs:
             cp "$source" "release-files/$name"
           done < <(find release-assets -type f -print0)
 
-          required_patterns=('*.exe' '*.msi')
-          if [[ "$PACKAGE_TARGET" == 'all' ]]; then
-            required_patterns+=(
+          required_patterns=(
+              "C-Studio_${RELEASE_TAG#v}_x64-setup.exe"
+              "C-Studio_${RELEASE_TAG#v}_x64*.msi"
               'C-Studio-arm64.app.zip'
               'C-Studio-x64.app.zip'
-              '*_aarch64.dmg'
-              '*_x64.dmg'
+              "C-Studio_${RELEASE_TAG#v}_aarch64.dmg"
+              "C-Studio_${RELEASE_TAG#v}_x64.dmg"
+              "C-Studio_${RELEASE_TAG#v}_amd64.deb"
+              "C-Studio_${RELEASE_TAG#v}_amd64.AppImage"
               'cool2mcool-*-linux-x86_64.tar.gz'
               'cool2mcool-*-linux-aarch64.tar.gz'
               'cool2mcool-*-macos-arm64.tar.gz'
-            )
-          fi
+          )
 
           for pattern in "${required_patterns[@]}"; do
             if ! compgen -G "release-files/$pattern" >/dev/null; then
@@ -270,14 +333,6 @@ jobs:
           done
 
           mkdir checksum-files
-          if [[ "$PACKAGE_TARGET" == 'windows' ]]; then
-            while IFS= read -r -d '' source; do
-              name=$(basename "$source")
-              if [[ "$name" != 'SHA256SUMS' ]]; then
-                cp "$source" "checksum-files/$name"
-              fi
-            done < <(find existing-release-assets -type f -print0)
-          fi
           cp release-files/* checksum-files/
 
           (
@@ -289,8 +344,8 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          PACKAGE_TARGET: ${{ inputs.target }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -298,10 +353,7 @@ jobs:
           mapfile -d '' release_assets \
             < <(find release-files -maxdepth 1 -type f ! -name 'SHA256SUMS' -print0)
 
-          if [[ "$PACKAGE_TARGET" == 'windows' ]]; then
-            gh release upload "$RELEASE_TAG" "${release_assets[@]}" --clobber
-            gh release upload "$RELEASE_TAG" release-files/SHA256SUMS --clobber
-          elif gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${release_assets[@]}" --clobber
             gh release upload "$RELEASE_TAG" release-files/SHA256SUMS --clobber
           else

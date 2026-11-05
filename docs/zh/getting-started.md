@@ -83,7 +83,7 @@ AGP、接触矩阵 bin、PAF、覆盖度和 GFA 中的 contig 标识需要一致
 
 ## 6. 保存编辑后的 AGP
 
-macOS 按 ++cmd+s++，Windows 按 ++ctrl+s++，也可以点击保存图标。
+macOS 按 ++cmd+s++，Windows / Linux 按 ++ctrl+s++，也可以点击保存图标。
 C-Studio 会同时保存编辑后的 AGP 和同前缀的 `.history.json` 历史文件。
 历史文件记录已执行和已撤销的操作；与 AGP 匹配时，重新打开项目后可以恢复
 这些记录，继续撤销或重做。

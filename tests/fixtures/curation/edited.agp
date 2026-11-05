@@ -1,0 +1,8 @@
+Chr02	1	4000	1	W	ctgC	1	4000	+
+Chr02	4001	4200	2	N	200	scaffold	yes	paired-ends
+Chr02	4201	8200	3	W	ctgD	1	4000	+
+Chr01	1	4000	1	W	ctgA	1	4000	+
+Chr01	4001	4100	2	U	100	contig	no	na
+Chr01	4101	6100	3	W	ctgB	2001	4000	-
+Chr01	6101	6200	4	U	100	contig	no	na
+Chr01	6201	8200	5	W	ctgB	1	2000	-

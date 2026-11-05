@@ -36,6 +36,13 @@ server-test = "cargo test --manifest-path crates/cstudio-server/Cargo.toml"
 server-build = "cargo build --release --manifest-path crates/cstudio-server/Cargo.toml --features portable-hdf5"
 package-macos = { cmd = "node scripts/package-macos.mjs", depends-on = ["package-install"], env = { APPLE_SIGNING_IDENTITY = "-" } }
 package-windows = { cmd = "node scripts/package-windows.mjs", depends-on = ["package-install"] }
+package-linux = { cmd = "node scripts/package-linux.mjs", depends-on = ["package-install"] }
+release-local = "node scripts/release-local.mjs"
+
+# On Apple Silicon, Pixi runs this environment's Intel toolchain under
+# Rosetta. Keeping it separate also supplies the matching Intel dylibs.
+[feature.package-intel]
+platforms = ["osx-64"]
 
 [feature.docs.dependencies]
 python = "3.12.*"
@@ -53,4 +60,5 @@ docs-serve-zh = "zensical serve -f mkdocs_zh.yml -a localhost:1212"
 
 [environments]
 package = { features = ["package"], no-default-feature = true }
+package-intel = { features = ["package", "package-intel"], no-default-feature = true }
 docs = { features = ["docs"], no-default-feature = true }

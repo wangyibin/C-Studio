@@ -39,32 +39,31 @@ describe("confirmed contact map layout styles", () => {
     );
   });
 
-  it("keeps the outer heatmap stage on one responsive square grid track", () => {
-    expect(confirmedRedesignStyles).toContain(
-      "grid-template-columns: 58px var(--contact-map-square-size, 0px) 42px minmax(0, 1fr);",
-    );
-    expect(confirmedRedesignStyles).toContain(
-      "grid-template-rows: 27px var(--contact-map-square-size, 0px) 39px minmax(0, 1fr);",
-    );
-    expect(viewportSource).toContain('layout.style.setProperty("--contact-map-square-size"');
+  it("lets the heatmap fill a rectangular grid with independent axis dimensions", () => {
+    const grid = confirmedRedesignStyles.match(/\.map-content\s*\{([^}]*)\}/)?.[1];
+    expect(grid).toMatch(/grid-template-columns:\s*\d+px minmax\(0, 1fr\) \d+px;/);
+    expect(grid).toMatch(/grid-template-rows:\s*\d+px minmax\(0, 1fr\) \d+px;/);
+    expect(confirmedRedesignStyles).not.toContain("--contact-map-square-size");
+    expect(viewportSource).toContain("viewportWidthPx: bounds.width");
+    expect(viewportSource).toContain("viewportHeightPx: bounds.height");
     expect(confirmedRedesignStyles).toMatch(
-      /\.heatmap-stage\s*\{[\s\S]*?width:\s*100%;[\s\S]*?height:\s*100%;[\s\S]*?aspect-ratio:\s*auto;/,
+      /\.heatmap-stage\s*\{[^}]*width:\s*100%;[^}]*height:\s*100%;[^}]*aspect-ratio:\s*auto;/,
     );
   });
 
   it("places the coverage track above the heatmap on their shared X grid", () => {
     expect(confirmedRedesignStyles).toMatch(
-      /\.map-content\.has-coverage-track\s*\{[\s\S]*?"coverage-gutter coverage-track coverage-end \."[\s\S]*?"ticks-y stage navigator-y \."[\s\S]*?"bottom-corner navigator-x navigator-corner \."/,
+      /\.map-content\.has-coverage-track\s*\{[^}]*"coverage-gutter coverage-track coverage-end"[^}]*"ticks-y stage navigator-y"[^}]*"bottom-corner navigator-x navigator-corner"/,
     );
     expect(styles).toMatch(
       /\.coverage-bars\s*\{[\s\S]*?grid-area:\s*coverage-track;/,
     );
     expect(viewportSource).toContain("<TrackPanel");
     expect(confirmedRedesignStyles).toContain(
-      "grid-template-rows: 27px clamp(42px, 6.5vh, 59px) var(--contact-map-square-size, 0px) 39px minmax(0, 1fr);",
+      "grid-template-rows: 27px clamp(42px, 6.5vh, 59px) minmax(0, 1fr) 39px;",
     );
     expect(confirmedRedesignStyles).toContain(
-      "grid-template-rows: 24px 36px var(--contact-map-square-size, 0px) 34px minmax(0, 1fr);",
+      "grid-template-rows: 24px 36px minmax(0, 1fr) 34px;",
     );
     expect(styles).toMatch(
       /\.coverage-chromosome-grid\s*\{[\s\S]*?pointer-events:\s*none;/,
