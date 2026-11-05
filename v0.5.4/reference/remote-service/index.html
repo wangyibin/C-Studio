@@ -1,0 +1,1625 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Documentation for visual genome assembly inspection and evidence-guided curation with C-Studio">
+      
+      
+      
+        <link rel="canonical" href="https://wangyibin.github.io/C-Studio/v0.5.4/reference/remote-service/">
+      
+      
+        <link rel="prev" href="../../user-guide/evidence/">
+      
+      
+        <link rel="next" href="../formats/">
+      
+      
+        
+          <link rel="alternate" href="/C-Studio/" hreflang="en">
+        
+          <link rel="alternate" href="/C-Studio/zh/" hreflang="zh">
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="zensical-0.0.54">
+    
+    
+      
+        <title>Remote service deployment and caching - C-Studio</title>
+      
+    
+    
+      
+        
+      
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.20815dad.min.css">
+      
+        
+          
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/modern/palette.dfe2e883.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,500,500i,700,700i%7CJetBrains+Mono:400,400i,700,700i&amp;display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_scope.pathname.endsWith("/")||(__md_scope=new URL(__md_scope.pathname+"/",location)),__md_hash=e=>[...e].reduce(((e,t)=>(e<<5)-e+t.charCodeAt(0)),0),__md_get=(e,t=localStorage,_=__md_scope)=>JSON.parse(t.getItem(_.pathname+"."+e)),__md_set=(e,t,_=localStorage,a=__md_scope)=>{try{_.setItem(a.pathname+"."+e,JSON.stringify(t))}catch(e){}},document.documentElement.setAttribute("data-platform",navigator.platform)</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="cyan">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer" aria-label="Navigation"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#remote-service-deployment-and-caching" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="C-Studio" class="md-header__button md-logo" aria-label="C-Studio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 2h2v2c0 1.44.68 2.61 1.88 3.78.86.83 2.01 1.63 3.21 2.42l-1.83 1.19C8.27 10.72 7.31 10 6.5 9.21 5.07 7.82 4 6.1 4 4zm14 0h2v2c0 2.1-1.07 3.82-2.5 5.21-1.41 1.38-3.21 2.52-4.96 3.63-1.75 1.12-3.45 2.21-4.66 3.38C6.68 17.39 6 18.56 6 20v2H4v-2c0-2.1 1.07-3.82 2.5-5.21 1.41-1.38 3.21-2.52 4.96-3.63 1.75-1.12 3.45-2.21 4.66-3.38C17.32 6.61 18 5.44 18 4zm-3.26 10.61c.99.67 1.95 1.39 2.76 2.18C18.93 16.18 20 17.9 20 20v2h-2v-2c0-1.44-.68-2.61-1.88-3.78-.86-.83-2.01-1.63-3.21-2.42zM7 3h10v1l-.06.5H7.06L7 4zm.68 3h8.64c-.24.34-.52.69-.9 1.06l-.51.44H9.07l-.49-.44c-.38-.37-.66-.72-.9-1.06m1.41 10.5h5.84l.49.44c.38.37.66.72.9 1.06H7.68c.24-.34.52-.69.9-1.06zm-2.03 3h9.88l.06.5v1H7v-1z"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer" aria-label="Navigation">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-menu" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            C-Studio
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Remote service deployment and caching
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="cyan"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="cyan"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+      <div class="md-header__option">
+  <div class="md-select">
+    
+    <button class="md-header__button md-icon" aria-label="Select language">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-languages" viewBox="0 0 24 24"><path d="m5 8 6 6M4 14l6-6 2-3M2 5h12M7 2h1M22 22l-5-10-5 10M14 18h6"/></svg>
+    </button>
+    <div class="md-select__inner">
+      <ul class="md-select__list">
+        
+          <li class="md-select__item">
+            <a href="/C-Studio/" hreflang="en" class="md-select__link">
+              English
+            </a>
+          </li>
+        
+          <li class="md-select__item">
+            <a href="/C-Studio/zh/" hreflang="zh" class="md-select__link">
+              简体中文
+            </a>
+          </li>
+        
+      </ul>
+    </div>
+  </div>
+</div>
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search" aria-label="Search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog" aria-label="Search">
+  <button type="button" class="md-search__button">
+    Search
+  </button>
+</div>
+      
+    
+    <div class="md-header__source">
+      
+        <a href="https://github.com/wangyibin/C-Studio" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.3.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path fill="currentColor" d="M216.5 362.5c-66-8-112.5-55.5-112.5-117 0-25 9-52 24-70-6.5-16.5-5.5-51.5 2-66 20-2.5 47 8 63 22.5 19-6 39-9 63.5-9s44.5 3 62.5 8.5c15.5-14 43-24.5 63-22 7 13.5 8 48.5 1.5 65.5 16 19 24.5 44.5 24.5 70.5 0 61.5-46.5 108-113.5 116.5 17 11 28.5 35 28.5 62.5v52c0 15 12.5 23.5 27.5 17.5C441 459.5 512 369 512 257 512 115.5 397 0 255.5 0S0 115.5 0 257c0 111 70.5 203 165.5 237.5 13.5 5 26.5-4 26.5-17.5v-40c-7 3-16 5-24 5-33 0-52.5-18-66.5-51.5-5.5-13.5-11.5-21.5-23-23-6-.5-8-3-8-6 0-6 10-10.5 20-10.5 14.5 0 27 9 40 27.5 10 14.5 20.5 21 33 21s20.5-4.5 32-16c8.5-8.5 15-16 21-21"/></svg>
+  </div>
+  <div class="md-source__repository">
+    wangyibin/C-Studio
+  </div>
+</a>
+      
+    </div>
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../installation/" class="md-tabs__link">
+        
+  
+  Installation
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../getting-started/" class="md-tabs__link">
+        
+  
+  Get started
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+      
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../user-guide/input-preparation/" class="md-tabs__link">
+          
+  
+  User guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+      
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="././" class="md-tabs__link">
+          
+  
+  Misc
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="C-Studio" class="md-nav__button md-logo" aria-label="C-Studio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 2h2v2c0 1.44.68 2.61 1.88 3.78.86.83 2.01 1.63 3.21 2.42l-1.83 1.19C8.27 10.72 7.31 10 6.5 9.21 5.07 7.82 4 6.1 4 4zm14 0h2v2c0 2.1-1.07 3.82-2.5 5.21-1.41 1.38-3.21 2.52-4.96 3.63-1.75 1.12-3.45 2.21-4.66 3.38C6.68 17.39 6 18.56 6 20v2H4v-2c0-2.1 1.07-3.82 2.5-5.21 1.41-1.38 3.21-2.52 4.96-3.63 1.75-1.12 3.45-2.21 4.66-3.38C17.32 6.61 18 5.44 18 4zm-3.26 10.61c.99.67 1.95 1.39 2.76 2.18C18.93 16.18 20 17.9 20 20v2h-2v-2c0-1.44-.68-2.61-1.88-3.78-.86-.83-2.01-1.63-3.21-2.42zM7 3h10v1l-.06.5H7.06L7 4zm.68 3h8.64c-.24.34-.52.69-.9 1.06l-.51.44H9.07l-.49-.44c-.38-.37-.66-.72-.9-1.06m1.41 10.5h5.84l.49.44c.38.37.66.72.9 1.06H7.68c.24-.34.52-.69.9-1.06zm-2.03 3h9.88l.06.5v1H7v-1z"/></svg>
+
+    </a>
+    C-Studio
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/wangyibin/C-Studio" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.3.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path fill="currentColor" d="M216.5 362.5c-66-8-112.5-55.5-112.5-117 0-25 9-52 24-70-6.5-16.5-5.5-51.5 2-66 20-2.5 47 8 63 22.5 19-6 39-9 63.5-9s44.5 3 62.5 8.5c15.5-14 43-24.5 63-22 7 13.5 8 48.5 1.5 65.5 16 19 24.5 44.5 24.5 70.5 0 61.5-46.5 108-113.5 116.5 17 11 28.5 35 28.5 62.5v52c0 15 12.5 23.5 27.5 17.5C441 459.5 512 369 512 257 512 115.5 397 0 255.5 0S0 115.5 0 257c0 111 70.5 203 165.5 237.5 13.5 5 26.5-4 26.5-17.5v-40c-7 3-16 5-24 5-33 0-52.5-18-66.5-51.5-5.5-13.5-11.5-21.5-23-23-6-.5-8-3-8-6 0-6 10-10.5 20-10.5 14.5 0 27 9 40 27.5 10 14.5 20.5 21 33 21s20.5-4.5 32-16c8.5-8.5 15-16 21-21"/></svg>
+  </div>
+  <div class="md-source__repository">
+    wangyibin/C-Studio
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Home
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Installation
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Get started
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  User guide
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+  User guide
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/input-preparation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Prepare input files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/project-data/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Project data
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/remote-contact-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Using remote files
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/interface/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Interface
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/navigation-selection/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Navigation and selection
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/assembly-editing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Assembly editing
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/evidence/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Evidence views
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Misc
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+  Misc
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Remote service deployment
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="././" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Remote service deployment
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      On this page
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#build-the-service" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Build the service
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#start-on-the-local-machine" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Start on the local machine
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#serve-another-machine" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Serve another machine
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#api-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        API boundary
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#operational-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Operational requirements
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#server-side-rendering" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Server-side rendering
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Server-side rendering">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#automatic-remote-agp-loading" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Automatic remote AGP loading
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#remote-read-optimization" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Remote read optimization
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#layout-revisions-and-independent-tile-reuse" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Layout revisions and independent tile reuse
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#background-warming-and-persistent-counts" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Background warming and persistent counts
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#image-tiles-during-pan" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Image tiles during pan
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../formats/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Data formats
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shortcuts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Keyboard shortcuts
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../limitations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Current limitations
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Troubleshooting
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  
+                    
+                    
+                    
+                      
+                    
+                    
+                      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+                      <div class="md-sidebar-button__wrapper">
+                        <label class="md-sidebar-button" for="__toc"></label>
+                      </div>
+                    
+                  
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      On this page
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#build-the-service" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Build the service
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#start-on-the-local-machine" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Start on the local machine
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#serve-another-machine" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Serve another machine
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#api-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        API boundary
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#operational-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Operational requirements
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#server-side-rendering" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Server-side rendering
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Server-side rendering">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#automatic-remote-agp-loading" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Automatic remote AGP loading
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#remote-read-optimization" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Remote read optimization
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#layout-revisions-and-independent-tile-reuse" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Layout revisions and independent tile reuse
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#background-warming-and-persistent-counts" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Background warming and persistent counts
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#image-tiles-during-pan" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Image tiles during pan
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+  
+  
+
+
+<h1 id="remote-service-deployment-and-caching">Remote service deployment and caching<a class="headerlink" href="#remote-service-deployment-and-caching" title="Permanent link">&para;</a></h1>
+<p>For connection steps, see <a href="../../user-guide/remote-contact-service/">Using remote files</a>. This page covers service deployment and maintenance.</p>
+<p>Maintainers build Linux x86_64 / ARM64 packages with <code>bash scripts/package-server.sh</code> or the <strong>Package C-Studio server</strong> GitHub workflow. The build does not publish a release automatically.</p>
+<h2 id="build-the-service">Build the service<a class="headerlink" href="#build-the-service" title="Permanent link">&para;</a></h2>
+<p>From the C-Studio source directory:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>--manifest-path<span class="w"> </span>crates/cstudio-server/Cargo.toml<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>--features<span class="w"> </span>portable-hdf5
+</span></code></pre></div>
+<p>The <code>portable-hdf5</code> build compiles HDF5 and zlib into the service build, so the
+server machine does not need a separately installed HDF5 runtime. The resulting
+binary is under <code>crates/cstudio-server/target/release/</code>.</p>
+<h2 id="start-on-the-local-machine">Start on the local machine<a class="headerlink" href="#start-on-the-local-machine" title="Permanent link">&para;</a></h2>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>crates/cstudio-server/target/release/cstudio-server<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>--dataset<span class="w"> </span><span class="nv">example</span><span class="o">=</span>/absolute/path/to/input.mcool
+</span></code></pre></div>
+<p>The safe default listens only on <code>127.0.0.1:8787</code>. In C-Studio, choose
+<strong>Add Data → Remote project or file…</strong> and enter:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>http://127.0.0.1:8787/v1/datasets/example
+</span></code></pre></div>
+<p>Repeat <code>--dataset ID=PATH</code> to publish more than one whitelisted file. The
+service does not accept arbitrary filesystem paths from clients.</p>
+<h2 id="serve-another-machine">Serve another machine<a class="headerlink" href="#serve-another-machine" title="Permanent link">&para;</a></h2>
+<p>Create a file containing one strong bearer token, then start the service on a
+private interface:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>crates/cstudio-server/target/release/cstudio-server<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>--bind<span class="w"> </span><span class="m">0</span>.0.0.0:8787<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>--token-file<span class="w"> </span>/absolute/path/to/cstudio-token.txt<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span>--dataset<span class="w"> </span><span class="nv">example</span><span class="o">=</span>/absolute/path/to/input.mcool
+</span></code></pre></div>
+<p>Enter the same token in C-Studio's connection dialog. The token stays in the
+current application memory and is not written into a project file.</p>
+<p>For traffic outside a trusted private network, put the service behind an HTTPS
+reverse proxy and use an <code>https://</code> dataset URL. A bearer token over plain HTTP
+can be read in transit. The service refuses a non-loopback listener without a
+token unless <code>--allow-unauthenticated-remote</code> is explicitly supplied.</p>
+<h2 id="api-boundary">API boundary<a class="headerlink" href="#api-boundary" title="Permanent link">&para;</a></h2>
+<p>API version 1 exposes:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/v1/health</code></td>
+<td>Liveness and API version</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/v1/datasets</code></td>
+<td>Registered datasets</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/v1/datasets/{id}/metadata</code></td>
+<td>Format, size, resolutions, and sources</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/v1/datasets/{id}/assembly</code></td>
+<td>Companion AGP</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/datasets/{id}/layouts</code></td>
+<td>Register a layout revision</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/datasets/{id}/render</code></td>
+<td>Server-rendered heatmap PNG</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/v1/datasets/{id}/cache</code></td>
+<td>Cache and warming status</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/datasets/{id}/overview</code></td>
+<td>A bounded overview for navigation</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/datasets/{id}/tiles</code></td>
+<td>Sparse binary <code>CST1</code> contact tiles</td>
+</tr>
+</tbody>
+</table>
+<p>The client registers the AGP-derived layout and references its revision, so server
+projection follows the desktop order, orientation, and source intervals. Older
+servers receive the full layout. Dataset files remain read-only; no endpoint
+modifies the source file.</p>
+<h2 id="operational-requirements">Operational requirements<a class="headerlink" href="#operational-requirements" title="Permanent link">&para;</a></h2>
+<ul>
+<li>The service process must be able to read every registered <code>.cool</code> or <code>.mcool</code>
+  file and traverse its parent directories.</li>
+<li>Keep dataset files stable while the service is running. Replace a file by
+  restarting the service rather than overwriting it in place.</li>
+<li>Use an SSH tunnel for a loopback listener; for direct access, make the advertised
+  service address reachable from the client.</li>
+<li>Use a reverse proxy for TLS, access logs, rate limits, and organization-level
+  authentication when exposing the service beyond one trusted workstation.</li>
+</ul>
+<p>The initial implementation uses the existing C-Studio reader caches within one
+service process. It does not yet provide a distributed tile cache, resumable
+offline downloads, or server-side PAF/GFA/coverage processing.</p>
+<h2 id="server-side-rendering">Server-side rendering<a class="headerlink" href="#server-side-rendering" title="Permanent link">&para;</a></h2>
+<p>Updated clients automatically use server rendering when dataset metadata advertises <code>png-v1</code>.
+The Linux service reads, projects through the current AGP layout, aggregates and colors the
+matrix. <code>POST /v1/datasets/{id}/render</code> returns a PNG for both the main viewport and overview.
+The desktop keeps selection, axes and editing controls; it does not download matrix tiles or
+build a matrix GPU atlas for these views.</p>
+<p>Build and connect as above after updating both client and server. The status bar reports
+<code>server rendering</code> / <code>Server rendered contact map</code>. Older servers without this capability
+continue using client rendering, with an upgrade notice in the connection status.</p>
+<p>Each image is limited to 1,048,576 pixels and 2048 pixels per side. Display bins are aggregated
+to screen size in integer multiples of the selected stored resolution; the status bar reports
+the actual display resolution. Each process admits two concurrent PNG jobs. Busy requests
+return 429 and the client retries with backoff. Replaced viewport requests are aborted, stale
+responses are discarded, and workers cooperatively stop reading when cancellation is observed.
+Images retain their original viewport coordinates while panning. Assembly edits, normalization,
+resolution and palette changes request a new rendering. Automatic color thresholds are reused
+per dataset, selected resolution and log setting across normalization changes.</p>
+<p>AGP editing remains local. PAF, GFA, coverage and explicitly requested numerical evidence
+queries can still consume client memory. This is not a full browser application or a migration
+of every computation. Image and aggregation limits do not bound total process RSS: HDF5 readers,
+normalization weights, layouts and concurrent reads also consume memory. Measure peak client and
+server memory and interaction latency with representative datasets before sizing deployment.</p>
+<h3 id="automatic-remote-agp-loading">Automatic remote AGP loading<a class="headerlink" href="#automatic-remote-agp-loading" title="Permanent link">&para;</a></h3>
+<p>Place an AGP beside the published <code>.cool/.mcool</code>. On startup the server prefers
+an AGP with the same basename, otherwise it selects the sole <code>.agp</code> in that
+directory. Ambiguous candidates are not selected. Only regular files are served;
+symlinks are excluded and the size limit is 32 MiB. Restart after adding or
+changing the AGP.</p>
+<p>Connecting with an empty assembly automatically loads the companion AGP; an
+existing assembly and its edits are preserved. <code>GET /v1/datasets/{id}/assembly</code>
+uses the same authentication settings; no token is needed when authentication is
+disabled. Layout interaction remains local while
+matrix reading and heatmap rendering remain remote. Saving edits exports locally
+and does not overwrite the server file.</p>
+<h3 id="remote-read-optimization">Remote read optimization<a class="headerlink" href="#remote-read-optimization" title="Permanent link">&para;</a></h3>
+<p>Remote main views use the local main surface's LOD decision function and send
+explicit source/display resolutions. The server must not silently replace that
+plan. Prefetch margins cannot change bin sizes or visible image density; margins
+shrink first when image capacity is limited. Auto scale samples every tenth
+record per complete visible tile, excludes diagonal cells, and uses the same P99
+and scale-cache rules. Prefetch tiles are excluded. Both paths wait for the
+complete visible tile set before fitting the initial scale so arrival order
+cannot change the threshold. Palette steps, opacity and log mapping also match.</p>
+<p>The server caches projected views with a 64 MiB budget and at most 256 LRU entries.
+Palette and scale changes reuse counts while encoding a fresh PNG. Keys include
+file path, size, modification time, layout, viewport, read/display resolutions,
+and normalization. In-flight work and references held by requests are additional
+memory; this is not a process RSS limit. Response headers
+<code>x-cstudio-source-resolution</code> and <code>x-cstudio-cache</code> report the chosen level and
+cache result. The desktop local reader does not use this server cache.</p>
+<p>Ordinary remote main views fill newly exposed regions with fixed PNG tiles during
+pan and switch to an exact viewport image at rest. Layout, zoom, or style changes
+invalidate the old tile layer; see “Image tiles during pan” below.</p>
+<p>Both Overview paths use the same fixed 320-bin plan, independent of main-layer
+completion order. Overview opacity is 0.9 and main opacity is 0.88 in both paths.
+New clients verify the display contract and returned display resolution; an old
+server triggers an upgrade message instead of silently using different rules.</p>
+<p>Complete-tile projection caches use the read extent rather than the PNG crop.
+Pans within the same tile set reuse counts and redraw the new camera; layout,
+resolution, normalization and file changes invalidate the relevant cache. Cold
+reads and entry into uncached tiles still require server computation.</p>
+<h3 id="layout-revisions-and-independent-tile-reuse">Layout revisions and independent tile reuse<a class="headerlink" href="#layout-revisions-and-independent-tile-reuse" title="Permanent link">&para;</a></h3>
+<p><code>POST /v1/datasets/{id}/layouts</code> registers a layout and returns <code>layoutId</code>.
+Main, overview, and pan-prefetch render requests then send the revision only.
+Identical layouts share registration; edits create a new revision. The registry
+retains at most 32 revisions / 32 MiB. Expiry or restart returns HTTP 410;
+the client registers again and retries once. Older servers retain inline layouts.</p>
+<p>Ordinary projected counts are cached per tile, including empty tiles. Only missing
+tiles are read/projected on a boundary crossing. Keys include layout revision,
+file identity, source/target resolution, normalization and tile size. The shared
+count cache retains at most 256 entries / 64 MiB (not a process RSS limit).
+Adaptive refinement retains its complete-neighborhood cache to preserve semantics.
+Pan prefetch and pointer-up reuse remain enabled; cold reads still take time.</p>
+<h3 id="background-warming-and-persistent-counts">Background warming and persistent counts<a class="headerlink" href="#background-warming-and-persistent-counts" title="Permanent link">&para;</a></h3>
+<p>Layout registration warms Overview and bounded global coarse levels. The queue
+holds at most 128 tiles. A successful foreground render schedules up to 16
+neighbor tiles; the latest neighborhood has priority. One background worker waits
+for idle render capacity and cooperatively cancels when foreground work arrives.
+Adaptive refinement is excluded from independent neighbor warming.</p>
+<p>Count tiles persist under <code>$XDG_CACHE_HOME/cstudio-server/port-&lt;port&gt;/counts-v1</code>
+(or <code>~/.cache/cstudio-server/port-&lt;port&gt;/counts-v1</code>). Default budget: 4 GiB.
+<code>CSTUDIO_DISK_CACHE_DIR</code> selects a dedicated root; <code>counts-v1</code> is created beneath
+it. <code>CSTUDIO_DISK_CACHE_MB</code> sets the MiB budget (0 disables persistence), and
+<code>CSTUDIO_PREWARM=0</code> disables warming. Restart to apply settings; use a separate
+custom directory for each server instance.</p>
+<p>Keys include stable layout content, file state, resolution, normalization and
+tile size. SHA-256 checksums reject corrupt entries; missing/corrupt entries are
+recomputed, and write failures do not fail the render. Budgets are not RSS limits.
+<code>GET /v1/datasets/{id}/cache</code> reports process-wide cache and worker statistics;
+authentication is required only when a token is configured. Warming starts when a layout is registered; first registration and
+uncached fine levels can still incur computation.</p>
+<h3 id="image-tiles-during-pan">Image tiles during pan<a class="headerlink" href="#image-tiles-during-pan" title="Permanent link">&para;</a></h3>
+<p>Remote pans compose retained images immediately and prefetch PNG tiles on a fixed genomic grid. Decoded tiles repaint the canvas during the gesture without waiting for pointer release. Reversals reuse retained tiles. Visible tiles take priority, with two concurrent loads, a bounded queue, a 32 MiB decoded-image budget, and look-ahead based on direction, velocity and recent latency.</p>
+<p>Tiles share the main view's resolution, normalization, palette and fixed color scale. Layout, style or zoom changes discard the old layer. An exact viewport image is retained at rest to preserve final pixel boundaries. Neighborhood-dependent adaptive refinement keeps the full-frame path. Newly exposed uncached areas may still need time to arrive.</p>
+<p>The server caches encoded PNG results, skipping projection, painting and encoding on a hit. Its encoded-image memory budget is 32 MiB. Persistent images share the existing <code>CSTUDIO_DISK_CACHE_MB</code> budget with count tiles and survive restarts. Keys cover file identity, layout content and the complete render parameters. <code>x-cstudio-image-cache: hit</code> identifies finished-image reuse; <code>/cache</code> reports process-local image cache statistics under <code>images</code>. These budgets are not process RSS limits.</p>
+<p>Updating the server enables finished-image reuse. In-gesture tile presentation also requires the updated desktop client; save edits before quitting and reopening it.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-circle-arrow-up" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m16 12-4-4-4 4M12 16V8"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../../user-guide/evidence/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Evidence views">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-arrow-left" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7M19 12H5"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Evidence views
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../formats/" class="md-footer__link md-footer__link--next" aria-label="Next: Data formats">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Data formats
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2026 C-Studio contributors
+    </div>
+  
+  
+    Made with
+    <a href="https://zensical.org/" target="_blank" rel="noopener">
+      Zensical
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["content.code.copy","content.tabs.link","navigation.footer","navigation.indexes","navigation.sections","navigation.tabs","navigation.top","navigation.version","search.highlight","search.share","search.suggest","toc.follow"],"search":"../../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"provider":"mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.e886cdf1.min.js"></script>
+      
+    
+  </body>
+</html>
