@@ -61,12 +61,15 @@ when reporting validation results.
 
 ## Desktop release builds
 
-Pushing a `v*` tag automatically builds and publishes macOS Apple Silicon,
-macOS Intel, Windows x86-64, and Linux x86-64 packages. The tag must match the version in
-`package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`.
-You can also run **Package desktop apps and cool2mcool** in GitHub Actions. Set
-`release_tag` to an existing `v*` tag to publish the packages and `SHA256SUMS`
-to its GitHub Release; leave it empty to upload workflow artifacts only.
+Desktop packaging runs when explicitly started. The release tag must match the
+version in `package.json`, `src-tauri/tauri.conf.json`, and
+`src-tauri/Cargo.toml`.
+
+You can build and upload packages locally, or manually run **Package desktop
+apps and cool2mcool** in GitHub Actions. Set `release_tag` to an existing `v*`
+tag to publish the packages and `SHA256SUMS` to its GitHub Release. Leave it
+empty to upload workflow artifacts only, including when the selected ref is a
+tag.
 
 macOS packages use separate architecture names: `C-Studio-arm64.app.zip` and
 `*_aarch64.dmg` for Apple Silicon, `C-Studio-x64.app.zip` and `*_x64.dmg` for
@@ -127,7 +130,13 @@ backs up the previous complete version before replacing it.
 Windows cross-packaging requires `cargo-xwin`, NSIS, and Wine (see
 `scripts/package-windows-from-macos.sh`); Pixi provides the LLVM tools and
 Windows Rust standard library. Local macOS builds produce the Windows `.exe`;
-the GitHub workflow also produces `.msi` on its Windows runner.
+the manual GitHub workflow also produces `.msi` on its Windows runner and
+`cool2mcool` archives for three platforms.
+
+To upload packages that you have already built, push the matching `v*` tag to
+GitHub, open **Releases → Draft a new release**, and select the tag. Add the
+seven files and `SHA256SUMS` from `output/releases/v<version>/`, then publish
+the release.
 
 To build and publish the same seven packages from this Mac:
 
@@ -138,7 +147,6 @@ pixi run --locked -e package release-local --publish
 This requires an authenticated GitHub CLI (`brew install gh` followed by
 `gh auth login`), a clean checkout of the
 matching tag, and that same tag already pushed to `origin`. It creates a draft,
-checks that all packages were uploaded, then publishes it. If the tag-triggered
-workflow is enabled, let that workflow publish; use `--publish` when its
-automatic publication is disabled. An existing Release is not overwritten
-by the local script.
+checks that all packages were uploaded, then publishes it. This command builds
+the packages before uploading them. An existing Release is not overwritten by
+the local script.

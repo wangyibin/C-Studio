@@ -151,7 +151,9 @@ libraries, avoiding a mismatch with Pixi's separate glibc sysroot.
 On an Apple Silicon Mac with Rosetta, Docker Desktop with Buildx, and the
 Windows cross-packaging tools, run `pixi run --locked -e package release-local`
 to build both macOS architectures, Windows and Linux together. The packages
-are collected in `output/releases/v<version>/`.
+are collected in `output/releases/v<version>/`; the Windows package is an
+NSIS `.exe`. After pushing the matching tag to GitHub, create a Release and
+upload the packages and `SHA256SUMS` from that directory.
 
 ### Verify a development checkout
 

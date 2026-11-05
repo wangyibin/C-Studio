@@ -142,7 +142,9 @@ glibc 构建环境混用。
 
 在装有 Rosetta、Docker Desktop（含 Buildx）及 Windows 交叉打包工具的 Apple Silicon
 Mac 上，运行 `pixi run --locked -e package release-local` 可一次生成两个 macOS
-架构、Windows 和 Linux 的全部桌面安装包，输出到 `output/releases/v<版本号>/`。
+架构、Windows NSIS `.exe` 和 Linux 的桌面安装包，输出到
+`output/releases/v<版本号>/`。将对应版本标签推送到 GitHub 后，可在 Releases 页面
+新建版本并上传该目录中的安装包和 `SHA256SUMS`。
 
 ### 验证开发检出版本
 

@@ -1,13 +1,10 @@
 name: Package desktop apps and cool2mcool
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Optional existing v* tag to build and publish macOS, Windows and Linux desktop packages
+        description: Optional existing v* tag to publish the built packages
         required: false
         type: string
 
@@ -268,7 +265,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        (inputs.release_tag != '' || github.ref_type == 'tag') &&
+        inputs.release_tag != '' &&
         needs.package-windows.result == 'success' &&
         needs.package-macos.result == 'success' &&
         needs.package-linux.result == 'success' &&
