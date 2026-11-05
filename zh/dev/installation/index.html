@@ -299,6 +299,8 @@
       
         
       
+        
+      
     
     
     
@@ -331,12 +333,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../reference/formats/" class="md-tabs__link">
+        <a href="../reference/remote-service/" class="md-tabs__link">
           
   
   Misc
@@ -551,6 +555,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#linux" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        构建 Linux 安装包
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#_5" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -608,6 +623,8 @@
   
     
     
+      
+        
       
         
       
@@ -706,6 +723,33 @@
     
   
   项目数据
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/remote-contact-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  使用远程文件
 
     
   </span>
@@ -850,6 +894,8 @@
       
         
       
+        
+      
     
     
     
@@ -892,6 +938,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/remote-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  远程服务部署与缓存
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1116,6 +1189,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#linux" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        构建 Linux 安装包
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#_5" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1150,16 +1234,17 @@
 
 
 <h1 id="_1">安装<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
-<p>C-Studio 为 Apple Silicon macOS 和 Windows x86-64 提供桌面版。大多数用户应直接从
+<p>C-Studio 桌面版的构建目标包括 macOS（Apple Silicon / Intel）、Windows x86-64
+和 Linux x86-64。大多数用户应直接从
 <a href="https://github.com/wangyibin/C-Studio/releases">GitHub Releases</a> 下载并安装；只有开发
 或需要测试特定源码检出版本时才需要从源码构建。</p>
 <h2 id="release">从 Release 安装<a class="headerlink" href="#release" title="Permanent link">&para;</a></h2>
-<div class="tabbed-set tabbed-alternate" data-tabs="1:2"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">macOS（Apple Silicon）</label><label for="__tabbed_1_2">Windows（x86-64）</label></div>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:3"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><input id="__tabbed_1_3" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">macOS（Apple Silicon / Intel）</label><label for="__tabbed_1_2">Windows（x86-64）</label><label for="__tabbed_1_3">Linux（x86-64）</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
 <ol>
 <li>打开 <a href="https://github.com/wangyibin/C-Studio/releases">GitHub Releases</a>，选择最新版本。</li>
-<li>下载 macOS ARM64 的 <code>.dmg</code> 安装包（推荐），或 <code>.app.zip</code> 归档包。</li>
+<li>下载 <code>.dmg</code> 安装包（推荐）或 <code>.app.zip</code> 归档包。Apple Silicon 选择 <code>aarch64</code> / <code>arm64</code>，Intel 选择 <code>x64</code>。</li>
 <li>打开下载的安装包，将 <code>C-Studio.app</code> 移到<strong>应用程序</strong>文件夹。</li>
 <li>从<strong>应用程序</strong>文件夹启动 C-Studio。</li>
 </ol>
@@ -1175,11 +1260,26 @@
 <p>当前 Windows 安装包未签名，可能触发 Microsoft SmartScreen。仅在确认安装程序来自
 官方 Release 页面后继续安装。</p>
 </div>
+<div class="tabbed-block">
+<p>打开 <a href="https://github.com/wangyibin/C-Studio/releases">GitHub Releases</a>，选择包含
+Linux <code>amd64</code> 安装包的版本。Linux 版以 Ubuntu 22.04 为构建基线，需要图形桌面环境。</p>
+<p>Ubuntu / Debian 用户下载 <code>.deb</code> 后，在下载目录运行：</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>./C-Studio_*_amd64.deb
+</span></code></pre></div>
+<p>安装后从应用菜单打开 <strong>C-Studio</strong>，或在终端运行 <code>c-studio</code>。
+HDF5 已包含在应用中，APT 会安装所需的系统运行库。</p>
+<p>也可以下载 AppImage，直接运行：</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>chmod<span class="w"> </span>+x<span class="w"> </span>C-Studio_*_amd64.AppImage
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>./C-Studio_*_amd64.AppImage
+</span></code></pre></div>
+<p>如果系统缺少 FUSE，可运行 <code>./C-Studio_*_amd64.AppImage --appimage-extract-and-run</code>。
+暂不提供 Linux ARM64 桌面安装包。</p>
+</div>
 </div>
 </div>
 <h2 id="_2">开发者：从源码运行或构建<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
 <h3 id="_3">依赖<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h3>
-<div class="tabbed-set tabbed-alternate" data-tabs="2:2"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">macOS</label><label for="__tabbed_2_2">Windows</label></div>
+<div class="tabbed-set tabbed-alternate" data-tabs="2:3"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><input id="__tabbed_2_3" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">macOS</label><label for="__tabbed_2_2">Windows</label><label for="__tabbed_2_3">Linux（Ubuntu 22.04 x86-64）</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
 <p>安装：</p>
@@ -1195,38 +1295,64 @@
 <li>Visual Studio C++ Build Tools，并选择 <strong>Desktop development with C++</strong></li>
 </ul>
 </div>
+<div class="tabbed-block">
+<p>安装 <a href="https://pixi.sh/latest/installation/">Pixi</a>，然后安装
+<a href="https://v2.tauri.app/start/prerequisites/#linux">Tauri 的 Linux 依赖</a>及打包工具：</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>sudo<span class="w"> </span>apt-get<span class="w"> </span>update
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>sudo<span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>--no-install-recommends<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span>build-essential<span class="w"> </span>pkg-config<span class="w"> </span>curl<span class="w"> </span>wget<span class="w"> </span>file<span class="w"> </span>patchelf<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span>libwebkit2gtk-4.1-dev<span class="w"> </span>libxdo-dev<span class="w"> </span>libssl-dev<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span>libayatana-appindicator3-dev<span class="w"> </span>librsvg2-dev<span class="w"> </span>libfuse2
+</span></code></pre></div>
 </div>
 </div>
-<p>Pixi 会安装固定版本的 Node.js、Rust、CMake 与 Ninja 打包工具链。Xcode 和
-Visual Studio 仍是系统依赖，因为它们提供对应操作系统的原生编译器、SDK 与
-打包工具。</p>
+</div>
+<p>Pixi 会安装固定版本的 Node.js、Rust、CMake 与 Ninja 打包工具链。原生编译器、
+SDK，以及 Linux 的 GTK / WebKitGTK 仍需通过系统安装。</p>
 <h3 id="_4">从源码运行<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h3>
 <p>在包含 <code>package.json</code> 和 <code>src-tauri/</code> 的应用仓库目录中打开终端，然后运行：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>tauri-dev
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>tauri-dev
 </span></code></pre></div>
 <p>Pixi 开发任务会启用 <code>portable-hdf5</code>，由 Cargo 构建 HDF5，并将其与 zlib
 静态链接到应用中，不需要安装系统 HDF5。</p>
 <h3 id="macos-apple-silicon">构建 macOS Apple Silicon 安装包<a class="headerlink" href="#macos-apple-silicon" title="Permanent link">&para;</a></h3>
 <p>请在 Apple Silicon Mac 上运行：</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-macos
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-macos
 </span></code></pre></div>
 <p>输出位于 <code>src-tauri/target/aarch64-apple-darwin/release/bundle/</code>。</p>
 <p>该命令使用临时签名，而不是 Apple Developer ID 公证。macOS 首次启动时可能需要
 右键应用并选择<strong>打开</strong>。</p>
 <h3 id="windows">构建 Windows 安装包<a class="headerlink" href="#windows" title="Permanent link">&para;</a></h3>
 <p>在 Windows x86-64 机器的 PowerShell 中运行：</p>
-<div class="language-powershell highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">pixi</span> <span class="n">install</span> <span class="n">-e</span> <span class="n">package</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">pixi</span> <span class="n">run</span> <span class="p">-</span><span class="n">-locked</span> <span class="n">-e</span> <span class="n">package</span> <span class="n">package-windows</span>
+<div class="language-powershell highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">pixi</span> <span class="n">install</span> <span class="n">-e</span> <span class="n">package</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="n">pixi</span> <span class="n">run</span> <span class="p">-</span><span class="n">-locked</span> <span class="n">-e</span> <span class="n">package</span> <span class="n">package-windows</span>
 </span></code></pre></div>
 <p>NSIS <code>.exe</code> 与 WiX <code>.msi</code> 位于
 <code>src-tauri/target/x86_64-pc-windows-msvc/release/bundle/</code>。它们当前没有正式签名，
 可能触发 Microsoft SmartScreen。</p>
+<h3 id="linux">构建 Linux 安装包<a class="headerlink" href="#linux" title="Permanent link">&para;</a></h3>
+<p>安装上述 Linux 依赖后，在 Linux x86-64 机器上运行：</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-linux
+</span></code></pre></div>
+<p><code>.deb</code> 与 <code>.AppImage</code> 分别位于
+<code>src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/</code> 下的 <code>deb/</code> 和
+<code>appimage/</code> 目录。脚本会检查可执行文件架构、Debian 包的版本和架构，并确认两种
+安装包均已生成。发布包使用 Ubuntu 22.04 构建；在更新的发行版上构建，可能
+提高运行所需的系统库版本。
+打包任务使用系统的 <code>/usr/bin/cc</code> 链接 GTK 和 WebKitGTK，避免与 Pixi 自带的
+glibc 构建环境混用。</p>
+<p>在装有 Rosetta、Docker Desktop（含 Buildx）及 Windows 交叉打包工具的 Apple Silicon
+Mac 上，运行 <code>pixi run --locked -e package release-local</code> 可一次生成两个 macOS
+架构、Windows NSIS <code>.exe</code> 和 Linux 的桌面安装包，输出到
+<code>output/releases/v&lt;版本号&gt;/</code>。将对应版本标签推送到 GitHub 后，可在 Releases 页面
+新建版本并上传该目录中的安装包和 <code>SHA256SUMS</code>。</p>
 <h3 id="_5">验证开发检出版本<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-test
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-frontend
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-rust-check
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-test
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-frontend
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-rust-check
 </span></code></pre></div>
 <p>这些检查通过，只能说明对应测试覆盖的软件行为正确，并不能证明新数据集上的
 生物学有效性。</p>

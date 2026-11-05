@@ -299,6 +299,8 @@
       
         
       
+        
+      
     
     
     
@@ -331,12 +333,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../../reference/formats/" class="md-tabs__link">
+        <a href="../../reference/remote-service/" class="md-tabs__link">
           
   
   Misc
@@ -493,6 +497,8 @@
       
         
       
+        
+      
     
     
     
@@ -581,6 +587,33 @@
     
   
   项目数据
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../remote-contact-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  使用远程文件
 
     
   </span>
@@ -716,7 +749,7 @@
   <a href="#_2" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        编辑模型
+        编辑会改变什么
       </span>
     </span>
   </a>
@@ -749,7 +782,7 @@
   <a href="#_5" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        感知拷贝的删除
+        删除前检查剩余拷贝
       </span>
     </span>
   </a>
@@ -838,6 +871,8 @@
       
         
       
+        
+      
     
     
     
@@ -880,6 +915,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/remote-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  远程服务部署与缓存
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1040,7 +1102,7 @@
   <a href="#_2" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        编辑模型
+        编辑会改变什么
       </span>
     </span>
   </a>
@@ -1073,7 +1135,7 @@
   <a href="#_5" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        感知拷贝的删除
+        删除前检查剩余拷贝
       </span>
     </span>
   </a>
@@ -1121,18 +1183,21 @@
 
 
 <h1 id="_1">组装编辑<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
-<h2 id="_2">编辑模型<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
-<p>C-Studio 编辑当前 AGP 放置列表。内部区间使用 0-based half-open，导入和导出的
-AGP 坐标使用 1-based closed。接触矩阵、覆盖度、PAF 和 GFA 保留各自原始坐标系，
-并通过编辑后的放置关系重新投影。</p>
+<h2 id="_2">编辑会改变什么<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
+<p>C-Studio 通过编辑 AGP，调整源序列区间在组装中的位置、顺序和方向。同一源序列
+区间可以在组装中出现多次，每次出现都作为一个可单独选择和编辑的拷贝。</p>
+<p>接触矩阵、覆盖度、PAF 和 GFA 保留各自的原始坐标，显示时根据编辑后的 AGP
+重新映射到组装位置。程序内部使用从 0 开始、左闭右开的区间（0-based half-open）；
+导入和导出的 AGP 使用从 1 开始、两端闭合的区间（1-based closed）。</p>
 <div class="admonition important">
-<p class="admonition-title">Important</p>
-<p>每次编辑都由用户发起。证据视图可以定位或预览候选，但不会替用户选择
-生物学操作。</p>
+<p class="admonition-title">每次编辑都需要由用户发起</p>
+<p>证据视图可以帮助定位或预览候选区域。是否拆分、移动、反向或复制序列，
+仍需由用户根据证据判断并执行。</p>
 </div>
 <h2 id="_3">先选择，再编辑<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
-<p>可在热图中使用 Shift 单击或 Shift 拖动，也可从覆盖度、共线性或 GFA 中选择。
-右键所选对象打开共享操作菜单。</p>
+<p>在热图中按住 Shift 单击或拖动，选择要编辑的对象。也可以从覆盖度、共线性或
+GFA 视图中选择。右键单击所选对象即可打开操作菜单，各视图使用同一套组装操作。</p>
+<p>下文将由一个或多个 contig 组成的编辑单元称为“组装块（block）”。</p>
 <h2 id="_4">可用操作<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1144,19 +1209,19 @@ AGP 坐标使用 1-based closed。接触矩阵、覆盖度、PAF 和 GFA 保留�
 <tbody>
 <tr>
 <td><strong>Rename…</strong></td>
-<td>验证后修改染色体、block 或 contig 的显示/导出名称</td>
+<td>检查名称有效后，修改染色体、组装块或 contig 的显示和导出名称</td>
 </tr>
 <tr>
 <td><strong>Reverse / rotate selection</strong></td>
-<td>反转所选顺序并翻转方向</td>
+<td>反转所选对象的排列顺序，并翻转方向</td>
 </tr>
 <tr>
 <td><strong>Copy</strong></td>
-<td>为所选源区间创建另一个放置</td>
+<td>在组装中为所选源序列区间添加一个拷贝</td>
 </tr>
 <tr>
 <td><strong>Dissolve block</strong></td>
-<td>将所选复合 block 拆成单 contig block</td>
+<td>拆开所选组装块，使每个 contig 各自成为一个组装块</td>
 </tr>
 <tr>
 <td><strong>Add chr boundaries</strong></td>
@@ -1164,51 +1229,56 @@ AGP 坐标使用 1-based closed。接触矩阵、覆盖度、PAF 和 GFA 保留�
 </tr>
 <tr>
 <td><strong>Remove chr boundaries</strong></td>
-<td>移除符合条件的所选染色体边界</td>
+<td>移除所选边界中符合条件的染色体边界</td>
 </tr>
 <tr>
 <td><strong>Delete gap / join blocks</strong></td>
-<td>删除符合条件的 AGP gap 行并连接相邻 block</td>
+<td>删除符合条件的 AGP 间隙行（gap），并连接相邻组装块</td>
 </tr>
 <tr>
 <td><strong>Move to debris</strong></td>
-<td>把所选序列保留到 debris 对象中</td>
+<td>将所选序列移入 debris 对象，保留这些序列</td>
 </tr>
 <tr>
 <td><strong>Delete contig…</strong></td>
-<td>经拷贝感知确认后移除所选放置</td>
+<td>显示剩余拷贝信息，经确认后从组装中移除所选拷贝</td>
 </tr>
 </tbody>
 </table>
-<p>拆分 contig 时，先选中它，再把指针移到其对角框内部。当出现剪切光标时单击。
-端部区域有保护，靠近端点的点击不会被当作剪切。</p>
-<p>移动所选对象时，把指针移到有效插入边界，出现插入光标后单击确认目标。移动与
-复制操作针对放置关系，不代表程序作出了生物学分组或拷贝数判断。</p>
-<h2 id="_5">感知拷贝的删除<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h2>
-<p><strong>Delete contig…</strong> 会打开确认对话框，区分拆分和未拆分拷贝，并报告每个所选源
-区间还剩多少拷贝。如果删除后一个拷贝都不剩，会明确突出这一损失。</p>
-<p>删除会从组装中移除放置，而不是移动到 debris。可以用 Undo 恢复；如果存在
-兼容的已保存历史 sidecar，重新打开后仍可恢复。</p>
+<p>拆分 contig 时，先选中它，再把鼠标指针移到热图中该 contig 的对角标注框内部。
+出现剪切光标后，单击即可拆分。程序会保护 contig 的两端，靠近端点的点击不会
+触发拆分。</p>
+<p>移动所选对象时，把鼠标指针移到允许插入的边界。出现插入光标后，单击确认
+目标位置。移动和复制调整的是源序列区间在组装中的排列，生物学上的分组和
+拷贝数仍需由用户判断。</p>
+<h2 id="_5">删除前检查剩余拷贝<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h2>
+<p>选择 <strong>Delete contig…</strong> 后，确认对话框会区分已拆分和未拆分的拷贝，并列出
+每个所选源序列区间在删除后还剩多少拷贝。如果某个区间一个拷贝也不剩，
+对话框会特别提示，便于确认是否要从组装中完全移除这段序列。</p>
+<p>删除会直接从组装中移除所选拷贝，不会将其移入 debris。可以用 <strong>Undo</strong> 恢复；
+如果已保存的历史文件与 AGP 匹配，重新打开项目后仍可通过撤销恢复。</p>
 <h2 id="_6">历史、撤销与重做<a class="headerlink" href="#_6" title="Permanent link">&para;</a></h2>
-<p>每个 reducer 编辑都会记录操作前后组装状态和影响摘要。</p>
+<p>每次编辑都会记录操作前后的组装状态，以及本次操作影响的内容。</p>
 <ul>
 <li><span class="keys"><kbd class="key-command">Cmd</kbd><span>+</span><kbd class="key-z">Z</kbd></span> / <span class="keys"><kbd class="key-control">Ctrl</kbd><span>+</span><kbd class="key-z">Z</kbd></span> 撤销一步；</li>
 <li><span class="keys"><kbd class="key-shift">Shift</kbd><span>+</span><kbd class="key-command">Cmd</kbd><span>+</span><kbd class="key-z">Z</kbd></span> / <span class="keys"><kbd class="key-control">Ctrl</kbd><span>+</span><kbd class="key-y">Y</kbd></span> 重做一步；</li>
-<li>悬停 History 条目可预览前后状态；</li>
-<li>单击 History 条目可定位受影响区域；</li>
-<li>右键已应用条目并选择 <strong>Undo to here</strong>，可一次回退其后的操作。</li>
+<li>将鼠标指针停在 <strong>History</strong> 中的一条记录上，可预览编辑前后的状态；</li>
+<li>单击 <strong>History</strong> 中的记录，可跳转到受影响的区域；</li>
+<li>右键单击已执行的记录并选择 <strong>Undo to here</strong>，可一次撤销该记录之后的操作。</li>
 </ul>
-<p>加载新项目会替换当前时间线；如果所选 AGP 存在兼容的历史 sidecar，会同时
-恢复。清空全部数据或重新加载源组装会清除编辑历史。</p>
+<p>加载新项目会替换当前编辑历史。如果所选 AGP 有匹配的历史文件，程序会同时
+恢复其中的记录。清空全部数据或重新加载源组装，会清除当前编辑历史。</p>
 <h2 id="_7">保存与自动保存<a class="headerlink" href="#_7" title="Permanent link">&para;</a></h2>
-<p>手动保存会把当前规范布局写成 AGP，同时保留尚存在的 <code>N</code>/<code>U</code> gap 元数据以及
-<code>0</code>、<code>na</code> 等合法未知方向。程序还会写入同前缀 <code>.history.json</code> sidecar，其中
-包含已应用和已撤销操作。只有 sidecar 与已保存 AGP 匹配时才会恢复。</p>
-<p>加载源 AGP 不等于授权覆盖它。首次手动保存始终会选择目标路径。已知可写
-普通 AGP 保存路径后，自动保存会在变更约五秒后同时写入两个文件。
-gzip AGP 只能作为只读输入目标；请先另存为普通 <code>.agp</code>。</p>
-<p>只有在确实要丢弃全部编辑并恢复最初加载的源 AGP 时，才使用
-<strong>Reload assembly…</strong>。其他已加载证据仍保留在工作区。</p>
+<p>手动保存会将当前组装布局写入 AGP，保留仍在组装中的 <code>N</code>/<code>U</code> 间隙记录及其
+元数据，也会保留 <code>0</code>、<code>na</code> 等合法的未知方向值。程序同时写入与 AGP 同前缀的
+<code>.history.json</code> 历史文件，记录已执行和已撤销的操作。重新打开时，只有历史文件
+与已保存的 AGP 匹配，程序才会恢复编辑历史。</p>
+<p>加载源 AGP 后，程序不会自动把它设为保存目标。第一次手动保存时，需要选择
+文件位置。选定可写的、未压缩的 AGP 保存位置并启用自动保存后，每次编辑约
+五秒后，程序会同时写入 AGP 和历史文件。gzip 压缩的 AGP 只作为输入文件，
+请先另存为未压缩的 <code>.agp</code>。</p>
+<p><strong>Reload assembly…</strong> 会丢弃全部编辑，恢复最初加载的源 AGP。请在确认要重新
+开始时使用这一操作。其他已加载的证据仍保留在工作区。</p>
 
 
 

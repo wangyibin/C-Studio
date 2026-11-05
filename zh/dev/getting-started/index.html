@@ -299,6 +299,8 @@
       
         
       
+        
+      
     
     
     
@@ -331,12 +333,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../reference/formats/" class="md-tabs__link">
+        <a href="../reference/remote-service/" class="md-tabs__link">
           
   
   Misc
@@ -568,7 +572,7 @@
   <a href="#5" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        5. 执行一次可撤销编辑
+        5. 尝试编辑并撤销
       </span>
     </span>
   </a>
@@ -602,6 +606,8 @@
   
     
     
+      
+        
       
         
       
@@ -700,6 +706,33 @@
     
   
   项目数据
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/remote-contact-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  使用远程文件
 
     
   </span>
@@ -844,6 +877,8 @@
       
         
       
+        
+      
     
     
     
@@ -886,6 +921,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/remote-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  远程服务部署与缓存
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1101,7 +1163,7 @@
   <a href="#5" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        5. 执行一次可撤销编辑
+        5. 尝试编辑并撤销
       </span>
     </span>
   </a>
@@ -1138,13 +1200,14 @@
 
 
 <h1 id="_1">快速开始<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
-<p>下面的流程会保留可恢复的源 AGP，并明确区分证据与编辑操作。</p>
+<p>本页介绍如何加载一个项目、尝试编辑并保存结果。建议保留源 AGP，把编辑结果
+另存为新文件，方便之后对照或重新开始。证据视图用于辅助判断，编辑由你手动执行。</p>
 <p>如果尚未生成输入文件，请先按<a href="../user-guide/input-preparation/">准备输入文件</a>操作。</p>
 <h2 id="_2">下载示例数据<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
 <p>从 <a href="https://github.com/wangyibin/C-Studio/releases/tag/v0.5.0">C-Studio v0.5.0 Release</a>
 下载 <a href="https://github.com/wangyibin/C-Studio/releases/download/v0.5.0/examples.tar.gz"><code>examples.tar.gz</code></a>
-并解压。若要打开解压后的示例，请选择 <strong>Add Data → Load project folder…</strong>，
-然后选中对应的项目目录。</p>
+并解压。在 C-Studio 中选择 <strong>Add Data → Load project folder…</strong>，
+然后选择解压后的示例项目目录。</p>
 <p>压缩包包含以下示例文件：</p>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>groups.final.agp
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>alfalfa.mapq1.mcool
@@ -1153,8 +1216,8 @@
 </span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>alfalfa.p_utg.noseq.gfa
 </span></code></pre></div>
 <h2 id="1">1. 准备项目目录<a class="headerlink" href="#1" title="Permanent link">&para;</a></h2>
-<p>处理真实项目时，建议把输入文件的副本放到一个独立目录中。组装编辑需要 AGP，
-其他证据均为可选。</p>
+<p>使用自己的数据时，建议把输入文件复制到一个单独的项目目录中。编辑组装需要
+AGP 文件，接触矩阵、共线性、覆盖度和组装图均为可选输入。</p>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>my-project/
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>├── assembly.agp
 </span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>├── contacts.mcool
@@ -1162,52 +1225,54 @@
 </span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>├── coverage.depth
 </span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>└── assembly.gfa
 </span></code></pre></div>
-<p>程序只扫描目录顶层。同一类型存在多个候选文件时，C-Studio 会按确定性规则加载
-一个，并把其他候选报告为已跳过。精确规则见<a href="../user-guide/project-data/">项目数据</a>。</p>
+<p>程序只读取项目目录顶层的文件，不进入子目录。同一类型有多个文件时，C-Studio
+会按固定规则选择其中一个，并列出跳过的文件。具体规则见<a href="../user-guide/project-data/">项目数据</a>。</p>
 <h2 id="2">2. 加载数据<a class="headerlink" href="#2" title="Permanent link">&para;</a></h2>
-<p>选择 <strong>Add Data → Load project folder…</strong>。也可以使用 <strong>Add Data</strong> 下的
-单文件入口逐个加载。</p>
-<p>从源码检出目录运行时，<strong>Load example project</strong> 可以打开检出目录中的
-<code>examples/</code> 目录。使用安装包时，请按上文下载并解压 v0.5.0 示例数据，
-再手动加载对应的示例项目目录。</p>
+<p>选择 <strong>Add Data → Load project folder…</strong>。也可以使用 <strong>Add Data</strong> 菜单中的
+单文件加载选项逐个添加文件。</p>
+<p>从源码目录运行时，<strong>Load example project</strong> 可以打开该目录下的 <code>examples/</code>。
+使用安装包时，请先按上文下载并解压 v0.5.0 示例数据，再通过
+<strong>Load project folder…</strong> 加载示例项目目录。</p>
 <h2 id="3">3. 检查工作区<a class="headerlink" href="#3" title="Permanent link">&para;</a></h2>
-<p>先确认状态栏和 <strong>Project Info</strong> 显示了预期的组装与矩阵，再检查：</p>
+<p>先在状态栏和 <strong>Project Info</strong> 中确认加载的是正确的组装与接触矩阵，再检查：</p>
 <ul>
 <li>主热图和覆盖度轨道；</li>
-<li>检查器中的 <strong>Overview</strong>、<strong>Synteny</strong> 和 <strong>GFA</strong> 标签；</li>
-<li>染色体、block 与 contig 标注框；</li>
-<li>存在 GFA 时的同源染色体正则表达式。</li>
+<li>检查面板中的 <strong>Overview</strong>、<strong>Synteny</strong> 和 <strong>GFA</strong> 标签页；</li>
+<li>染色体、组装块（block）和 contig 的标注框；</li>
+<li>已加载 GFA 时，用于识别同源染色体的正则表达式。</li>
 </ul>
-<p>如果 AGP、接触矩阵 bin、PAF、覆盖度和 GFA 中的 contig 标识不一致，相应证据
-将无法可靠投影。</p>
+<p>AGP、接触矩阵 bin、PAF、覆盖度和 GFA 中的 contig 标识需要一致，否则相应证据
+可能无法正确对应到组装中的位置。</p>
 <h2 id="4">4. 导航与选择<a class="headerlink" href="#4" title="Permanent link">&para;</a></h2>
 <ul>
 <li>拖动热图进行平移。</li>
-<li>滚轮默认沿对角线平移；使用平台对应的组合滚轮切换分辨率或垂直移动。</li>
+<li>滚轮默认沿对角线平移；配合平台对应的修饰键，可以切换分辨率或垂直平移。</li>
 <li>点击 <strong>Fit</strong> 回到全组装视图。</li>
-<li>在 X/Y <strong>Jump</strong> 中输入 <code>contig</code> 或 <code>contig:start-end</code>。</li>
-<li>Shift 单击组装标注可选择 contig 或染色体；Shift 拖动选择多个 contig；
-  在同步轨道中用 Command/Control 单击切换单个 contig。</li>
+<li>在 X/Y <strong>Jump</strong> 输入框中输入 <code>contig</code> 或 <code>contig:start-end</code>，跳转到对应区域。</li>
+<li>按住 Shift 单击组装标注，选择 contig 或染色体；按住 Shift 拖动，选择多个 contig。
+  在同步轨道中，按住 Command/Control 单击可选中或取消选中单个 contig。</li>
 </ul>
-<p>完整交互见<a href="../user-guide/navigation-selection/">导航与选择</a>。</p>
-<h2 id="5">5. 执行一次可撤销编辑<a class="headerlink" href="#5" title="Permanent link">&para;</a></h2>
-<p>右键选中的组装对象，选择 <strong>Reverse / rotate selection</strong>、<strong>Copy</strong> 或
-<strong>Move to debris</strong> 等操作。观察接触矩阵、轨道和证据视图如何按编辑后的 AGP
-重新投影。</p>
-<p>继续操作前，使用 <strong>Undo</strong> 或 <strong>History</strong> 验证可恢复性。删除需要确认，并会报告
-是否有源区间在删除后不再保留任何拷贝。</p>
+<p>完整操作说明见<a href="../user-guide/navigation-selection/">导航与选择</a>。</p>
+<h2 id="5">5. 尝试编辑并撤销<a class="headerlink" href="#5" title="Permanent link">&para;</a></h2>
+<p>右键单击选中的组装对象，选择 <strong>Reverse / rotate selection</strong>、<strong>Copy</strong> 或
+<strong>Move to debris</strong> 等操作。编辑后，接触图、轨道和其他证据视图会按照新的 AGP
+布局更新。</p>
+<p>继续编辑前，先用 <strong>Undo</strong> 撤销这次操作，或在 <strong>History</strong> 中查看编辑记录，
+确认能够恢复到编辑前的状态。删除操作需要确认；如果某段源序列在删除后一个
+拷贝也不剩，对话框会提示。</p>
 <h2 id="6-agp">6. 保存编辑后的 AGP<a class="headerlink" href="#6-agp" title="Permanent link">&para;</a></h2>
-<p>macOS 按 <span class="keys"><kbd class="key-command">Cmd</kbd><span>+</span><kbd class="key-s">S</kbd></span>，Windows 按 <span class="keys"><kbd class="key-control">Ctrl</kbd><span>+</span><kbd class="key-s">S</kbd></span>，也可以点击保存图标。
-C-Studio 会同时保存编辑后的 AGP 和同前缀 <code>.history.json</code> sidecar，后者记录
-可兼容恢复的撤销/重做时间线。</p>
+<p>macOS 按 <span class="keys"><kbd class="key-command">Cmd</kbd><span>+</span><kbd class="key-s">S</kbd></span>，Windows / Linux 按 <span class="keys"><kbd class="key-control">Ctrl</kbd><span>+</span><kbd class="key-s">S</kbd></span>，也可以点击保存图标。
+C-Studio 会同时保存编辑后的 AGP 和同前缀的 <code>.history.json</code> 历史文件。
+历史文件记录已执行和已撤销的操作；与 AGP 匹配时，重新打开项目后可以恢复
+这些记录，继续撤销或重做。</p>
 <div class="admonition important">
-<p class="admonition-title">首次保存会选择目标路径</p>
-<p>加载 AGP 不会把源文件自动设为保存目标。首次手动保存会询问写入
-位置。建立目标后，可选自动保存会在变更约五秒后同时写入 AGP 和
-history sidecar。</p>
+<p class="admonition-title">首次保存需要选择文件位置</p>
+<p>加载 AGP 后，程序不会自动把源文件设为保存目标。第一次手动保存时，
+需要选择文件位置。设置好保存位置后，可以启用自动保存；每次编辑约五秒后，
+程序会同时写入 AGP 和历史文件。</p>
 </div>
-<p>压缩的 <code>.agp.gz</code> 不会被直接覆盖。请先保存到普通 AGP 目标，再启用自动
-保存。</p>
+<p>压缩的 <code>.agp.gz</code> 只作为输入文件，不会被直接覆盖。请先另存为未压缩的 <code>.agp</code>，
+再启用自动保存。</p>
 
 
 
