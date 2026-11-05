@@ -297,6 +297,8 @@
       
         
       
+        
+      
     
     
     
@@ -331,12 +333,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="../formats/" class="md-tabs__link">
+        <a href="../remote-service/" class="md-tabs__link">
           
   
   Misc
@@ -491,6 +495,8 @@
       
         
       
+        
+      
     
     
     
@@ -576,6 +582,33 @@
     
   
   Project data
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/remote-contact-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Using remote files
 
     
   </span>
@@ -722,6 +755,8 @@
       
         
       
+        
+      
     
     
     
@@ -767,6 +802,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../remote-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Remote service deployment
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -941,9 +1003,10 @@
 <h1 id="current-limitations">Current limitations<a class="headerlink" href="#current-limitations" title="Permanent link">&para;</a></h1>
 <p>C-Studio is under active development. Keep these boundaries in mind:</p>
 <ul>
-<li>Desktop packages target Apple Silicon macOS and Windows x86-64. macOS packages
-  are not notarized, Windows packages are unsigned, and there is no Linux
-  desktop release.</li>
+<li>Desktop builds target macOS Apple Silicon / Intel, Windows x86-64, and Linux
+  x86-64. macOS packages are not notarized and Windows packages are unsigned.
+  Linux builds use Ubuntu 22.04 as their baseline and require a graphical desktop;
+  Linux ARM64 desktop packages are not provided.</li>
 <li><strong>Load example project</strong> requires a source checkout; packaged applications
   should load example files individually.</li>
 <li>C-Studio exports edited AGP files and their optional history sidecars, but

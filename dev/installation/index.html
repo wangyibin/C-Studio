@@ -299,6 +299,8 @@
       
         
       
+        
+      
     
     
     
@@ -331,12 +333,14 @@
       
         
       
+        
+      
     
     
     
     
       <li class="md-tabs__item">
-        <a href="../reference/formats/" class="md-tabs__link">
+        <a href="../reference/remote-service/" class="md-tabs__link">
           
   
   Misc
@@ -551,6 +555,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#build-linux-packages" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Build Linux packages
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#verify-a-development-checkout" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -608,6 +623,8 @@
   
     
     
+      
+        
       
         
       
@@ -706,6 +723,33 @@
     
   
   Project data
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/remote-contact-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Using remote files
 
     
   </span>
@@ -850,6 +894,8 @@
       
         
       
+        
+      
     
     
     
@@ -892,6 +938,33 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/remote-service/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Remote service deployment
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -1116,6 +1189,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#build-linux-packages" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Build Linux packages
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#verify-a-development-checkout" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1150,17 +1234,18 @@
 
 
 <h1 id="installation">Installation<a class="headerlink" href="#installation" title="Permanent link">&para;</a></h1>
-<p>C-Studio is distributed for macOS Apple Silicon and Windows x86-64. Most users
+<p>C-Studio's desktop builds target macOS Apple Silicon / Intel, Windows x86-64,
+and Linux x86-64. Most users
 should install a package from the <a href="https://github.com/wangyibin/C-Studio/releases">GitHub Releases</a>
 page. Building from source is only needed for development or for testing a
 specific checkout.</p>
 <h2 id="install-a-release-package">Install a release package<a class="headerlink" href="#install-a-release-package" title="Permanent link">&para;</a></h2>
-<div class="tabbed-set tabbed-alternate" data-tabs="1:2"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">macOS (Apple Silicon)</label><label for="__tabbed_1_2">Windows (x86-64)</label></div>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:3"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><input id="__tabbed_1_3" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">macOS (Apple Silicon / Intel)</label><label for="__tabbed_1_2">Windows (x86-64)</label><label for="__tabbed_1_3">Linux (x86-64)</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
 <ol>
 <li>Open <a href="https://github.com/wangyibin/C-Studio/releases">GitHub Releases</a> and select the latest release.</li>
-<li>Download the macOS ARM64 <code>.dmg</code> package (preferred), or the <code>.app.zip</code> archive.</li>
+<li>Download the <code>.dmg</code> package (preferred), or the <code>.app.zip</code> archive. Choose <code>aarch64</code> / <code>arm64</code> for Apple Silicon or <code>x64</code> for Intel.</li>
 <li>Open the downloaded package and move <code>C-Studio.app</code> to <strong>Applications</strong>.</li>
 <li>Start C-Studio from <strong>Applications</strong>.</li>
 </ol>
@@ -1178,11 +1263,27 @@ require you to Control-click the app and choose <strong>Open</strong> the first 
 SmartScreen. Only continue after verifying that the installer came from
 the official release page.</p>
 </div>
+<div class="tabbed-block">
+<p>Open <a href="https://github.com/wangyibin/C-Studio/releases">GitHub Releases</a> and choose
+a release containing the Linux <code>amd64</code> packages. Builds use Ubuntu 22.04 as
+the baseline and require a graphical desktop session.</p>
+<p>On Ubuntu / Debian, download the <code>.deb</code> package and run in its directory:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>./C-Studio_*_amd64.deb
+</span></code></pre></div>
+<p>Start <strong>C-Studio</strong> from the applications menu, or run <code>c-studio</code> in a terminal.
+HDF5 is included in the application; APT installs the system runtime dependencies.</p>
+<p>To use the AppImage without installing the application:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>chmod<span class="w"> </span>+x<span class="w"> </span>C-Studio_*_amd64.AppImage
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>./C-Studio_*_amd64.AppImage
+</span></code></pre></div>
+<p>If FUSE is unavailable, run <code>./C-Studio_*_amd64.AppImage --appimage-extract-and-run</code>.
+Linux ARM64 desktop packages are not provided.</p>
+</div>
 </div>
 </div>
 <h2 id="for-developers-run-or-build-from-source">For developers: run or build from source<a class="headerlink" href="#for-developers-run-or-build-from-source" title="Permanent link">&para;</a></h2>
 <h3 id="prerequisites">Prerequisites<a class="headerlink" href="#prerequisites" title="Permanent link">&para;</a></h3>
-<div class="tabbed-set tabbed-alternate" data-tabs="2:2"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">macOS</label><label for="__tabbed_2_2">Windows</label></div>
+<div class="tabbed-set tabbed-alternate" data-tabs="2:3"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><input id="__tabbed_2_3" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">macOS</label><label for="__tabbed_2_2">Windows</label><label for="__tabbed_2_3">Linux (Ubuntu 22.04 x86-64)</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
 <p>Install:</p>
@@ -1198,24 +1299,34 @@ the official release page.</p>
 <li>Visual Studio C++ Build Tools with <strong>Desktop development with C++</strong></li>
 </ul>
 </div>
+<div class="tabbed-block">
+<p>Install <a href="https://pixi.sh/latest/installation/">Pixi</a>, then install the
+<a href="https://v2.tauri.app/start/prerequisites/#linux">Tauri Linux prerequisites</a>
+and packaging tools:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>sudo<span class="w"> </span>apt-get<span class="w"> </span>update
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>sudo<span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>--no-install-recommends<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span>build-essential<span class="w"> </span>pkg-config<span class="w"> </span>curl<span class="w"> </span>wget<span class="w"> </span>file<span class="w"> </span>patchelf<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span>libwebkit2gtk-4.1-dev<span class="w"> </span>libxdo-dev<span class="w"> </span>libssl-dev<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span>libayatana-appindicator3-dev<span class="w"> </span>librsvg2-dev<span class="w"> </span>libfuse2
+</span></code></pre></div>
+</div>
 </div>
 </div>
 <p>Pixi installs the pinned Node.js, Rust, CMake, and Ninja packaging toolchain.
-The Xcode and Visual Studio components remain system prerequisites because they
-provide each operating system's native compiler, SDK, and packaging tools.</p>
+Native compilers, SDKs, and Linux GTK / WebKitGTK remain system prerequisites.</p>
 <h3 id="run-from-a-source-checkout">Run from a source checkout<a class="headerlink" href="#run-from-a-source-checkout" title="Permanent link">&para;</a></h3>
 <p>Open a terminal in the application repository—the directory containing
 <code>package.json</code> and <code>src-tauri/</code>—then run:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>tauri-dev
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>tauri-dev
 </span></code></pre></div>
 <p>The Pixi development task enables <code>portable-hdf5</code>, so Cargo builds and
 statically links HDF5 with zlib support. No system HDF5 installation is
 required.</p>
 <h3 id="build-a-macos-apple-silicon-package">Build a macOS Apple Silicon package<a class="headerlink" href="#build-a-macos-apple-silicon-package" title="Permanent link">&para;</a></h3>
 <p>Run this on an Apple Silicon Mac:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-macos
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-macos
 </span></code></pre></div>
 <p>Outputs are written below
 <code>src-tauri/target/aarch64-apple-darwin/release/bundle/</code>.</p>
@@ -1223,16 +1334,34 @@ required.</p>
 require right-clicking the app and choosing <strong>Open</strong> the first time.</p>
 <h3 id="build-windows-installers">Build Windows installers<a class="headerlink" href="#build-windows-installers" title="Permanent link">&para;</a></h3>
 <p>Run this on a Windows x86-64 machine in PowerShell:</p>
-<div class="language-powershell highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">pixi</span> <span class="n">install</span> <span class="n">-e</span> <span class="n">package</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">pixi</span> <span class="n">run</span> <span class="p">-</span><span class="n">-locked</span> <span class="n">-e</span> <span class="n">package</span> <span class="n">package-windows</span>
+<div class="language-powershell highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">pixi</span> <span class="n">install</span> <span class="n">-e</span> <span class="n">package</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="n">pixi</span> <span class="n">run</span> <span class="p">-</span><span class="n">-locked</span> <span class="n">-e</span> <span class="n">package</span> <span class="n">package-windows</span>
 </span></code></pre></div>
 <p>The NSIS <code>.exe</code> and WiX <code>.msi</code> installers are written below
 <code>src-tauri/target/x86_64-pc-windows-msvc/release/bundle/</code>. They are unsigned and
 may trigger Microsoft SmartScreen.</p>
+<h3 id="build-linux-packages">Build Linux packages<a class="headerlink" href="#build-linux-packages" title="Permanent link">&para;</a></h3>
+<p>After installing the Linux prerequisites, run on Linux x86-64:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>pixi<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>package
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-linux
+</span></code></pre></div>
+<p>The <code>.deb</code> and <code>.AppImage</code> files are written to the <code>deb/</code> and <code>appimage/</code>
+subdirectories of <code>src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/</code>.
+The task verifies the x86-64 executables, Debian version and architecture, and
+both output files. Use Ubuntu 22.04 for release builds: building on a newer
+distribution can raise the minimum runtime library versions.
+The task uses <code>/usr/bin/cc</code> to link against the distribution's GTK and WebKitGTK
+libraries, avoiding a mismatch with Pixi's separate glibc sysroot.</p>
+<p>On an Apple Silicon Mac with Rosetta, Docker Desktop with Buildx, and the
+Windows cross-packaging tools, run <code>pixi run --locked -e package release-local</code>
+to build both macOS architectures, Windows and Linux together. The packages
+are collected in <code>output/releases/v&lt;version&gt;/</code>; the Windows package is an
+NSIS <code>.exe</code>. After pushing the matching tag to GitHub, create a Release and
+upload the packages and <code>SHA256SUMS</code> from that directory.</p>
 <h3 id="verify-a-development-checkout">Verify a development checkout<a class="headerlink" href="#verify-a-development-checkout" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-test
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-frontend
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-rust-check
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-test
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-frontend
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>pixi<span class="w"> </span>run<span class="w"> </span>--locked<span class="w"> </span>-e<span class="w"> </span>package<span class="w"> </span>package-rust-check
 </span></code></pre></div>
 <p>Passing these checks establishes software correctness for the covered tests; it
 does not establish biological validity on a new dataset.</p>
