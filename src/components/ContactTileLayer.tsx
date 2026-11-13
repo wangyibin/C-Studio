@@ -544,9 +544,14 @@ export function contactTileViewportForBufferedSurface(
   // The shared GPU front has already moved to this exact camera during the
   // pointer gesture. Never reconstruct it from the old buffered frame while
   // the authoritative target is arriving: that creates target -> source ->
-  // target on every pointer-up. Resolution/layout swaps have no committed pan
-  // camera and continue to freeze their old front below.
-  if (committedPanViewport) {
+  // target on every pointer-up. A resolution swap can publish before the
+  // parent releases its old pan; a camera at that old scale cannot own the new
+  // front surface.
+  if (committedPanViewport
+    && committedPanViewport.xEnd - committedPanViewport.xStart
+      === frame.contactMap.viewport.xEnd - frame.contactMap.viewport.xStart
+    && committedPanViewport.yEnd - committedPanViewport.yStart
+      === frame.contactMap.viewport.yEnd - frame.contactMap.viewport.yStart) {
     return committedPanViewport;
   }
   const supersededByAtomicSwap = Boolean(
@@ -604,6 +609,7 @@ function contactTileBufferedGpuScene(
     scene: {
       boundaries,
       dataScope: `${map.layoutScope ?? ""}|${map.normalization ?? "raw"}`,
+      dataViewport: contactTileGpuDataViewport(map),
       descriptors: contactTileCanvasDescriptorsForViewport(
         tiles,
         map.resolution,
@@ -814,6 +820,7 @@ export function ContactTileLayer({
     return {
       boundaries,
       dataScope: `${map.layoutScope ?? ""}|${map.normalization ?? "raw"}`,
+      dataViewport: contactTileGpuDataViewport(map),
       descriptors: contactTileCanvasDescriptorsForViewport(
         tiles,
         map.resolution,
@@ -826,7 +833,9 @@ export function ContactTileLayer({
       resolution: map.resolution,
       tileSizeBins,
       visibleLayerComplete: map.visibleLayerComplete === true,
-      viewport: committedPanViewport ?? viewport ?? map.viewport,
+      viewport: contactTileViewportForBufferedSurface(
+        "presented", incomingFrame, incomingFrame, viewport, committedPanViewport,
+      ),
       renderStyle: incomingFrame.renderStyle,
       sourceLayout: contactTileGpuSourceLayout(map),
     };
@@ -1843,6 +1852,7 @@ function ContactTileGpuCanvas({
     const painted = renderer.setScene({
       boundaries,
       dataScope: `${contactMap.layoutScope ?? ""}|${contactMap.normalization ?? "raw"}`,
+      dataViewport: contactTileGpuDataViewport(contactMap),
       descriptors,
       generation: contactMap.renderGeneration,
       overview,
@@ -2009,6 +2019,31 @@ export function canonicalTilesForRendering(tiles: ContactMapTile[]): ContactMapT
     }
   }
   return [...unique.values()];
+}
+
+const contactTileDataViewportCache = new WeakMap<
+  NonNullable<ContactMapView["layoutBlocks"]>, ContactViewport
+>();
+
+function contactTileGpuDataViewport(map: ContactMapView): ContactViewport | undefined {
+  const blocks = map.layoutBlocks;
+  if (!blocks?.length) {
+    return undefined;
+  }
+  const cached = contactTileDataViewportCache.get(blocks);
+  if (cached) {
+    return cached;
+  }
+  let end = 0;
+  for (const block of blocks) {
+    end = Math.max(end, block.visualEnd);
+  }
+  if (!Number.isFinite(end) || end <= 0) {
+    return undefined;
+  }
+  const viewport = { xStart: 0, xEnd: end, yStart: 0, yEnd: end };
+  contactTileDataViewportCache.set(blocks, viewport);
+  return viewport;
 }
 
 function contactTileGpuSourceLayout(

@@ -41,9 +41,10 @@ export interface ContactColorScale {
 
 // C-Studio displays the assembly-wide matrix, which corresponds to Juicebox
 // Desktop's whole-genome view. Juicebox uses P99 there (P95 for a chromosome
-// pair), samples every tenth record in each block, and excludes the diagonal.
+// pair). We exclude the diagonal and sample visible coordinates consistently
+// across sparse and dense tile representations.
 const juiceboxAssemblyAutoThresholdPercentile = 99;
-const juiceboxRecordSampleStride = 10;
+const autoScaleSampleStride = 10;
 
 const defaultColorScale = {
   log: false,
@@ -62,40 +63,44 @@ export function contactAutoColorScaleKey(
   targetResolution: number,
   tileSizeBins: number,
   log: boolean,
+  revision = 0,
 ): string {
   return [
     coolPath,
     targetResolution,
     tileSizeBins,
     log ? "log" : "linear",
+    ...(revision ? [`refit:${revision}`] : []),
   ].join("|");
 }
 
 export function contactCountSampleForColorScale(contactMap: ContactMapView): number[] {
   const counts: number[] = [];
-
-  if (contactMap.tiles && contactMap.tiles.length > 0) {
-    const tileSizeBins = contactMap.tileSizeBins ?? 256;
-
+  const smallSample: number[] = [];
+  let eligibleCount = 0;
+  const { viewport, resolution } = contactMap;
+  const intersects = (x: number, y: number) =>
+    (x + 1) * resolution > viewport.xStart && x * resolution < viewport.xEnd
+    && (y + 1) * resolution > viewport.yStart && y * resolution < viewport.yEnd;
+  const visit = (x: number, y: number, count: number) => {
+    if (x === y || !Number.isFinite(count) || count <= 0
+      || !(intersects(x, y) || intersects(y, x))) return;
+    eligibleCount += 1;
+    if (eligibleCount <= 10_000) smallSample.push(count);
+    // Coordinate-based sampling is independent of sparse record order and dense
+    // array offsets. Include all small views so fine levels are not undersampled.
+    const hash = (Math.imul(Math.min(x, y), 73856093)
+      ^ Math.imul(Math.max(x, y), 19349663)) >>> 0;
+    if (hash % autoScaleSampleStride === 0) counts.push(count);
+  };
+  if (contactMap.tiles?.length) {
     for (const tile of contactMap.tiles) {
-      forEachContactTileCell(tile, tileSizeBins, (xBin, yBin, count, index) => {
-        if (index % juiceboxRecordSampleStride === 0 && xBin !== yBin) {
-          counts.push(count);
-        }
-      });
+      forEachContactTileCell(tile, contactMap.tileSizeBins ?? 256, visit);
     }
-
-    return counts;
+  } else {
+    for (const cell of contactMap.cells) visit(cell.xBin, cell.yBin, cell.count);
   }
-
-  for (let index = 0; index < contactMap.cells.length; index += juiceboxRecordSampleStride) {
-    const cell = contactMap.cells[index];
-    if (cell.xBin !== cell.yBin) {
-      counts.push(cell.count);
-    }
-  }
-
-  return counts;
+  return eligibleCount <= 10_000 ? smallSample : counts.length ? counts : smallSample;
 }
 
 export function estimateContactColorScale(counts: number[], log: boolean): ContactColorScale {
@@ -160,4 +165,11 @@ function clamp(value: number, min: number, max: number) {
 
 function clamp01(value: number) {
   return clamp(value, 0, 1);
+}
+
+/** Bound retained resolution estimates, including explicit Auto refits. */
+export function cacheAutoColorScale(cache: Map<string, ContactColorScale>, key: string, scale: ContactColorScale) {
+  cache.delete(key);
+  cache.set(key, scale);
+  if (cache.size > 128) cache.delete(cache.keys().next().value!);
 }

@@ -65,4 +65,15 @@ describe("coverageView", () => {
     expect(request.viewport).toEqual({ xStart: 180, xEnd: 260, yStart: 0, yEnd: 1 });
     expect(buildBrowserCoverageView(request).viewport).toEqual(request.viewport);
   });
+
+  it("queries a narrow region of a long record while retaining complete edge bins", () => {
+    const layout = [{ ...blocks[0], sourceEnd: 10_000_000, visualEnd: 10_000_000 }];
+    const request = buildCoverageViewRequest(
+      [{ chrom: "ctgA", start: 0, end: 10_000_000, value: 20 }],
+      layout, 10_000_000, { displayResolution: 10, viewport: { xStart: 4_000_005, xEnd: 4_000_025, yStart: 0, yEnd: 1 } },
+    );
+    expect(buildBrowserCoverageView(request).bins).toEqual([
+      { xBin: 400_000, value: 20 }, { xBin: 400_001, value: 20 }, { xBin: 400_002, value: 20 },
+    ]);
+  });
 });

@@ -20,6 +20,7 @@ import {
   contactTileGpuVirtualTextureBudgetBytes,
   contactTileGpuVirtualTextureEnabled,
   contactFramePresentationDestination,
+  contactFramePanDestination,
   contactTileSourcePagePlan,
   contactTileVirtualCamera,
   contactTileVirtualPageExactFlag,
@@ -30,6 +31,13 @@ import {
 } from "./contactTileGpu";
 
 describe("retained frame presentation geometry", () => {
+  it("moves retained pixels in both genomic axes without stretching", () => {
+    expect(contactFramePanDestination(256, 256, 512, 384,
+      { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      { xStart: 1_000, xEnd: 5_000, yStart: 500, yEnd: 4_500 },
+    )).toEqual({ left: -32, right: 352, bottom: 48, top: 432 });
+  });
+
   it("centers a square front frame without stretching after a landscape resize", () => {
     expect(contactFramePresentationDestination(256, 256, 512, 384)).toEqual({
       left: 64,
@@ -96,6 +104,18 @@ describe("retained pan scene ownership", () => {
       { ...currentScene, generation: 8, viewport: retainedViewport },
       retainedViewport,
     )).toBe(true);
+  });
+
+  it("does not reapply a fine pan after a coarser scene has been presented", () => {
+    const coarse = {
+      ...currentScene,
+      generation: 8,
+      resolution: 2_500_000,
+      viewport: { xStart: 0, xEnd: 40_000_000, yStart: 0, yEnd: 40_000_000 },
+    };
+    expect(contactTileGpuSceneCanUseRetainedPanViewport(
+      coarse, { ...coarse }, retainedViewport,
+    )).toBe(false);
   });
 });
 
@@ -660,7 +680,7 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
-  it("re-blits the stable front without stretching while a staging fence blocks pointer camera draws", () => {
+  it("keeps panning through a staging fence and presents its latest camera on completion", () => {
     const {
       canvas,
       blitFramebuffer,
@@ -740,8 +760,10 @@ describe("contactTileFloatTextureData", () => {
       19,
     );
 
-    renderer?.setPanViewport(targetScene.viewport);
+    const latestViewport = { xStart: 5_000, xEnd: 9_000, yStart: 0, yEnd: 4_000 };
+    renderer?.retainPanViewport(latestViewport);
     expect(blitFramebuffer).toHaveBeenCalledTimes(3);
+    expect(renderer?.presentedViewport()).toEqual(latestViewport);
     expect(firstPresented).not.toHaveBeenCalled();
     expect(secondPresented).not.toHaveBeenCalled();
 
@@ -749,6 +771,10 @@ describe("contactTileFloatTextureData", () => {
     expect(blitFramebuffer).toHaveBeenCalledTimes(4);
     expect(firstPresented).toHaveBeenCalledWith(true);
     expect(secondPresented).toHaveBeenCalledWith(true);
+    expect(renderer?.presentedViewport()).toEqual(latestViewport);
+    expect(blitFramebuffer).toHaveBeenLastCalledWith(
+      0, 0, 256, 256, -32, 0, 352, 384, 26, 19,
+    );
     renderer?.destroy();
   });
 
@@ -897,6 +923,52 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
+  it("presents normalized whole-genome margins without a Raw overview, while rejecting interior holes", () => {
+    const { canvas } = mockWebGlCanvas();
+    const renderer = createContactTileGpuRenderer(canvas, 16 * 1024 * 1024, {
+      performanceEnabled: false,
+      virtualTextureEnabled: true,
+    });
+    const renderStyle = { colormap: "Reds" as const, colorScale: { log: false, min: 0, max: 10 } };
+    const front = {
+      dataScope: "layout|VC",
+      descriptors: [{ key: "0:0", tile: { tileX: 0, tileY: 0, cells: [{ xBin: 0, yBin: 0, count: 4 }] }, transpose: false }],
+      generation: 1, resolution: 50_000, tileSizeBins: 4,
+      visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 200_000, yStart: 0, yEnd: 200_000 },
+      renderStyle,
+    };
+    expect(renderer?.setScene(front)).toBe(true);
+    const tile01 = { tileX: 0, tileY: 1, cells: [{ xBin: 0, yBin: 4, count: 7 }] };
+    const coarse = {
+      ...front,
+      generation: 2, resolution: 2_500_000,
+      // Two pages cover the finite 16.25 Mb assembly. The wider camera also
+      // includes an intentional third, empty X page (20-25 Mb).
+      dataViewport: { xStart: 0, xEnd: 16_250_000, yStart: 0, yEnd: 16_250_000 },
+      viewport: { xStart: 0, xEnd: 25_000_000, yStart: 0, yEnd: 16_250_000 },
+      descriptors: [
+        front.descriptors[0],
+        { key: "0:1", tile: tile01, transpose: false },
+        { key: "1:0", tile: tile01, transpose: true },
+        { key: "1:1", tile: { tileX: 1, tileY: 1, cells: [] }, transpose: false },
+      ],
+    };
+    const presented = vi.fn();
+    expect(renderer?.stageScene(coarse, presented)).toBe(true);
+    expect(presented).toHaveBeenCalledWith(true);
+    expect(renderer?.presentedViewport()).toEqual(coarse.viewport);
+
+    const missingPagePresented = vi.fn();
+    expect(renderer?.stageScene({
+      ...coarse,
+      generation: 3,
+      descriptors: coarse.descriptors.filter((descriptor) => descriptor.key !== "1:0"),
+    }, missingPagePresented)).toBe(true);
+    expect(missingPagePresented).toHaveBeenCalledWith(false);
+    renderer?.destroy();
+  });
+
   it("retains the exact front when a visible page exists only in the overview", () => {
     const { canvas, blitFramebuffer, fenceSync } = mockWebGlCanvas();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
@@ -966,8 +1038,8 @@ describe("contactTileFloatTextureData", () => {
     renderer?.destroy();
   });
 
-  it("holds the complete front during pan instead of mixing overview and exact pages", () => {
-    const { canvas, blitFramebuffer, clear, drawArrays } = mockWebGlCanvas();
+  it("translates exact front pixels across missing pages without uploading or mixing overview pixels", () => {
+    const { canvas, blitFramebuffer, clear, drawArrays, texSubImage3D, clientWidthRead, getError } = mockWebGlCanvas();
     const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
       performanceEnabled: false,
       virtualTextureEnabled: true,
@@ -1002,16 +1074,111 @@ describe("contactTileFloatTextureData", () => {
     const frontClears = clear.mock.calls.length;
     const frontPresentations = blitFramebuffer.mock.calls.length;
     const fallbacks = renderer?.performanceSnapshot().virtualTextureFallbacks ?? 0;
+    const uploads = texSubImage3D.mock.calls.length;
+    const layoutReads = clientWidthRead.mock.calls.length;
+    const validations = getError.mock.calls.length;
 
     // Page (1, 0) is represented by the overview but has not arrived as an
-    // exact tile. Pointer motion must leave the prior complete FBO untouched.
-    renderer?.setPanViewport({ xStart: 0, xEnd: 800, yStart: 0, yEnd: 400 });
+    // exact tile. Move existing pixels and clear only the destination surface.
+    renderer?.setPanViewport({ xStart: 200, xEnd: 600, yStart: 0, yEnd: 400 });
 
     expect(drawArrays).toHaveBeenCalledTimes(frontDraws);
-    expect(clear).toHaveBeenCalledTimes(frontClears);
-    expect(blitFramebuffer).toHaveBeenCalledTimes(frontPresentations);
+    expect(clear).toHaveBeenCalledTimes(frontClears + 1);
+    expect(blitFramebuffer).toHaveBeenCalledTimes(frontPresentations + 1);
+    expect(blitFramebuffer).toHaveBeenLastCalledWith(
+      0, 0, 256, 256, -128, 0, 128, 256, 26, 19,
+    );
     expect(renderer?.performanceSnapshot().virtualTextureFallbacks)
       .toBe(fallbacks + 1);
+    // Successive moves use the FBO's original camera, never compound offsets.
+    const nextViewport = { xStart: 300, xEnd: 700, yStart: 0, yEnd: 400 };
+    renderer?.setPanViewport(nextViewport);
+    renderer?.setPanViewport(nextViewport);
+    expect(blitFramebuffer).toHaveBeenLastCalledWith(
+      0, 0, 256, 256, -192, 0, 64, 256, 26, 19,
+    );
+    expect(renderer?.presentedViewport()).toEqual(nextViewport);
+    expect(texSubImage3D).toHaveBeenCalledTimes(uploads);
+    expect(clientWidthRead).toHaveBeenCalledTimes(layoutReads);
+    expect(getError).toHaveBeenCalledTimes(validations);
+    renderer?.setPanViewport({ xStart: 0, xEnd: 400, yStart: 0, yEnd: 400 });
+    expect(blitFramebuffer).toHaveBeenLastCalledWith(
+      0, 0, 256, 256, 0, 0, 256, 256, 26, 19,
+    );
+    renderer?.destroy();
+  });
+
+  it.each(["projected", "source", "source-only"])("shows arriving pan pages before release with missing pages (%s)", (mode) => {
+    const useSourceLayout = mode !== "projected";
+    const projectedComplete = mode !== "source-only";
+    const { canvas, blitFramebuffer } = mockWebGlCanvas();
+    const gl = canvas.getContext("webgl2")!;
+    const frames: FrameRequestCallback[] = [];
+    const renderer = createContactTileGpuRenderer(canvas, 4 * 1024 * 1024, {
+      performanceEnabled: false, virtualTextureEnabled: true,
+      requestFrame: (callback) => { frames.push(callback); return frames.length; },
+      cancelFrame: () => undefined,
+    });
+    const flushFrames = () => {
+      for (let i = 0; i < 30 && frames.length > 0; i += 1) frames.shift()!(i);
+      expect(frames).toHaveLength(0);
+    };
+    const descriptor = (tileX: number) => ({
+      key: `${tileX}:0`, transpose: false,
+      tile: { tileX, tileY: 0, cells: [{ xBin: tileX * 4, yBin: 0, count: 8 }] },
+    });
+    const overview = contactOverviewFloatTextureData({
+      resolution: 100, viewport: { xStart: 0, xEnd: 2_000, yStart: 0, yEnd: 2_000 },
+      cells: [{ xBin: 0, yBin: 0, count: 9 }],
+    }, 4);
+    const addressSpace = buildContactSourceAddressSpace([{ name: "a", length: 2_000 }]);
+    const layoutBlocks = [{
+      id: "a", objectId: "chr1", sourceId: "a", sourceStart: 0, sourceEnd: 2_000,
+      visualStart: 0, visualEnd: 2_000, orientation: "+" as const,
+    }];
+    const layoutMap = (end: number) => buildContactGpuLayoutMap({
+      addressSpace, layoutBlocks, resolution: 100, tileSizeBins: 4,
+      viewport: { xStart: 0, xEnd: end },
+    });
+    const initialScene = {
+      descriptors: projectedComplete ? [0, 1].map(descriptor) : [], generation: 1, resolution: 100,
+      tileSizeBins: 4, visibleLayerComplete: projectedComplete, overview,
+      viewport: { xStart: 0, xEnd: 800, yStart: 0, yEnd: 400 },
+      renderStyle: { colormap: "Reds" as const, colorScale: { log: false, min: 0, max: 10 } },
+      sourceLayout: useSourceLayout ? {
+        dataScope: "source-pan-test", generation: 1,
+        descriptors: [0, 1].map(descriptor), sourceTiles: [0, 1],
+        xMap: layoutMap(800), yMap: layoutMap(400),
+      } : undefined,
+    };
+    expect(renderer?.setScene(initialScene)).toBe(true);
+    flushFrames();
+    const target = { xStart: 800, xEnd: 1_600, yStart: 0, yEnd: 400 };
+    renderer?.retainPanViewport(target);
+    const presentations = blitFramebuffer.mock.calls.length;
+    const uploads = renderer!.performanceSnapshot().virtualTextureUploads;
+    expect(renderer?.appendSceneDescriptors({
+      descriptors: [descriptor(2)], generation: 2, resolution: 100, tileSizeBins: 4,
+    })).toBe(true);
+    renderer?.presentAppendedSceneDescriptors();
+    flushFrames();
+    expect(blitFramebuffer.mock.calls.length).toBeGreaterThan(presentations);
+    expect(renderer!.performanceSnapshot().virtualTextureUploads).toBeGreaterThan(uploads);
+    expect(renderer?.presentedViewport()).toEqual(target);
+    // The missing page stays white rather than showing Raw overview pixels.
+    const overviewUniformIndex = vi.mocked(gl.getUniformLocation).mock.calls
+      .findIndex(([, name]) => name === "u_has_overview");
+    const overviewUniform = vi.mocked(gl.getUniformLocation).mock.results[overviewUniformIndex]!.value;
+    const overviewUpdates = vi.mocked(gl.uniform1i).mock.calls
+      .filter(([location]) => location === overviewUniform);
+    expect(overviewUpdates[overviewUpdates.length - 1]?.[1]).toBe(0);
+    if (useSourceLayout) {
+      const sourceDraws = renderer!.performanceSnapshot().sourceLayoutDraws;
+      expect(renderer?.setScene(initialScene)).toBe(true);
+      flushFrames();
+      expect(renderer?.presentedViewport()).toEqual(target);
+      expect(renderer!.performanceSnapshot().sourceLayoutDraws).toBe(sourceDraws);
+    }
     renderer?.destroy();
   });
 
@@ -1298,6 +1465,49 @@ describe("contactTileFloatTextureData", () => {
       virtualTextureLayers: 3,
       evictions: 1,
     });
+    renderer?.destroy();
+  });
+
+  it("loads new pages during a long pan even after the atlas fills", () => {
+    const { canvas, texSubImage3D, texImage3D } = mockWebGlCanvas();
+    const frames: FrameRequestCallback[] = [];
+    const flushFrames = () => {
+      for (let i = 0; i < 30 && frames.length > 0; i += 1) {
+        frames.shift()!(i);
+      }
+      expect(frames).toHaveLength(0);
+    };
+    const renderer = createContactTileGpuRenderer(canvas, 256, {
+      performanceEnabled: false, virtualTextureEnabled: true, texturePreference: "r32f",
+      requestFrame: (callback) => { frames.push(callback); return frames.length; },
+      cancelFrame: () => undefined,
+    });
+    const descriptor = (tileX: number) => ({
+      key: `${tileX}:0:source`, transpose: false,
+      tile: { tileX, tileY: 0, cells: [{ xBin: tileX * 4, yBin: 0, count: tileX + 1 }] },
+    });
+    expect(renderer?.setScene({
+      descriptors: [0, 1, 2].map(descriptor), generation: 1,
+      resolution: 1_000, tileSizeBins: 4, visibleLayerComplete: true,
+      viewport: { xStart: 0, xEnd: 4_000, yStart: 0, yEnd: 4_000 },
+      renderStyle: { colormap: "Reds", colorScale: { log: false, min: 0, max: 10 } },
+    })).toBe(true);
+    flushFrames();
+    const allocations = texImage3D.mock.calls.length;
+    for (const tileX of [3, 4, 5, 1_000, 2_000]) {
+      const viewport = { xStart: tileX * 4_000, xEnd: (tileX + 1) * 4_000, yStart: 0, yEnd: 4_000 };
+      renderer?.retainPanViewport(viewport);
+      const uploads = texSubImage3D.mock.calls.length;
+      expect(renderer?.appendSceneDescriptors({
+        descriptors: [descriptor(tileX)], generation: 2, resolution: 1_000, tileSizeBins: 4,
+      })).toBe(true);
+      expect(renderer?.presentAppendedSceneDescriptors()).toBe(true);
+      flushFrames();
+      expect(texSubImage3D).toHaveBeenCalledTimes(uploads + 1);
+      expect(renderer?.presentedViewport()).toEqual(viewport);
+    }
+    expect(texImage3D).toHaveBeenCalledTimes(allocations);
+    expect(renderer?.performanceSnapshot().virtualTextureLayers).toBeLessThanOrEqual(3);
     renderer?.destroy();
   });
 

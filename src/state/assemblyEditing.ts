@@ -913,45 +913,98 @@ export function planGfaBlockCreation(
   for (let index = 1; index < selected.length; index += 1) {
     const left = selected[index - 1];
     const right = selected[index];
-    const leftSide = displayedAssemblySide(left, "right");
-    const rightSide = displayedAssemblySide(right, "left");
-    const betweenSources = links.filter((link) => (
-      (link.from.segmentName === left.sourceId && link.to.segmentName === right.sourceId)
-      || (link.from.segmentName === right.sourceId && link.to.segmentName === left.sourceId)
-    ));
-    const matches = betweenSources.filter((link) => gfaLinkMatchesBoundary(
-      link,
-      left.sourceId,
-      leftSide,
-      right.sourceId,
-      rightSide,
-    ));
-    if (matches.length > 1) {
+    // Extending an existing block must not trim its internal overlaps again.
+    if (left.assemblyBlockId && left.assemblyBlockId === right.assemblyBlockId) {
+      continue;
+    }
+    const plan = planGfaBoundaryJoin(left, right, links);
+    if (!plan.ok) {
+      return plan;
+    }
+    joins.push(plan.join);
+  }
+  return { ok: true, selectedBlockIds: selected.map((block) => block.id), joins };
+}
+
+function planGfaBoundaryJoin(
+  left: ContactMapLayoutBlock,
+  right: ContactMapLayoutBlock,
+  links: ReadonlyArray<GfaLinkEvidence>,
+): { ok: true; join: GfaBlockJoinPlan } | { ok: false; reason: string } {
+  const leftSide = displayedAssemblySide(left, "right");
+  const rightSide = displayedAssemblySide(right, "left");
+  const betweenSources = links.filter((link) => (
+    (link.from.segmentName === left.sourceId && link.to.segmentName === right.sourceId)
+    || (link.from.segmentName === right.sourceId && link.to.segmentName === left.sourceId)
+  ));
+  const matches = betweenSources.filter((link) => gfaLinkMatchesBoundary(
+    link,
+    left.sourceId,
+    leftSide,
+    right.sourceId,
+    rightSide,
+  ));
+  let link = matches[0] ?? null;
+  if (matches.length > 1) {
+    const forward = matches.filter((match) => match.from.segmentName === left.sourceId);
+    const reverse = matches.filter((match) => match.from.segmentName === right.sourceId);
+    // Hifiasm prints a source-side overlap per directed arc. Reciprocal arcs
+    // can differ (e.g. 22922M / 22920M); trim the right contig using the arc
+    // whose source is that contig, not a min/max or file-order choice.
+    // Accept only a unique reciprocal pair with independently verified L1/LN.
+    if (matches.length === 2 && forward.length === 1 && reverse.length === 1
+      && matches.every((match) => match.fromOverlapBases !== undefined)) {
+      link = reverse[0];
+    } else {
       return { ok: false, reason: `Multiple GFA overlaps match ${left.sourceId} → ${right.sourceId}.` };
     }
-    if (matches.length === 0 && betweenSources.length > 0) {
-      return { ok: false, reason: `GFA link orientation conflicts at ${left.sourceId} → ${right.sourceId}.` };
+  }
+  if (matches.length === 0 && betweenSources.length > 0) {
+    return { ok: false, reason: `GFA link orientation conflicts at ${left.sourceId} → ${right.sourceId}.` };
+  }
+  const trimRightBases = link ? exactGfaOverlapLength(link.overlap) : 0;
+  if (trimRightBases === null) {
+    return { ok: false, reason: `Overlap ${link!.overlap} is not a simple ungapped M/= CIGAR; review it before joining.` };
+  }
+  if (trimRightBases > 0) {
+    for (const block of [left, right]) {
+      if (!isKnownAssemblyOrientation(block.orientation)) {
+        return { ok: false, reason: `Orientation ${block.orientation} cannot safely resolve the overlap on ${block.sourceId}.` };
+      }
     }
-    const link = matches[0] ?? null;
-    const trimRightBases = link ? exactGfaOverlapLength(link.overlap) : 0;
-    if (link && trimRightBases === null) {
-      return { ok: false, reason: `Overlap ${link.overlap} is not a simple ungapped M/= CIGAR; review it before joining.` };
-    }
-    if ((trimRightBases ?? 0) > 0 && !isKnownAssemblyOrientation(right.orientation)) {
-      return { ok: false, reason: `Orientation ${right.orientation} cannot safely resolve the overlap on ${right.sourceId}.` };
-    }
-    if ((trimRightBases ?? 0) >= right.sourceEnd - right.sourceStart) {
-      return { ok: false, reason: `Overlap is not shorter than ${right.sourceId}.` };
-    }
-    joins.push({
+  }
+  if (trimRightBases >= right.sourceEnd - right.sourceStart) {
+    return { ok: false, reason: `Overlap is not shorter than ${right.sourceId}.` };
+  }
+  return {
+    ok: true,
+    join: {
       leftBlockId: left.id,
       rightBlockId: right.id,
       linkId: link?.id ?? null,
       overlap: link?.overlap ?? null,
-      trimRightBases: trimRightBases ?? 0,
-    });
+      trimRightBases,
+    },
+  };
+}
+
+function applyGfaBoundaryJoin(block: ContactMapLayoutBlock, join: GfaBlockJoinPlan) {
+  const next = { ...block, gapBefore: undefined };
+  if (join.trimRightBases > 0 && join.linkId && join.overlap) {
+    next.gfaOverlapBefore = {
+      linkId: join.linkId,
+      cigar: join.overlap,
+      trimmedBases: join.trimRightBases + (block.gfaOverlapBefore?.trimmedBases ?? 0),
+      originalSourceStart: block.gfaOverlapBefore?.originalSourceStart ?? block.sourceStart,
+      originalSourceEnd: block.gfaOverlapBefore?.originalSourceEnd ?? block.sourceEnd,
+    };
+    if (block.orientation === "-") {
+      next.sourceEnd -= join.trimRightBases;
+    } else {
+      next.sourceStart += join.trimRightBases;
+    }
   }
-  return { ok: true, selectedBlockIds: selected.map((block) => block.id), joins };
+  return next;
 }
 
 /** Apply one validated GFA-aware block creation without modifying the source FASTA. */
@@ -971,25 +1024,7 @@ export function createAssemblyBlockFromGfa(
     if (!selectedIds.has(block.id)) {
       return block;
     }
-    let next = { ...block };
-    if (join) {
-      next.gapBefore = undefined;
-      if (join.trimRightBases > 0 && join.linkId && join.overlap) {
-        next.gfaOverlapBefore = {
-          linkId: join.linkId,
-          cigar: join.overlap,
-          trimmedBases: join.trimRightBases,
-          originalSourceStart: block.sourceStart,
-          originalSourceEnd: block.sourceEnd,
-        };
-        if (block.orientation === "-") {
-          next.sourceEnd -= join.trimRightBases;
-        } else {
-          next.sourceStart += join.trimRightBases;
-        }
-      }
-    }
-    return next;
+    return join ? applyGfaBoundaryJoin(block, join) : block;
   });
   return recomputeVisualCoordinates(rebuildAssemblyBlockMembership(edited));
 }
@@ -1400,13 +1435,27 @@ export function hasDeletableGap(
 export function deleteGapsBetweenSelection(
   blocks: ContactMapLayoutBlock[],
   selection: AssemblySelection | null,
+  links: ReadonlyArray<GfaLinkEvidence> = [],
 ): ContactMapLayoutBlock[] {
+  const plan = planAssemblyGapDeletion(blocks, selection, links);
+  return plan.ok ? plan.blocks : blocks;
+}
+
+/** Validate all selected gap joins before applying any source-interval trims. */
+export function planAssemblyGapDeletion(
+  blocks: ContactMapLayoutBlock[],
+  selection: AssemblySelection | null,
+  links: ReadonlyArray<GfaLinkEvidence> = [],
+): { ok: true; blocks: ContactMapLayoutBlock[]; trimmedBases: number }
+  | { ok: false; reason: string } {
   if (selection?.kind !== "contigs") {
-    return blocks;
+    return { ok: true, blocks, trimmedBases: 0 };
   }
   const selected = new Set(selectedBlockIds(blocks, selection));
   const deletedGapBeforeIds = new Set<string>();
-  const joinedBlocks = blocks.map((block, index) => {
+  const joinedBlocks: ContactMapLayoutBlock[] = [];
+  let trimmedBases = 0;
+  for (const [index, block] of blocks.entries()) {
     const previous = blocks[index - 1];
     if (
       !previous
@@ -1415,15 +1464,27 @@ export function deleteGapsBetweenSelection(
       || !selected.has(block.id)
       || !block.gapBefore?.length
     ) {
-      return block;
+      joinedBlocks.push(block);
+      continue;
     }
 
+    // A cut within one contig is restored from its adjacent source intervals,
+    // independently of any graph self-link for that contig.
+    if (canRestoreSplitSiblings(previous, block)) {
+      joinedBlocks.push({ ...block, gapBefore: undefined });
+    } else {
+      const plan = planGfaBoundaryJoin(previous, block, links);
+      if (!plan.ok) {
+        return plan;
+      }
+      joinedBlocks.push(applyGfaBoundaryJoin(block, plan.join));
+      trimmedBases += plan.join.trimRightBases;
+    }
     deletedGapBeforeIds.add(block.id);
-    return { ...block, gapBefore: undefined };
-  });
+  }
 
   if (deletedGapBeforeIds.size === 0) {
-    return blocks;
+    return { ok: true, blocks, trimmedBases: 0 };
   }
 
   const restoredBlocks = joinedBlocks.reduce<ContactMapLayoutBlock[]>((result, block) => {
@@ -1440,9 +1501,11 @@ export function deleteGapsBetweenSelection(
     return result;
   }, []);
 
-  return recomputeVisualCoordinates(
-    rebuildAssemblyBlockMembership(restoredBlocks),
-  );
+  return {
+    ok: true,
+    blocks: recomputeVisualCoordinates(rebuildAssemblyBlockMembership(restoredBlocks)),
+    trimmedBases,
+  };
 }
 
 function canRestoreSplitSiblings(

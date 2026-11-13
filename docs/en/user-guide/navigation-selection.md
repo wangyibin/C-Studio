@@ -21,7 +21,26 @@ windows show more sequence vertically. Resizing preserves square matrix bins.
 Areas beyond the assembly end remain empty; zoom in to view a smaller interval.
 
 The whole-genome navigators along the axes can also move one axis independently.
+While dragging the X or Y chromosome bar, the heatmap follows the pointer and
+each arriving tile appears immediately, without waiting for pointer release or
+the rest of the viewport to load. Releasing confirms the position.
 Pan positions are constrained by the assembly extent.
+
+While new contact-map tiles load, the existing heatmap continues to follow the
+pointer. Newly exposed areas may briefly remain white, then fill when their
+tiles arrive. This temporary blank area does not indicate missing contacts.
+
+The coverage track follows the X viewport during heatmap dragging, X chromosome
+bar dragging, and wheel panning, including its bars, chromosome boundaries, and
+selection. Newly loaded coverage appears without waiting for release. The depth
+scale stays stable during panning; moving only Y leaves coverage in place.
+
+The Overview viewport window also follows heatmap dragging, X/Y chromosome bar
+dragging, and wheel panning before release. Cancelling a drag restores both the
+window and the main heatmap to their previous position.
+
+When switching resolution or normalization, the current frame remains visible
+until the new frame is ready, then the heatmap switches to the new viewport.
 
 ## Jump to a region
 

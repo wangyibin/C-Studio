@@ -48,6 +48,26 @@ describe("GFA evidence import", () => {
     expect(graph.nodes.find((node) => node.id === "a1")?.length).toBe(100);
   });
 
+  it("retains asymmetric hifiasm source overlaps verified by L1, even when S records follow L", () => {
+    const document = parseGfaText([
+      "L\ta\t-\tb\t+\t22922M\tL1:i:4252605\tL2:i:0",
+      "L\tb\t-\ta\t+\t22920M\tL1:i:52247\tL2:i:0",
+      "S\ta\t*\tLN:i:4275527",
+      "S\tb\t*\tLN:i:75167",
+    ].join("\n"));
+    expect(document.links.map((link) => link.fromOverlapBases)).toEqual([22922, 22920]);
+  });
+
+  it("does not infer hifiasm source lengths from missing or inconsistent L1 tags", () => {
+    const document = parseGfaText([
+      "S\ta\t*\tLN:i:100",
+      "S\tb\t*\tLN:i:100",
+      "L\ta\t+\tb\t+\t12M\tL1:i:90",
+      "L\tb\t-\ta\t-\t10M",
+    ].join("\n"));
+    expect(document.links.every((link) => link.fromOverlapBases === undefined)).toBe(true);
+  });
+
   it("keeps graph-only segments in an Unplaced group", () => {
     const document = parseGfaText("S\ta\t*\tLN:i:100\nS\tb\t*\tLN:i:80");
     const graph = buildGfaAssemblyGraph(document, [

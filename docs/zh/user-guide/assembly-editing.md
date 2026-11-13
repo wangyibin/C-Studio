@@ -31,9 +31,24 @@ GFA 视图中选择。右键单击所选对象即可打开操作菜单，各视�
 | **Dissolve block** | 拆开所选组装块，使每个 contig 各自成为一个组装块 |
 | **Add chr boundaries** | 在所选 contig 周围增加染色体边界 |
 | **Remove chr boundaries** | 移除所选边界中符合条件的染色体边界 |
-| **Delete gap / join blocks** | 删除符合条件的 AGP 间隙行（gap），并连接相邻组装块 |
+| **Delete gap / join blocks** | 删除符合条件的 AGP 间隙行（gap），连接相邻组装块，并根据已加载的 GFA 去除重叠 |
 | **Move to debris** | 将所选序列移入 debris 对象，保留这些序列 |
 | **Delete contig…** | 显示剩余拷贝信息，经确认后从组装中移除所选拷贝 |
+
+复制完成后，选中状态会转移到本次生成的副本。整条染色体的副本保留染色体选区，可继续按染色体插入、移动或编辑；contig 副本保留 contig 选区。
+
+加载 GFA 后，**Delete gap / join blocks**（++cmd+j++ / ++ctrl+j++）会检查每个
+新连接边界的 `L` 记录。如果存在唯一且方向匹配的连接，并且重叠 CIGAR 仅包含
+`M`/`=`，程序会从右侧 contig 的显示左端裁去相应长度，修改 AGP 源序列区间，
+原始 FASTA 不变。已有连接不会重复裁剪。GFA 中没有这对 contig 的连接时，
+仅删除 gap；存在多条匹配连接、方向冲突或不支持的重叠时，本次编辑不执行，
+并在 Messages 中显示原因。Undo 会恢复 gap 和源序列区间；**Dissolve block**
+也会恢复已记录的重叠裁剪。
+
+hifiasm 的双向连接可能分别记录两个源 contig 上不同的重叠长度。当 `L1` 标签与
+源序列长度一致、且双向连接唯一时，Join 使用被裁剪 contig 自身记录的重叠长度。
+仅移动或反向 contig 后保存不会触发去重；需要选中相邻组装块并执行
+**Delete gap / join blocks**。
 
 拆分 contig 时，先选中它，再把鼠标指针移到热图中该 contig 的对角标注框内部。
 出现剪切光标后，单击即可拆分。程序会保护 contig 的两端，靠近端点的点击不会

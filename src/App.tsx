@@ -1,3 +1,4 @@
+import { writeAgpBundleStreaming } from "./state/agpStreamingSave";
 import { RemoteImageTileLayer, remoteImageTileGrid } from "./state/remoteImageTiles";
 import { RemoteRasterFlight } from "./state/remoteRasterFlight";
 import type { ContactViewport } from "./state/contactViewport";
@@ -16,6 +17,8 @@ import { exportAgpText } from "./state/agpExport";
 import {
   agpAutoSaveDelayMs,
   agpSavePlan,
+  agpSaveDialogPath,
+  editedAgpFilename,
   shouldScheduleAgpAutoSave,
 } from "./state/agpAutoSave";
 import {
@@ -26,6 +29,7 @@ import {
   windowCloseRequestAction,
 } from "./state/windowCloseGuard";
 import {
+  cacheAutoColorScale,
   contactAutoColorScaleKey,
   contactCountSampleForColorScale,
   estimateContactColorScale,
@@ -80,6 +84,7 @@ import {
   parseBedGraphText,
   type BedGraphRecord,
   type CoverageView,
+  type CoverageViewportLoader,
 } from "./state/coverageView";
 import {
   createContactTileCacheKeyResolver,
@@ -1315,6 +1320,7 @@ export function App() {
   const contactMainLodTileCacheRef = useRef<Map<string, ContactMapTile>>(
     contactMainLodTileCacheLru.toMap(),
   );
+  const [autoColorScaleRevisions, setAutoColorScaleRevisions] = useState<Record<string, number>>({});
   const autoColorScaleCacheRef = useRef<Map<string, ContactColorScale>>(new Map());
   const lastCompleteContactMapRef = useRef<ContactMapView | null>(null);
   const placementPreviewRestoreFrameRef = useRef<ContactMapView | null>(null);
@@ -1375,6 +1381,7 @@ export function App() {
       : null
   ));
   const savedAgpPathRef = useRef<string | null>(null);
+  const downloadedAgpFilenameRef = useRef<string | null>(null);
   const [savedAgpPath, setSavedAgpPath] = useState<string | null>(null);
   const savingAgpRef = useRef(false);
   const isAgpDirtyRef = useRef(false);
@@ -1525,13 +1532,25 @@ export function App() {
         startedAt,
       );
     }
+    if (action.type === "resetColorScaleAuto") {
+      // Explicit Auto refits only this level. Panning never changes its key.
+      const resolution = currentUiState.contact.resolution;
+      setAutoColorScaleRevisions((revisions) => ({
+        ...revisions,
+        [resolution]: (revisions[resolution] ?? 0) + 1,
+      }));
+    }
     if (action.type === "commitContactViewportPan") {
       // Tile requests remain grid-deduplicated while every settled camera gets
       // one presentation pass, including moves that stay inside the same tiles.
       setContactViewportCommitRevision((revision) => revision + 1);
     }
-    dispatchUi(action);
-  }, [contactResolutionResponsiveness, contactTilePerformance]);
+    // Both the shared context menu and the join shortcut reach this dispatcher.
+    // Use the complete imported graph, independent of the visible GFA subgraph.
+    dispatchUi(action.type === "deleteAssemblyGaps"
+      ? { ...action, links: gfaDocument?.links ?? [] }
+      : action);
+  }, [contactResolutionResponsiveness, contactTilePerformance, gfaDocument]);
   const handleContactTileLayerCommit = useCallback((event: ContactTileRenderMilestone) => {
     if (event.generation === contactTileGenerationRef.current) {
       const completeLayer = lastCompleteContactMapRef.current;
@@ -2610,9 +2629,10 @@ export function App() {
   );
 
   const remoteRenderViewportKey = remoteRendering ? JSON.stringify(effectiveContactTileViewport) : "";
+  const autoColorScaleRevision = autoColorScaleRevisions[uiState.contact.resolution] ?? 0;
   const remoteRenderStyleKey = remoteRendering
     ? JSON.stringify([uiState.contact.colormap, uiState.contact.colorScale.auto
-      ? { auto: true, log: uiState.contact.colorScale.log } : uiState.contact.colorScale]) : "";
+      ? { auto: true, log: uiState.contact.colorScale.log, revision: autoColorScaleRevision } : uiState.contact.colorScale]) : "";
 
   const prepareRemoteRaster = useCallback((viewport: ContactViewport) => {
       const plan = remoteRenderPlan(viewport, effectiveContactTileResolution,
@@ -2627,7 +2647,7 @@ export function App() {
       const panRequest = { viewport, width: uiState.contact.viewportWidthPx,
         height: uiState.contact.viewportHeightPx };
       const scaleKey = `raster|${contactAutoColorScaleKey(contactCoolPath!,
-        plan.targetResolution, 256, uiState.contact.colorScale.log)}`;
+        plan.targetResolution, 256, uiState.contact.colorScale.log, autoColorScaleRevision)}`;
       const cachedScale = uiState.contact.colorScale.auto
         ? autoColorScaleCacheRef.current.get(scaleKey) : undefined;
       const load = (signal: AbortSignal) => loadRemoteRaster({
@@ -2664,7 +2684,7 @@ export function App() {
   }, [contactCoolPath, effectiveContactTileResolution, effectiveContactTileTotalSpanBp,
     contactAvailableResolutions, contactIsMcool, contactMainLodEnabled,
     uiState.contact.viewportWidthPx, uiState.contact.viewportHeightPx, uiState.normalization,
-    remoteRenderStyleKey, viewContactLayoutBlocks]);
+    remoteRenderStyleKey, autoColorScaleRevision, viewContactLayoutBlocks]);
 
   useEffect(() => {
     remotePanPrefetchRef.current = remoteRendering && contactCoolPath ? (viewport) => {
@@ -2735,7 +2755,7 @@ export function App() {
           if (uiState.contact.colorScale.auto && map.raster) {
             const scale = cachedScale ?? { auto: true, log: uiState.contact.colorScale.log,
               min: 0, max: map.raster.scaleMax };
-            autoColorScaleCacheRef.current.set(scaleKey, scale);
+            cacheAutoColorScale(autoColorScaleCacheRef.current, scaleKey, scale);
             dispatchUi({ type: "setAutoColorScale", scale });
           }
           setStatusMessage(`Server rendered contact map · ${map.resolution} bp display bins`);
@@ -3188,13 +3208,14 @@ export function App() {
         renderGeneration: generation,
         isTransientResolutionPreview: false,
       });
-      const mainLodAutoColorScaleKey = contactAutoColorScaleKey(
-        contactCoolPath,
-        mainLodPlan.targetResolution,
-        lodTileSizeBins,
-        uiState.contact.colorScale.log,
-      );
       const applyMainLodAutoColorScale = (map: ContactMapView) => {
+        const mainLodAutoColorScaleKey = contactAutoColorScaleKey(
+          contactCoolPath,
+          mainLodPlan.targetResolution,
+          lodTileSizeBins,
+          uiState.contact.colorScale.log,
+          autoColorScaleRevision,
+        );
         if (
           contactTileReplacementPreviewActive
           || !uiState.contact.colorScale.auto
@@ -3213,7 +3234,7 @@ export function App() {
           return;
         }
         const scale = estimateContactColorScale(counts, uiState.contact.colorScale.log);
-        autoColorScaleCacheRef.current.set(mainLodAutoColorScaleKey, scale);
+        cacheAutoColorScale(autoColorScaleCacheRef.current, mainLodAutoColorScaleKey, scale);
         dispatchUi({ type: "setAutoColorScale", scale });
       };
       let mainLodPaintScheduled = false;
@@ -3709,13 +3730,14 @@ export function App() {
       visibleLayerComplete: world.missingVisibleTiles.length === 0,
       renderGeneration: generation,
     });
-    const autoColorScaleKey = contactAutoColorScaleKey(
-      contactCoolPath,
-      targetResolution,
-      tileSizeBins,
-      uiState.contact.colorScale.log,
-    );
     const applyAutoColorScale = (map: ContactMapView) => {
+      const autoColorScaleKey = contactAutoColorScaleKey(
+        contactCoolPath,
+        targetResolution,
+        tileSizeBins,
+        uiState.contact.colorScale.log,
+        autoColorScaleRevision,
+      );
       if (
         contactTileReplacementPreviewActive
         || !uiState.contact.colorScale.auto
@@ -3736,7 +3758,7 @@ export function App() {
         return;
       }
       const scale = estimateContactColorScale(counts, uiState.contact.colorScale.log);
-      autoColorScaleCacheRef.current.set(autoColorScaleKey, scale);
+      cacheAutoColorScale(autoColorScaleCacheRef.current, autoColorScaleKey, scale);
       dispatchUi({ type: "setAutoColorScale", scale });
     };
     const initialContactMap = contactMapForWorld(tileWorld);
@@ -4670,6 +4692,7 @@ export function App() {
     contactTileReplacementPreviewActive,
     contactPanPrefetchBridge,
     contactPanPrefetchQueue,
+    autoColorScaleRevision,
     uiState.contact.colorScale.auto,
     uiState.contact.colorScale.log,
     uiState.normalization,
@@ -5200,24 +5223,8 @@ export function App() {
     uiState.normalization,
   ]);
 
-  useEffect(() => {
-    if (backgroundAssemblyLayout.blocks.length === 0 || (!dataset?.coverage_path && coverageRecords.length === 0)) {
-      setCoverageView(null);
-      return;
-    }
-
-    let cancelled = false;
-    const renderGeneration = contactTileGenerationRef.current;
+  const loadCoverageViewport = useCallback<CoverageViewportLoader>(async ({ viewport, displayResolution }) => {
     const totalSpanBp = Math.max(1, backgroundAssemblyLayout.totalSpan);
-    const viewport = buildCenteredContactViewport({
-      centerMb: uiState.contact.viewportCenterXMb,
-      centerXMb: uiState.contact.viewportCenterXMb,
-      totalSpanBp,
-      windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
-      viewportWidthPx: uiState.contact.viewportWidthPx,
-      viewportHeightPx: uiState.contact.viewportHeightPx,
-    });
-    const displayResolution = contactResolutionToBasePairs(uiState.contact.resolution);
     const coverageLayoutBlocks = placeHiddenChromosomeBlocksAfter(
       backgroundAssemblyLayout,
       Math.ceil(viewport.xEnd / displayResolution) * displayResolution,
@@ -5231,18 +5238,42 @@ export function App() {
         viewport,
       },
     );
-    const coveragePromise = coverageRecords.length > 0
-      ? invoke<CoverageView>("build_coverage_view", { request })
-      : invoke<CoverageView>("build_coverage_view_from_bedgraph", {
+    try {
+      return await (coverageRecords.length > 0
+        ? invoke<CoverageView>("build_coverage_view", { request })
+        : invoke<CoverageView>("build_coverage_view_from_bedgraph", {
           request: {
             bedgraphPath: dataset?.coverage_path,
             displayResolution: request.displayResolution,
             viewport: request.viewport,
             layoutBlocks: request.layoutBlocks,
           },
-        });
+        }));
+    } catch (error) {
+      if (coverageRecords.length > 0) return buildBrowserCoverageView(request);
+      throw error;
+    }
+  }, [backgroundAssemblyLayout, coverageRecords, dataset?.coverage_path]);
 
-    coveragePromise
+  useEffect(() => {
+    if (backgroundAssemblyLayout.blocks.length === 0 || (!dataset?.coverage_path && coverageRecords.length === 0)) {
+      setCoverageView(null);
+      return;
+    }
+
+    let cancelled = false;
+    const renderGeneration = contactTileGenerationRef.current;
+    const viewport = buildCenteredContactViewport({
+      centerMb: uiState.contact.viewportCenterXMb,
+      centerXMb: uiState.contact.viewportCenterXMb,
+      totalSpanBp: Math.max(1, backgroundAssemblyLayout.totalSpan),
+      windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
+      viewportWidthPx: uiState.contact.viewportWidthPx,
+      viewportHeightPx: uiState.contact.viewportHeightPx,
+    });
+
+    const displayResolution = contactResolutionToBasePairs(uiState.contact.resolution);
+    loadCoverageViewport({ viewport, displayResolution })
       .then((view) => {
         if (!cancelled && renderGeneration === contactTileGenerationRef.current) {
           setCoverageView({ ...view, renderGeneration });
@@ -5250,13 +5281,6 @@ export function App() {
       })
       .catch((error) => {
         if (cancelled || renderGeneration !== contactTileGenerationRef.current) {
-          return;
-        }
-        if (coverageRecords.length > 0) {
-          setCoverageView({
-            ...buildBrowserCoverageView(request),
-            renderGeneration,
-          });
           return;
         }
         setCoverageView(null);
@@ -5271,6 +5295,7 @@ export function App() {
     contactAvailableResolutions,
     coverageRecords,
     dataset?.coverage_path,
+    loadCoverageViewport,
     uiState.contact.colorScale.auto,
     uiState.contact.colorScale.log,
     uiState.contact.resolution,
@@ -5375,6 +5400,7 @@ export function App() {
         importedDataset.agp_path,
       );
       savedAgpPathRef.current = null;
+      downloadedAgpFilenameRef.current = null;
       setSavedAgpPath(null);
       const canonicalAgp = exportAgpText(importedDataset.agp_layout.blocks);
       setSavedAgpText(canonicalAgp);
@@ -5406,6 +5432,7 @@ export function App() {
         example.dataset.agp_path,
       );
       savedAgpPathRef.current = null;
+      downloadedAgpFilenameRef.current = null;
       setSavedAgpPath(null);
       const canonicalAgp = exportAgpText(example.dataset.agp_layout.blocks);
       setSavedAgpText(canonicalAgp);
@@ -5473,6 +5500,7 @@ export function App() {
 
     sourceAgpRef.current = sourceAgpSnapshot(agpLayout, file.name);
     savedAgpPathRef.current = null;
+    downloadedAgpFilenameRef.current = null;
     setSavedAgpPath(null);
     const canonicalAgp = exportAgpText(agpLayout.blocks);
     setSavedAgpText(canonicalAgp);
@@ -5533,6 +5561,7 @@ export function App() {
 
       sourceAgpRef.current = sourceAgpSnapshot(agpLayout, bundle.agp.path);
       savedAgpPathRef.current = null;
+      downloadedAgpFilenameRef.current = null;
       setSavedAgpPath(null);
       setSavedAgpText(canonicalAgp);
       setSavedHistoryIdentity(historyIdentityForArchive(restoredHistory));
@@ -5713,6 +5742,7 @@ export function App() {
       );
       sourceAgpRef.current = sourceAgpSnapshot(agpLayout, bundle.agp.path);
       savedAgpPathRef.current = null;
+      downloadedAgpFilenameRef.current = null;
       setSavedAgpPath(null);
       setSavedAgpText(canonicalAgp);
       setSavedHistoryIdentity(historyIdentityForArchive(restoredHistory));
@@ -5893,6 +5923,7 @@ export function App() {
         // A loaded source file is not a user-confirmed save destination. The
         // first explicit Save must ask where the edited AGP should be written.
         savedAgpPathRef.current = null;
+        downloadedAgpFilenameRef.current = null;
         sourceAgpRef.current = sourceAgpSnapshot(agpLayout, bundle.agp.path);
         setSavedAgpPath(null);
         setSavedAgpText(canonicalAgp);
@@ -6259,6 +6290,7 @@ export function App() {
 
     sourceAgpRef.current = null;
     savedAgpPathRef.current = null;
+    downloadedAgpFilenameRef.current = null;
     setSavedAgpPath(null);
     setSavedAgpText("");
     setSavedHistoryIdentity("");
@@ -6319,6 +6351,7 @@ export function App() {
 
     const layout = cloneAgpLayout(source.layout);
     savedAgpPathRef.current = null;
+    downloadedAgpFilenameRef.current = null;
     setSavedAgpPath(null);
     setSavedAgpText(source.canonicalText);
     setSavedHistoryIdentity(emptyOperationHistoryIdentity());
@@ -6355,25 +6388,40 @@ export function App() {
 
     savingAgpRef.current = true;
     const agpText = currentAgpText;
-    const historyText = serializeOperationHistory({
-      canonicalAgp: agpText,
-      operationHistory: uiState.operationHistory,
-      redoStack: uiState.redoStack,
-      nextOperationId: uiState.nextOperationId,
-    });
-    const filename = editedAgpFilename(dataset?.agp_path ?? "assembly.agp");
+    let historyText: string | null = null;
+    const filename = editedAgpFilename(
+      sourceAgpRef.current?.path ?? dataset?.agp_path ?? "assembly.agp",
+      savedAgpPathRef.current ?? downloadedAgpFilenameRef.current,
+    );
     const automatic = options.automatic === true;
     const saveAs = options.saveAs === true;
     const savedStatus = automatic ? "AGP auto-saved" : saveAs ? "AGP saved as" : "AGP saved";
+    let attemptedPath: string | null = savedAgpPathRef.current;
+    let saveStage = "Preparing operation history";
+    const reportWriteStarted = (path: string) => {
+      attemptedPath = path;
+      saveStage = "Writing AGP and operation history";
+      const status = `${saveStage}: ${path}`;
+      setStatusMessage(status);
+      dispatchUi({ type: "appendLog", message: status });
+    };
     try {
+      const history = {
+        canonicalAgp: agpText,
+        operationHistory: uiState.operationHistory,
+        redoStack: uiState.redoStack,
+        nextOperationId: uiState.nextOperationId,
+      };
+      // Browser downloads retain the legacy path; native saves never construct
+      // or send a single history-sized JSON string.
+      if (!("__TAURI_INTERNALS__" in window)) {
+        historyText = serializeOperationHistory(history);
+      }
       const existingPath = savedAgpPathRef.current;
       const plan = agpSavePlan({ automatic, saveAs, savePath: existingPath });
       if (plan === "overwrite" && existingPath) {
-        const overwritten = await invoke<boolean>("overwrite_agp_bundle", {
-          path: existingPath,
-          contents: agpText,
-          historyContents: historyText,
-        });
+        reportWriteStarted(existingPath);
+        const overwritten = await writeAgpBundleStreaming(invoke, existingPath, history, true);
         if (overwritten) {
           setSavedAgpText(agpText);
           setSavedHistoryIdentity(currentHistoryIdentity);
@@ -6398,11 +6446,12 @@ export function App() {
         return false;
       }
 
+      saveStage = "Choosing save destination";
       setStatusMessage("Opening AGP save dialog…");
       dispatchUi({ type: "appendLog", message: "Opening AGP Save As dialog" });
       const selectedPath = await saveDialog({
         title: saveAs ? "Save edited AGP as" : "Save edited AGP",
-        defaultPath: existingPath ?? filename,
+        defaultPath: agpSaveDialogPath(dataset?.agp_path ?? "", filename, existingPath),
         filters: [
           { name: "AGP files", extensions: ["agp"] },
           { name: "Text files", extensions: ["txt"] },
@@ -6411,14 +6460,13 @@ export function App() {
 
       if (!selectedPath) {
         setStatusMessage("AGP save canceled");
+        dispatchUi({ type: "appendLog", message: "AGP save dialog returned no destination; nothing was written" });
         return false;
       }
 
-      const savedPath = await invoke<string>("write_agp_bundle", {
-        path: selectedPath,
-        contents: agpText,
-        historyContents: historyText,
-      });
+      reportWriteStarted(selectedPath);
+      const savedPath = await writeAgpBundleStreaming(invoke, selectedPath, history);
+      if (!savedPath) throw new Error("Save destination is unavailable");
 
       savedAgpPathRef.current = savedPath;
       setSavedAgpPath(savedPath);
@@ -6430,9 +6478,16 @@ export function App() {
       dispatchUi({ type: "appendLog", message });
       return true;
     } catch (error) {
-      if (savedAgpPathRef.current) {
-        setStatusMessage(`AGP save failed: ${String(error)}`);
-        dispatchUi({ type: "appendLog", message: `AGP save failed: ${String(error)}` });
+      // A native write failure must not masquerade as a successful browser
+      // download: that leaves no saved destination for the next Save.
+      if ("__TAURI_INTERNALS__" in window || savedAgpPathRef.current || historyText === null) {
+        const details = `AGP save failed during ${saveStage.toLowerCase()}${attemptedPath ? `\nDestination: ${attemptedPath}` : ""}\n${String(error)}`;
+        setStatusMessage(details);
+        dispatchUi({ type: "appendLog", message: details });
+        dispatchUi({ type: "setBottomPanel", panel: "messages" });
+        if (!automatic && "__TAURI_INTERNALS__" in window) {
+          await message(details, { title: "AGP save failed", kind: "error" }).catch(() => undefined);
+        }
         return false;
       }
       downloadTextFile(filename, agpText, "text/plain;charset=utf-8");
@@ -6444,6 +6499,7 @@ export function App() {
       setSavedAgpText(agpText);
       setSavedHistoryIdentity(currentHistoryIdentity);
       setDataset((current) => current ? { ...current, agp_path: filename } : current);
+      downloadedAgpFilenameRef.current = filename;
       setStatusMessage(`AGP and history downloaded: ${filename}, ${operationHistoryFilename(filename)}`);
       dispatchUi({
         type: "appendLog",
@@ -7082,6 +7138,7 @@ export function App() {
       }
       syntenyView={syntenyView}
       coverageView={coverageView}
+      onLoadCoverageViewport={loadCoverageViewport}
       pafRecords={pafRecords}
       pafImported={pafImported}
       gfaDocument={gfaDocument}
@@ -7306,11 +7363,6 @@ function sourceAgpSnapshot(
     layout: sourceLayout,
     canonicalText: exportAgpText(sourceLayout.blocks),
   };
-}
-
-function editedAgpFilename(path: string) {
-  const basename = path.split(/[\\/]/).filter(Boolean).pop() ?? "assembly.agp";
-  return basename.replace(/(?:\.agp|\.txt)?$/i, ".edited.agp");
 }
 
 function agpBundleSavedMessage(status: string, agpPath: string) {

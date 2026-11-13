@@ -1,5 +1,7 @@
 mod commands;
+mod agp_stream_save;
 mod contact_display_cache;
+mod contact_display_maintenance;
 mod contact_display_memory_cache;
 mod contact_lod_cache;
 mod webcontent_memory;
@@ -44,6 +46,10 @@ pub fn run() {
             commands::write_agp_file,
             commands::overwrite_agp_file,
             commands::write_agp_bundle,
+            commands::begin_agp_stream_save,
+            commands::append_agp_stream_save,
+            commands::finish_agp_stream_save,
+            commands::abort_agp_stream_save,
             commands::overwrite_agp_bundle,
             commands::set_window_title,
             commands::build_contact_map_view,

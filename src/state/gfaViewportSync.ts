@@ -63,20 +63,28 @@ export function gfaPrimaryHomologScaffoldsForHeatmapViewport(
   return new Set(column?.scaffolds.map((scaffold) => scaffold.id) ?? []);
 }
 
+/** Assembly order is independent of the camera; rebuild only after an edit. */
+export function buildGfaViewportIndex(blocks: ContactMapLayoutBlock[]) {
+  const orderedByScaffold = new Map<string, ContactMapLayoutBlock[]>();
+  const positionById = new Map<string, number>();
+  for (const block of [...blocks].sort((left, right) => (
+    left.visualStart - right.visualStart || left.visualEnd - right.visualEnd
+  ))) {
+    const values = orderedByScaffold.get(block.objectId) ?? [];
+    positionById.set(block.id, values.length);
+    values.push(block);
+    orderedByScaffold.set(block.objectId, values);
+  }
+  return { orderedByScaffold, positionById };
+}
+
 export function gfaContigsForHeatmapViewport(
   blocks: ContactMapLayoutBlock[],
   viewport: ContactViewport,
   flankCount = 5,
   selectedOccurrenceIds: ReadonlySet<string> = new Set<string>(),
+  index = buildGfaViewportIndex(blocks),
 ) {
-  const orderedByScaffold = new Map<string, ContactMapLayoutBlock[]>();
-  for (const block of [...blocks].sort((left, right) => (
-    left.visualStart - right.visualStart || left.visualEnd - right.visualEnd
-  ))) {
-    const values = orderedByScaffold.get(block.objectId) ?? [];
-    values.push(block);
-    orderedByScaffold.set(block.objectId, values);
-  }
   const selected = blocks.filter((block) => selectedOccurrenceIds.has(block.id));
   const viewportFocalBlocks = [
     focusBlockForAxis(blocks, viewport.xStart, viewport.xEnd),
@@ -88,14 +96,14 @@ export function gfaContigsForHeatmapViewport(
   const output = new Set<string>();
   const safeFlankCount = Number.isFinite(flankCount) ? Math.max(0, Math.floor(flankCount)) : 0;
   for (const block of focalBlocks) {
-    const scaffoldBlocks = orderedByScaffold.get(block.objectId) ?? [];
-    const index = scaffoldBlocks.findIndex((candidate) => candidate.id === block.id);
-    if (index < 0) {
+    const scaffoldBlocks = index.orderedByScaffold.get(block.objectId) ?? [];
+    const position = index.positionById.get(block.id);
+    if (position === undefined) {
       continue;
     }
     for (
-      let neighborIndex = Math.max(0, index - safeFlankCount);
-      neighborIndex <= Math.min(scaffoldBlocks.length - 1, index + safeFlankCount);
+      let neighborIndex = Math.max(0, position - safeFlankCount);
+      neighborIndex <= Math.min(scaffoldBlocks.length - 1, position + safeFlankCount);
       neighborIndex += 1
     ) {
       output.add(scaffoldBlocks[neighborIndex].id);
@@ -118,17 +126,16 @@ function focusBlockForAxis(
   if (centered) {
     return centered;
   }
-  return blocks
-    .map((block) => ({
-      block,
-      overlap: Math.max(
-        0,
-        Math.min(block.visualEnd, viewportEnd) - Math.max(block.visualStart, viewportStart),
-      ),
-    }))
-    .filter((candidate) => candidate.overlap > 0)
-    .sort((left, right) => (
-      right.overlap - left.overlap
-      || left.block.visualStart - right.block.visualStart
-    ))[0]?.block ?? null;
+  let best: ContactMapLayoutBlock | null = null;
+  let largestOverlap = 0;
+  for (const block of blocks) {
+    const overlap = Math.min(block.visualEnd, viewportEnd) - Math.max(block.visualStart, viewportStart);
+    if (overlap > largestOverlap || (
+      overlap > 0 && overlap === largestOverlap && best && block.visualStart < best.visualStart
+    )) {
+      best = block;
+      largestOverlap = overlap;
+    }
+  }
+  return best;
 }

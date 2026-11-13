@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  cacheAutoColorScale,
   contactAutoColorScaleKey,
   contactCountSampleForColorScale,
   estimateContactColorScale,
@@ -146,83 +147,75 @@ describe("normalizeContactValue", () => {
 });
 
 describe("contactCountSampleForColorScale", () => {
-  it("matches Juicebox's per-block stride, diagonal filter, and visible-tile scope", () => {
-    const visibleCounts = Array.from({ length: 20_005 }, (_, index) => index + 1);
-    const counts = contactCountSampleForColorScale({
-      resolution: 1_000,
-      viewport: { xStart: 0, xEnd: 512_000, yStart: 0, yEnd: 512_000 },
-      cells: [],
-      tileSizeBins: 256,
-      tiles: [
-        {
-          tileX: 0,
-          tileY: 0,
-          cells: visibleCounts.map((count, index) => ({
-            xBin: index,
-            yBin: index % 20 === 0 ? index : 1,
-            count,
-          })),
-        },
-      ],
-      cachedTiles: [
-        {
-          tileX: 1,
-          tileY: 1,
-          cells: [{ xBin: 300, yBin: 300, count: 999_999 }],
-        },
-      ],
-    });
-
-    // Every twentieth sampled record is diagonal and therefore omitted.
-    expect(counts).toHaveLength(1_000);
-    expect(counts[0]).toBe(11);
-    expect(counts[counts.length - 1]).toBe(19_991);
-    expect(counts).not.toContain(999_999);
+  const viewport = { xStart: 0, xEnd: 8000, yStart: 0, yEnd: 8000 };
+  it("excludes offscreen and diagonal values but includes mirrored visible bins", () => {
+    const cells = [
+      { xBin: 1, yBin: 2, count: 4 },
+      { xBin: 1, yBin: 1, count: 99999 },
+      { xBin: 30, yBin: 31, count: 99999 },
+      { xBin: 2, yBin: 3, count: 12 },
+    ];
+    expect(contactCountSampleForColorScale({ resolution: 1000, viewport, cells })).toEqual([4, 12]);
+    expect(contactCountSampleForColorScale({ resolution: 1000,
+      viewport: { xStart: 2000, xEnd: 3000, yStart: 1000, yEnd: 2000 }, cells })).toEqual([4]);
   });
 
-  it("samples packed visible counts without materializing contact cells", () => {
-    const packedTile = {
-      tileX: 2,
-      tileY: 3,
-      cells: [],
-      packedCells: {
-        xLocal: new Uint16Array(Array.from({ length: 21 }, (_, index) => index)),
-        yLocal: new Uint16Array(Array.from({ length: 21 }, () => 40)),
-        counts: new Float64Array(Array.from({ length: 21 }, (_, index) => index + 0.25)),
-      },
-    };
-    const counts = contactCountSampleForColorScale({
-      resolution: 1_000,
-      viewport: { xStart: 0, xEnd: 1_000_000, yStart: 0, yEnd: 1_000_000 },
-      cells: [],
-      tileSizeBins: 256,
-      tiles: [packedTile],
-      cachedTiles: [{
-        tileX: 0,
-        tileY: 0,
-        cells: [],
-        packedCells: {
-          xLocal: new Uint16Array([0]),
-          yLocal: new Uint16Array([0]),
-          counts: new Float64Array([999_999]),
-        },
-      }],
-    });
-
-    expect(counts).toEqual([0.25, 10.25, 20.25]);
+  it("uses identical samples for sparse, packed and dense representations", () => {
+    const cells = Array.from({ length: 128 * 128 }, (_, i) => ({
+      xBin: i % 128, yBin: Math.floor(i / 128), count: i % 13 === 0 ? 0 : i + 1,
+    }));
+    const base = { resolution: 1000,
+      viewport: { xStart: 0, xEnd: 128000, yStart: 0, yEnd: 128000 }, cells: [], tileSizeBins: 128 };
+    const sparse = contactCountSampleForColorScale({ ...base,
+      tiles: [{ tileX: 0, tileY: 0, cells }] });
+    const dense = contactCountSampleForColorScale({ ...base,
+      tiles: [{ tileX: 0, tileY: 0, cells: [], denseOccupiedCount: cells.length, denseValues: new Float32Array(cells.map(c => c.count)) }] });
+    const packed = contactCountSampleForColorScale({ ...base,
+      tiles: [{ tileX: 0, tileY: 0, cells: [], packedCells: {
+        xLocal: new Uint16Array(cells.map(c => c.xBin)),
+        yLocal: new Uint16Array(cells.map(c => c.yBin)),
+        counts: new Float64Array(cells.map(c => c.count)),
+      } }] });
+    expect(dense).toEqual(sparse);
+    expect(packed).toEqual(sparse);
+    expect(estimateContactColorScale(contactCountSampleForColorScale({ ...base, cells: [...cells].reverse() }), false))
+      .toEqual(estimateContactColorScale(sparse, false));
   });
 
-  it("applies the same stride and diagonal filter to untiled overview cells", () => {
-    const counts = contactCountSampleForColorScale({
-      resolution: 1_000,
-      viewport: { xStart: 0, xEnd: 1_000_000, yStart: 0, yEnd: 1_000_000 },
-      cells: Array.from({ length: 21 }, (_, index) => ({
-        xBin: index,
-        yBin: index === 10 ? index : 30,
-        count: index + 1,
-      })),
-    });
-
-    expect(counts).toEqual([1, 21]);
+  it("does not lose fine-resolution signals between stride positions", () => {
+    const cells = Array.from({ length: 21 }, (_, i) => ({ xBin: i, yBin: 30, count: i === 9 ? 100 : 1 }));
+    const counts = contactCountSampleForColorScale({ resolution: 1000,
+      viewport: { xStart: 0, xEnd: 64000, yStart: 0, yEnd: 64000 }, cells });
+    expect(counts).toHaveLength(21);
+    expect(estimateContactColorScale(counts, false).max).toBe(100);
   });
+
+  it("keeps Max during pan and refits the current view only on explicit Auto", () => {
+    const cells = [
+      { xBin: 1, yBin: 2, count: 100 },
+      { xBin: 20, yBin: 21, count: 2 },
+    ];
+    const bright = { resolution: 1000, viewport, cells };
+    const faint = { ...bright, viewport: { xStart: 20000, xEnd: 24000, yStart: 20000, yEnd: 24000 } };
+    expect(estimateContactColorScale(contactCountSampleForColorScale(bright), false).max).toBe(100);
+    expect(estimateContactColorScale(contactCountSampleForColorScale(faint), false).max).toBe(2);
+    const cache = new Map();
+    const key = contactAutoColorScaleKey("test", 1000, 256, false);
+    cacheAutoColorScale(cache, key, estimateContactColorScale(contactCountSampleForColorScale(bright), false));
+    // Panning retains the estimate; explicit Auto uses a fresh revision.
+    expect(cache.get(contactAutoColorScaleKey("test", 1000, 256, false)).max).toBe(100);
+    const refitKey = contactAutoColorScaleKey("test", 1000, 256, false, 1);
+    expect(cache.has(refitKey)).toBe(false);
+    cacheAutoColorScale(cache, refitKey, estimateContactColorScale(contactCountSampleForColorScale(faint), false));
+    expect(cache.get(refitKey).max).toBe(2);
+    expect(cache.has(contactAutoColorScaleKey("test", 5000, 256, false))).toBe(false);
+  });
+});
+
+it("bounds the automatic resolution cache", () => {
+  const cache = new Map();
+  for (let i = 0; i < 200; i++) cacheAutoColorScale(cache, String(i), { min: 0, max: i + 1, auto: true, log: false });
+  expect(cache.size).toBe(128);
+  expect(cache.has("0")).toBe(false);
+  expect(cache.get("199").max).toBe(200);
 });

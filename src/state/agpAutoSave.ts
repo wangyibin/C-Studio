@@ -33,3 +33,17 @@ export function shouldScheduleAgpAutoSave({
 }) {
   return enabled && Boolean(savePath) && dirty && hasBlocks;
 }
+
+/** Keep the suggested edited filename beside the loaded AGP on either desktop platform. */
+export function agpSaveDialogPath(sourcePath: string, filename: string, savePath: string | null) {
+  if (savePath) return savePath;
+  const separatorIndex = Math.max(sourcePath.lastIndexOf("/"), sourcePath.lastIndexOf("\\"));
+  return sourcePath.slice(0, separatorIndex + 1) + filename;
+}
+
+export function editedAgpFilename(sourcePath: string, savedPath: string | null = null) {
+  const path = savedPath ?? sourcePath;
+  const basename = path.split(/[\\/]/).filter(Boolean).pop() ?? "assembly.agp";
+  if (savedPath) return basename;
+  return basename.replace(/(?:\.agp(?:\.gz)?|\.txt)?$/i, ".edited.agp");
+}

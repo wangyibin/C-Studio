@@ -41,6 +41,7 @@ use crate::{
     contact_display_cache::{
         self, DisplayCacheStorageFormat, DisplayCacheTile, DisplayCacheValues,
     },
+    contact_display_maintenance::{schedule_prune, PruneRequest},
     contact_display_memory_cache::DecodedDisplayTileCache,
     contact_lod_cache::{self, LodCacheCell, LodCachePayload},
     webcontent_memory::{sample_webcontent_memory, WebContentMemoryMonitorState},
@@ -2077,6 +2078,27 @@ pub fn write_agp_file(path: String, contents: String) -> Result<String, String> 
 }
 
 #[tauri::command]
+pub fn begin_agp_stream_save(path: String, require_existing: bool) -> Result<Option<u64>, String> {
+    let history = history_sidecar_path(Path::new(&path));
+    crate::agp_stream_save::begin(path, history, require_existing)
+}
+
+#[tauri::command]
+pub fn append_agp_stream_save(session: u64, part: String, contents: String) -> Result<(), String> {
+    crate::agp_stream_save::append(session, &part, &contents)
+}
+
+#[tauri::command]
+pub fn finish_agp_stream_save(session: u64) -> Result<String, String> {
+    crate::agp_stream_save::finish(session)
+}
+
+#[tauri::command]
+pub fn abort_agp_stream_save(session: u64) -> Result<(), String> {
+    crate::agp_stream_save::abort(session)
+}
+
+#[tauri::command]
 pub fn write_agp_bundle(
     path: String,
     contents: String,
@@ -3871,40 +3893,28 @@ fn store_persistent_display_tiles(
         .lock()
         .map(|cache| (cache.len(), cache.resident_bytes()))
         .unwrap_or((0, 0));
-    let dataset_prune = contact_display_cache::prune_tree(
-        &context.dataset_root,
-        persistent_display_cache_dataset_budget_bytes(),
-        DISPLAY_CACHE_MAX_DATASET_ENTRIES,
-    );
-    let global_prune = contact_display_cache::prune_tree(
-        &context.global_root,
-        persistent_display_cache_global_budget_bytes(),
-        DISPLAY_CACHE_MAX_GLOBAL_ENTRIES,
-    );
+    schedule_prune([
+        PruneRequest {
+            root: context.dataset_root,
+            max_bytes: persistent_display_cache_dataset_budget_bytes(),
+            max_entries: DISPLAY_CACHE_MAX_DATASET_ENTRIES,
+        },
+        PruneRequest {
+            root: context.global_root,
+            max_bytes: persistent_display_cache_global_budget_bytes(),
+            max_entries: DISPLAY_CACHE_MAX_GLOBAL_ENTRIES,
+        },
+    ]);
     if contact_tile_perf_logging_enabled() {
         eprintln!(
-            "CSTUDIO_PERF event=contact_display_cache status=stored tiles={} bytes={} failed={} write_us={} memory_entries={} memory_resident_bytes={} dataset_pruned_entries={} dataset_pruned_bytes={} global_pruned_entries={} global_pruned_bytes={}",
+            "CSTUDIO_PERF event=contact_display_cache status=stored tiles={} bytes={} failed={} write_us={} memory_entries={} memory_resident_bytes={}",
             stored,
             stored_bytes,
             failed,
             started.elapsed().as_micros(),
             memory_entries,
             memory_resident_bytes,
-            dataset_prune.as_ref().map_or(0, |stats| stats.removed_entries),
-            dataset_prune.as_ref().map_or(0, |stats| stats.removed_bytes),
-            global_prune.as_ref().map_or(0, |stats| stats.removed_entries),
-            global_prune.as_ref().map_or(0, |stats| stats.removed_bytes),
         );
-        if let Err(error) = dataset_prune {
-            eprintln!(
-                "CSTUDIO_PERF event=contact_display_cache status=dataset_prune_failed error={error}"
-            );
-        }
-        if let Err(error) = global_prune {
-            eprintln!(
-                "CSTUDIO_PERF event=contact_display_cache status=global_prune_failed error={error}"
-            );
-        }
     }
 }
 

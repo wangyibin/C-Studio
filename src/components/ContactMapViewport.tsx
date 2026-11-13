@@ -80,7 +80,7 @@ export {
   contactWheelPanMode,
   contactWheelPanIntent,
 } from "../state/contactWheel";
-import type { CoverageView } from "../state/coverageView";
+import type { CoverageView, CoverageViewportLoader } from "../state/coverageView";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import type { PlacementRecommendationCandidate } from "../state/assemblyPlacementRecommendation";
 import { defaultGfaHomologPattern } from "../state/gfaHomologLayout";
@@ -111,7 +111,7 @@ import type {
   ContactTileGpuRenderer,
 } from "./contactTileGpu";
 import { GenomeAxisNavigator } from "./GenomeAxisNavigator";
-import { TrackPanel } from "./TrackPanel";
+import { TrackPanel, type CoverageTrackPanController } from "./TrackPanel";
 
 const usePrePaintEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
@@ -138,6 +138,7 @@ interface ContactMapViewportProps {
   contactTileDeltaStream?: ContactTileDeltaRenderStream | null;
   overviewContactMap?: ContactMapView | null;
   coverageView: CoverageView | null;
+  onLoadCoverageViewport?: CoverageViewportLoader;
   uiState: UiState;
   homologPattern?: string;
   onUiAction: (action: UiAction) => void;
@@ -150,6 +151,7 @@ interface ContactMapViewportProps {
   onContactPanGestureStart?: () => void;
   onContactPanTilePrefetch?: (preview: ContactPanPreview) => void;
   onContactViewportPreview?: (preview: ContactPanPreview | null) => void;
+  /** Includes per-frame pan cameras; consumers should avoid parent setState. */
   onPresentedViewportChange?: (viewport: ContactViewport | null) => void;
   onViewportNavigationControllerChange?: (
     controller: ContactViewportNavigationController | null,
@@ -1331,6 +1333,7 @@ export function ContactMapViewport({
   contactTileDeltaStream,
   overviewContactMap,
   coverageView: incomingCoverageView,
+  onLoadCoverageViewport,
   dataset,
   onContactTileLayerCommit,
   onContactTileLayerPaintComplete,
@@ -1362,6 +1365,7 @@ export function ContactMapViewport({
     commit: () => undefined,
     cancel: () => undefined,
   });
+  const coveragePanControllerRef = useRef<CoverageTrackPanController | null>(null);
   useEffect(() => {
     let presentationFrame: number | null = null;
     let pendingBatches: ContactPanPrefetchBatch[] = [];
@@ -1396,9 +1400,50 @@ export function ContactMapViewport({
   }), [contactPanPrefetchBridge]);
   usePrePaintEffect(() => {
     // Resolution/normalization controls update before the replacement heatmap
-    // has reached the staging FBO. Do not let an earlier neighbor-prewarm frame
-    // compete with that atomic handoff.
-    contactTilePanRendererRef.current?.discardPrefetchedPages();
+    // reaches the staging FBO. This also covers toolbar changes, which do not
+    // pass through the resolution-wheel handler. Cancel the previous gesture
+    // without committing its fine viewport over the newly selected camera.
+    const renderer = contactTilePanRendererRef.current;
+    renderer?.discardPrefetchedPages();
+    const hadPan = Boolean(
+      pendingCommittedPanViewportRef.current
+      || wheelPanSessionRef.current
+      || dragStateRef.current
+      || navigationPreviewViewportRef.current,
+    );
+    cancelScheduledPanFrame();
+    if (wheelPanCommitTimerRef.current !== null) {
+      window.clearTimeout(wheelPanCommitTimerRef.current);
+      wheelPanCommitTimerRef.current = null;
+    }
+    wheelPanSessionRef.current = null;
+    navigationPreviewViewportRef.current = null;
+    setNavigationPreviewActive(false);
+    if (dragStateRef.current) {
+      dragStateRef.current = null;
+      setDragState(null);
+    }
+    panLoadingSuspendedRef.current = false;
+    panTilePrefetchSignatureRef.current = null;
+    resetPanPrefetchPrediction();
+    const releaseViewport = renderer?.presentedViewport();
+    if (hadPan) {
+      traceContactPanCamera("resolution_supersedes_pan", {
+        pendingCommittedViewport: pendingCommittedPanViewportRef.current,
+        releaseViewport,
+        resolution: uiState.contact.resolution,
+        normalization: uiState.normalization,
+      }, true);
+    }
+    pendingCommittedPanViewportRef.current = null;
+    if (releaseViewport) {
+      renderer?.releasePanViewport(releaseViewport);
+      coveragePanControllerRef.current?.finish(releaseViewport);
+      onPresentedViewportChange?.(releaseViewport);
+    }
+    if (hadPan) {
+      onContactViewportPreview?.(null);
+    }
   }, [uiState.contact.resolution, uiState.normalization]);
   const assemblyOverlayLayerRef = useRef<HTMLDivElement>(null);
   const assemblyBoundaryCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -1407,6 +1452,7 @@ export function ContactMapViewport({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const latestContactMapRef = useRef<ContactMapView | null>(null);
   const latestDisplayContactMapRef = useRef<ContactMapView | null>(null);
+  const settledPresentationViewportRef = useRef<ContactViewport | null>(null);
   const latestUiStateRef = useRef(uiState);
   latestUiStateRef.current = uiState;
   const resolutionWheelReadyAtRef = useRef(0);
@@ -1425,6 +1471,8 @@ export function ContactMapViewport({
   const panViewportVelocitySampleRef = useRef<ContactViewportVelocitySample | null>(null);
   const panPrefetchFrontierRef = useRef<ContactPanPrefetchFrontier | null>(null);
   const wheelPanSessionRef = useRef<WheelPanSession | null>(null);
+  const navigationPreviewViewportRef = useRef<ContactViewport | null>(null);
+  const [, setNavigationPreviewActive] = useState(false);
   const wheelPanCommitTimerRef = useRef<number | null>(null);
   const [assemblyBoundaryPanViewport, setAssemblyBoundaryPanViewport] = useState<
     ContactViewport | null
@@ -1657,11 +1705,12 @@ export function ContactMapViewport({
   const presentedLiveViewport = freezePresentedAnnotationViewport && presentationContactMap
     ? presentationContactMap.viewport
     : liveViewport;
+  settledPresentationViewportRef.current = presentedLiveViewport;
   const displayViewport = dragState?.previewViewport ?? presentedLiveViewport;
   const navigationViewport = contactVisibleInteractionViewport(
     displayViewport,
     pendingCommittedPanViewportRef.current,
-    dragState?.previewViewport
+    currentPanPreviewViewport()
       ?? (contactViewportPreview && contactViewportPreviewIsPan(contactViewportPreview)
         ? contactViewportPreview.viewport
         : null),
@@ -1682,9 +1731,7 @@ export function ContactMapViewport({
   const assemblyInteractionViewport = contactVisibleInteractionViewport(
     displayViewport,
     pendingCommittedPanViewportRef.current,
-    dragStateRef.current?.previewViewport
-      ?? wheelPanSessionRef.current?.previewViewport
-      ?? null,
+    currentPanPreviewViewport(),
   );
   const displayedCutBinSizeBp = presentationContactMap?.resolution
     ?? contactResolutionToBasePairs(uiState.contact.resolution);
@@ -1844,8 +1891,7 @@ export function ContactMapViewport({
     drawContactAssemblyBoundaries(
       assemblyBoundaryCanvasRef.current,
       gpuAssemblyBoundaries,
-      dragStateRef.current?.previewViewport
-        ?? wheelPanSessionRef.current?.previewViewport
+      currentPanPreviewViewport()
         ?? pendingCommittedPanViewportRef.current ?? displayViewport,
       bounds.width,
       bounds.height,
@@ -2063,6 +2109,8 @@ export function ContactMapViewport({
           }
           onUiAction({ type: "clearAssemblySelection" });
           dragStateRef.current = null;
+          navigationPreviewViewportRef.current = null;
+          setNavigationPreviewActive(false);
           panLoadingSuspendedRef.current = false;
           panTilePrefetchSignatureRef.current = null;
           resetPanPrefetchPrediction();
@@ -2089,6 +2137,8 @@ export function ContactMapViewport({
       onUiAction({ type: "clearAssemblySelection" });
       cancelScheduledAssemblyPointerFrame();
       dragStateRef.current = null;
+      navigationPreviewViewportRef.current = null;
+      setNavigationPreviewActive(false);
       panLoadingSuspendedRef.current = false;
       panTilePrefetchSignatureRef.current = null;
       resetPanPrefetchPrediction();
@@ -2110,6 +2160,9 @@ export function ContactMapViewport({
       cancelScheduledAssemblyPointerFrame();
       lastAssemblyPointerRef.current = null;
       finishWheelPan();
+      if (navigationPreviewViewportRef.current) {
+        cancelNavigationPreview();
+      }
       if (dragStateRef.current) {
         dragStateRef.current = null;
         panLoadingSuspendedRef.current = false;
@@ -2133,6 +2186,7 @@ export function ContactMapViewport({
         wheelPanCommitTimerRef.current = null;
       }
       wheelPanSessionRef.current = null;
+      navigationPreviewViewportRef.current = null;
       panLoadingSuspendedRef.current = false;
       panTilePrefetchSignatureRef.current = null;
       resetPanPrefetchPrediction();
@@ -2205,8 +2259,7 @@ export function ContactMapViewport({
         const displayedViewport = contactVisibleInteractionViewport(
           latestDisplayContactMapRef.current?.viewport ?? sourceContactMap.viewport,
           pendingCommittedPanViewportRef.current,
-          dragStateRef.current?.previewViewport
-            ?? wheelPanSessionRef.current?.previewViewport
+          currentPanPreviewViewport()
             ?? null,
         );
         const now = performance.now();
@@ -2430,7 +2483,7 @@ export function ContactMapViewport({
       if (map?.raster) {
         drawContactAssemblyBoundaries(
           assemblyBoundaryCanvasRef.current, assemblyBoundariesRef.current,
-          dragStateRef.current?.previewViewport ?? wheelPanSessionRef.current?.previewViewport
+          currentPanPreviewViewport()
             ?? pendingCommittedPanViewportRef.current ?? map.viewport,
           bounds.width, bounds.height,
         );
@@ -2468,8 +2521,7 @@ export function ContactMapViewport({
         frame = null;
         const map = latestDisplayContactMapRef.current;
         if (map?.raster?.tileLayer !== layer) return;
-        const viewport = dragStateRef.current?.previewViewport
-          ?? wheelPanSessionRef.current?.previewViewport
+        const viewport = currentPanPreviewViewport()
           ?? pendingCommittedPanViewportRef.current ?? map.viewport;
         drawContactMapBuffer(canvasRef.current, {...map, viewport}, latestUiStateRef.current);
       });
@@ -2513,8 +2565,8 @@ export function ContactMapViewport({
     redrawAnimationFrameRef.current = window.requestAnimationFrame(() => {
       redrawAnimationFrameRef.current = null;
       drawContactMapBuffer(canvasRef.current, displayContactMap?.raster ? {
-        ...displayContactMap, viewport: dragStateRef.current?.previewViewport
-          ?? wheelPanSessionRef.current?.previewViewport ?? pendingCommittedPanViewportRef.current ?? displayContactMap.viewport,
+        ...displayContactMap, viewport: currentPanPreviewViewport()
+          ?? pendingCommittedPanViewportRef.current ?? displayContactMap.viewport,
       } : displayContactMap, uiState);
       if (pendingCommittedPanViewportRef.current === null) {
         resetPanTransform();
@@ -2828,6 +2880,7 @@ export function ContactMapViewport({
     width: number,
     height: number,
   ) {
+    coveragePanControllerRef.current?.preview(previewContactMap.viewport);
     const {
       offsetX: rawOffsetX,
       offsetY: rawOffsetY,
@@ -2878,6 +2931,9 @@ export function ContactMapViewport({
       assemblySelectionBandsRef.current.style.setProperty("--selection-pan-x", `${offsetX}px`);
       assemblySelectionBandsRef.current.style.setProperty("--selection-pan-y", `${offsetY}px`);
     }
+    // Pointer, wheel, axis and Overview navigation all present through this
+    // RAF path. Keep the Overview window on this same camera before release.
+    onPresentedViewportChange?.(previewContactMap.viewport);
   }
 
   function schedulePanTransform(
@@ -2913,14 +2969,36 @@ export function ContactMapViewport({
     pendingPanFrameRef.current = null;
   }
 
+  function currentPanPreviewViewport(): ContactViewport | null {
+    return dragStateRef.current?.previewViewport
+      ?? wheelPanSessionRef.current?.previewViewport
+      ?? navigationPreviewViewportRef.current;
+  }
+
   function resetPanTransform() {
+    // A cancelled gesture must not reapply a queued camera on the next RAF.
+    cancelScheduledPanFrame();
+    // A tile completion or React redraw can arrive before pointer-up. Rebase
+    // onto that frame while keeping the gesture's camera, including previews
+    // from the X/Y navigators and the Overview navigation controller.
+    const previewViewport = currentPanPreviewViewport();
+    const sourceContactMap = latestDisplayContactMapRef.current;
+    const bounds = currentCanvasFrameBounds();
+    if (previewViewport && sourceContactMap && bounds) {
+      applyPanTransform(
+        sourceContactMap, { ...sourceContactMap, viewport: previewViewport },
+        bounds.width, bounds.height,
+      );
+      return;
+    }
     if (canvasRef.current) {
       canvasRef.current.style.transform = "";
     }
     if (contactTileTransformRef.current) {
       contactTileTransformRef.current.style.transform = "";
     }
-    const authoritativeViewport = latestContactMapRef.current?.viewport;
+    const authoritativeViewport = pendingCommittedPanViewportRef.current
+      ?? latestContactMapRef.current?.viewport;
     traceContactPanCamera("viewport_transform_reset", {
       authoritativeViewport,
       pendingCommittedViewport: pendingCommittedPanViewportRef.current,
@@ -2928,6 +3006,12 @@ export function ContactMapViewport({
     });
     if (authoritativeViewport) {
       contactTilePanRendererRef.current?.releasePanViewport(authoritativeViewport);
+      coveragePanControllerRef.current?.finish(authoritativeViewport);
+      // A newly requested resolution may still be loading. At rest, the
+      // Overview follows the retained frame, not the requested camera.
+      onPresentedViewportChange?.(
+        pendingCommittedPanViewportRef.current ?? settledPresentationViewportRef.current,
+      );
     }
     resetPanAnnotationTransform();
   }
@@ -2963,6 +3047,12 @@ export function ContactMapViewport({
     }
 
     const sourceContactMap = latestDisplayContactMapRef.current ?? liveContactMap;
+    if (!navigationPreviewViewportRef.current) {
+      // Only enter/leave the gesture through React; pointer samples stay on
+      // the imperative camera path and are coalesced by requestAnimationFrame.
+      setNavigationPreviewActive(true);
+    }
+    navigationPreviewViewportRef.current = previewViewport;
     if (!panLoadingSuspendedRef.current) {
       panLoadingSuspendedRef.current = true;
       contactTilePanRendererRef.current?.discardPrefetchedPages();
@@ -2978,6 +3068,8 @@ export function ContactMapViewport({
   }
 
   function axisNavigatorViewport(axis: "x" | "y", centerRatio: number) {
+    const currentViewport = navigationPreviewViewportRef.current
+      ?? pendingCommittedPanViewportRef.current ?? liveViewport;
     return contactViewportForAxisNavigator({
       axis,
       centerRatio,
@@ -2985,8 +3077,8 @@ export function ContactMapViewport({
       viewportSpanMb: uiState.contact.viewportSpanMb,
       viewportWidthPx: uiState.contact.viewportWidthPx,
       viewportHeightPx: uiState.contact.viewportHeightPx,
-      centerXMb: uiState.contact.viewportCenterXMb,
-      centerYMb: uiState.contact.viewportCenterYMb,
+      centerXMb: (currentViewport.xStart + currentViewport.xEnd) / 2_000_000,
+      centerYMb: (currentViewport.yStart + currentViewport.yEnd) / 2_000_000,
     });
   }
 
@@ -2995,6 +3087,8 @@ export function ContactMapViewport({
   }
 
   function cancelNavigationPreview() {
+    navigationPreviewViewportRef.current = null;
+    setNavigationPreviewActive(false);
     cancelScheduledPanFrame();
     resetPanTransform();
     panLoadingSuspendedRef.current = false;
@@ -3022,6 +3116,8 @@ export function ContactMapViewport({
     } else {
       pendingCommittedPanViewportRef.current = null;
     }
+    navigationPreviewViewportRef.current = null;
+    setNavigationPreviewActive(false);
     onUiAction({
       type: "commitContactViewportPan",
       viewport: finalViewport,
@@ -3092,9 +3188,7 @@ export function ContactMapViewport({
     return contactVisibleInteractionViewport(
       displayViewport,
       pendingCommittedPanViewportRef.current,
-      dragStateRef.current?.previewViewport
-        ?? wheelPanSessionRef.current?.previewViewport
-        ?? null,
+      currentPanPreviewViewport(),
     );
   }
 
@@ -3480,6 +3574,8 @@ export function ContactMapViewport({
         {hasCoverageTrack ? (
           <TrackPanel
             coverageView={presentationCoverageView}
+            panControllerRef={coveragePanControllerRef}
+            onLoadCoverageViewport={onLoadCoverageViewport}
             assemblyBlocks={assemblyBlocks}
             viewport={displayViewport}
             totalSpanMb={totalSpanMb}

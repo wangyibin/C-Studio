@@ -127,6 +127,8 @@ export interface ContactTileGpuScene {
   boundaries?: readonly ContactTileGpuBoundary[];
   /** Exact matrix/layout/normalization identity for shared GPU residency. */
   dataScope?: string;
+  /** Finite matrix extent, independent of whether a matching overview exists. */
+  dataViewport?: ContactViewport;
   descriptors: readonly ContactTileCanvasDescriptor[];
   generation?: number;
   overview?: ContactTileGpuOverview | null;
@@ -762,6 +764,8 @@ interface VirtualTextureState {
   lastUsedByTileKey: Map<string, number>;
   plan: ContactTileVirtualPagePlan;
   pageTableData: Uint32Array;
+  /** False while atlas layers are being changed ahead of their page table. */
+  pageTableReady: boolean;
   bytes: number;
 }
 
@@ -1749,6 +1753,9 @@ export function createContactTileGpuRenderer(
   let uploadedBoundaries: readonly ContactTileGpuBoundary[] | null = null;
   let uploadedBoundaryCount = 0;
   let framePresentation: FramePresentationResources | null = null;
+  // The FBO's camera stays fixed when its pixels are only translated onto the
+  // default framebuffer. Keep it separate from the camera actually on screen.
+  let framePresentationViewport: ContactViewport | null = null;
   let stagingFramePresentation: FramePresentationResources | null = null;
   let hasPresentedFrontFrame = false;
   let virtualTextureState: VirtualTextureState | null = null;
@@ -1763,6 +1770,7 @@ export function createContactTileGpuRenderer(
     visibleScene: ContactTileGpuScene;
     target: "front" | "staging";
     onPresented?: (presented: boolean) => void;
+    panViewport?: ContactViewport;
   }
 
   interface PendingPresentationFence extends PendingVirtualPresentation {
@@ -1772,6 +1780,7 @@ export function createContactTileGpuRenderer(
 
   let pendingVirtualPresentation: PendingVirtualPresentation | null = null;
   let retainedPanViewport: ContactViewport | null = null;
+  let projectedPanSourceLayout: ContactTileGpuSourceLayout | null = null;
   let lastPresentedViewport: ContactViewport | null = null;
   let pendingPresentationFence: PendingPresentationFence | null = null;
   let pendingPrefetchScene: ContactTileGpuScene | null = null;
@@ -2021,10 +2030,11 @@ export function createContactTileGpuRenderer(
   const rebuildVirtualTextureState = (
     activeScene: ContactTileGpuScene,
     format = virtualTextureFormatForScene(activeScene),
+    allowMissingPages = false,
   ) => {
     if (
       !virtualResources
-      || (!activeScene.sourceLayout && activeScene.visibleLayerComplete !== true)
+      || (!allowMissingPages && !activeScene.sourceLayout && activeScene.visibleLayerComplete !== true)
     ) {
       return false;
     }
@@ -2115,6 +2125,7 @@ export function createContactTileGpuRenderer(
         populatedTiles: [],
       },
       pageTableData,
+      pageTableReady: false,
       bytes: (
         capacity
         * activeScene.tileSizeBins
@@ -2141,8 +2152,9 @@ export function createContactTileGpuRenderer(
     byteBudget = Number.POSITIVE_INFINITY,
     millisecondBudget = Number.POSITIVE_INFINITY,
     trackQueueFrame = false,
+    allowMissingPages = false,
   ): VirtualTextureAppendResult => {
-    if (!activeScene.sourceLayout && activeScene.visibleLayerComplete !== true) {
+    if (!allowMissingPages && !activeScene.sourceLayout && activeScene.visibleLayerComplete !== true) {
       return "failed";
     }
     const requiredFormat = virtualTextureFormatForScene(activeScene);
@@ -2153,7 +2165,7 @@ export function createContactTileGpuRenderer(
       || virtualTextureState.tileSizeBins !== activeScene.tileSizeBins
       || !currentFormatIsCompatible
     ) {
-      if (!rebuildVirtualTextureState(activeScene, requiredFormat)) {
+      if (!rebuildVirtualTextureState(activeScene, requiredFormat, allowMissingPages)) {
         return "failed";
       }
     }
@@ -2202,6 +2214,9 @@ export function createContactTileGpuRenderer(
       }
     }
     const selected = contactTileGpuUploadBatch(candidates, byteBudget);
+    if (selected.length > 0) {
+      current.pageTableReady = false;
+    }
     if (trackQueueFrame) {
       uploadContext.performance.uploadQueueFrames += 1;
       uploadContext.performance.uploadQueueMaxDepth = Math.max(
@@ -2349,6 +2364,7 @@ export function createContactTileGpuRenderer(
     }
     current.plan = plan;
     current.pageTableData = pageTableData;
+    current.pageTableReady = true;
     current.bytes = (
       current.capacity
       * activeScene.tileSizeBins
@@ -2376,7 +2392,7 @@ export function createContactTileGpuRenderer(
   const virtualTextureCoversViewport = (
     state: VirtualTextureState,
     viewport: ContactViewport,
-    overview: ContactTileGpuOverview | null,
+    dataViewport: ContactViewport | null,
     sourceLayout?: ContactTileGpuSourceLayout,
   ) => {
     if (sourceLayout) {
@@ -2449,13 +2465,9 @@ export function createContactTileGpuRenderer(
     const lastX = Math.ceil(viewport.xEnd / tileSpan) - 1;
     const firstY = Math.floor(viewport.yStart / tileSpan);
     const lastY = Math.ceil(viewport.yEnd / tileSpan) - 1;
-    // The overview establishes the finite genome rectangle, but it is not a
-    // presentable substitute for a missing exact page inside that rectangle.
-    // Magnifying one coarse overview texel across a fine viewport is what
-    // produces the large solid colour blocks during loading. Pages whose
-    // *visible portion* lies wholly beyond the overview remain legal white
-    // aspect-ratio margins.
-    const overviewViewport = overview?.viewport ?? null;
+    // Require exact pages inside the finite matrix, but allow white aspect-
+    // ratio margins outside it. Normalized scenes may intentionally omit the
+    // Raw overview, so matrix bounds must not depend on overview pixels.
     for (let pageY = firstY; pageY <= lastY; pageY += 1) {
       for (let pageX = firstX; pageX <= lastX; pageX += 1) {
         const localX = pageX - state.plan.originX;
@@ -2470,20 +2482,20 @@ export function createContactTileGpuRenderer(
         if ((flags & contactTileVirtualPageExactFlag) !== 0) {
           continue;
         }
-        if (!overviewViewport) {
+        if (!dataViewport) {
           return false;
         }
         const visiblePageXStart = Math.max(viewport.xStart, pageX * tileSpan);
         const visiblePageXEnd = Math.min(viewport.xEnd, (pageX + 1) * tileSpan);
         const visiblePageYStart = Math.max(viewport.yStart, pageY * tileSpan);
         const visiblePageYEnd = Math.min(viewport.yEnd, (pageY + 1) * tileSpan);
-        const visiblePageIntersectsOverview = (
-          visiblePageXEnd > overviewViewport.xStart
-          && visiblePageXStart < overviewViewport.xEnd
-          && visiblePageYEnd > overviewViewport.yStart
-          && visiblePageYStart < overviewViewport.yEnd
+        const visiblePageIntersectsData = (
+          visiblePageXEnd > dataViewport.xStart
+          && visiblePageXStart < dataViewport.xEnd
+          && visiblePageYEnd > dataViewport.yStart
+          && visiblePageYStart < dataViewport.yEnd
         );
-        if (visiblePageIntersectsOverview) {
+        if (visiblePageIntersectsData) {
           return false;
         }
       }
@@ -2495,21 +2507,23 @@ export function createContactTileGpuRenderer(
     activeScene: ContactTileGpuScene,
     presentation = framePresentation,
     present = true,
+    allowMissingPages = false,
   ) => {
     const state = virtualTextureState;
     if (
       !virtualResources
       || !state
-      || (!activeScene.sourceLayout && activeScene.visibleLayerComplete !== true)
+      || !state.pageTableReady
+      || (!allowMissingPages && !activeScene.sourceLayout && activeScene.visibleLayerComplete !== true)
       || state.resolution !== activeScene.resolution
       || state.tileSizeBins !== activeScene.tileSizeBins
       || !presentation
-      || !virtualTextureCoversViewport(
+      || (!allowMissingPages && !virtualTextureCoversViewport(
         state,
         activeScene.viewport,
-        activeScene.overview ?? null,
+        activeScene.dataViewport ?? activeScene.overview?.viewport ?? null,
         activeScene.sourceLayout,
-      )
+      ))
     ) {
       uploadContext.performance.virtualTextureFallbacks += 1;
       return false;
@@ -2518,7 +2532,10 @@ export function createContactTileGpuRenderer(
       uploadContext.performance.virtualTextureFallbacks += 1;
       return false;
     }
-    const overview = activeScene.overview ?? null;
+    // During a held drag, publish each exact page as it arrives. Unknown
+    // pages stay white; a Raw/coarse overview must not masquerade as new data.
+    // Replacement scenes still require full coverage before they can commit.
+    const overview = allowMissingPages ? null : activeScene.overview ?? null;
     if (overview && !overviewTextureEntry) {
       uploadContext.performance.virtualTextureFallbacks += 1;
       return false;
@@ -2672,6 +2689,7 @@ export function createContactTileGpuRenderer(
       presentFramePresentation(gl, presentation, canvas.width, canvas.height);
       if (presentation === framePresentation) {
         hasPresentedFrontFrame = true;
+        framePresentationViewport = activeScene.viewport;
         lastPresentedViewport = activeScene.viewport;
       }
     }
@@ -2955,6 +2973,7 @@ export function createContactTileGpuRenderer(
         presentFramePresentation(gl, presentation, canvas.width, canvas.height);
         if (presentation === framePresentation) {
           hasPresentedFrontFrame = true;
+          framePresentationViewport = activeScene.viewport;
           lastPresentedViewport = activeScene.viewport;
         }
       }
@@ -2980,6 +2999,7 @@ export function createContactTileGpuRenderer(
       presentFramePresentation(gl, presentation, canvas.width, canvas.height);
       if (presentation === framePresentation) {
         hasPresentedFrontFrame = true;
+        framePresentationViewport = activeScene.viewport;
         lastPresentedViewport = activeScene.viewport;
       }
     }
@@ -3049,6 +3069,20 @@ export function createContactTileGpuRenderer(
     return drawVirtualTexturePan(activeScene, presentation, present);
   };
 
+  const presentRetainedPanFrame = (viewport: ContactViewport) => {
+    if (!hasPresentedFrontFrame || !framePresentation || !framePresentationViewport
+      || !sameContactTileGpuViewportSpan(framePresentationViewport, viewport)) {
+      return false;
+    }
+    presentFramePresentation(gl, framePresentation, canvas.width, canvas.height,
+      contactFramePanDestination(
+        framePresentation.width, framePresentation.height, canvas.width, canvas.height,
+        framePresentationViewport, viewport,
+      ));
+    lastPresentedViewport = viewport;
+    return true;
+  };
+
   const presentStagingFrame = () => {
     if (!stagingFramePresentation) {
       traceContactPanCamera("gpu_fbo_present_missing", {
@@ -3062,6 +3096,7 @@ export function createContactTileGpuRenderer(
     stagingFramePresentation = previousFrontPresentation;
     presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
     hasPresentedFrontFrame = true;
+    framePresentationViewport = scene?.viewport ?? framePresentationViewport;
     lastPresentedViewport = scene?.viewport ?? lastPresentedViewport;
     uploadContext.performance.framebufferSwaps += 1;
     traceContactPanCamera("gpu_fbo_present", {
@@ -3115,9 +3150,19 @@ export function createContactTileGpuRenderer(
     deltaScene = null;
     deltaBuffers = new Map();
     pendingAppendedDescriptors.clear();
-    presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
     hasPresentedFrontFrame = true;
+    framePresentationViewport = pending.scene.viewport;
     lastPresentedViewport = pending.scene.viewport;
+    // A pointer can advance while the staging fence is pending. Present the
+    // latest camera, rather than snapping back to the camera submitted earlier.
+    if (pending.panViewport) {
+      scene = { ...scene, viewport: pending.panViewport };
+      if (!drawVirtualTexturePan(scene)) {
+        presentRetainedPanFrame(pending.panViewport);
+      }
+    } else {
+      presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+    }
     uploadContext.performance.uploadFenceSignals += 1;
     pending.onPresented?.(true);
     pendingPrefetchScene = contactTileGpuUploadPlan(pending.scene)
@@ -3379,12 +3424,13 @@ export function createContactTileGpuRenderer(
         uploadBudgetBytes,
         uploadBudgetMilliseconds,
         true,
+        true,
       );
       if (result !== "pending") {
         pendingPrefetchScene = null;
         pendingPrefetchGeneration = undefined;
         if (result === "ready" && pendingPrefetchPresentationRequested && scene) {
-          drawVirtualTexturePan(scene);
+          drawVirtualTexturePan(scene, framePresentation, true, true);
         }
         pendingPrefetchPresentationRequested = false;
       }
@@ -3505,15 +3551,37 @@ export function createContactTileGpuRenderer(
     return true;
   };
 
-  const sceneWithRetainedPanViewport = (nextScene: ContactTileGpuScene) => (
-    contactTileGpuSceneCanUseRetainedPanViewport(
+  const sceneWithRetainedPanViewport = (nextScene: ContactTileGpuScene) => {
+    if (
+      scene
+      && projectedPanSourceLayout
+      && nextScene.sourceLayout
+      && scene.generation === nextScene.generation
+      && nextScene.sourceLayout.dataScope === projectedPanSourceLayout.dataScope
+      && nextScene.sourceLayout.generation === projectedPanSourceLayout.generation
+      && nextScene.sourceLayout.xMap === projectedPanSourceLayout.xMap
+      && nextScene.sourceLayout.yMap === projectedPanSourceLayout.yMap
+      && contactTileGpuSceneCanUseRetainedPanViewport(
+        scene, { ...nextScene, sourceLayout: undefined }, retainedPanViewport,
+      )
+    ) {
+      // A late React publication of the old source frame must not reattach
+      // its bounded address map or erase pages received during this gesture.
+      return {
+        ...scene,
+        viewport: retainedPanViewport,
+        boundaries: nextScene.boundaries,
+        renderStyle: nextScene.renderStyle,
+      };
+    }
+    return contactTileGpuSceneCanUseRetainedPanViewport(
       scene,
       nextScene,
       retainedPanViewport,
     )
       ? { ...nextScene, viewport: retainedPanViewport }
-      : nextScene
-  );
+      : nextScene;
+  };
 
   const setActivePanViewport = (viewport: ContactViewport) => {
     traceContactPanCamera("gpu_camera_request", {
@@ -3528,9 +3596,12 @@ export function createContactTileGpuRenderer(
       return;
     }
     if (pendingVirtualPresentation || pendingPresentationFence) {
-      // The retained front FBO is authoritative while atlas layers/page-table
-      // entries are in flight. Sampling a half-updated atlas would be worse
-      // than holding the already-painted surface for this frame.
+      const pending = pendingPresentationFence ?? pendingVirtualPresentation!;
+      if (sameContactTileGpuViewportSpan(pending.scene.viewport, viewport)) {
+        pending.panViewport = viewport;
+      }
+      // Translate the immutable front while the staging atlas is in flight.
+      // This requires neither texture uploads nor a read of partial GPU pages.
       const pendingTarget = pendingPresentationFence?.target
         ?? pendingVirtualPresentation?.target;
       if (
@@ -3541,7 +3612,9 @@ export function createContactTileGpuRenderer(
         // A resize can invalidate the default surface even when its contents
         // are preserved. Re-blit the stable front while hidden staging/fence
         // work is still running.
-        presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+        if (!presentRetainedPanFrame(viewport)) {
+          presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+        }
         traceContactPanCamera("gpu_camera_represent", {
           requestedViewport: viewport,
           pendingTarget,
@@ -3567,7 +3640,9 @@ export function createContactTileGpuRenderer(
         // front has painted. Re-present the authoritative FBO on that final
         // same-camera publication without redrawing the heatmap or uploading
         // any texture.
-        presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+        if (!presentRetainedPanFrame(viewport)) {
+          presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+        }
         traceContactPanCamera("gpu_camera_represent", {
           requestedViewport: viewport,
           reason: "same-viewport",
@@ -3586,28 +3661,25 @@ export function createContactTileGpuRenderer(
       return;
     }
     if (pendingPrefetchScene) {
-      // A camera move that remains inside the resident page table can still
-      // render. Crossing into a queued page simply retains the last front
-      // FBO until that page becomes exact; never fall back to bulk uploads.
-      if (scene && drawVirtualTexturePan(scene)) {
+      // Missing pages must not stop the camera. Reuse the exact front pixels
+      // and leave newly exposed regions white until their pages are ready.
+      if (scene && drawVirtualTexturePan(scene, framePresentation, true, Boolean(retainedPanViewport))) {
         pendingAppendedDescriptors.clear();
         traceContactPanCamera("gpu_camera_draw", {
           viewport: scene.viewport,
           mode: "prefetch",
         });
       } else {
-        traceContactPanCamera("gpu_camera_hold", {
+        const translated = presentRetainedPanFrame(viewport);
+        traceContactPanCamera(translated ? "gpu_camera_translate" : "gpu_camera_hold", {
           viewport: scene?.viewport,
           mode: "prefetch",
         });
       }
       return;
     }
-    // Pretext/Juicebox-style camera navigation: the visible textures are
-    // sampled through one page-table draw. Once that atomic path owns a
-    // presented front, an exact-page miss must retain the old complete frame;
-    // clearing into the legacy overview + resident-tile draw would expose a
-    // mixed-resolution checkerboard during the drag.
+    // Use exact pages when available, otherwise translate the last exact FBO.
+    // Avoid bulk uploads and mixed-resolution overview tiles in pointer frames.
     const activeScene = scene;
     const atomicVirtualPanActive = Boolean(
       activeScene
@@ -3618,7 +3690,9 @@ export function createContactTileGpuRenderer(
       && virtualTextureState.resolution === activeScene.resolution
       && virtualTextureState.tileSizeBins === activeScene.tileSizeBins,
     );
-    const virtualDrawn = activeScene && drawVirtualTexturePan(activeScene);
+    const virtualDrawn = activeScene && drawVirtualTexturePan(
+      activeScene, framePresentation, true, Boolean(retainedPanViewport),
+    );
     const legacyDrawn = !virtualDrawn && !atomicVirtualPanActive
       ? draw(true)
       : false;
@@ -3626,7 +3700,8 @@ export function createContactTileGpuRenderer(
     if (drawn) {
       pendingAppendedDescriptors.clear();
     }
-    traceContactPanCamera(drawn ? "gpu_camera_draw" : "gpu_camera_hold", {
+    const translated = !drawn && presentRetainedPanFrame(viewport);
+    traceContactPanCamera(drawn ? "gpu_camera_draw" : translated ? "gpu_camera_translate" : "gpu_camera_hold", {
       viewport: activeScene?.viewport,
       mode: activeScene?.sourceLayout ? "source-layout" : "atlas",
     });
@@ -4060,7 +4135,23 @@ export function createContactTileGpuRenderer(
       ) {
         return false;
       }
-      const currentScene = scene;
+      // Pan batches contain projected visual tiles. A source-layout map is
+      // bounded to the old viewport and would ignore those new pages. Switch
+      // this gesture to the projected atlas, retaining only terminal old
+      // tiles; a partial projected layer must not invent exact zero cells.
+      const currentScene = scene.sourceLayout ? {
+        ...scene,
+        sourceLayout: undefined,
+        descriptors: scene.visibleLayerComplete === true ? scene.descriptors : [],
+      } : scene;
+      if (scene.sourceLayout) {
+        projectedPanSourceLayout = scene.sourceLayout;
+      }
+      if (scene.sourceLayout && virtualTextureState) {
+        // The old table addresses compact source pages, not visual pages.
+        // Keep translating the front FBO until the new table is uploaded.
+        virtualTextureState.pageTableReady = false;
+      }
       const refreshesPendingPrefetch = pendingPrefetchScene !== null
         && pendingPrefetchGeneration === input.generation;
       const usesPersistentAtlas = Boolean(
@@ -4079,7 +4170,37 @@ export function createContactTileGpuRenderer(
       const maximumUniqueTiles = usesPersistentAtlas
         ? virtualTextureState!.capacity
         : Math.max(1, Math.floor(safeTextureBudget / bytesPerTile));
-      const retainedDescriptors = [...currentScene.descriptors];
+      const tileSpan = currentScene.resolution * currentScene.tileSizeBins;
+      const nearViewport = (descriptor: ContactTileCanvasDescriptor) => {
+        const x = descriptor.transpose ? descriptor.tile.tileY : descriptor.tile.tileX;
+        const y = descriptor.transpose ? descriptor.tile.tileX : descriptor.tile.tileY;
+        return x >= Math.floor(currentScene.viewport.xStart / tileSpan) - 1
+          && x <= Math.ceil(currentScene.viewport.xEnd / tileSpan)
+          && y >= Math.floor(currentScene.viewport.yStart / tileSpan) - 1
+          && y <= Math.ceil(currentScene.viewport.yEnd / tileSpan);
+      };
+      // A long drag must make room before the final pointer-up scene arrives.
+      // Rank both old and incoming pages around the live camera; retaining
+      // every old descriptor forever otherwise silently drops each new tile
+      // once this set reaches the atlas budget.
+      const wantedTiles = new Set(contactTileGpuUploadPlan({
+        ...currentScene,
+        sourceLayout: undefined,
+        descriptors: [...currentScene.descriptors, ...input.descriptors].filter(nearViewport),
+      }).slice(0, maximumUniqueTiles).map(({ key }) => key));
+      const keepDescriptor = (descriptor: ContactTileCanvasDescriptor) => (
+        nearViewport(descriptor) && (
+          contactTileCellCount(descriptor.tile) === 0
+          || wantedTiles.has(contactTileKey(descriptor.tile))
+        )
+      );
+      const incomingDescriptors = input.descriptors.filter(keepDescriptor);
+      const retainedDescriptors = currentScene.descriptors.filter(keepDescriptor);
+      for (const [key, descriptor] of pendingAppendedDescriptors) {
+        if (!keepDescriptor(descriptor)) {
+          pendingAppendedDescriptors.delete(key);
+        }
+      }
       const retainedDescriptorKeys = new Set(
         retainedDescriptors.map((descriptor) => descriptor.key),
       );
@@ -4088,7 +4209,7 @@ export function createContactTileGpuRenderer(
         retainedTiles.set(contactTileKey(descriptor.tile), descriptor.tile);
       }
       const incomingTiles = new Map<string, ContactMapTile>();
-      for (const descriptor of input.descriptors) {
+      for (const descriptor of incomingDescriptors) {
         incomingTiles.set(contactTileKey(descriptor.tile), descriptor.tile);
       }
       const refreshedTiles = new Map<string, ContactMapTile>();
@@ -4118,9 +4239,6 @@ export function createContactTileGpuRenderer(
           // Keep a complete tile from the currently presented generation over
           // a partial snapshot for the same page.
           if (retainedTiles.has(tileKey)) {
-            continue;
-          }
-          if (retainedTiles.size >= maximumUniqueTiles) {
             continue;
           }
           retainedTiles.set(tileKey, tile);
@@ -4192,7 +4310,7 @@ export function createContactTileGpuRenderer(
         }
       }
 
-      for (const descriptor of input.descriptors) {
+      for (const descriptor of incomingDescriptors) {
         if (retainedDescriptorKeys.has(descriptor.key)) {
           continue;
         }
@@ -4255,11 +4373,9 @@ export function createContactTileGpuRenderer(
       }
       const descriptors = [...pendingAppendedDescriptors.values()];
       pendingAppendedDescriptors.clear();
-      // The page table was already extended by appendSceneDescriptors(). If
-      // it now covers the live camera, present one complete virtual-texture
-      // frame immediately. Otherwise preserve the current framebuffer and
-      // overlay only the newly resident legacy quads below.
-      if (drawVirtualTexturePan(scene)) {
+      // Completed pages can refresh the held camera without waiting for every
+      // other visible page or for a pointer-up generation to arrive.
+      if (drawVirtualTexturePan(scene, framePresentation, true, true)) {
         return true;
       }
       if (descriptors.length === 0) {
@@ -4336,6 +4452,7 @@ export function createContactTileGpuRenderer(
         retainedViewport: retainedPanViewport,
       });
       retainedPanViewport = null;
+      projectedPanSourceLayout = null;
       setActivePanViewport(viewport);
     },
     presentedViewport: () => lastPresentedViewport,
@@ -4357,7 +4474,9 @@ export function createContactTileGpuRenderer(
           || destination.right !== canvas.width
           || destination.top !== canvas.height;
         if (aspectChanged) {
-          presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+          if (!lastPresentedViewport || !presentRetainedPanFrame(lastPresentedViewport)) {
+            presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+          }
           traceContactPanCamera("gpu_redraw_aspect_hold", {
             sourceWidth: framePresentation.width,
             sourceHeight: framePresentation.height,
@@ -4376,7 +4495,9 @@ export function createContactTileGpuRenderer(
           // though the authoritative front FBO is still valid. Re-present that
           // stable surface now; the pending scene will replace it atomically
           // once its fence signals.
-          presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+          if (!lastPresentedViewport || !presentRetainedPanFrame(lastPresentedViewport)) {
+            presentFramePresentation(gl, framePresentation, canvas.width, canvas.height);
+          }
           traceContactPanCamera("gpu_redraw_represent", {
             pendingTarget: pendingPresentationFence?.target
               ?? pendingVirtualPresentation?.target,
@@ -4387,10 +4508,16 @@ export function createContactTileGpuRenderer(
       }
       if (scene && pendingPrefetchScene) {
         // Resize/style invalidation must not bypass the frame-budgeted queue.
-        // Repaint only when the resident page table already covers the camera;
-        // otherwise retain the last front surface until the queue catches up.
-        drawVirtualTexturePan(scene);
+        // A held camera can show ready pages; an atlas still being uploaded
+        // uses the retained front until its matching page table is ready.
+        if (!drawVirtualTexturePan(scene, framePresentation, true, Boolean(retainedPanViewport))) {
+          presentRetainedPanFrame(scene.viewport);
+        }
         return true;
+      }
+      if (scene && retainedPanViewport) {
+        return drawVirtualTexturePan(scene, framePresentation, true, true)
+          || presentRetainedPanFrame(retainedPanViewport);
       }
       return scene?.sourceLayout
         ? drawCompleteVirtualScene(scene)
@@ -5376,18 +5503,43 @@ function ensureFramePresentationResources(
   return { framebuffer, texture, width, height };
 }
 
+/** Project retained pixels at the same scale; WebGL clips the translated edges. */
+export function contactFramePanDestination(
+  sourceWidth: number,
+  sourceHeight: number,
+  width: number,
+  height: number,
+  sourceViewport: ContactViewport,
+  viewport: ContactViewport,
+): ContactFramePresentationDestination {
+  const destination = contactFramePresentationDestination(sourceWidth, sourceHeight, width, height);
+  const offsetX = Math.round((sourceViewport.xStart - viewport.xStart)
+    / Math.max(1, sourceViewport.xEnd - sourceViewport.xStart)
+    * (destination.right - destination.left));
+  // Genomic Y grows downwards; framebuffer Y grows upwards.
+  const offsetY = Math.round((viewport.yStart - sourceViewport.yStart)
+    / Math.max(1, sourceViewport.yEnd - sourceViewport.yStart)
+    * (destination.top - destination.bottom));
+  return {
+    left: destination.left + offsetX,
+    right: destination.right + offsetX,
+    bottom: destination.bottom + offsetY,
+    top: destination.top + offsetY,
+  };
+}
+
+function sameContactTileGpuViewportSpan(left: ContactViewport, right: ContactViewport) {
+  return left.xEnd - left.xStart === right.xEnd - right.xStart
+    && left.yEnd - left.yStart === right.yEnd - right.yStart;
+}
+
 function presentFramePresentation(
   gl: WebGL2RenderingContext,
   frame: FramePresentationResources,
   width: number,
   height: number,
+  destination = contactFramePresentationDestination(frame.width, frame.height, width, height),
 ) {
-  const destination = contactFramePresentationDestination(
-    frame.width,
-    frame.height,
-    width,
-    height,
-  );
   gl.bindFramebuffer(gl.READ_FRAMEBUFFER, frame.framebuffer);
   gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
   const fillsTarget = destination.left === 0
@@ -5456,6 +5608,7 @@ export function contactTileGpuSceneCanUseRetainedPanViewport(
   return currentScene.resolution === nextScene.resolution
     && currentScene.tileSizeBins === nextScene.tileSizeBins
     && currentDataScope === nextDataScope
+    && sameContactTileGpuViewportSpan(currentScene.viewport, retainedViewport)
     && (
       currentScene.generation === nextScene.generation
       || sameContactTileGpuViewport(nextScene.viewport, retainedViewport)
@@ -5481,6 +5634,11 @@ function sameContactTileGpuScene(left: ContactTileGpuScene, right: ContactTileGp
   if (
     left.generation !== right.generation
     || left.dataScope !== right.dataScope
+    || !(
+      left.dataViewport === right.dataViewport
+      || (left.dataViewport && right.dataViewport
+        && sameContactTileGpuViewport(left.dataViewport, right.dataViewport))
+    )
     || left.resolution !== right.resolution
     || left.tileSizeBins !== right.tileSizeBins
     || left.visibleLayerComplete !== right.visibleLayerComplete

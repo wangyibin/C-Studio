@@ -138,11 +138,15 @@ and does not overwrite the server file.
 Remote main views use the local main surface's LOD decision function and send
 explicit source/display resolutions. The server must not silently replace that
 plan. Prefetch margins cannot change bin sizes or visible image density; margins
-shrink first when image capacity is limited. Auto scale samples every tenth
-record per complete visible tile, excludes diagonal cells, and uses the same P99
-and scale-cache rules. Prefetch tiles are excluded. Both paths wait for the
-complete visible tile set before fitting the initial scale so arrival order
-cannot change the threshold. Palette steps, opacity and log mapping also match.
+shrink first when image capacity is limited. Auto scale samples positive off-diagonal bins intersecting the current viewport
+(including mirrored bins), using a coordinate hash independent of tile storage
+format. Views with up to 10,000 eligible bins use every value; larger views sample
+approximately one tenth. Both paths retain P99 and wait for complete visible
+tiles. Scale caches are per resolution and retain at most 128 entries. Panning keeps
+Max stable; switching levels restores that level’s estimate. Clicking Auto
+explicitly refits the current viewport at the current level, including when Auto
+is already active. Manual ranges remain unchanged.
+Palette steps, opacity and log mapping also match.
 
 The server caches projected views with a 64 MiB budget and at most 256 LRU entries.
 Palette and scale changes reuse counts while encoding a fresh PNG. Keys include

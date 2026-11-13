@@ -1,5 +1,5 @@
 import { drawRemoteRaster } from "../state/remoteContactRaster";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { LocateFixed, Maximize2 } from "lucide-react";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
@@ -37,6 +37,7 @@ import {
   buildCenteredContactViewport,
   type ContactViewport,
 } from "../state/contactViewport";
+import type { ContactViewportPresentation } from "../state/contactViewportPresentation";
 import {
   SyntenyDotplot,
 } from "./SyntenyDotplot";
@@ -52,11 +53,14 @@ import { GfaPreviewCard } from "./GfaGraphPanel";
 import { AssemblyPlacementRecommendationCard } from "./AssemblyPlacementRecommendationCard";
 import type { PafPreviewRecord } from "../state/pafPreview";
 
+const usePrePaintEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
+
 interface InspectorPanelProps {
   dataset: ExampleDatasetSummary | null;
   contactMap: ContactMapView | null;
   overviewContactMap: ContactMapView | null;
   presentedContactViewport?: ContactViewport | null;
+  contactViewportPresentation?: ContactViewportPresentation;
   status: AppStatus;
   statusMessage: string;
   isAgpDirty?: boolean;
@@ -86,6 +90,7 @@ export function InspectorPanel({
   dataset,
   overviewContactMap,
   presentedContactViewport = null,
+  contactViewportPresentation,
   status,
   statusMessage,
   isAgpDirty = false,
@@ -208,6 +213,7 @@ export function InspectorPanel({
           <ContactOverview
             overviewContactMap={overviewContactMap}
             presentedContactViewport={presentedContactViewport}
+            contactViewportPresentation={contactViewportPresentation}
             totalSpanBp={Math.max(
               1,
               viewAssemblyBlocks.length > 0
@@ -1063,6 +1069,7 @@ function formatCount(count: number, singular: string, plural = `${singular}s`) {
 interface ContactOverviewProps {
   overviewContactMap: ContactMapView | null;
   presentedContactViewport: ContactViewport | null;
+  contactViewportPresentation?: ContactViewportPresentation;
   totalSpanBp: number;
   uiState: UiState;
   onViewportPreview: (viewport: ContactViewport) => void;
@@ -1131,6 +1138,7 @@ export function contactOverviewViewportAtRatio(
 function ContactOverview({
   overviewContactMap,
   presentedContactViewport,
+  contactViewportPresentation,
   totalSpanBp,
   uiState,
   onViewportPreview,
@@ -1139,6 +1147,7 @@ function ContactOverview({
   onExpand,
 }: ContactOverviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const windowRef = useRef<HTMLDivElement>(null);
   const displayedOverview = contactNavigationOverviewMap(overviewContactMap);
   // Keep the transitional pixels and their coordinate span from the same
   // last-complete snapshot. A copy/delete edit swaps both atomically.
@@ -1147,26 +1156,25 @@ function ContactOverview({
     displayedOverview?.viewport.xEnd ?? totalSpanBp,
   );
   const totalSpanMb = Math.max(1, Math.round(displayedTotalSpanBp / 1_000_000));
-  const [dragRatio, setDragRatio] = useState<{ x: number; y: number } | null>(null);
   const dragRatioRef = useRef<{ x: number; y: number } | null>(null);
   const overviewWindowViewport = contactOverviewWindowViewport(
-    presentedContactViewport,
+    contactViewportPresentation
+      ? contactViewportPresentation.getViewport()
+      : presentedContactViewport,
     displayedTotalSpanBp,
     uiState,
   );
-  const viewportXStartRatio = Math.min(1, Math.max(0, overviewWindowViewport.xStart / displayedTotalSpanBp));
-  const viewportXEndRatio = Math.min(1, Math.max(0, overviewWindowViewport.xEnd / displayedTotalSpanBp));
-  const viewportYStartRatio = Math.min(1, Math.max(0, overviewWindowViewport.yStart / displayedTotalSpanBp));
-  const viewportYEndRatio = Math.min(1, Math.max(0, overviewWindowViewport.yEnd / displayedTotalSpanBp));
-  const committedCenterRatio = {
-    x: (viewportXStartRatio + viewportXEndRatio) / 2,
-    y: (viewportYStartRatio + viewportYEndRatio) / 2,
-  };
-  const centerRatio = dragRatio ?? committedCenterRatio;
-  const windowWidth = Math.min(100, Math.max(3, (viewportXEndRatio - viewportXStartRatio) * 100));
-  const windowHeight = Math.min(100, Math.max(3, (viewportYEndRatio - viewportYStartRatio) * 100));
-  const windowLeft = Math.min(100 - windowWidth, Math.max(0, centerRatio.x * 100 - windowWidth / 2));
-  const windowTop = Math.min(100 - windowHeight, Math.max(0, centerRatio.y * 100 - windowHeight / 2));
+
+  usePrePaintEffect(() => contactViewportPresentation?.subscribe((viewport) => {
+    if (windowRef.current) {
+      // Only move the rectangle. The raster and the rest of the inspector do
+      // not render for camera samples, even during long held gestures.
+      Object.assign(windowRef.current.style, contactOverviewWindowStyle(
+        contactOverviewWindowViewport(viewport, displayedTotalSpanBp, uiState),
+        displayedTotalSpanBp,
+      ));
+    }
+  }), [contactViewportPresentation, displayedTotalSpanBp, uiState]);
 
   useEffect(() => {
     drawOverviewHeatmap(
@@ -1194,7 +1202,6 @@ function ContactOverview({
     event.currentTarget.setPointerCapture(event.pointerId);
     const ratio = ratioFromEvent(event);
     dragRatioRef.current = ratio;
-    setDragRatio(ratio);
     onViewportPreview(viewportFromRatio(ratio));
   }
 
@@ -1202,21 +1209,21 @@ function ContactOverview({
     if (dragRatioRef.current !== null) {
       const ratio = ratioFromEvent(event);
       dragRatioRef.current = ratio;
-      setDragRatio(ratio);
       onViewportPreview(viewportFromRatio(ratio));
     }
   }
 
   function stopDrag(event: React.PointerEvent<HTMLDivElement>) {
+    if (dragRatioRef.current === null) {
+      return;
+    }
     const ratio = ratioFromEvent(event);
     dragRatioRef.current = null;
-    setDragRatio(null);
     onViewportCommit(viewportFromRatio(ratio));
   }
 
   function cancelDrag() {
     dragRatioRef.current = null;
-    setDragRatio(null);
     onViewportCancel();
   }
 
@@ -1260,18 +1267,29 @@ function ContactOverview({
         <Maximize2 size={11} aria-hidden="true" />
       </button>
       <div
+        ref={windowRef}
         className="overview-window"
-        style={{
-          left: `${windowLeft}%`,
-          top: `${windowTop}%`,
-          width: `${windowWidth}%`,
-          height: `${windowHeight}%`,
-        }}
+        style={contactOverviewWindowStyle(overviewWindowViewport, displayedTotalSpanBp)}
       />
       <span className="overview-start">0 Mb</span>
       <span className="overview-end">{totalSpanMb.toLocaleString()} Mb</span>
     </div>
   );
+}
+
+function contactOverviewWindowStyle(viewport: ContactViewport, totalSpanBp: number) {
+  const xStart = Math.min(1, Math.max(0, viewport.xStart / totalSpanBp));
+  const xEnd = Math.min(1, Math.max(0, viewport.xEnd / totalSpanBp));
+  const yStart = Math.min(1, Math.max(0, viewport.yStart / totalSpanBp));
+  const yEnd = Math.min(1, Math.max(0, viewport.yEnd / totalSpanBp));
+  const width = Math.min(100, Math.max(3, (xEnd - xStart) * 100));
+  const height = Math.min(100, Math.max(3, (yEnd - yStart) * 100));
+  return {
+    left: `${Math.min(100 - width, Math.max(0, (xStart + xEnd) * 50 - width / 2))}%`,
+    top: `${Math.min(100 - height, Math.max(0, (yStart + yEnd) * 50 - height / 2))}%`,
+    width: `${width}%`,
+    height: `${height}%`,
+  };
 }
 
 export function drawOverviewHeatmap(

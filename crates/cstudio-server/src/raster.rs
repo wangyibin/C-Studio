@@ -527,9 +527,15 @@ fn compute_inner(
     if scale.auto {
         scale.min = 0.0;
         scale.max = if r.target_resolution.is_some() {
-            auto_max_tiles(&cells, r.scale_tiles.as_deref(), r.tile_size_bins)
+            auto_max_tiles(
+                &cells,
+                r.scale_tiles.as_deref(),
+                r.tile_size_bins,
+                r.viewport,
+                resolution,
+            )
         } else {
-            auto_max(&cells)
+            auto_max(&cells, r.viewport, resolution)
         };
     }
     let pixels = rasterize(&r, resolution, &cells, &scale, cancelled)?;
@@ -568,36 +574,66 @@ fn auto_max_tiles(
     cells: &[ContactMapCell],
     selected: Option<&[TileKeyRequest]>,
     tile_size: u64,
+    viewport: ViewportRequest,
+    resolution: u64,
 ) -> f64 {
     let selected = selected.map(|ts| {
         ts.iter()
             .map(|t| canonical_tile(t.tile_x, t.tile_y))
             .collect::<BTreeSet<_>>()
     });
-    let mut indexes = BTreeMap::<(u64, u64), usize>::new();
-    let mut samples = Vec::new();
-    for cell in cells {
-        let tile = canonical_tile(cell.x_bin / tile_size, cell.y_bin / tile_size);
-        if selected.as_ref().is_some_and(|set| !set.contains(&tile)) {
-            continue;
-        }
-        let index = indexes.entry(tile).or_default();
-        if *index % 10 == 0 && cell.x_bin != cell.y_bin {
-            samples.push(cell.count);
-        }
-        *index += 1;
-    }
-    percentile_max(samples)
+    visible_auto_max(
+        cells.iter().filter(|cell| {
+            let tile = canonical_tile(cell.x_bin / tile_size, cell.y_bin / tile_size);
+            selected.as_ref().is_none_or(|set| set.contains(&tile))
+        }),
+        viewport,
+        resolution,
+    )
 }
 
-fn auto_max(cells: &[ContactMapCell]) -> f64 {
-    let values: Vec<_> = cells
-        .iter()
-        .step_by(10)
-        .filter(|c| c.x_bin != c.y_bin && c.count.is_finite() && c.count > 0.0)
-        .map(|c| c.count)
-        .collect();
-    percentile_max(values)
+fn auto_max(cells: &[ContactMapCell], viewport: ViewportRequest, resolution: u64) -> f64 {
+    visible_auto_max(cells.iter(), viewport, resolution)
+}
+
+fn visible_auto_max<'a>(
+    cells: impl Iterator<Item = &'a ContactMapCell>,
+    viewport: ViewportRequest,
+    resolution: u64,
+) -> f64 {
+    let intersects = |x: u64, y: u64| {
+        (x as f64 + 1.0) * resolution as f64 > viewport.x_start as f64
+            && x as f64 * (resolution as f64) < viewport.x_end as f64
+            && (y as f64 + 1.0) * resolution as f64 > viewport.y_start as f64
+            && y as f64 * (resolution as f64) < viewport.y_end as f64
+    };
+    let mut samples = Vec::new();
+    let mut small_sample = Vec::new();
+    let mut eligible = 0;
+    for cell in cells {
+        if cell.x_bin == cell.y_bin
+            || !cell.count.is_finite()
+            || cell.count <= 0.0
+            || !(intersects(cell.x_bin, cell.y_bin) || intersects(cell.y_bin, cell.x_bin))
+        {
+            continue;
+        }
+        eligible += 1;
+        if eligible <= 10_000 {
+            small_sample.push(cell.count);
+        }
+        // Same wrapping coordinate hash and small-view fallback as the desktop.
+        let hash = (cell.x_bin.min(cell.y_bin) as u32).wrapping_mul(73856093)
+            ^ (cell.x_bin.max(cell.y_bin) as u32).wrapping_mul(19349663);
+        if hash % 10 == 0 {
+            samples.push(cell.count);
+        }
+    }
+    percentile_max(if eligible <= 10_000 || samples.is_empty() {
+        small_sample
+    } else {
+        samples
+    })
 }
 
 fn percentile_max(mut values: Vec<f64>) -> f64 {
@@ -952,7 +988,81 @@ mod tests {
                 tile_y: 1,
             },
         ];
-        assert_eq!(auto_max_tiles(&cells, Some(&tiles), 256), 8.0);
+        assert_eq!(
+            auto_max_tiles(
+                &cells,
+                Some(&tiles),
+                256,
+                ViewportRequest {
+                    x_start: 0,
+                    x_end: 600,
+                    y_start: 0,
+                    y_end: 600
+                },
+                1
+            ),
+            8.0
+        );
+    }
+
+    #[test]
+    fn auto_scale_uses_visible_signal_including_small_samples() {
+        let cells = vec![
+            ContactMapCell {
+                x_bin: 1,
+                y_bin: 2,
+                count: 100.0,
+            },
+            ContactMapCell {
+                x_bin: 20,
+                y_bin: 21,
+                count: 2.0,
+            },
+            ContactMapCell {
+                x_bin: 1,
+                y_bin: 1,
+                count: 99999.0,
+            },
+        ];
+        assert_eq!(
+            auto_max(
+                &cells,
+                ViewportRequest {
+                    x_start: 0,
+                    x_end: 8,
+                    y_start: 0,
+                    y_end: 8
+                },
+                1
+            ),
+            100.0
+        );
+        assert_eq!(
+            auto_max(
+                &cells,
+                ViewportRequest {
+                    x_start: 20,
+                    x_end: 24,
+                    y_start: 20,
+                    y_end: 24
+                },
+                1
+            ),
+            2.0
+        );
+        assert_eq!(
+            auto_max(
+                &cells,
+                ViewportRequest {
+                    x_start: 2,
+                    x_end: 3,
+                    y_start: 1,
+                    y_end: 2
+                },
+                1
+            ),
+            100.0
+        );
     }
 
     #[test]
@@ -1064,11 +1174,15 @@ mod tests {
     #[test]
     fn auto_scale_excludes_diagonal_and_log_scale_matches_desktop() {
         assert_eq!(
-            auto_max(&[ContactMapCell {
-                x_bin: 0,
-                y_bin: 0,
-                count: 999.0
-            }]),
+            auto_max(
+                &[ContactMapCell {
+                    x_bin: 0,
+                    y_bin: 0,
+                    count: 999.0
+                }],
+                request().viewport,
+                10
+            ),
             1.0
         );
         let mut r = request();

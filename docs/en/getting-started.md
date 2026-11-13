@@ -96,9 +96,15 @@ contains the compatible undo/redo timeline.
 !!! important "The first save chooses a destination"
 
     Loading an AGP does not make the source file the save destination. The first
-    manual save asks where to write the edited AGP. After that destination is
+    manual save asks where to write the edited AGP, defaulting to the loaded AGP’s folder (the project directory when loading a project folder). You can choose another directory. After that destination is
     established, optional auto-save writes both the AGP and history sidecar
     about five seconds after a change.
 
 Compressed `.agp.gz` input is never overwritten directly. Save to a plain AGP
 target before enabling auto-save.
+
+Within an editing session, subsequent saves reuse the established filename without appending another `.edited`. Browser preview reuses its first suggested download name; manual renames in the browser download dialog cannot be read back by the app.
+
+Save asks for a destination the first time, then updates the current AGP and history sidecar in place. Save As always opens a dialog using the current saved path and filename as its default. After a successful Save As, subsequent saves write to the new file.
+
+Desktop saves stream large operation histories in bounded chunks, avoiding a single history-sized IPC request. The writing status remains visible until both files are complete and the save destination is updated.

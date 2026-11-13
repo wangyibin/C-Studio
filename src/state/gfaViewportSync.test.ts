@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { classifyGfaScaffolds } from "./gfaHomologLayout";
 import type { ContactMapLayoutBlock } from "./importers";
 import {
+  buildGfaViewportIndex,
   gfaContigsForHeatmapViewport,
   gfaPrimaryHomologScaffoldsForHeatmapViewport,
   gfaScaffoldsForHeatmapViewport,
@@ -22,6 +23,33 @@ function block(id: string, objectId: string, visualStart: number, visualEnd: num
 }
 
 describe("GFA heatmap viewport synchronization", () => {
+  it("reuses assembly order across camera moves and rebuilds it after an edit", () => {
+    const blocks = [block("c", "Chr01g1", 20, 30), block("a", "Chr01g1", 0, 10),
+      block("b", "Chr01g1", 10, 20), block("d", "Chr02g1", 30, 40)];
+    const index = buildGfaViewportIndex(blocks);
+    const selected = new Set(["d"]);
+    expect([...gfaContigsForHeatmapViewport(blocks,
+      { xStart: 0, xEnd: 5, yStart: 0, yEnd: 5 }, 1, selected, index,
+    )].sort()).toEqual(["a", "b", "d"]);
+    expect([...gfaContigsForHeatmapViewport(blocks,
+      { xStart: 25, xEnd: 30, yStart: 25, yEnd: 30 }, 1, selected, index,
+    )].sort()).toEqual(["b", "c", "d"]);
+    const edited = [block("a", "Chr01g1", 20, 30), block("b", "Chr01g1", 0, 10),
+      block("c", "Chr01g1", 10, 20), blocks[3]];
+    expect([...gfaContigsForHeatmapViewport(edited,
+      { xStart: 0, xEnd: 5, yStart: 0, yEnd: 5 }, 1, selected, buildGfaViewportIndex(edited),
+    )].sort()).toEqual(["b", "c", "d"]);
+    expect(blocks.map(({ id }) => id)).toEqual(["c", "a", "b", "d"]);
+  });
+
+  it("breaks equal gap overlaps by visual order regardless of input order", () => {
+    const blocks = [block("b", "Chr02g1", 60, 100), block("a", "Chr01g1", 0, 40)];
+    const homologs = classifyGfaScaffolds(["Chr01g1", "Chr02g1"]);
+    expect([...gfaPrimaryHomologScaffoldsForHeatmapViewport(blocks,
+      { xStart: 20, xEnd: 80, yStart: 20, yEnd: 80 }, homologs,
+    )]).toEqual(["Chr01g1"]);
+  });
+
   it("expands a visible chromosome to its whole homolog group across both axes", () => {
     const blocks = [
       block("a", "Chr01g1", 0, 100),

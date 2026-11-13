@@ -354,6 +354,9 @@ pub fn prune_tree(
             ));
         }
     }
+    if entries.len() <= max_entries && total_bytes <= max_bytes {
+        return Ok(DisplayCachePruneStats::default());
+    }
     entries.sort_by_key(|entry| entry.0);
     let mut stats = DisplayCachePruneStats::default();
     let mut retained_entries = entries.len();

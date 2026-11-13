@@ -16,6 +16,8 @@ export interface GfaLinkEvidence {
   from: { segmentName: string; orientation: "+" | "-"; side: GfaSegmentSide };
   to: { segmentName: string; orientation: "+" | "-"; side: GfaSegmentSide };
   overlap: string;
+  /** Hifiasm source-side overlap, verified by LN = L1 + the single-M overlap. */
+  fromOverlapBases?: number;
 }
 
 export interface GfaImportSummary {
@@ -81,6 +83,7 @@ export function parseGfaText(text: string, fileName = "assembly.gfa"): GfaEviden
   const links: GfaLinkEvidence[] = [];
   const warnings: string[] = [];
   const canonicalLinks = new Set<string>();
+  const sourceExtensions = new Map<string, number>();
   let lineCount = 0;
   let aRecordCount = 0;
 
@@ -153,6 +156,10 @@ export function parseGfaText(text: string, fileName = "assembly.gfa"): GfaEviden
         to: { segmentName: columns[3], orientation: columns[4], side: toSide },
         overlap: columns[5],
       });
+      const extension = integerTag(columns.slice(6), "L1");
+      if (extension !== null) {
+        sourceExtensions.set(links[links.length - 1].id, extension);
+      }
       continue;
     }
 
@@ -174,6 +181,16 @@ export function parseGfaText(text: string, fileName = "assembly.gfa"): GfaEviden
   for (const link of links) {
     if (!segments[link.from.segmentName] || !segments[link.to.segmentName]) {
       warn(`Link ${link.id} references a missing S segment`);
+    }
+    const sourceLength = segments[link.from.segmentName]?.length;
+    const extension = sourceExtensions.get(link.id);
+    const overlap = /^(\d+)M$/.exec(link.overlap);
+    if (sourceLength != null && extension !== undefined && overlap) {
+      const overlapBases = Number(overlap[1]);
+      if (Number.isSafeInteger(overlapBases) && extension >= 0
+        && sourceLength - extension === overlapBases) {
+        link.fromOverlapBases = overlapBases;
+      }
     }
   }
 

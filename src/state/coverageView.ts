@@ -28,6 +28,11 @@ export interface CoverageViewRequest {
   bedgraphRecords: BedGraphRecord[];
 }
 
+export type CoverageViewportLoader = (request: {
+  viewport: ContactViewport;
+  displayResolution: number;
+}) => Promise<CoverageView>;
+
 interface CoverageViewRequestOptions {
   displayResolution?: number;
   viewport?: ContactViewport;
@@ -105,8 +110,14 @@ export function buildBrowserCoverageView(request: CoverageViewRequest): Coverage
       const visualEnd = block.orientation === "-"
         ? block.visualStart + block.sourceEnd - overlapStart
         : block.visualStart + overlapEnd - block.sourceStart;
-      const firstBin = Math.floor(visualStart / request.displayResolution);
-      const lastBin = Math.floor((visualEnd - 1) / request.displayResolution);
+      const firstBin = Math.max(
+        Math.floor(visualStart / request.displayResolution),
+        Math.floor(request.viewport.xStart / request.displayResolution),
+      );
+      const lastBin = Math.min(
+        Math.floor((visualEnd - 1) / request.displayResolution),
+        Math.ceil(request.viewport.xEnd / request.displayResolution) - 1,
+      );
 
       for (let xBin = firstBin; xBin <= lastBin; xBin += 1) {
         const binStart = xBin * request.displayResolution;

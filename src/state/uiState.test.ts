@@ -13,7 +13,7 @@ import {
   storedContactResolutionsForDataset,
 } from "./uiState";
 import type { ContactMapLayoutBlock } from "./importers";
-import { selectedBlockIds } from "./assemblyEditing";
+import { buildAssemblyEditModel, buildAssemblyInteractionIndex, insertionTargetAtScreenPoint, selectedBlockIds } from "./assemblyEditing";
 import { buildCenteredContactViewport } from "./contactViewport";
 
 describe("reduceUiState", () => {
@@ -2022,8 +2022,24 @@ describe("reduceUiState", () => {
       "Chr01:2:ctg2",
       "Chr02:1:ctg3",
     ]);
-    expect(state.assembly.selection).toBeNull();
+    expect(state.assembly.selection).toEqual({ kind: "contigs", ids: ["Chr01:1:ctg1_d2"] });
     expect(state.logEntries[state.logEntries.length - 1]?.message).toBe("Selection copied");
+  });
+
+  it("transfers a multi-selection to each new generation of copies", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, {
+      type: "selectAssemblyContigs",
+      ids: ["Chr01:1:ctg1", "Chr02:1:ctg3"],
+    });
+    for (let iteration = 0; iteration < 2; iteration += 1) {
+      const previousIds = new Set(state.assembly.blocks.map((block) => block.id));
+      state = reduceUiState(state, { type: "copyAssemblySelection" });
+      const copies = state.assembly.blocks.filter((block) => !previousIds.has(block.id));
+      expect(copies).toHaveLength(2);
+      expect(state.assembly.selection).toEqual({ kind: "contigs", ids: copies.map((block) => block.id) });
+    }
   });
 
   it("copies the selected chromosome into a new chromosome from the reducer", () => {
@@ -2040,7 +2056,30 @@ describe("reduceUiState", () => {
       ["Chr01:2:ctg2_d2", "Chr01_d2", "ctg2"],
       ["Chr02:1:ctg3", "Chr02", "ctg3"],
     ]);
-    expect(state.assembly.selection).toBeNull();
+    expect(state.assembly.selection).toEqual({ kind: "chromosome", id: "Chr01_d2" });
+  });
+
+  it("offers chromosome insertion after copying and moves the copy as a chromosome", () => {
+    let state = createInitialUiState("Browser preview mode");
+    state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
+    state = reduceUiState(state, { type: "selectAssemblyChromosome", id: "Chr01" });
+    state = reduceUiState(state, { type: "copyAssemblySelection" });
+    const model = buildAssemblyEditModel(state.assembly.blocks);
+    const selectedIds = new Set(selectedBlockIds(state.assembly.blocks, state.assembly.selection));
+    const selectionKind = state.assembly.selection!.kind;
+    const index = buildAssemblyInteractionIndex(model, selectedIds, selectionKind);
+    const target = insertionTargetAtScreenPoint(model, selectedIds, { x: 0, y: 0 }, {
+      sizePx: 580, tolerancePx: 7, viewportStart: 0, viewportEnd: model.totalSpan, selectionKind,
+    }, index);
+    expect(target?.targetBlockId).toBe("Chr01:1:ctg1");
+    state = reduceUiState(state, {
+      type: "moveAssemblySelectionBefore", targetBlockId: target!.targetBlockId,
+    });
+    expect(state.assembly.blocks.map((block) => block.objectId)).toEqual([
+      "Chr01_d2", "Chr01_d2", "Chr01", "Chr01", "Chr02",
+    ]);
+    state = reduceUiState(state, { type: "undo" });
+    expect(state.assembly.selection).toEqual({ kind: "chromosome", id: "Chr01_d2" });
   });
 
   it("copies a clicked contig directly from the reducer", () => {
@@ -2055,7 +2094,7 @@ describe("reduceUiState", () => {
       "Chr01:2:ctg2_d2",
       "Chr02:1:ctg3",
     ]);
-    expect(state.assembly.selection).toBeNull();
+    expect(state.assembly.selection).toEqual({ kind: "contigs", ids: ["Chr01:2:ctg2_d2"] });
   });
 
   it("keeps a split segment selected precisely and copies only that interval", () => {
@@ -2097,7 +2136,7 @@ describe("reduceUiState", () => {
     ))).toHaveLength(2);
   });
 
-  it("copies the selected contig before a coverage target and exits selection", () => {
+  it("copies the selected contig before a coverage target and selects the copy", () => {
     let state = createInitialUiState("Browser preview mode");
 
     state = reduceUiState(state, { type: "setAssemblyBlocks", blocks: assemblyBlocks });
@@ -2113,7 +2152,7 @@ describe("reduceUiState", () => {
       ["Chr01:1:ctg1_d2", "Chr02"],
       ["Chr02:1:ctg3", "Chr02"],
     ]);
-    expect(state.assembly.selection).toBeNull();
+    expect(state.assembly.selection).toEqual({ kind: "contigs", ids: ["Chr01:1:ctg1_d2"] });
     expect(state.logEntries[state.logEntries.length - 1]?.message).toBe("Selection copied to target");
   });
 
@@ -2368,7 +2407,7 @@ describe("reduceUiState", () => {
       "Chr01:2:ctg2",
       "Chr02:1:ctg3",
     ]);
-    expect(state.assembly.selection).toBeNull();
+    expect(state.assembly.selection).toEqual({ kind: "contigs", ids: ["Chr01:1:ctg1_d2"] });
 
     state = reduceUiState(state, { type: "undo" });
     expect(state.assembly.blocks.map((block) => block.id)).toEqual([
@@ -2386,7 +2425,7 @@ describe("reduceUiState", () => {
       "Chr01:2:ctg2",
       "Chr02:1:ctg3",
     ]);
-    expect(state.assembly.selection).toBeNull();
+    expect(state.assembly.selection).toEqual({ kind: "contigs", ids: ["Chr01:1:ctg1_d2"] });
   });
 
   it("records affected chromosomes and contigs for history entries", () => {

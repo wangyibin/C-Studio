@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { createInitialUiState } from "../state/uiState";
 import { contactColorLut } from "../state/contactColor";
+import { createContactViewportPresentation } from "../state/contactViewportPresentation";
 import type { AppStatus, ContactMapView, ExampleDatasetSummary } from "../App";
 import {
   contactNavigationOverviewMap,
@@ -206,6 +207,31 @@ describe("InspectorPanel", () => {
       yStart: 250_000_000,
       yEnd: 350_000_000,
     });
+  });
+
+  it("mounts the Overview window in the latest camera instead of the settled UI state", () => {
+    const uiState = createInitialUiState("ready");
+    const presentation = createContactViewportPresentation();
+    presentation.publish({ xStart: 100, xEnd: 500, yStart: 200, yEnd: 400 });
+    const markup = renderToStaticMarkup(
+      <InspectorPanel
+        dataset={dataset}
+        contactMap={contactMap}
+        overviewContactMap={contactMap}
+        contactViewportPresentation={presentation}
+        status={status}
+        statusMessage="ready"
+        uiState={uiState}
+        onUiAction={() => undefined}
+        syntenyView={null}
+        assemblyBlocks={[]}
+        selectedAssemblyBlockIds={[]}
+        pafRecords={[]}
+      />,
+    );
+
+    expect(markup).toContain('class="overview-window" style="left:10%;top:20');
+    expect(markup).toContain('width:40%;height:20%');
   });
 
   it("binds the overview to the active contact map", () => {

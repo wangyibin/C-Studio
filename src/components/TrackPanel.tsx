@@ -1,10 +1,13 @@
 import {
   useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type Ref,
 } from "react";
 import { Eye, EyeOff, SlidersHorizontal } from "lucide-react";
 import {
@@ -21,7 +24,8 @@ import {
   horizontalViewportFocusRatio,
   type ContactViewport,
 } from "../state/contactViewport";
-import type { CoverageView } from "../state/coverageView";
+import type { CoverageView, CoverageViewportLoader } from "../state/coverageView";
+import { coveragePanTransform, createCoveragePanLoader, type CoveragePanLoader } from "../state/coveragePan";
 import type { ContactMapLayoutBlock } from "../state/importers";
 import type { UiAction, UiState } from "../state/uiState";
 
@@ -33,7 +37,16 @@ interface TrackPanelProps {
   onUiAction: (action: UiAction) => void;
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
   totalSpanMb?: number;
+  panControllerRef?: Ref<CoverageTrackPanController>;
+  onLoadCoverageViewport?: CoverageViewportLoader;
 }
+
+export interface CoverageTrackPanController {
+  preview(viewport: ContactViewport): void;
+  finish(viewport: ContactViewport): void;
+}
+
+const usePrePaintEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
 export interface CoverageTrackBar {
   xBin: number;
@@ -102,6 +115,8 @@ export function TrackPanel({
   onUiAction,
   uiState,
   viewport,
+  panControllerRef,
+  onLoadCoverageViewport,
   totalSpanMb = uiState.contact.totalSpanMb,
 }: TrackPanelProps) {
   const activeAssemblyBlocks = assemblyBlocks ?? uiState.assembly.blocks;
@@ -116,12 +131,23 @@ export function TrackPanel({
   const coveragePanDragRef = useRef<CoveragePanDrag | null>(null);
   const coverageScaleControlRef = useRef<HTMLDetailsElement | null>(null);
   const coverageBarsRef = useRef<HTMLDivElement | null>(null);
+  const coverageContentRef = useRef<HTMLDivElement | null>(null);
+  const panLoaderRef = useRef<CoveragePanLoader | null>(null);
+  const previewScope = useMemo(() => ({}), [
+    activeAssemblyBlocks, onLoadCoverageViewport, sourceCoverageView?.resolution,
+  ]);
+  const liveCoverageViewportRef = useRef<{
+    scope: object; viewport: ContactViewport; active: boolean;
+  } | null>(null);
+  const [previewCoverage, setPreviewCoverage] = useState<{
+    scope: object; view: CoverageView;
+  } | null>(null);
   const [coverageViewportWidthPx, setCoverageViewportWidthPx] = useState(
     fallbackAssemblyBoundaryViewportWidthPx,
   );
   const lastDragSelectionSignatureRef = useRef("");
   const suppressCoverageClickRef = useRef(false);
-  const coverageView = useMemo(() => (
+  const baseCoverageView = useMemo(() => (
     sourceCoverageView && viewport
       ? {
           ...sourceCoverageView,
@@ -133,7 +159,15 @@ export function TrackPanel({
         }
       : sourceCoverageView
   ), [sourceCoverageView, viewport]);
-  const coverageRenderBarLimit = coverageRenderBarLimitForWidth(coverageViewportWidthPx);
+  const coverageView = previewCoverage?.scope === previewScope
+    ? previewCoverage.view : baseCoverageView;
+  const coverageRenderWidthPx = coverageViewportWidthPx * (
+    coverageView && baseCoverageView
+      ? (coverageView.viewport.xEnd - coverageView.viewport.xStart)
+        / Math.max(1, baseCoverageView.viewport.xEnd - baseCoverageView.viewport.xStart)
+      : 1
+  );
+  const coverageRenderBarLimit = coverageRenderBarLimitForWidth(coverageRenderWidthPx);
   const bars = useMemo(
     () => buildCoverageTrackBars(
       coverageView,
@@ -160,14 +194,80 @@ export function TrackPanel({
   const chromosomeBoundaries = buildCoverageChromosomeBoundaries(
     coverageView?.viewport ?? null,
     activeAssemblyBlocks,
-    coverageViewportWidthPx,
+    coverageRenderWidthPx,
   );
-  const coverageValues = bars.map((bar) => bar.value);
+  // Panning changes X only. Keep the depth scale stable until the committed
+  // coverage view changes, including while overscanned data arrives.
+  const scaleBars = useMemo(() => buildCoverageTrackBars(
+    baseCoverageView, activeAssemblyBlocks, coverageRenderBarLimitForWidth(coverageViewportWidthPx),
+  ), [baseCoverageView, activeAssemblyBlocks, coverageViewportWidthPx]);
+  const coverageValues = scaleBars.map((bar) => bar.value);
   const automaticScale = coverageAutoScaleDomain(coverageValues, automaticMultiplier);
   const scale = scaleOverride ?? automaticScale;
   const referenceDepth = coverageReferenceDepth(coverageValues);
   const referenceLines = coverageReferenceMultiples(coverageValues, referenceDepth)
     .map((multiple) => ({ multiple, value: (referenceDepth ?? 0) * multiple }));
+
+  function coverageInteractionViewport() {
+    const live = liveCoverageViewportRef.current;
+    return live?.scope === previewScope ? live.viewport : baseCoverageView?.viewport ?? null;
+  }
+
+  function applyCoverageViewport(target: ContactViewport) {
+    const content = coverageContentRef.current;
+    if (content && coverageView) {
+      Object.assign(content.style, coveragePanTransform(coverageView.viewport, target));
+    }
+    if (coverageBarsRef.current) {
+      coverageBarsRef.current.dataset.viewportXStart = String(target.xStart);
+      coverageBarsRef.current.dataset.viewportXEnd = String(target.xEnd);
+    }
+  }
+
+  useImperativeHandle(panControllerRef, () => ({
+    preview(target) {
+      liveCoverageViewportRef.current = { scope: previewScope, viewport: target, active: true };
+      applyCoverageViewport(target);
+      if (uiState.tracks.coverageVisible && sourceCoverageView) {
+        panLoaderRef.current?.request(target, sourceCoverageView);
+      }
+    },
+    finish(target) {
+      liveCoverageViewportRef.current = { scope: previewScope, viewport: target, active: false };
+      panLoaderRef.current?.cancel();
+      applyCoverageViewport(target);
+      setPreviewCoverage(null);
+    },
+  }));
+
+  usePrePaintEffect(() => {
+    const live = liveCoverageViewportRef.current;
+    const target = live?.scope === previewScope && live.active
+      ? live.viewport : baseCoverageView?.viewport;
+    if (target) {
+      liveCoverageViewportRef.current = {
+        scope: previewScope, viewport: target, active: live?.scope === previewScope && live.active,
+      };
+      applyCoverageViewport(target);
+    }
+  }, [coverageView, baseCoverageView, previewScope, uiState.tracks.coverageVisible]);
+
+  useEffect(() => {
+    if (!onLoadCoverageViewport || !uiState.tracks.coverageVisible) return;
+    const loader = createCoveragePanLoader(onLoadCoverageViewport, (view) => {
+      const live = liveCoverageViewportRef.current;
+      if (live?.scope === previewScope && live.active) {
+        setPreviewCoverage((current) => current?.scope === previewScope && current.view === view
+          ? current : { scope: previewScope, view });
+      }
+    });
+    panLoaderRef.current = loader;
+    const live = liveCoverageViewportRef.current;
+    if (live?.scope === previewScope && live.active && sourceCoverageView) {
+      loader.request(live.viewport, sourceCoverageView);
+    }
+    return () => { loader.dispose(); panLoaderRef.current = null; };
+  }, [previewScope, uiState.tracks.coverageVisible]);
 
   useEffect(() => {
     function abandonCoverageSelection(event: KeyboardEvent) {
@@ -359,7 +459,7 @@ export function TrackPanel({
 
     event.preventDefault();
     const ids = coverageContigIdsInRatioRange(
-      coverageView?.viewport ?? null,
+      coverageInteractionViewport(),
       activeAssemblyBlocks,
       nextDrag.startRatio,
       nextDrag.currentRatio,
@@ -384,7 +484,7 @@ export function TrackPanel({
         ? clamp01((event.clientX - bounds.left) / bounds.width)
         : drag.currentRatio;
       const ids = coverageContigIdsInRatioRange(
-        coverageView?.viewport ?? null,
+        coverageInteractionViewport(),
         activeAssemblyBlocks,
         drag.startRatio,
         currentRatio,
@@ -392,7 +492,7 @@ export function TrackPanel({
       onUiAction({ type: "selectAssemblyContigs", ids });
     } else {
       const id = coverageBlockIdAtRatio(
-        coverageView?.viewport ?? null,
+        coverageInteractionViewport(),
         activeAssemblyBlocks,
         drag.startRatio,
       );
@@ -445,8 +545,9 @@ export function TrackPanel({
     }
     event.preventDefault();
     const deltaXPx = event.clientX - (drag.moved ? drag.lastClientX : drag.startClientX);
-    const deltaXMb = coverageView
-      ? horizontalViewportDragDeltaMb(deltaXPx, bounds.width, coverageView.viewport)
+    const interactionViewport = coverageInteractionViewport();
+    const deltaXMb = interactionViewport
+      ? horizontalViewportDragDeltaMb(deltaXPx, bounds.width, interactionViewport)
       : 0;
     if (deltaXMb !== 0) {
       onUiAction({ type: "panContactViewport", deltaXMb, deltaYMb: 0 });
@@ -638,18 +739,62 @@ export function TrackPanel({
           onDoubleClick={zoomCoverageAtPointer}
           onContextMenu={onContextMenu}
         >
-          {bars.map((bar) => (
-            <span
-              key={bar.xBin}
-              className={`coverage-bin ${bar.value > scale.max ? "coverage-bin-clipped" : ""}`}
-              aria-hidden="true"
-              style={{
-                left: `${bar.leftRatio * 100}%`,
-                width: `${bar.widthRatio * 100}%`,
-                height: `${coverageValueHeightRatio(bar.value, scale) * 100}%`,
-              }}
-            />
-          ))}
+          <div ref={coverageContentRef} className="coverage-pan-content">
+            {bars.map((bar) => (
+              <span
+                key={bar.xBin}
+                className={`coverage-bin ${bar.value > scale.max ? "coverage-bin-clipped" : ""}`}
+                aria-hidden="true"
+                style={{
+                  left: `${bar.leftRatio * 100}%`,
+                  width: `${bar.widthRatio * 100}%`,
+                  height: `${coverageValueHeightRatio(bar.value, scale) * 100}%`,
+                }}
+              />
+            ))}
+            <div className="coverage-chromosome-grid" aria-hidden="true">
+              {chromosomeBoundaries.map((boundary) => (
+                <span
+                  key={boundary.positionBp}
+                  data-boundary-bp={boundary.positionBp}
+                  style={{ left: `${boundary.leftRatio * 100}%` }}
+                />
+              ))}
+            </div>
+            <div className="coverage-contig-hit-layer">
+              {interactiveRanges.map((range) => {
+                const block = blocksById.get(range.id);
+                const blockName = block ? assemblyContigDisplayName(block) : range.id;
+                return (
+                  <button
+                    key={range.id}
+                    type="button"
+                    data-block-id={range.id}
+                    aria-pressed={selectedIds.has(range.id)}
+                    aria-label={`Select ${blockName} in coverage`}
+                    title={`${blockName} · Click to replace · Shift-drag multiple · Cmd/Ctrl-click toggle`}
+                    style={{
+                      left: `${range.leftRatio * 100}%`,
+                      width: `${range.widthRatio * 100}%`,
+                    }}
+                    onClick={(event) => selectCoverageContig(range.id, event)}
+                  />
+                );
+              })}
+            </div>
+            <div className="coverage-selection-layer" aria-hidden="true">
+              {selectionRanges.map((range) => (
+                <span
+                  key={range.id}
+                  data-block-id={range.id}
+                  style={{
+                    left: `${range.leftRatio * 100}%`,
+                    width: `${range.widthRatio * 100}%`,
+                  }}
+                />
+              ))}
+            </div>
+          </div>
           {referenceLines.length > 0 ? (
             <div className="coverage-reference-lines" aria-hidden="true">
               {referenceLines.map((reference) => (
@@ -658,55 +803,11 @@ export function TrackPanel({
                   className={`coverage-reference-line coverage-reference-${reference.multiple}x`}
                   data-coverage-multiple={reference.multiple}
                   data-coverage-value={reference.value}
-                  style={{
-                    bottom: `${coverageValueHeightRatio(reference.value, scale) * 100}%`,
-                  }}
+                  style={{ bottom: `${coverageValueHeightRatio(reference.value, scale) * 100}%` }}
                 />
               ))}
             </div>
           ) : null}
-          <div className="coverage-chromosome-grid" aria-hidden="true">
-            {chromosomeBoundaries.map((boundary) => (
-              <span
-                key={boundary.positionBp}
-                data-boundary-bp={boundary.positionBp}
-                style={{ left: `${boundary.leftRatio * 100}%` }}
-              />
-            ))}
-          </div>
-          <div className="coverage-contig-hit-layer">
-            {interactiveRanges.map((range) => {
-              const block = blocksById.get(range.id);
-              const blockName = block ? assemblyContigDisplayName(block) : range.id;
-              return (
-                <button
-                  key={range.id}
-                  type="button"
-                  data-block-id={range.id}
-                  aria-pressed={selectedIds.has(range.id)}
-                  aria-label={`Select ${blockName} in coverage`}
-                  title={`${blockName} · Click to replace · Shift-drag multiple · Cmd/Ctrl-click toggle`}
-                  style={{
-                    left: `${range.leftRatio * 100}%`,
-                    width: `${range.widthRatio * 100}%`,
-                  }}
-                  onClick={(event) => selectCoverageContig(range.id, event)}
-                />
-              );
-            })}
-          </div>
-          <div className="coverage-selection-layer" aria-hidden="true">
-            {selectionRanges.map((range) => (
-              <span
-                key={range.id}
-                data-block-id={range.id}
-                style={{
-                  left: `${range.leftRatio * 100}%`,
-                  width: `${range.widthRatio * 100}%`,
-                }}
-              />
-            ))}
-          </div>
           {coverageSelectionDrag?.moved ? (
             <div
               className="coverage-range-selection-preview"

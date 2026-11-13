@@ -27,9 +27,27 @@ or GFA. Right-click the selection to open the shared operation menu.
 | **Dissolve block** | Split a selected composite block into singleton contigs |
 | **Add chr boundaries** | Create chromosome boundaries around selected contigs |
 | **Remove chr boundaries** | Remove eligible selected chromosome boundaries |
-| **Delete gap / join blocks** | Remove eligible AGP gap rows and join the neighboring blocks |
+| **Delete gap / join blocks** | Remove eligible AGP gaps, join neighboring blocks, and trim overlaps supported by the loaded GFA |
 | **Move to debris** | Retain the selected sequence in a debris object |
 | **Delete contig…** | Remove selected placements after a copy-aware confirmation |
+
+After copying, selection moves to the newly created copies. Whole-chromosome copies retain chromosome selection for subsequent insertion, movement, and editing; contig copies retain contig selection.
+
+When a GFA is loaded, **Delete gap / join blocks** (++cmd+j++ / ++ctrl+j++)
+checks each newly joined boundary against its `L` records. A unique link matching
+the contig orientations with a simple `M`/`=` overlap trims that many bases from
+the displayed left end of the right-hand contig. The AGP source interval changes;
+the source FASTA stays unchanged. Existing joins are not trimmed again. Without
+a matching contig pair in the GFA, joining only removes the gap. Ambiguous links,
+conflicting orientations, and unsupported overlaps leave the selection unchanged
+and show a reason in Messages. Undo restores the gap and source intervals;
+**Dissolve block** also restores the recorded trims.
+
+For hifiasm links whose `L1` tag agrees with the source segment length, a unique
+reciprocal pair may report different overlaps on its two source contigs. Joining
+uses the overlap recorded on the contig being trimmed. Moving or reversing a
+contig and saving does not apply overlap trimming; select the adjacent blocks
+and run **Delete gap / join blocks** first.
 
 To split a contig, first select it, then hover an internal point of its diagonal
 box. When the cut cursor appears, click to split. End regions are guarded so an

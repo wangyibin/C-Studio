@@ -5,7 +5,7 @@ import {
   copySelection,
   copySelectionBefore,
   deleteContigSelection,
-  deleteGapsBetweenSelection,
+  planAssemblyGapDeletion,
   dissolveAssemblyBlockSelection,
   moveSelectionBefore,
   moveSelectionToDebris,
@@ -327,7 +327,7 @@ export type UiAction =
   | { type: "copyAssemblySelectionBefore"; targetBlockId: string }
   | { type: "copyAssemblyContig"; id: string }
   | { type: "splitAssemblyContig"; blockId: string; visualPosition: number }
-  | { type: "deleteAssemblyGaps" }
+  | { type: "deleteAssemblyGaps"; links?: GfaLinkEvidence[] }
   | { type: "renameAssemblySelection"; name: string }
   | { type: "clearLoadedData" }
   | { type: "appendLog"; message: string };
@@ -1436,7 +1436,9 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
           selection: null,
         },
       };
-    case "restoreAssemblyHistory":
+    case "restoreAssemblyHistory": {
+      const currentSnapshot = action.operationHistory[action.operationHistory.length - 1]?.afterAssembly
+        ?? action.redoStack[action.redoStack.length - 1]?.beforeAssembly;
       return {
         ...state,
         operationHistory: action.operationHistory,
@@ -1445,10 +1447,24 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         historyPreviewOperationId: null,
         assembly: {
           ...state.assembly,
-          blocks: action.blocks,
+          // AGP stores trimmed intervals but cannot store their reversible GFA
+          // metadata. Recover it from the matching, validated history sidecar.
+          blocks: action.blocks.map((block, index) => {
+            const saved = currentSnapshot?.blocks[index];
+            if (!saved?.gfaOverlapBefore
+              || saved.objectId !== block.objectId
+              || (saved.displayName?.trim() || saved.sourceId) !== block.sourceId
+              || saved.sourceStart !== block.sourceStart
+              || saved.sourceEnd !== block.sourceEnd
+              || saved.orientation !== block.orientation) {
+              return block;
+            }
+            return { ...block, gfaOverlapBefore: { ...saved.gfaOverlapBefore } };
+          }),
           selection: null,
         },
       };
+    }
     case "toggleAssemblyOverlay": {
       const key = action.overlay === "chromosome"
         ? "showChromosomeBoxes"
@@ -1857,19 +1873,31 @@ export function reduceUiState(state: UiState, action: UiAction): UiState {
         "split_contig",
       );
     }
-    case "deleteAssemblyGaps":
+    case "deleteAssemblyGaps": {
+      const plan = planAssemblyGapDeletion(
+        state.assembly.blocks,
+        state.assembly.selection,
+        action.links,
+      );
+      if (!plan.ok) {
+        return withLog({
+          ...state,
+          activeBottomPanel: "messages",
+          layout: { ...state.layout, bottomCollapsed: false },
+        }, `Join blocked: ${plan.reason}`);
+      }
       return withAssemblyHistory(
         state,
         {
-          blocks: deleteGapsBetweenSelection(
-            state.assembly.blocks,
-            state.assembly.selection,
-          ),
+          blocks: plan.blocks,
           selection: null,
         },
-        "Gap deleted; blocks joined",
+        plan.trimmedBases > 0
+          ? `Gap deleted; blocks joined; ${plan.trimmedBases.toLocaleString()} bp GFA overlap trimmed`
+          : "Gap deleted; blocks joined",
         "delete_gap",
       );
+    }
     case "renameAssemblySelection": {
       const target = assemblyRenameTarget(state.assembly.blocks, state.assembly.selection);
       const name = action.name.trim();
@@ -1901,10 +1929,30 @@ function withAssemblyHistory(
   type: ContextOperationType,
 ): UiState {
   // Editing helpers return the original block array when an operation cannot
-  // be applied. Keep the selection in that case; only a completed edit is a
-  // one-shot selection action.
+  // be applied. Keep the selection in that case.
   if (assembly.blocks === state.assembly.blocks) {
     return state;
+  }
+
+  if (type === "copy_new" || type === "copy_to_group") {
+    const originalIds = new Set(state.assembly.blocks.map((block) => block.id));
+    const copies = assembly.blocks.filter((block) => !originalIds.has(block.id));
+    const copiedChromosomeId = type === "copy_new"
+      && state.assembly.selection?.kind === "chromosome"
+      && copies.length > 0
+      && copies.every((block) => block.objectId === copies[0].objectId)
+      && !state.assembly.blocks.some((block) => block.objectId === copies[0].objectId)
+      ? copies[0].objectId
+      : null;
+    assembly = {
+      ...assembly,
+      selection: copiedChromosomeId
+        ? { kind: "chromosome", id: copiedChromosomeId }
+        : copies.length === 0 ? state.assembly.selection : {
+          kind: "contigs",
+          ids: copies.map((block) => block.id),
+        },
+    };
   }
 
   const beforeAssembly = snapshotAssembly(state.assembly);
@@ -2041,6 +2089,7 @@ function snapshotAssembly(assembly: Pick<UiState["assembly"], "blocks" | "select
     blocks: assembly.blocks.map((block) => ({
       ...block,
       gapBefore: block.gapBefore ? { ...block.gapBefore } : undefined,
+      gfaOverlapBefore: block.gfaOverlapBefore ? { ...block.gfaOverlapBefore } : undefined,
     })),
     selection: cloneAssemblySelection(assembly.selection),
   };

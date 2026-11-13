@@ -639,6 +639,7 @@ export function GfaPreviewCard({
     () => classifyGfaScaffolds(fullGraph.groupOrder, homologPattern),
     [fullGraph.groupOrder, homologPattern],
   );
+  const visibleScaffoldKey = [...visibleScaffoldIds].sort().join("\u0000");
   const graph = useMemo(
     () => graphForGfaOnlyNodeVisibility(
       graphForVisibleHomologScaffolds(
@@ -650,7 +651,7 @@ export function GfaPreviewCard({
       ),
       false,
     ),
-    [chromosomeFilterActive, fullGraph, homologs, visibleScaffoldIds],
+    [chromosomeFilterActive, fullGraph, homologs, visibleScaffoldKey],
   );
   const chromosomeScaffolds = useMemo(
     () => homologScaffoldIds(homologs),
@@ -975,11 +976,12 @@ export function GfaGraphPanel({
     [bandageLayoutRequest, layoutRevision],
   );
   const guidedGraphKey = visibleGuidedGraph.nodes.map((node) => node.id).join("\u0000");
-  const hiCContactMapReady = Boolean(
+  const needsContactEvidence = showHiCLinks || gfaReviewOptionVisible;
+  const hiCContactMapReady = useMemo(() => Boolean(
     contactMap && gfaHiCContactMapUsesLayout(contactMap, assemblyBlocks),
-  );
+  ), [contactMap, assemblyBlocks]);
   const hiCLinks = useMemo(
-    () => contactMap && gfaHiCContactMapUsesLayout(contactMap, assemblyBlocks)
+    () => needsContactEvidence && hiCContactMapReady && contactMap
       ? buildLengthNormalizedGfaHiCLinks(
         contactMap,
         assemblyBlocks,
@@ -990,7 +992,7 @@ export function GfaGraphPanel({
           : gfaEndpointHiCOverviewPartnerLimit(hiCLinkLimit),
       )
       : [],
-    [activeGraph.nodes, assemblyBlocks, contactMap, hiCLinkLimit, layoutMode],
+    [needsContactEvidence, hiCContactMapReady, activeGraph.nodes, assemblyBlocks, contactMap, hiCLinkLimit, layoutMode],
   );
   const activeNodesById = useMemo(
     () => new Map(activeGraph.nodes.map((node) => [node.id, node])),
@@ -1099,12 +1101,12 @@ export function GfaGraphPanel({
     ],
   );
   const curationIssues = useMemo(
-    () => buildGfaCurationIssues({
+    () => gfaReviewOptionVisible ? buildGfaCurationIssues({
       document,
       graph: activeGraph,
       assemblyBlocks,
       hiCLinks,
-    }),
+    }) : [],
     [activeGraph, assemblyBlocks, document, hiCLinks],
   );
   const selectedCurationIssue = curationIssues.find(

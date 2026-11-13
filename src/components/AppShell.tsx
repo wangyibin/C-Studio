@@ -26,7 +26,7 @@ import {
   assemblyContigSelectionIntent,
   selectedBlockIds,
 } from "../state/assemblyEditing";
-import type { CoverageView } from "../state/coverageView";
+import type { CoverageView, CoverageViewportLoader } from "../state/coverageView";
 import type { PafPreviewRecord } from "../state/pafPreview";
 import type { GfaEvidenceDocument } from "../state/gfa";
 import type { GfaBandageLayoutLoader } from "../state/gfaBandageLayout";
@@ -44,8 +44,10 @@ import {
   buildCenteredContactViewport,
   type ContactViewport,
 } from "../state/contactViewport";
+import { createContactViewportPresentation } from "../state/contactViewportPresentation";
 import {
   gfaContigsForHeatmapViewport,
+  buildGfaViewportIndex,
   gfaPrimaryHomologScaffoldsForHeatmapViewport,
   gfaScaffoldsForHeatmapViewport,
 } from "../state/gfaViewportSync";
@@ -97,6 +99,7 @@ interface AppShellProps {
   overviewContactMap: ContactMapView | null;
   syntenyView: SyntenyView | null;
   coverageView: CoverageView | null;
+  onLoadCoverageViewport?: CoverageViewportLoader;
   pafRecords: ReadonlyArray<PafPreviewRecord>;
   pafImported: boolean;
   gfaDocument: GfaEvidenceDocument | null;
@@ -206,6 +209,7 @@ export function AppShell({
   overviewContactMap,
   syntenyView,
   coverageView,
+  onLoadCoverageViewport,
   pafRecords,
   pafImported,
   gfaDocument,
@@ -282,9 +286,7 @@ export function AppShell({
   const [inspectorWidth, setInspectorWidth] = useState<number | null>(null);
   const [gfaPanelOpen, setGfaPanelOpen] = useState(false);
   const [heatmapPanelOpen, setHeatmapPanelOpen] = useState(true);
-  const [presentedContactViewport, setPresentedContactViewport] = useState<ContactViewport | null>(
-    null,
-  );
+  const contactViewportPresentation = useMemo(createContactViewportPresentation, []);
   const contactViewportNavigationControllerRef = useRef<
     ContactViewportNavigationController | null
   >(null);
@@ -417,16 +419,16 @@ export function AppShell({
           || uiState.contact.totalSpanMb * 1_000_000)
     ) / 1_000_000,
   );
-  const selectedAssemblyBlockIds = selectedBlockIds(
+  const selectedAssemblyBlockIds = useMemo(() => selectedBlockIds(
     activeAssemblyBlocks,
     uiState.assembly.selection,
-  );
+  ), [activeAssemblyBlocks, uiState.assembly.selection]);
   const placementSelectionKey = uiState.assembly.selection?.kind === "contigs"
     ? `contigs:${selectedAssemblyBlockIds.join("\u0000")}`
     : uiState.assembly.selection?.kind === "chromosome"
       ? `chromosome:${uiState.assembly.selection.id}`
       : "none";
-  const heatmapViewport = buildCenteredContactViewport({
+  const heatmapViewport = useMemo(() => buildCenteredContactViewport({
     centerMb: uiState.contact.viewportCenterMb,
     centerXMb: uiState.contact.viewportCenterXMb,
     centerYMb: uiState.contact.viewportCenterYMb,
@@ -434,7 +436,15 @@ export function AppShell({
     windowSizeBp: uiState.contact.viewportSpanMb * 1_000_000,
     viewportWidthPx: uiState.contact.viewportWidthPx,
     viewportHeightPx: uiState.contact.viewportHeightPx,
-  });
+  }), [
+    activeAssemblyTotalBp,
+    uiState.contact.viewportCenterMb,
+    uiState.contact.viewportCenterXMb,
+    uiState.contact.viewportCenterYMb,
+    uiState.contact.viewportSpanMb,
+    uiState.contact.viewportWidthPx,
+    uiState.contact.viewportHeightPx,
+  ]);
   const placementPreviewContextRef = useRef({
     blocks: activeAssemblyBlocks,
     totalSpanBp: activeAssemblyTotalBp,
@@ -517,54 +527,64 @@ export function AppShell({
   const visibleChromosomeCount = chromosomeIds.filter(
     (id) => chromosomeVisibility.visibleIds.has(id),
   ).length;
-  const knownAssemblyObjectIds = new Set([...chromosomeIds, ...unanchoredObjectIds]);
-  const chromosomeByBlockId = new Map(
+  const knownAssemblyObjectIds = useMemo(() => new Set([...chromosomeIds, ...unanchoredObjectIds]),
+    [chromosomeIds, unanchoredObjectIds]);
+  const chromosomeByBlockId = useMemo(() => new Map(
     activeAssemblyBlocks.map((block) => [block.id, block.objectId]),
-  );
-  // Without an explicit filter, Curation/Bandage follow the heatmap viewport
-  // and expand each hit to its whole homolog group. An explicit checkbox or
-  // regex selection becomes authoritative so filtered chromosomes stay shown.
-  const automaticGfaVisibleHomologScaffoldIds = gfaScaffoldsForHeatmapViewport(
-    viewAssemblyBlocks,
-    heatmapViewport,
-    gfaHomologs,
-  );
-  const gfaVisibleHomologScaffoldIds = chromosomeDisplayScope(
-    automaticGfaVisibleHomologScaffoldIds,
-    chromosomeVisibility,
-  );
-  // The compact preview follows one primary group until the user explicitly
-  // chooses a chromosome display set.
-  const automaticGfaPreviewScaffoldIds = gfaPrimaryHomologScaffoldsForHeatmapViewport(
-    viewAssemblyBlocks,
-    heatmapViewport,
-    gfaHomologs,
-  );
-  const gfaPreviewScaffoldIds = chromosomeDisplayScope(
-    automaticGfaPreviewScaffoldIds,
-    chromosomeVisibility,
-  );
-  // Guided normally narrows to the AGP contig plus five neighbors per side;
-  // explicit chromosome selection lifts that focus to all matching AGP blocks.
-  const automaticGfaGuidedContigIds = gfaContigsForHeatmapViewport(
-    viewAssemblyBlocks,
-    heatmapViewport,
-    5,
-    new Set(selectedAssemblyBlockIds),
-  );
-  const explicitlyVisibleChromosomeContigIds = chromosomeVisibility.active
-    ? activeAssemblyBlocks
-      .filter((block) => chromosomeVisibility.visibleIds.has(block.objectId))
-      .map((block) => block.id)
-    : [];
-  const gfaGuidedContigIds = new Set([
-    ...explicitlyVisibleChromosomeContigIds,
-    ...[...automaticGfaGuidedContigIds].filter((id) => {
-      const chromosomeId = chromosomeByBlockId.get(id);
-      return chromosomeId === undefined
-        || !knownAssemblyObjectIds.has(chromosomeId)
-        || chromosomeVisibility.visibleIds.has(chromosomeId);
-    }),
+  ), [activeAssemblyBlocks]);
+  const gfaViewportIndex = useMemo(() => buildGfaViewportIndex(viewAssemblyBlocks), [viewAssemblyBlocks]);
+  const { gfaVisibleHomologScaffoldIds, gfaPreviewScaffoldIds, gfaGuidedContigIds } = useMemo(() => {
+    // Without an explicit filter, Curation/Bandage follow the heatmap viewport
+    // and expand each hit to its whole homolog group. An explicit checkbox or
+    // regex selection becomes authoritative so filtered chromosomes stay shown.
+    const automaticGfaVisibleHomologScaffoldIds = gfaScaffoldsForHeatmapViewport(
+      viewAssemblyBlocks,
+      heatmapViewport,
+      gfaHomologs,
+    );
+    const gfaVisibleHomologScaffoldIds = chromosomeDisplayScope(
+      automaticGfaVisibleHomologScaffoldIds,
+      chromosomeVisibility,
+    );
+    // The compact preview follows one primary group until the user explicitly
+    // chooses a chromosome display set.
+    const automaticGfaPreviewScaffoldIds = gfaPrimaryHomologScaffoldsForHeatmapViewport(
+      viewAssemblyBlocks,
+      heatmapViewport,
+      gfaHomologs,
+    );
+    const gfaPreviewScaffoldIds = chromosomeDisplayScope(
+      automaticGfaPreviewScaffoldIds,
+      chromosomeVisibility,
+    );
+    // Guided normally narrows to the AGP contig plus five neighbors per side;
+    // explicit chromosome selection lifts that focus to all matching AGP blocks.
+    const automaticGfaGuidedContigIds = gfaContigsForHeatmapViewport(
+      viewAssemblyBlocks,
+      heatmapViewport,
+      5,
+      new Set(selectedAssemblyBlockIds),
+      gfaViewportIndex,
+    );
+    const explicitlyVisibleChromosomeContigIds = chromosomeVisibility.active
+      ? activeAssemblyBlocks
+        .filter((block) => chromosomeVisibility.visibleIds.has(block.objectId))
+        .map((block) => block.id)
+      : [];
+    const gfaGuidedContigIds = new Set([
+      ...explicitlyVisibleChromosomeContigIds,
+      ...[...automaticGfaGuidedContigIds].filter((id) => {
+        const chromosomeId = chromosomeByBlockId.get(id);
+        return chromosomeId === undefined
+          || !knownAssemblyObjectIds.has(chromosomeId)
+          || chromosomeVisibility.visibleIds.has(chromosomeId);
+      }),
+    ]);
+    return { gfaVisibleHomologScaffoldIds, gfaPreviewScaffoldIds, gfaGuidedContigIds };
+  }, [
+    viewAssemblyBlocks, activeAssemblyBlocks, heatmapViewport, gfaHomologs,
+    chromosomeVisibility, selectedAssemblyBlockIds, gfaViewportIndex,
+    chromosomeByBlockId, knownAssemblyObjectIds,
   ]);
   const selectedContactNormalization = contactNormalizationForBackend(uiState.normalization);
   const displayedContactNormalization = contactMap?.normalization;
@@ -1411,6 +1431,7 @@ export function AppShell({
                   contactTileDeltaStream={contactTileDeltaStream}
                   overviewContactMap={overviewContactMap}
                   coverageView={coverageView}
+                  onLoadCoverageViewport={onLoadCoverageViewport}
                   assemblyBlocks={viewAssemblyBlocks}
                   uiState={uiState}
                   homologPattern={gfaHomologPattern}
@@ -1424,7 +1445,7 @@ export function AppShell({
                   onContactPanGestureStart={onContactPanGestureStart}
                   onContactPanTilePrefetch={onContactPanTilePrefetch}
                   onContactViewportPreview={onContactViewportPreview}
-                  onPresentedViewportChange={setPresentedContactViewport}
+                  onPresentedViewportChange={contactViewportPresentation.publish}
                   onViewportNavigationControllerChange={handleViewportNavigationControllerChange}
                   contactPanPrefetchBridge={contactPanPrefetchBridge}
                   onContactTileLayerCommit={onContactTileLayerCommit}
@@ -1548,7 +1569,7 @@ export function AppShell({
               dataset={dataset}
               contactMap={contactMap}
               overviewContactMap={contactInspectorOverviewEnabled ? overviewContactMap : null}
-              presentedContactViewport={presentedContactViewport}
+              contactViewportPresentation={contactViewportPresentation}
               status={status}
               statusMessage={statusMessage}
               isAgpDirty={isAgpDirty}

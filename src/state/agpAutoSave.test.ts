@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   agpAutoSaveDelayMs,
   agpSavePlan,
+  agpSaveDialogPath,
+  editedAgpFilename,
   shouldScheduleAgpAutoSave,
 } from "./agpAutoSave";
 
@@ -15,7 +17,7 @@ describe("AGP auto-save", () => {
     })).toBe("overwrite");
   });
 
-  it("always opens a dialog for Save As", () => {
+  it("always opens a dialog for Save As, including after saving", () => {
     expect(agpSavePlan({ automatic: false, saveAs: true, savePath: null })).toBe("dialog");
     expect(agpSavePlan({
       automatic: false,
@@ -69,5 +71,44 @@ describe("AGP auto-save", () => {
       dirty: true,
       hasBlocks: false,
     })).toBe(false);
+  });
+});
+
+describe("AGP save dialog location", () => {
+  it.each([
+    ["/data/project/groups.agp", "/data/project/groups.edited.agp"],
+    ["C:\\data\\project\\groups.agp", "C:\\data\\project\\groups.edited.agp"],
+    ["/groups.agp", "/groups.edited.agp"],
+    ["groups.agp", "groups.edited.agp"],
+    ["", "groups.edited.agp"],
+  ])("defaults to the loaded AGP folder: %s", (source, expected) => {
+    expect(agpSaveDialogPath(source, "groups.edited.agp", null)).toBe(expected);
+  });
+
+  it("keeps the destination previously chosen by the user", () => {
+    expect(agpSaveDialogPath("/project/groups.agp", "groups.edited.agp", "/output/result.agp"))
+      .toBe("/output/result.agp");
+  });
+});
+
+describe("save filename continuity", () => {
+  it("reuses the first download name across repeated saves", () => {
+    let currentPath = "groups.edit.agp";
+    let downloadedName: string | null = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const filename = editedAgpFilename(currentPath, downloadedName);
+      expect(filename).toBe("groups.edit.edited.agp");
+      downloadedName = filename;
+      currentPath = filename;
+    }
+  });
+
+  it("preserves a user-chosen native filename exactly", () => {
+    expect(editedAgpFilename("groups.edit.agp", "/project/groups.edit.eidt.agp"))
+      .toBe("groups.edit.eidt.agp");
+  });
+
+  it("starts a new suggestion for a newly loaded assembly", () => {
+    expect(editedAgpFilename("/other/new.agp", null)).toBe("new.edited.agp");
   });
 });

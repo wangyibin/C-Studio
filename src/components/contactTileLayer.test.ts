@@ -309,6 +309,14 @@ describe("contact tile presentation buffer", () => {
     )).toBe(target.contactMap.viewport);
   });
 
+  it("discards the fine committed pan camera after a coarse resolution takes the front slot", () => {
+    const fine = contactTileFrame(1, 50_000);
+    const coarse = contactTileFrame(2, 2_500_000);
+    expect(contactTileViewportForBufferedSurface(
+      "presented", coarse, coarse, coarse.contactMap.viewport, fine.contactMap.viewport,
+    )).toBe(coarse.contactMap.viewport);
+  });
+
   it("stages a selected-resolution change even when both choices reuse one LOD resolution", () => {
     const fineChoice = contactTileFrame(1, 500_000);
     fineChoice.contactMap.requestedResolution = 1_000;
