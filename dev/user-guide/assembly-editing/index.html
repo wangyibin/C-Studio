@@ -1231,7 +1231,7 @@ or GFA. Right-click the selection to open the shared operation menu.</p>
 </tr>
 <tr>
 <td><strong>Delete gap / join blocks</strong></td>
-<td>Remove eligible AGP gap rows and join the neighboring blocks</td>
+<td>Remove eligible AGP gaps, join neighboring blocks, and trim overlaps supported by the loaded GFA</td>
 </tr>
 <tr>
 <td><strong>Move to debris</strong></td>
@@ -1243,6 +1243,21 @@ or GFA. Right-click the selection to open the shared operation menu.</p>
 </tr>
 </tbody>
 </table>
+<p>After copying, selection moves to the newly created copies. Whole-chromosome copies retain chromosome selection for subsequent insertion, movement, and editing; contig copies retain contig selection.</p>
+<p>When a GFA is loaded, <strong>Delete gap / join blocks</strong> (<span class="keys"><kbd class="key-command">Cmd</kbd><span>+</span><kbd class="key-j">J</kbd></span> / <span class="keys"><kbd class="key-control">Ctrl</kbd><span>+</span><kbd class="key-j">J</kbd></span>)
+checks each newly joined boundary against its <code>L</code> records. A unique link matching
+the contig orientations with a simple <code>M</code>/<code>=</code> overlap trims that many bases from
+the displayed left end of the right-hand contig. The AGP source interval changes;
+the source FASTA stays unchanged. Existing joins are not trimmed again. Without
+a matching contig pair in the GFA, joining only removes the gap. Ambiguous links,
+conflicting orientations, and unsupported overlaps leave the selection unchanged
+and show a reason in Messages. Undo restores the gap and source intervals;
+<strong>Dissolve block</strong> also restores the recorded trims.</p>
+<p>For hifiasm links whose <code>L1</code> tag agrees with the source segment length, a unique
+reciprocal pair may report different overlaps on its two source contigs. Joining
+uses the overlap recorded on the contig being trimmed. Moving or reversing a
+contig and saving does not apply overlap trimming; select the adjacent blocks
+and run <strong>Delete gap / join blocks</strong> first.</p>
 <p>To split a contig, first select it, then hover an internal point of its diagonal
 box. When the cut cursor appears, click to split. End regions are guarded so an
 unsafe near-end click is not treated as a cut.</p>
